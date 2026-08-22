@@ -137,7 +137,13 @@ typedef enum {
  *  values, if this ever needs delta-merge semantics at this layer too — as of Phase 1
  *  W3, this layer is a transport, not a state machine: merge policy lives in WindowModel,
  *  this struct just carries whatever fieldFlags + values rail-probe/CRBridge observed for
- *  a single order). */
+ *  a single order).
+ *
+ *  `ownerWindowId` (adr/0008 §3): TS_WINDOW_STATE_ORDER.ownerWindowId, gated on the wire
+ *  by WINDOW_ORDER_FIELD_OWNER (0x00000002) — this layer is still a transport, not a
+ *  state machine, so it carries whatever the caller copied in for a given order (0 is a
+ *  legitimate "no owner" value, not just "field absent"); bit-gated delta-merge across
+ *  orders is WindowModel's job, same as every other sub-field here. */
 typedef struct {
     uint32_t windowId;
     uint32_t fieldFlags;
@@ -148,8 +154,17 @@ typedef struct {
     uint32_t style;
     uint32_t styleEx;
     uint32_t show;
+    uint32_t ownerWindowId;
     crdpq_text_t title;
 } crdpq_window_order_t;
+
+/* adr/0008 §5's ABI/version discipline: no version number, no reserved padding — a struct
+ * layout change must be caught by the compiler at build time, not papered over by
+ * convention. 300 was measured (not estimated) with `clang`/arm64 immediately after adding
+ * `ownerWindowId` above; if this ever fires, some other field in this struct (or its
+ * `crdpq_text_t` member) changed shape and every consumer needs re-auditing, not just this
+ * assert updating. */
+_Static_assert(sizeof(crdpq_window_order_t) == 300, "crdpq_window_order_t layout changed -- re-measure and audit consumers (adr/0008 §5)");
 
 /** WindowDelete, WindowIcon. */
 typedef struct {

@@ -5,6 +5,8 @@ import Foundation
 /// `libfreerdp/core/window.c`'s own order parser (`update_read_window_state_order`,
 /// window.c:311-332) gates each sub-field's read on the matching bit.
 private enum WindowOrderField {
+    /// `WINDOW_ORDER_FIELD_OWNER` (window.h:35) — gates `ownerWindowId` (adr/0008 §3).
+    static let owner: UInt32 = 0x0000_0002
     static let title: UInt32 = 0x0000_0004
     static let style: UInt32 = 0x0000_0008 // gates BOTH style and extendedStyle together
     static let show: UInt32 = 0x0000_0010
@@ -36,6 +38,11 @@ public struct WindowState: Sendable, Equatable {
     public var styleEx: UInt32 = 0
     public var show: UInt32 = 0
     public var title: String = ""
+    /// `TS_WINDOW_STATE_ORDER.ownerWindowId` (adr/0008 §3), bit-gated on
+    /// `WINDOW_ORDER_FIELD_OWNER` exactly like every other conditional sub-field below —
+    /// an absent bit means "unchanged", not "no owner"; 0 is itself a legitimate owner
+    /// value ("no owner"/desktop-owned) once actually observed on the wire.
+    public var ownerWindowId: UInt32 = 0
     /// Set once a `WindowIcon` or `WindowCachedIcon` order has been seen for this window.
     /// The probe log doesn't carry icon bytes, only that an icon order occurred.
     public var hasIcon: Bool = false
@@ -56,6 +63,9 @@ public struct WindowState: Sendable, Equatable {
     /// `WindowUpdate`; several later updates for the same window carry no title bit and
     /// would otherwise erase it.
     mutating func merge(_ payload: WindowOrderPayload) {
+        if payload.fieldFlags & WindowOrderField.owner != 0 {
+            ownerWindowId = payload.ownerWindowId
+        }
         if payload.fieldFlags & WindowOrderField.offset != 0 {
             offsetX = payload.windowOffsetX
             offsetY = payload.windowOffsetY

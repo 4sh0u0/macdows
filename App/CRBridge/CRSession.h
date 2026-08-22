@@ -69,6 +69,20 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// form — W4b's rendering layer only distinguishes hidden-vs-shown, not which shown state
 /// (Z-order/minimize/restore fidelity is Phase 2, adr/0005 §7).
 @property (nonatomic, readonly) uint32_t show;
+/// WindowCreate/Update only, meaningful only when `fieldFlags` sets the style bit (0x0008,
+/// which gates BOTH `style` and `styleEx` together, per MacdowsCore's WindowModel.swift).
+/// `TS_WINDOW_STATE_ORDER.style` (a `WS_*` bitmask, freerdp/window.h) — Phase 2 W0①'s
+/// style/owner-based window filter (adr/0008 §3) is this field's first real consumer.
+@property (nonatomic, readonly) uint32_t style;
+/// WindowCreate/Update only, meaningful only when `fieldFlags` sets the style bit (0x0008;
+/// see `style` above). `TS_WINDOW_STATE_ORDER.extendedStyle` (a `WS_EX_*` bitmask).
+@property (nonatomic, readonly) uint32_t styleEx;
+/// WindowCreate/Update only, meaningful only when `fieldFlags` sets the owner bit (0x0002,
+/// `WINDOW_ORDER_FIELD_OWNER`). `TS_WINDOW_STATE_ORDER.ownerWindowId` (adr/0008 §3) — 0 is
+/// a legitimate "no owner" value on the wire, not just "field absent"; callers must gate on
+/// `fieldFlags` exactly like every other conditional sub-field on this class, never treat a
+/// bare 0 here as authoritative without checking the bit first.
+@property (nonatomic, readonly) uint32_t ownerWindowId;
 
 /// ExecResult.execResult; ExecResult.rawResult; ExecResult's program/file path.
 @property (nonatomic, readonly) uint32_t execResult;

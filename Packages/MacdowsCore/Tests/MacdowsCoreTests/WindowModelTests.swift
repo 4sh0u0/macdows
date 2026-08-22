@@ -28,7 +28,8 @@ struct WindowModelTests {
         style: UInt32 = 0,
         styleEx: UInt32 = 0,
         show: UInt32 = 0,
-        title: String = ""
+        title: String = "",
+        ownerWindowId: UInt32 = 0
     ) -> WindowOrderPayload {
         WindowOrderPayload(
             windowId: windowId,
@@ -41,7 +42,8 @@ struct WindowModelTests {
             style: style,
             styleEx: styleEx,
             show: show,
-            title: title
+            title: title,
+            ownerWindowId: ownerWindowId
         )
     }
 
@@ -53,6 +55,7 @@ struct WindowModelTests {
     // (duplicated here deliberately — these tests exist specifically to catch the file
     // under test using the wrong constant, so they must not share that file's constants).
 
+    static let fieldOwner: UInt32 = 0x0000_0002
     static let fieldTitle: UInt32 = 0x0000_0004
     static let fieldStyle: UInt32 = 0x0000_0008
     static let fieldShow: UInt32 = 0x0000_0010
@@ -290,5 +293,45 @@ struct WindowModelTests {
         let payload = Self.windowOrder(windowId: 1, fieldFlags: Self.fieldWndRects, numVisibilityRects: 9)
         _ = model.apply(Self.event(.windowUpdate(payload), line: 2))
         #expect(model.windows[1]?.numVisibilityRects == 0, "WND_RECTS alone must not apply numVisibilityRects — that would mean the fix regressed to accepting either bit")
+    }
+
+    // MARK: - adr/0008 §3: ownerWindowId bit-gated delta-merge
+
+    @Test("WindowCreate with the OWNER bit sets ownerWindowId; a later WindowUpdate without OWNER must not clear it")
+    func ownerWindowIdSurvivesUpdateWithoutOwnerBit() {
+        var model = WindowModel()
+
+        let created = Self.windowOrder(
+            windowId: 1, fieldFlags: Self.fieldOwner | Self.fieldSize,
+            width: 800, height: 600, ownerWindowId: 4242
+        )
+        _ = model.apply(Self.event(.windowCreate(created), line: 1))
+        #expect(model.windows[1]?.ownerWindowId == 4242, "OWNER bit on Create must set ownerWindowId")
+
+        // Geometry-only update, deliberately NOT carrying the OWNER bit — matches real
+        // capture behavior (adr/0008 §0: OWNER is set on every WindowCreate but absent on
+        // every WindowUpdate across all six phase05 samples).
+        let moved = Self.windowOrder(windowId: 1, fieldFlags: Self.fieldOffset, offsetX: 10, offsetY: 20)
+        #expect(moved.fieldFlags & Self.fieldOwner == 0, "test sanity: OWNER must not be set on this update")
+        _ = model.apply(Self.event(.windowUpdate(moved), line: 2))
+
+        let state = try! #require(model.windows[1])
+        #expect(state.offsetX == 10 && state.offsetY == 20, "the offset bit's own field must still apply")
+        #expect(state.ownerWindowId == 4242, "an update without the OWNER bit must NOT clear the previously-known owner")
+    }
+
+    @Test("a WindowUpdate that DOES carry the OWNER bit overwrites ownerWindowId, including to 0")
+    func ownerWindowIdUpdatesWhenBitIsSet() {
+        var model = WindowModel()
+        _ = model.apply(Self.event(.windowCreate(Self.windowOrder(
+            windowId: 1, fieldFlags: Self.fieldOwner, ownerWindowId: 4242
+        )), line: 1))
+        #expect(model.windows[1]?.ownerWindowId == 4242)
+
+        // 0 is itself a legitimate wire value ("no owner"), not "field absent" — the OWNER
+        // bit is what carries that meaning, not a non-zero check on the value.
+        let reowned = Self.windowOrder(windowId: 1, fieldFlags: Self.fieldOwner, ownerWindowId: 0)
+        _ = model.apply(Self.event(.windowUpdate(reowned), line: 2))
+        #expect(model.windows[1]?.ownerWindowId == 0, "OWNER bit set with value 0 must overwrite, not be mistaken for 'absent'")
     }
 }

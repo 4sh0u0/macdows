@@ -65,6 +65,9 @@
 @property (nonatomic) uint32_t windowWidth;
 @property (nonatomic) uint32_t windowHeight;
 @property (nonatomic) uint32_t show;
+@property (nonatomic) uint32_t style;
+@property (nonatomic) uint32_t styleEx;
+@property (nonatomic) uint32_t ownerWindowId;
 @property (nonatomic) uint32_t execResult;
 @property (nonatomic) uint32_t rawResult;
 @property (nonatomic) NSString *program;
@@ -124,6 +127,9 @@ static CRDPEvent *CRDPEventFromCrdpEvent(const CrdpEvent *ev)
             out.windowWidth = wo->width;
             out.windowHeight = wo->height;
             out.show = wo->show;
+            out.style = wo->style;
+            out.styleEx = wo->styleEx;
+            out.ownerWindowId = wo->ownerWindowId;
             break;
         }
         case CRDPQ_EVENT_WINDOW_DELETE:
@@ -366,6 +372,16 @@ static BOOL crb_window_common(rdpContext *context, const WINDOW_ORDER_INFO *orde
     ev.payload.windowOrder.style = windowState->style;
     ev.payload.windowOrder.styleEx = windowState->extendedStyle;
     ev.payload.windowOrder.show = windowState->showState;
+    /* adr/0008 §3: bit-gated, NOT unconditional like style/styleEx/show above. Sample
+     * evidence (adr/0008 §0) is explicit that the OWNER bit is set on every WindowCreate
+     * but absent on every WindowUpdate in six real captures -- an unconditional copy here
+     * would zero out the already-known owner on every single WindowUpdate a real session
+     * ever sees, not just a theoretical edge case. `ev.payload` was already
+     * memset-to-zero above, so the else case (bit absent) is simply "leave it at 0",
+     * matching this transport layer's existing convention for every other conditional
+     * sub-field on this struct. */
+    if (orderInfo->fieldFlags & WINDOW_ORDER_FIELD_OWNER)
+        ev.payload.windowOrder.ownerWindowId = windowState->ownerWindowId;
 
     if (orderInfo->fieldFlags & WINDOW_ORDER_FIELD_TITLE)
     {

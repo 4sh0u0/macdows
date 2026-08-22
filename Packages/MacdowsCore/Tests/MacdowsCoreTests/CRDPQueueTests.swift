@@ -494,14 +494,17 @@ struct CRDPQueueLayoutTests {
     /// catch, since nothing else in this suite would notice a layout regression.
     @Test("CrdpEvent and CrdpCommand match their measured, known-good sizes")
     func reportSizes() {
-        // crdpq_window_order_t (296B: 9 x 4B scalar fields + crdpq_text_t's 260B,
-        // 4-byte-aligned) is the largest union member, so it sets crdpq_event_payload_t's
-        // size; CrdpEvent adds a 4B type tag + 4B generation on top (8-byte aligned
-        // overall because of the union's own internal alignment needs) = 304B total.
+        // crdpq_window_order_t (300B: 10 x 4B scalar fields, including adr/0008 §3's
+        // ownerWindowId, + crdpq_text_t's 260B, 4-byte-aligned -- see crdpq.h's own
+        // _Static_assert pinning this same number at the C layer) is the largest union
+        // member, but crdpq_event_payload_t's OWN alignment is 8 (crdpq_surface_mapped_t's
+        // uint64_t windowId, not window_order_t, sets that), so the union's size is padded
+        // up from 300 to the next multiple of 8 = 304B. CrdpEvent adds a 4B type tag + 4B
+        // generation on top = 312B total.
         #expect(MemoryLayout<crdpq_text_t>.size == 260)
-        #expect(MemoryLayout<crdpq_window_order_t>.size == 296)
-        #expect(MemoryLayout<crdpq_event_payload_t>.size == 296)
-        #expect(MemoryLayout<CrdpEvent>.size == 304)
+        #expect(MemoryLayout<crdpq_window_order_t>.size == 300)
+        #expect(MemoryLayout<crdpq_event_payload_t>.size == 304)
+        #expect(MemoryLayout<CrdpEvent>.size == 312)
         #expect(MemoryLayout<CrdpEvent>.alignment == 8)
 
         // crdpq_cmd_execute_t (crdpq_text_t alone, 260B) is the largest CrdpCommand union

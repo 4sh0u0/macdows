@@ -313,6 +313,57 @@ public struct WindowOrderPayload: Decodable, Sendable, Equatable {
     public let styleEx: UInt32
     public let show: UInt32
     public let title: String
+    /// `TS_WINDOW_STATE_ORDER.ownerWindowId` (adr/0008 §3). Never emitted by
+    /// `rail-probe.c`'s current `log_event` calls — verified against every
+    /// `samples/phase05-rail-events-2026-08-19/*.jsonl` line: zero matches for this key
+    /// (adr/0008 §0) — so this decodes as 0 when the key is absent, per adr/0008 §5's
+    /// replay-compat rule ("new fields append; absent means 0/false, never a decode
+    /// failure"). A future probe build that does log it decodes the real value normally.
+    public let ownerWindowId: UInt32
+
+    private enum CodingKeys: String, CodingKey {
+        case windowId, fieldFlags, windowOffsetX, windowOffsetY, windowWidth, windowHeight
+        case numVisibilityRects, style, styleEx, show, title, ownerWindowId
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        windowId = try container.decode(UInt32.self, forKey: .windowId)
+        fieldFlags = try container.decode(UInt32.self, forKey: .fieldFlags)
+        windowOffsetX = try container.decode(Int32.self, forKey: .windowOffsetX)
+        windowOffsetY = try container.decode(Int32.self, forKey: .windowOffsetY)
+        windowWidth = try container.decode(UInt32.self, forKey: .windowWidth)
+        windowHeight = try container.decode(UInt32.self, forKey: .windowHeight)
+        numVisibilityRects = try container.decode(UInt32.self, forKey: .numVisibilityRects)
+        style = try container.decode(UInt32.self, forKey: .style)
+        styleEx = try container.decode(UInt32.self, forKey: .styleEx)
+        show = try container.decode(UInt32.self, forKey: .show)
+        title = try container.decode(String.self, forKey: .title)
+        ownerWindowId = try container.decodeIfPresent(UInt32.self, forKey: .ownerWindowId) ?? 0
+    }
+
+    /// Explicit memberwise init — a custom `init(from:)` above suppresses Swift's
+    /// synthesized one, and `WindowModelTests`' `@testable`-visible construction helper
+    /// relies on calling this directly. `ownerWindowId` defaults to 0, matching this
+    /// struct's own decode-when-absent behavior.
+    init(
+        windowId: UInt32, fieldFlags: UInt32, windowOffsetX: Int32, windowOffsetY: Int32,
+        windowWidth: UInt32, windowHeight: UInt32, numVisibilityRects: UInt32, style: UInt32,
+        styleEx: UInt32, show: UInt32, title: String, ownerWindowId: UInt32 = 0
+    ) {
+        self.windowId = windowId
+        self.fieldFlags = fieldFlags
+        self.windowOffsetX = windowOffsetX
+        self.windowOffsetY = windowOffsetY
+        self.windowWidth = windowWidth
+        self.windowHeight = windowHeight
+        self.numVisibilityRects = numVisibilityRects
+        self.style = style
+        self.styleEx = styleEx
+        self.show = show
+        self.title = title
+        self.ownerWindowId = ownerWindowId
+    }
 }
 
 struct WindowIdPayload: Decodable { let windowId: UInt32 }

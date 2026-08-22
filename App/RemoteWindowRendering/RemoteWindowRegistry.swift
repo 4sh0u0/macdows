@@ -12,15 +12,19 @@ import os
 /// replay/test surface, not a second live-rendering consumer. Mirrors crdpq.h's own
 /// precedent of not sharing these constants with its C transport layer either.
 private enum WindowOrderField {
+    static let owner: UInt32 = 0x0000_0002
     static let title: UInt32 = 0x0000_0004
+    static let style: UInt32 = 0x0000_0008 // gates BOTH style and extendedStyle together
     static let show: UInt32 = 0x0000_0010
     static let size: UInt32 = 0x0000_0400
     static let offset: UInt32 = 0x0000_0800
 }
 
-/// Accumulated per-windowId state this registry needs to paint something — narrower than
-/// MacdowsCore.WindowState (no style/styleEx/visibility-rects; this rendering layer
-/// consumes none of them, W4b's LocalMoveResize/Z-order work being Phase 2).
+/// Accumulated per-windowId state this registry needs to paint something and decide
+/// whether it's mappable — narrower than MacdowsCore.WindowState (no visibility-rects;
+/// this rendering layer doesn't consume them yet, that being adr/0008 §6's deferred W1
+/// work). style/styleEx/ownerWindowId were added in Phase 2 W0① specifically to drive
+/// `WindowMappability.isMappableWindow` below, replacing the old size-only cap.
 private struct PendingWindowState {
     var offsetX: Int32 = 0
     var offsetY: Int32 = 0
@@ -28,12 +32,18 @@ private struct PendingWindowState {
     var height: UInt32 = 0
     var show: UInt32 = 0
     var title: String = ""
+    var style: UInt32 = 0
+    var styleEx: UInt32 = 0
+    var ownerWindowId: UInt32 = 0
 
     /// Applies only the sub-fields `event.fieldFlags` actually flags present — a delta
     /// order's unset bit means "unchanged", not "reset to zero/empty" (same invariant
     /// MacdowsCore.WindowState.merge documents and enforces for the JSONL-replay path).
     mutating func merge(_ event: CRDPEvent) {
         let flags = event.fieldFlags
+        if flags & WindowOrderField.owner != 0 {
+            ownerWindowId = event.ownerWindowId
+        }
         if flags & WindowOrderField.offset != 0 {
             offsetX = event.offsetX
             offsetY = event.offsetY
@@ -41,6 +51,10 @@ private struct PendingWindowState {
         if flags & WindowOrderField.size != 0 {
             width = event.windowWidth
             height = event.windowHeight
+        }
+        if flags & WindowOrderField.style != 0 {
+            style = event.style
+            styleEx = event.styleEx
         }
         if flags & WindowOrderField.show != 0 {
             show = event.show
@@ -69,7 +83,7 @@ final class RemoteWindowRegistry {
     /// a later FrameReady(surfaceId) can be routed to the right RemoteWindow. Unlike
     /// MacdowsCore.WindowModel's surfaceBindings/pendingBindings pair, this registry
     /// doesn't separately track "settled vs. pending" — a FrameReady for a surfaceId whose
-    /// window doesn't exist yet (or is filtered out, see isLikelyContentWindow) is simply
+    /// window doesn't exist yet (or is filtered out, see isMappableWindow) is simply
     /// skipped; adr/0005 §1's "a GFX frame is state, not an event" means nothing is lost by doing so —
     /// the next FrameReady for the same surfaceId will retry once/if the window exists.
     private var surfaceToWindow: [UInt32: UInt32] = [:]
@@ -127,24 +141,19 @@ final class RemoteWindowRegistry {
         Double(NSScreen.screens.first?.frame.height ?? 0)
     }
 
-    /// W4b temporary size-based filter (spec's own words: a "temporary policy", not a permanent
-    /// windowing design). A RemoteApp session's whole-desktop container surface (observed
-    /// ~2560x1410 against the real lab host, matching a full virtual-desktop "Program
-    /// Manager"-class window) and assorted 1x1 helper windows RAIL creates for its own
-    /// bookkeeping aren't real user-visible content — mapping either to a visible NSWindow
-    /// just adds noise (a huge black/blank window, or a scattering of 1-pixel windows)
-    /// with no acceptance-criteria value. A real allow/deny-list belongs to a later phase
-    /// once more window classes have actually been observed against a real host; this is
-    /// a narrow, explicitly temporary guard, not general windowing policy.
-    private static func isLikelyContentWindow(width: UInt32, height: UInt32) -> Bool {
-        if width <= 1 || height <= 1 { return false }
-        // Garbage-value guard: in the Int32 era any wire value with bit 31 set came out
-        // negative and failed the <=1 check; the UInt32 migration silently removed that
-        // accidental protection (a 0x80000000-wide order would have built a 2-billion-
-        // point NSWindow). No sane single window exceeds 16384 in either dimension.
-        if width > 16384 || height > 16384 { return false }
-        if width >= 2000 && height >= 1000 { return false }
-        return true
+    /// Phase 2 W0① (docs/plans/phase2.md W0①, adr/0008 §3): thin call-site wrapper over
+    /// `MacdowsCore.WindowMappability.isMappableWindow` — the actual decision logic lives
+    /// there (a pure, no-AppKit function) specifically so this AppKit-side live path and
+    /// `MacdowsCoreTests`' replay-fixture regression test exercise the identical
+    /// implementation. Replaces the prior W4b `isLikelyContentWindow`, whose own doc
+    /// comment called its `width >= 2000 && height >= 1000` cap an explicitly temporary
+    /// policy — it dropped every maximized content window (Word, Edge, ...), which is
+    /// exactly what this pass exists to stop doing.
+    private static func isMappableWindow(_ state: PendingWindowState, fieldFlags: UInt32) -> Bool {
+        WindowMappability.isMappableWindow(
+            width: state.width, height: state.height, style: state.style, styleEx: state.styleEx,
+            ownerWindowId: state.ownerWindowId, fieldFlags: fieldFlags
+        )
     }
 
     /// Call once per drained event, in delivery order (`session.drainEvents { registry.handle($0) }`)
@@ -194,10 +203,10 @@ final class RemoteWindowRegistry {
         state.merge(event)
         geometry[windowId] = state
 
-        guard state.hasKnownSize, Self.isLikelyContentWindow(width: state.width, height: state.height) else {
-            // Not enough geometry yet, or filtered out (see isLikelyContentWindow) — if a
+        guard state.hasKnownSize, Self.isMappableWindow(state, fieldFlags: event.fieldFlags) else {
+            // Not enough geometry yet, or filtered out (see isMappableWindow) — if a
             // RemoteWindow was already created for this windowId before it grew into a
-            // filtered size (not expected in practice, but not assumed impossible either),
+            // filtered style (not expected in practice, but not assumed impossible either),
             // it's deliberately left alone here rather than torn down mid-session; only
             // WindowDelete/a generation rollover removes an existing RemoteWindow.
             return
@@ -454,7 +463,7 @@ final class RemoteWindowRegistry {
     private func handleFrameReady(surfaceId: UInt32) {
         guard let windowId = surfaceToWindow[surfaceId], let window = windows[windowId] else {
             // Either not yet bound to a window, or bound to a window this registry isn't
-            // rendering (isLikelyContentWindow filter) — either way, nothing to present;
+            // rendering (isMappableWindow filter) — either way, nothing to present;
             // see surfaceToWindow's own doc comment for why this is safe to just skip.
             return
         }

@@ -940,14 +940,23 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 + "leave zero if this was the only window open)")
         }
 
-        // H3: every visible window's size must fall in a broad, non-brittle plausible-
-        // content band -- a lower bound (excludes 1x1 RAIL helper windows and
-        // anything else clearly not real content, without being so tight it flakes on
-        // legitimate smaller dialogs) and an upper bound that excludes the desktop
-        // container surface RemoteWindowRegistry's own isLikelyContentWindow filter is
-        // already supposed to keep out (observed ~2560x1410 "Program Manager"-class) --
-        // this assertion exists specifically to independently catch a regression in that
-        // filter, not merely to restate it.
+        // H3, revised for Phase 2 W0① (docs/plans/phase2.md W0①): every visible window's
+        // size must clear a broad, non-brittle plausible-content floor. The upper bound
+        // this band used to carry (2000pt) existed only to independently catch a
+        // regression in RemoteWindowRegistry's now-removed size-only cap (`isLikelyContentWindow`,
+        // `width>=2000 && height>=1000`) -- W0① replaced that cap with a style/owner-based
+        // filter (adr/0008 §3), and a maximized real content window is now explicitly
+        // SUPPOSED to become a large visible RemoteWindow, so re-imposing that same 2000pt
+        // ceiling here would silently reintroduce the exact regression this pass exists to
+        // fix. The desktop-container window itself ("Program Manager") is still excluded
+        // -- now by RemoteWindowRegistry's style check, not by this harness duplicating a
+        // size heuristic -- so no upper bound is needed to catch that specific case
+        // anymore. What remains is a generous garbage-value sanity net only, one order of
+        // magnitude under RemoteWindowRegistry's own 16384 hard ceiling
+        // (WindowMappability.isMappableWindow), loose enough that no plausible maximized
+        // window on any real display trips it. No maximize e2e is added here (deferred to
+        // W2 -- no SysCommand lever exposed yet); this only stops the band itself from
+        // becoming a second place a maximize regression would need fixing.
         for w in visibleWindows {
             let width = w.frame.width
             let height = w.frame.height
@@ -957,9 +966,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // excludes every RAIL helper class actually observed (1x1 bookkeeping windows,
             // the 136x39 tray helper, 1009x4 edge strips) -- which is this band's job.
             check(
-                width >= 150 && height >= 80 && width < 2000 && height < 2000,
-                "visible window \"\(w.title)\" (id \(w.windowId)) size is in the plausible-content band, "
-                    + "not desktop-container-sized (got \(width)x\(height))"
+                width >= 150 && height >= 80 && width < 10000 && height < 10000,
+                "visible window \"\(w.title)\" (id \(w.windowId)) size is in the plausible-content band "
+                    + "(got \(width)x\(height))"
             )
         }
 
