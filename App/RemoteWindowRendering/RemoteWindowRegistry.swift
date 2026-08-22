@@ -474,6 +474,9 @@ final class RemoteWindowRegistry {
         let isVisible: Bool
         let hasDisplayedContent: Bool
         let title: String
+        /// Phase 2 W0③ first-frame gating diagnostic -- see `RemoteWindow.firstFrameTimedOut`'s
+        /// own doc comment.
+        let firstFrameTimedOut: Bool
     }
 
     /// Diagnostics only (Tools/window-smoke's W4c input end-to-end assertions) — exposes
@@ -491,7 +494,8 @@ final class RemoteWindowRegistry {
         windows.map { windowId, window in
             WindowSnapshot(
                 windowId: windowId, frame: window.frame, isVisible: window.isVisible,
-                hasDisplayedContent: window.hasDisplayedContent, title: window.title
+                hasDisplayedContent: window.hasDisplayedContent, title: window.title,
+                firstFrameTimedOut: window.firstFrameTimedOut
             )
         }
     }

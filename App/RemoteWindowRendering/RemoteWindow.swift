@@ -64,6 +64,33 @@ final class RemoteWindow {
     }
     private let contentView: RemoteWindowContentView
 
+    /// Phase 2 W0③ first-frame gating: true once this window's real order/visibility gate
+    /// has cleared -- either because its first GFX surface actually presented (see
+    /// `present(surface:mappedSize:via:)`) or because `firstFrameTimeout` fired first (see
+    /// `firstFrameTimeoutFired()`). While this is false, `setVisible` records the
+    /// requested show-state in `pendingVisible` but never calls `orderFront`/`orderOut` on
+    /// the real `NSWindow` -- this is the actual fix for the black-box gap that
+    /// `win.backgroundColor = .black` below used to just document as an accepted cosmetic
+    /// artifact (W4b review L3).
+    private var hasClearedFirstFrameGate = false
+    /// The RAIL server's last-requested show-state for this window (see `setVisible`),
+    /// captured even while gated so the correct state can be applied the instant the gate
+    /// clears. Irrelevant once `hasClearedFirstFrameGate` is true -- `setVisible` applies
+    /// immediately at that point, same as before this feature existed.
+    private var pendingVisible = false
+    /// Diagnostics only (Tools/window-smoke's first-frame gating assertion) -- true if this
+    /// window's gate cleared via `firstFrameTimeout` rather than a real presented frame,
+    /// i.e. it was shown with no content yet. Not read anywhere on the real rendering path.
+    private(set) var firstFrameTimedOut = false
+    /// Cancellable handle for the 2s no-paint fallback armed in `init` -- cancelled by
+    /// `present` (a real frame arrived first) and by `close(via:)` (nothing left to time
+    /// out). `DispatchWorkItem` rather than a plain `asyncAfter` closure specifically so it
+    /// can be cancelled outright rather than merely superseded (contrast
+    /// `RemoteWindowRegistry`'s move-throttle trailing-flush, which only ever needs the
+    /// latter).
+    private var firstFrameTimeoutWorkItem: DispatchWorkItem?
+    private static let firstFrameTimeout: TimeInterval = 2.0
+
     /// W4c review H1: token for the `NSWindow.didResignKeyNotification` observer below,
     /// removed in `close(via:)`/`deinit` — a block-based `NotificationCenter` observer
     /// keeps firing (and keeps this instance alive, via the closure's captures) until
@@ -83,14 +110,12 @@ final class RemoteWindow {
         win.title = title
         win.hasShadow = true
         win.isOpaque = true
-        // L3 (W4b review): a solid black window is visible for however long elapses
-        // between this window being ordered front and its first real surface actually
-        // being assigned (window creation and first paint are two separate control-lane
-        // events, never atomic) — a known, accepted, purely cosmetic gap for this phase,
-        // not a bug to chase down here. A real fix (e.g. deferring orderFront until the
-        // first frame is in hand, or an interim placeholder less jarring than solid black)
-        // is W4c/Phase 2 scope; this comment documents the artifact rather than changing
-        // behavior to work around it now.
+        // L3 (W4b review) resolved by Phase 2 W0③: this window is never ordered front
+        // until either its first real surface presents or firstFrameTimeout fires (see
+        // hasClearedFirstFrameGate below), so this solid-black background is no longer
+        // something a user can actually see appear -- kept anyway as the layer's own
+        // backing color for whatever sliver of a frame CoreAnimation might composite
+        // before contentLayer.contents is first assigned.
         win.backgroundColor = .black
 
         let layer = CALayer()
@@ -143,6 +168,19 @@ final class RemoteWindow {
                 contentView?.onEvent?(.focusLost)
             }
         }
+
+        // Phase 2 W0③: arms the 2s no-paint fallback (see firstFrameTimeoutWorkItem's own
+        // doc comment). [weak self]: this timer must not be what keeps a closed
+        // RemoteWindow alive. assumeIsolated: same "block-based API, statically Sendable,
+        // dynamically always main-actor" situation as the didResignKeyObserver closure
+        // above.
+        let timeoutWorkItem = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                self?.firstFrameTimeoutFired()
+            }
+        }
+        firstFrameTimeoutWorkItem = timeoutWorkItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.firstFrameTimeout, execute: timeoutWorkItem)
     }
 
     /// Diagnostics only (Tools/window-smoke's assertion battery) — not read anywhere on
@@ -226,12 +264,38 @@ final class RemoteWindow {
     /// visible/hidden bool (adr/0005 §7: full minimize/maximize/Z-order fidelity is Phase
     /// 2). `true` orders the window front; `false` orders it out without closing/
     /// destroying it, so a later visibility flip doesn't need to reconstruct the NSWindow.
+    /// Phase 2 W0③: while `hasClearedFirstFrameGate` is false, this only records the
+    /// request in `pendingVisible` -- the real `orderFront`/`orderOut` call is deferred
+    /// until `present` or `firstFrameTimeoutFired` actually clears the gate, so a window
+    /// with nothing painted yet never shows as a solid black box.
     func setVisible(_ visible: Bool) {
+        pendingVisible = visible
+        guard hasClearedFirstFrameGate else { return }
+        applyVisibility(visible)
+    }
+
+    private func applyVisibility(_ visible: Bool) {
         if visible {
             window.orderFront(nil)
         } else {
             window.orderOut(nil)
         }
+    }
+
+    /// Fires 2s after `init` if no frame has presented by then (see
+    /// `firstFrameTimeoutWorkItem`'s own doc comment) -- clears the gate and applies
+    /// whatever show-state is currently pending, so a pathological window that never
+    /// paints is still visible/debuggable rather than gated forever. Deliberately does
+    /// NOT flip `hasDisplayedContent`/`displayedSurface` -- there is still no real content;
+    /// a genuine frame arriving later just assigns it via `present` as normal (that method's
+    /// own gate-clearing branch is simply skipped by then, since there is nothing left to
+    /// clear or re-apply).
+    private func firstFrameTimeoutFired() {
+        firstFrameTimeoutWorkItem = nil
+        guard !hasClearedFirstFrameGate else { return } // present() already cleared it; stale fire
+        firstFrameTimedOut = true
+        hasClearedFirstFrameGate = true
+        applyVisibility(pendingVisible)
     }
 
     /// W4c click-to-activate's local half (the remote half is `CRSession.activateWindow(_:)`
@@ -291,12 +355,29 @@ final class RemoteWindow {
         displayedSurface = surface
         displayedMappedSize = mappedSize
         CATransaction.commit()
+
+        if !hasClearedFirstFrameGate {
+            // Phase 2 W0③: this window's first real content -- clear the gate and apply
+            // whatever show-state RAIL has asked for since creation (see `setVisible`), now
+            // that there's something other than solid black to actually show. Cancelling
+            // the timeout work item here (rather than just letting it check
+            // `hasClearedFirstFrameGate` and no-op) avoids ever firing it needlessly.
+            hasClearedFirstFrameGate = true
+            firstFrameTimeoutWorkItem?.cancel()
+            firstFrameTimeoutWorkItem = nil
+            applyVisibility(pendingVisible)
+        }
     }
 
     /// Closes the window and recycles whatever surface it was last displaying (if any).
     /// Call exactly once, from `RemoteWindowRegistry` only, on `WindowDelete` or a
     /// generation rollover — not idempotent against a second call.
     func close(via session: CRSession) {
+        // Phase 2 W0③: nothing left to time out once this window is closing -- covers
+        // WindowDelete, closeAllWindows, and prepareForReconnect alike, since all three
+        // route through this one method (see this method's own doc comment above).
+        firstFrameTimeoutWorkItem?.cancel()
+        firstFrameTimeoutWorkItem = nil
         if let didResignKeyObserver {
             NotificationCenter.default.removeObserver(didResignKeyObserver)
             self.didResignKeyObserver = nil

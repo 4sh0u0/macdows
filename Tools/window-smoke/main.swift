@@ -182,6 +182,15 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private var frameReadyCount = 0
     private var evidenceRoutineRan = false
 
+    // Phase 2 W0③ (first-frame gating): windowIds already checked the first time their
+    // own isVisible flipped true -- checked exactly once per windowId so a later
+    // legitimate re-hide/re-show (RAIL show-state toggling) never re-triggers this.
+    private var firstFrameGateChecked: Set<UInt32> = []
+    // One entry per windowId observed visible with neither real content nor a logged
+    // timeout -- collected rather than asserted immediately so finish() reports every
+    // offender in one gating check, not one assertion per window.
+    private var firstFrameGateViolations: [String] = []
+
     // W4c review: push-drain latency samples, one per drainNow() invocation that observed
     // at least one FRAME_READY -- see drainNow()'s own comment for exactly what this
     // measures and why. Milliseconds, not seconds, matching how the p95 assertion in
@@ -366,6 +375,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        checkFirstFrameGate(registry.windowSnapshots())
         runActivateExperiment(elapsed: elapsed, session: session, registry: registry)
         runInputTest(elapsed: elapsed, registry: registry)
 
@@ -582,6 +592,30 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         }
         guard kr == KERN_SUCCESS else { return nil }
         return Int(info.resident_size)
+    }
+
+    /// Phase 2 W0③ verification (docs/plans/phase2.md W0 item ③, "首帧门控：首帧前不
+    /// orderFront"): the very first time each windowId is observed visible, it must
+    /// already have real displayed content -- OR `RemoteWindow`'s 2s no-paint fallback
+    /// must have fired for it (plumbed through as `WindowSnapshot.firstFrameTimedOut`) --
+    /// never neither. Catches a regression back to the pre-W0③ behavior (ordered front
+    /// immediately on WindowCreate, before any frame had a chance to present) without this
+    /// harness needing to control frame timing itself.
+    private func checkFirstFrameGate(_ snapshots: [RemoteWindowRegistry.WindowSnapshot]) {
+        for snap in snapshots where snap.isVisible && !firstFrameGateChecked.contains(snap.windowId) {
+            firstFrameGateChecked.insert(snap.windowId)
+            if snap.hasDisplayedContent {
+                print("[first-frame] windowId=\(snap.windowId) became visible with content already presented")
+            } else if snap.firstFrameTimedOut {
+                print("[first-frame] windowId=\(snap.windowId) became visible via the 2s no-paint timeout "
+                    + "(logged explicitly here, not shown as a silent black box)")
+            } else {
+                let detail = "windowId=\(snap.windowId) title=\"\(snap.title)\" became visible with no "
+                    + "displayed content and no first-frame timeout recorded"
+                print("[first-frame] VIOLATION: \(detail)")
+                firstFrameGateViolations.append(detail)
+            }
+        }
     }
 
     /// Experiment 1 (W4b review round 2): t=6s sample, t=8s ClientActivate, t=20s sample --
@@ -1125,6 +1159,17 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 check(false, "input test (\(inputTestMode)) found a ready target window to act on before the run ended")
             }
         }
+
+        // Phase 2 W0③: see checkFirstFrameGate's own doc comment -- every window this run
+        // ever observed become visible must have done so either with content already
+        // presented or via the logged 2s timeout, never neither.
+        check(
+            firstFrameGateViolations.isEmpty,
+            "no window became visible without either displayed content or a logged first-frame "
+                + "timeout (\(firstFrameGateViolations.count) violation(s)"
+                + (firstFrameGateViolations.isEmpty ? "" : ": " + firstFrameGateViolations.joined(separator: "; "))
+                + ")"
+        )
 
         check(frameReadyCount > 0, "received >=1 FRAME_READY event during the run (got \(frameReadyCount))")
 
