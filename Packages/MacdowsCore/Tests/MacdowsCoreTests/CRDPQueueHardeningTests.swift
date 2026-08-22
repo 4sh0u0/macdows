@@ -514,3 +514,193 @@ struct CRDPQueueOutboundCapacityCeilingTests {
         #expect(crdpq_outbound_dropped_count(q) == 1)
     }
 }
+
+// MARK: - adr/0008: bounded-array truncation semantics + sentinel pass-through
+//
+// These exercise the CONTRACT crdpq.h/CRSession.mm implement: the wire count is preserved
+// even when the array itself is bounded/truncated (a deliberate asymmetry from
+// `crdpq_text_t`'s own truncation convention -- see crdpq.h's doc comments on
+// `crdpq_monitored_desktop_t`/`crdpq_window_order_t`), CRDPQ_MAX_WINDOW_IDS/
+// CRDPQ_MAX_VISIBILITY_RECTS are the actual bounds a caller must clamp to, and both survive
+// a real crdpq_post/crdpq_drain round trip (the queue's own POD deep-copy, exercised here
+// for the first time against structs this large). NOTE: the *clamping arithmetic* itself
+// (`min(wireCount, MAX)`) lives in CRSession.mm's crb_monitored_desktop/crb_window_common
+// (Objective-C++, App target) -- not reachable from this Swift package's tests -- so these
+// tests apply that same clamp inline when constructing the fixture, then assert the queue
+// preserves the result faithfully. End-to-end coverage of CRSession.mm's own clamp sites
+// belongs to Tools/window-smoke, not here.
+
+@Suite("adr/0008: MonitoredDesktop.windowIds truncation + activeWindowId sentinel")
+struct CRDPQMonitoredDesktopTruncationTests {
+    @Test("97 windowIds: exactly 96 stored, truncated flag set, wire count (97) preserved through post/drain")
+    func windowIdsTruncatedAt96() {
+        let wireCount: UInt32 = 97
+        var ev = CrdpEvent()
+        ev.type = CRDPQ_EVENT_MONITORED_DESKTOP
+        ev.payload.monitoredDesktop.fieldFlags = 0x0000_0010 // WINDOW_ORDER_FIELD_DESKTOP_ZORDER
+        ev.payload.monitoredDesktop.numWindowIds = wireCount
+        ev.payload.monitoredDesktop.windowIdsTruncated = wireCount > UInt32(CRDPQ_MAX_WINDOW_IDS)
+        withUnsafeMutablePointer(to: &ev.payload.monitoredDesktop.windowIds) { arrayPtr in
+            arrayPtr.withMemoryRebound(to: UInt32.self, capacity: Int(CRDPQ_MAX_WINDOW_IDS)) { buf in
+                for i in 0..<Int(CRDPQ_MAX_WINDOW_IDS) {
+                    buf[i] = UInt32(i) + 1000 // distinct, easy-to-spot values
+                }
+            }
+        }
+
+        let q = crdpq_control_create(nil, nil)
+        defer { crdpq_control_destroy(q) }
+        #expect(crdpq_post(q, &ev))
+        let drained = drainToArray(q)
+        #expect(drained.count == 1)
+
+        let md = drained[0].payload.monitoredDesktop
+        #expect(md.numWindowIds == 97, "wire count must survive even though only 96 slots exist")
+        #expect(md.windowIdsTruncated)
+        var mutableMd = md
+        withUnsafeMutablePointer(to: &mutableMd.windowIds) { arrayPtr in
+            arrayPtr.withMemoryRebound(to: UInt32.self, capacity: Int(CRDPQ_MAX_WINDOW_IDS)) { buf in
+                for i in 0..<Int(CRDPQ_MAX_WINDOW_IDS) {
+                    #expect(buf[i] == UInt32(i) + 1000, "slot \(i) corrupted by the queue's deep copy")
+                }
+            }
+        }
+    }
+
+    @Test("24 windowIds (a real observed maximum, adr/0008 §0): not truncated, wire count == stored count")
+    func windowIdsUnderBoundNotTruncated() {
+        let count: UInt32 = 24
+        var ev = CrdpEvent()
+        ev.type = CRDPQ_EVENT_MONITORED_DESKTOP
+        ev.payload.monitoredDesktop.fieldFlags = 0x0000_0010
+        ev.payload.monitoredDesktop.numWindowIds = count
+        ev.payload.monitoredDesktop.windowIdsTruncated = false
+        withUnsafeMutablePointer(to: &ev.payload.monitoredDesktop.windowIds) { arrayPtr in
+            arrayPtr.withMemoryRebound(to: UInt32.self, capacity: Int(count)) { buf in
+                for i in 0..<Int(count) { buf[i] = UInt32(i) }
+            }
+        }
+
+        let q = crdpq_control_create(nil, nil)
+        defer { crdpq_control_destroy(q) }
+        #expect(crdpq_post(q, &ev))
+        let drained = drainToArray(q)
+        #expect(drained[0].payload.monitoredDesktop.numWindowIds == 24)
+        #expect(!drained[0].payload.monitoredDesktop.windowIdsTruncated)
+    }
+
+    @Test("activeWindowId's 0xFFFFFFFF sentinel (adr/0008 §0: no active window) survives post/drain unchanged")
+    func activeWindowIdSentinelPassesThroughUnchanged() {
+        var ev = CrdpEvent()
+        ev.type = CRDPQ_EVENT_MONITORED_DESKTOP
+        ev.payload.monitoredDesktop.fieldFlags = 0x0000_0020 // WINDOW_ORDER_FIELD_DESKTOP_ACTIVE_WND
+        ev.payload.monitoredDesktop.activeWindowId = 0xFFFF_FFFF
+
+        let q = crdpq_control_create(nil, nil)
+        defer { crdpq_control_destroy(q) }
+        #expect(crdpq_post(q, &ev))
+        let drained = drainToArray(q)
+        #expect(drained[0].payload.monitoredDesktop.activeWindowId == 0xFFFF_FFFF, "the sentinel must not be reinterpreted/clamped by the transport -- that's the consumer's job (adr/0008 §0)")
+    }
+}
+
+@Suite("adr/0008: WindowOrder.visibilityRects truncation")
+struct CRDPQVisibilityRectsTruncationTests {
+    @Test("33 rects: exactly 32 stored, truncated flag set, wire count (33) preserved through post/drain")
+    func visibilityRectsTruncatedAt32() {
+        let wireCount: UInt32 = 33
+        var ev = makeWindowCreateEvent(windowId: 42)
+        ev.payload.windowOrder.numVisibilityRects = wireCount
+        ev.payload.windowOrder.visibilityRectsTruncated = wireCount > UInt32(CRDPQ_MAX_VISIBILITY_RECTS)
+        withUnsafeMutablePointer(to: &ev.payload.windowOrder.visibilityRects) { arrayPtr in
+            arrayPtr.withMemoryRebound(to: crdpq_rect_t.self, capacity: Int(CRDPQ_MAX_VISIBILITY_RECTS)) { buf in
+                for i in 0..<Int(CRDPQ_MAX_VISIBILITY_RECTS) {
+                    let v = UInt16(i)
+                    buf[i] = crdpq_rect_t(left: v, top: v + 1, right: v + 2, bottom: v + 3)
+                }
+            }
+        }
+
+        let q = crdpq_control_create(nil, nil)
+        defer { crdpq_control_destroy(q) }
+        #expect(crdpq_post(q, &ev))
+        let drained = drainToArray(q)
+        let wo = drained[0].payload.windowOrder
+        #expect(wo.numVisibilityRects == 33, "wire count must survive even though only 32 slots exist")
+        #expect(wo.visibilityRectsTruncated)
+        var mutableWo = wo
+        withUnsafeMutablePointer(to: &mutableWo.visibilityRects) { arrayPtr in
+            arrayPtr.withMemoryRebound(to: crdpq_rect_t.self, capacity: Int(CRDPQ_MAX_VISIBILITY_RECTS)) { buf in
+                for i in 0..<Int(CRDPQ_MAX_VISIBILITY_RECTS) {
+                    let v = UInt16(i)
+                    #expect(buf[i].left == v && buf[i].top == v + 1 && buf[i].right == v + 2 && buf[i].bottom == v + 3, "slot \(i) corrupted by the queue's deep copy")
+                }
+            }
+        }
+    }
+}
+
+@Suite("adr/0008: the three previously-unwired event types round-trip through the queue")
+struct CRDPQNewEventTypesTests {
+    @Test("LocalMoveSize: isMoveSizeStart survives as a real bool, posX/posY as int32_t")
+    func localMoveSizeRoundTrips() {
+        var ev = CrdpEvent()
+        ev.type = CRDPQ_EVENT_LOCAL_MOVE_SIZE
+        ev.payload.localMoveSize.windowId = 7
+        ev.payload.localMoveSize.isMoveSizeStart = true
+        ev.payload.localMoveSize.moveSizeType = 5 // an LMS_* handshake constant, uninterpreted here
+        ev.payload.localMoveSize.posX = -120
+        ev.payload.localMoveSize.posY = 2580 // near the largest position observed in samples
+
+        let q = crdpq_control_create(nil, nil)
+        defer { crdpq_control_destroy(q) }
+        #expect(crdpq_post(q, &ev))
+        let drained = drainToArray(q)
+        #expect(drained[0].type == CRDPQ_EVENT_LOCAL_MOVE_SIZE)
+        let lms = drained[0].payload.localMoveSize
+        #expect(lms.windowId == 7)
+        #expect(lms.isMoveSizeStart)
+        #expect(lms.moveSizeType == 5)
+        #expect(lms.posX == -120)
+        #expect(lms.posY == 2580)
+    }
+
+    @Test("MinMaxInfo: all eight int32_t fields round-trip")
+    func minMaxInfoRoundTrips() {
+        var ev = CrdpEvent()
+        ev.type = CRDPQ_EVENT_MIN_MAX_INFO
+        ev.payload.minMaxInfo.windowId = 9
+        ev.payload.minMaxInfo.maxWidth = 1920
+        ev.payload.minMaxInfo.maxHeight = 1080
+        ev.payload.minMaxInfo.maxPosX = -1
+        ev.payload.minMaxInfo.maxPosY = -1
+        ev.payload.minMaxInfo.minTrackWidth = 160
+        ev.payload.minMaxInfo.minTrackHeight = 120
+        ev.payload.minMaxInfo.maxTrackWidth = 7680
+        ev.payload.minMaxInfo.maxTrackHeight = 4320
+
+        let q = crdpq_control_create(nil, nil)
+        defer { crdpq_control_destroy(q) }
+        #expect(crdpq_post(q, &ev))
+        let drained = drainToArray(q)
+        let mmi = drained[0].payload.minMaxInfo
+        #expect(mmi.windowId == 9)
+        #expect(mmi.maxWidth == 1920 && mmi.maxHeight == 1080)
+        #expect(mmi.maxPosX == -1 && mmi.maxPosY == -1)
+        #expect(mmi.minTrackWidth == 160 && mmi.minTrackHeight == 120)
+        #expect(mmi.maxTrackWidth == 7680 && mmi.maxTrackHeight == 4320)
+    }
+
+    @Test("ZOrderSync: windowIdMarker round-trips, carries no array (adr/0008 §1)")
+    func zorderSyncRoundTrips() {
+        var ev = CrdpEvent()
+        ev.type = CRDPQ_EVENT_ZORDER_SYNC
+        ev.payload.zorderSync.windowIdMarker = 0xABCD_1234
+
+        let q = crdpq_control_create(nil, nil)
+        defer { crdpq_control_destroy(q) }
+        #expect(crdpq_post(q, &ev))
+        let drained = drainToArray(q)
+        #expect(drained[0].payload.zorderSync.windowIdMarker == 0xABCD_1234)
+    }
+}

@@ -130,7 +130,33 @@ typedef enum {
     CRDPQ_EVENT_SURFACE_MAPPED,
     CRDPQ_EVENT_FRAME_READY,
     CRDPQ_EVENT_DISCONNECTED,
+    /* adr/0008 §1: the three RAIL callbacks CRSession.mm previously left unwired
+     * ("no curated crdpq event type exists for any of them yet"). */
+    CRDPQ_EVENT_LOCAL_MOVE_SIZE,
+    CRDPQ_EVENT_MIN_MAX_INFO,
+    CRDPQ_EVENT_ZORDER_SYNC,
 } crdpq_event_type_t;
+
+/** adr/0008 §2b: a wire-faithful `RECTANGLE_16` (window.c:462/478 parses this as four
+ *  `Stream_Read_UINT16`s, unsigned, window-relative) — deliberately NOT widened to
+ *  int32_t the way offsets/positions elsewhere in this header are: window_order is the
+ *  highest-frequency event type, and widening every visibility rect would push
+ *  crdpq_window_order_t (already the largest union member) up by another 768 bytes for
+ *  no observed need (adr/0008 §2b). */
+typedef struct {
+    uint16_t left;
+    uint16_t top;
+    uint16_t right;
+    uint16_t bottom;
+} crdpq_rect_t;
+
+/** adr/0008 §2b: upper bound on `crdpq_window_order_t.visibilityRects`. The protocol's own
+ *  hard ceiling is 65535 (window.c:462, a `Stream_Read_UINT16` — 2 bytes, not the 1-byte
+ *  ceiling `numWindowIds` below has); 32 is a shape-based estimate (not observation-based —
+ *  see adr/0008 §2b's "the observed×4 input is missing, not small" discussion) covering the
+ *  scan-band decomposition of a typical rounded/irregular window region with a full extra
+ *  multiple of headroom, at a cost of 256 bytes/slot. */
+#define CRDPQ_MAX_VISIBILITY_RECTS 32
 
 /** WindowCreate/WindowUpdate. Matches MS-RDPERP's TS_WINDOW_STATE_ORDER field set (see
  *  Packages/MacdowsCore/.../WindowModel.swift's WindowOrderField for the fieldFlags bit
@@ -156,15 +182,28 @@ typedef struct {
     uint32_t show;
     uint32_t ownerWindowId;
     crdpq_text_t title;
+    /* adr/0008 §2b: `numVisibilityRects` holds the WIRE value (not the stored count),
+     * exactly like `crdpq_monitored_desktop_t.numWindowIds` below — deliberate asymmetry
+     * from `crdpq_text_t`'s own truncation convention (crdpq.h's own doc comment on
+     * CRDPQ_TEXT_BUF_SIZE explains why a string's original length isn't useful to a
+     * consumer, but "how many rects did the server actually send" is a real signal here).
+     * Existence of the array itself is gated by the caller on WINDOW_ORDER_FIELD_VISIBILITY
+     * (0x0200) -- see CRSession.mm's crb_window_common, which is the only writer. */
+    uint32_t numVisibilityRects;
+    bool visibilityRectsTruncated;
+    crdpq_rect_t visibilityRects[CRDPQ_MAX_VISIBILITY_RECTS];
 } crdpq_window_order_t;
 
 /* adr/0008 §5's ABI/version discipline: no version number, no reserved padding — a struct
  * layout change must be caught by the compiler at build time, not papered over by
- * convention. 300 was measured (not estimated) with `clang`/arm64 immediately after adding
- * `ownerWindowId` above; if this ever fires, some other field in this struct (or its
- * `crdpq_text_t` member) changed shape and every consumer needs re-auditing, not just this
- * assert updating. */
-_Static_assert(sizeof(crdpq_window_order_t) == 300, "crdpq_window_order_t layout changed -- re-measure and audit consumers (adr/0008 §5)");
+ * convention. 564 was measured (not estimated) with `clang`/arm64 immediately after adding
+ * the three `visibilityRects`-related fields above (adr/0008 §2b/§4; up from 300 before
+ * this ADR -- note this baseline already includes `ownerWindowId`, added a commit earlier
+ * as W0's style/owner filter work, so it doesn't match adr/0008 §4's own illustrative table,
+ * which was written against a pre-ownerWindowId 296B baseline); if this ever fires, some
+ * other field in this struct (or its `crdpq_text_t`/`crdpq_rect_t` member) changed shape and
+ * every consumer needs re-auditing, not just this assert updating. */
+_Static_assert(sizeof(crdpq_window_order_t) == 564, "crdpq_window_order_t layout changed -- re-measure and audit consumers (adr/0008 §5)");
 
 /** WindowDelete, WindowIcon. */
 typedef struct {
@@ -177,12 +216,42 @@ typedef struct {
     uint32_t notifyIconId;
 } crdpq_notify_icon_t;
 
-/** MonitoredDesktop. */
+/** adr/0008 §2a: upper bound on `crdpq_monitored_desktop_t.windowIds`. The protocol's own
+ *  hard ceiling is 255 (window.c:1068, a `Stream_Read_UINT8` -- genuinely 1 byte, unlike
+ *  `CRDPQ_MAX_VISIBILITY_RECTS` above); 96 is 4x the observed max of 24
+ *  (samples/phase05-rail-events-2026-08-19). Deliberately NOT 255: adr/0008 §4 shows taking
+ *  the full protocol ceiling would make this struct (not crdpq_window_order_t, the
+ *  overwhelmingly higher-frequency event) the union's largest member, inflating every
+ *  control-lane slot -- including every window order -- for a bound this event type has
+ *  never come close to needing. */
+#define CRDPQ_MAX_WINDOW_IDS 96
+
+/** MonitoredDesktop. `activeWindowId` is `0xFFFFFFFF` (observed 134/150 times in
+ *  samples/phase05-rail-events-2026-08-19) when no window on this desktop currently has
+ *  focus -- this layer passes that sentinel through unchanged (it is still a transport,
+ *  not a policy layer); a consumer MUST treat it as "no active window", never as a literal
+ *  windowId (adr/0008 §0).
+ *
+ *  `numWindowIds` holds the WIRE value, not `min(numWindowIds, CRDPQ_MAX_WINDOW_IDS)` --
+ *  see `crdpq_window_order_t.numVisibilityRects`'s doc comment above for why (the same
+ *  asymmetry from `crdpq_text_t`'s truncation convention, deliberate both places). The
+ *  `windowIds` array's very existence (not just its populated length) is gated by the
+ *  caller on `WINDOW_ORDER_FIELD_DESKTOP_ZORDER` (0x10) -- confirmed against every sample
+ *  (adr/0008 §0: every `numWindowIds>0` record carries that bit, every `numWindowIds==0`
+ *  record doesn't) and against FreeRDP's own parser (window.c's
+ *  update_read_desktop_actively_monitored_order only touches numWindowIds/windowIds inside
+ *  that bit's `if`) -- see CRSession.mm's crb_monitored_desktop, the only writer. */
 typedef struct {
     uint32_t fieldFlags;
     uint32_t activeWindowId;
     uint32_t numWindowIds;
+    bool windowIdsTruncated;
+    uint32_t windowIds[CRDPQ_MAX_WINDOW_IDS];
 } crdpq_monitored_desktop_t;
+
+/* adr/0008 §5: measured (not estimated) with clang/arm64 -- see crdpq_window_order_t's own
+ * assert comment for the same discipline. Up from 12 bytes before this ADR. */
+_Static_assert(sizeof(crdpq_monitored_desktop_t) == 400, "crdpq_monitored_desktop_t layout changed -- re-measure and audit consumers (adr/0008 §5)");
 
 /** ServerExecuteResult. */
 typedef struct {
@@ -219,6 +288,57 @@ typedef struct {
     uint32_t surfaceId;
 } crdpq_frame_ready_t;
 
+/** ServerLocalMoveSize <- RAIL_LOCALMOVESIZE_ORDER (client/rail.h:453-460). adr/0008 §0's
+ *  caveat: this shape was NEVER observed in any of the six
+ *  samples/phase05-rail-events-2026-08-19 captures (the probe never dragged/resized a
+ *  window) -- verified only against the header and MS-RDPERP, not real wire bytes. W3's
+ *  first live LocalMoveSize must be treated as a verification event for this struct, not
+ *  an already-proven assumption.
+ *
+ *  `posX`/`posY` are `INT16` on the wire; widened to `int32_t` here purely for uniformity
+ *  with every other offset/position field this header exposes as `int32_t` (adr/0008 §1) --
+ *  this is NOT a claim that the upstream INT16 narrowing was wrong or needs fixing; FreeRDP
+ *  has already parsed the value by the time it reaches this struct. Observed values (where
+ *  analogous position fields exist elsewhere) top out around 2580, nowhere near either
+ *  type's range limit. */
+typedef struct {
+    uint32_t windowId;
+    /* Upstream is `BOOL` (a typedef for `int`) -- the writer MUST normalize with `!= 0`,
+     * never memcpy/assign the raw int bit pattern into this `bool` (adr/0008 §1). */
+    bool isMoveSizeStart;
+    uint16_t moveSizeType;
+    int32_t posX;
+    int32_t posY;
+} crdpq_local_move_size_t;
+_Static_assert(sizeof(crdpq_local_move_size_t) == 16, "crdpq_local_move_size_t layout changed -- re-measure and audit consumers (adr/0008 §5)");
+
+/** ServerMinMaxInfo <- RAIL_MINMAXINFO_ORDER (client/rail.h:440-451). Same INT16->int32_t
+ *  widening rationale as `crdpq_local_move_size_t.posX/posY` above applies to all eight
+ *  fields here. */
+typedef struct {
+    uint32_t windowId;
+    int32_t maxWidth;
+    int32_t maxHeight;
+    int32_t maxPosX;
+    int32_t maxPosY;
+    int32_t minTrackWidth;
+    int32_t minTrackHeight;
+    int32_t maxTrackWidth;
+    int32_t maxTrackHeight;
+} crdpq_min_max_info_t;
+_Static_assert(sizeof(crdpq_min_max_info_t) == 36, "crdpq_min_max_info_t layout changed -- re-measure and audit consumers (adr/0008 §5)");
+
+/** ServerZOrderSync <- RAIL_ZORDER_SYNC (rail.h:495-498). adr/0008 §1: despite the name,
+ *  this carries NO Z-order array -- it's a boundary marker ("a sync just happened"), not a
+ *  data payload. `windowIdMarker` is opaque; do not treat it as a real windowId. The actual
+ *  ordered array is `crdpq_monitored_desktop_t.windowIds` (§2a) -- a consumer of this event
+ *  should re-read the most recently observed MonitoredDesktop event's array, not wait for
+ *  this one to carry data it never will. */
+typedef struct {
+    uint32_t windowIdMarker;
+} crdpq_zorder_sync_t;
+_Static_assert(sizeof(crdpq_zorder_sync_t) == 4, "crdpq_zorder_sync_t layout changed -- re-measure and audit consumers (adr/0008 §5)");
+
 typedef union {
     crdpq_window_order_t windowOrder;   /* WINDOW_CREATE, WINDOW_UPDATE */
     crdpq_window_id_t windowId;         /* WINDOW_DELETE, WINDOW_ICON */
@@ -228,10 +348,21 @@ typedef union {
     crdpq_handshake_flags_t handshakeFlags;
     crdpq_surface_mapped_t surfaceMapped;
     crdpq_frame_ready_t frameReady;
+    crdpq_local_move_size_t localMoveSize;   /* CRDPQ_EVENT_LOCAL_MOVE_SIZE */
+    crdpq_min_max_info_t minMaxInfo;         /* CRDPQ_EVENT_MIN_MAX_INFO */
+    crdpq_zorder_sync_t zorderSync;          /* CRDPQ_EVENT_ZORDER_SYNC */
     /* CRDPQ_EVENT_DISCONNECTED carries no payload — the envelope's `generation` field
      * (the generation *as of the disconnect*, per adr/0005 §4 step 3: "post
      * DISCONNECTED(gen)") is everything a consumer needs. */
 } crdpq_event_payload_t;
+
+/* adr/0008 §5: measured (not estimated) with clang/arm64. `crdpq_window_order_t` (564) is
+ * still this union's largest member post-ADR (adr/0008 §4's deliberate "take 96, not 255"
+ * bound choice for CRDPQ_MAX_WINDOW_IDS exists specifically to keep it that way); the
+ * union's own alignment is 8 (from `crdpq_surface_mapped_t`'s `uint64_t windowId`, not from
+ * `crdpq_window_order_t`), so 564 pads up to the next multiple of 8. Up from 304 before this
+ * ADR. */
+_Static_assert(sizeof(crdpq_event_payload_t) == 568, "crdpq_event_payload_t layout changed -- re-measure and audit consumers (adr/0008 §5)");
 
 /** One control-lane event. POD, no pointers, safe to memcpy — this is the whole point
  *  (adr/0005 §1/§3). `generation` is stamped by crdpq_post itself at enqueue time from
@@ -244,6 +375,11 @@ typedef struct {
     crdpq_generation_t generation;
     crdpq_event_payload_t payload;
 } CrdpEvent;
+
+/* adr/0008 §5: measured (not estimated) with clang/arm64. type(4)+generation(4)+payload(568)
+ * = 576, already an exact multiple of the struct's own 8-byte alignment, so no further
+ * padding. Up from 312 before this ADR. */
+_Static_assert(sizeof(CrdpEvent) == 576, "CrdpEvent layout changed -- re-measure and audit consumers (adr/0008 §5)");
 
 typedef struct crdpq_control crdpq_control_t;
 

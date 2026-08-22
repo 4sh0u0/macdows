@@ -27,6 +27,15 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
     /// `-copyPublishedSurface:`. Carries no pixels itself (adr/0005 §2: this is a
     /// notification, not a copy of the frame state).
     CRDPEventKindFrameReady,
+    /// adr/0008 §1: ServerLocalMoveSize. NOT verified against any real capture (adr/0008
+    /// §0's caveat — the six phase05 samples never dragged/resized a window); W3's first
+    /// live occurrence is a verification event for this shape, not an already-proven one.
+    CRDPEventKindLocalMoveSize,
+    /// adr/0008 §1: ServerMinMaxInfo.
+    CRDPEventKindMinMaxInfo,
+    /// adr/0008 §1: ServerZOrderSync — a boundary marker only, carries no Z-order array
+    /// (see `windowId`'s own doc comment below).
+    CRDPEventKindZOrderSync,
 };
 
 @interface CRDPEvent : NSObject
@@ -39,7 +48,12 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 @property (nonatomic, readonly) uint32_t generation;
 
 /// WindowCreate/Update/Delete/Icon, NotifyIconCreate/Update/Delete (window owner),
-/// MonitoredDesktop.activeWindowId.
+/// MonitoredDesktop.activeWindowId (adr/0008 §0: `0xFFFFFFFF` when no window on that
+/// desktop currently has focus — callers MUST treat that sentinel as "no active window",
+/// never as a literal windowId), LocalMoveSize/MinMaxInfo.windowId. Also reused
+/// (adr/0008 §1) for ZOrderSync.windowIdMarker — despite the field name, that is NOT a
+/// real window id, just an opaque Z-order sync boundary marker; never perform a
+/// windowId-keyed lookup against it.
 @property (nonatomic, readonly) uint32_t windowId;
 /// NotifyIconCreate/Update/Delete only.
 @property (nonatomic, readonly) uint32_t notifyIconId;
@@ -84,6 +98,25 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// bare 0 here as authoritative without checking the bit first.
 @property (nonatomic, readonly) uint32_t ownerWindowId;
 
+/// WindowCreate/Update only, meaningful only when `fieldFlags` sets the visibility bit
+/// (0x0200, `WINDOW_ORDER_FIELD_VISIBILITY`). `TS_WINDOW_STATE_ORDER.visibilityRects`
+/// (adr/0008 §2b), flattened as `[left, top, right, bottom, left, top, right, bottom, ...]`
+/// — `visibilityRects.count / 4` is the number of rects actually carried (bounded by
+/// `CRDPQ_MAX_VISIBILITY_RECTS`, 32); `numVisibilityRects` below is the wire's own
+/// (possibly larger) count, and `visibilityRectsTruncated` says whether they differ. Not
+/// yet consumed by any live rendering path (adr/0008 §6: the rects->mask algorithm is
+/// adr/0010's job) — this class only carries them to the main thread unmodified.
+@property (nonatomic, readonly) NSArray<NSNumber *> *visibilityRects;
+/// WindowCreate/Update only. The wire's own `numVisibilityRects` — may exceed
+/// `visibilityRects.count / 4` when truncated; see `crdpq_window_order_t`'s own doc
+/// comment (crdpq.h) for why the wire count itself is preserved rather than just the
+/// stored count.
+@property (nonatomic, readonly) uint32_t numVisibilityRects;
+/// WindowCreate/Update only. YES iff the server sent more rects than
+/// `CRDPQ_MAX_VISIBILITY_RECTS` (32) could hold — adr/0008 §4's fail-open contract applies
+/// (degrade to the full window rect, never fabricate a smaller one from a truncated set).
+@property (nonatomic, readonly) BOOL visibilityRectsTruncated;
+
 /// ExecResult.execResult; ExecResult.rawResult; ExecResult's program/file path.
 @property (nonatomic, readonly) uint32_t execResult;
 @property (nonatomic, readonly) uint32_t rawResult;
@@ -104,6 +137,51 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 @property (nonatomic, readonly) uint64_t mappedWindowId;
 @property (nonatomic, readonly) uint32_t mappedWidth;
 @property (nonatomic, readonly) uint32_t mappedHeight;
+
+/// MonitoredDesktop only, meaningful only when `fieldFlags` sets the Z-order bit (0x10,
+/// `WINDOW_ORDER_FIELD_DESKTOP_ZORDER`). Ordered top-to-bottom Z order (adr/0008 §2a) as
+/// `NSNumber`-boxed `uint32_t` window ids — empty when that bit wasn't set for this order.
+/// May hold fewer entries than `numWindowIds` if the server's own array was larger than
+/// `CRDPQ_MAX_WINDOW_IDS` (96); see `windowIdsTruncated`. adr/0008 §4's fail-open contract:
+/// a consumer must leave the relative order of any windowId NOT in this array untouched —
+/// never infer it belongs at the bottom just because it was cut off.
+@property (nonatomic, readonly) NSArray<NSNumber *> *windowIds;
+/// MonitoredDesktop only. The wire's own `numWindowIds` — may exceed `windowIds.count`
+/// when truncated; see `crdpq_monitored_desktop_t`'s own doc comment (crdpq.h).
+@property (nonatomic, readonly) uint32_t numWindowIds;
+/// MonitoredDesktop only. YES iff the server sent more window ids than
+/// `CRDPQ_MAX_WINDOW_IDS` (96) could hold.
+@property (nonatomic, readonly) BOOL windowIdsTruncated;
+
+/// LocalMoveSize only (adr/0008 §1) — `windowId` above names the moving/sizing window.
+/// `TS_RAIL_ORDER_LOCALMOVESIZE`'s own boolean: YES at the start of a local move/size
+/// operation, NO when it ends (normalized from the wire's raw `BOOL`/`int` — never a
+/// bit-pattern reinterpretation).
+@property (nonatomic, readonly) BOOL isMoveSizeStart;
+/// LocalMoveSize only. Opaque handshake value (`LMS_*` constants) — this class does not
+/// interpret it; that semantic belongs to whichever future layer implements W3's
+/// move/resize handshake (adr/0008 §1).
+@property (nonatomic, readonly) uint16_t moveSizeType;
+/// LocalMoveSize only. Position at the moment of this notification, widened from the
+/// wire's `INT16` to `int32_t` purely for uniformity with `offsetX`/`offsetY` above
+/// (adr/0008 §1 — not a claim that the upstream INT16 narrowing needs fixing).
+@property (nonatomic, readonly) int32_t moveSizePosX;
+@property (nonatomic, readonly) int32_t moveSizePosY;
+
+/// MinMaxInfo only (adr/0008 §1) — `windowId` above names the window this applies to.
+/// `TS_RAIL_ORDER_MINMAXINFO`'s eight fields verbatim, each widened from the wire's
+/// `INT16` to `int32_t` for the same uniformity reason as `moveSizePosX`/`moveSizePosY`.
+@property (nonatomic, readonly) int32_t maxWidth;
+@property (nonatomic, readonly) int32_t maxHeight;
+@property (nonatomic, readonly) int32_t maxPosX;
+@property (nonatomic, readonly) int32_t maxPosY;
+@property (nonatomic, readonly) int32_t minTrackWidth;
+@property (nonatomic, readonly) int32_t minTrackHeight;
+@property (nonatomic, readonly) int32_t maxTrackWidth;
+@property (nonatomic, readonly) int32_t maxTrackHeight;
+
+/// ZOrderSync carries no properties of its own beyond `windowId` (reused above for
+/// `windowIdMarker` — see that property's doc comment for why it is NOT a real window id).
 
 @end
 

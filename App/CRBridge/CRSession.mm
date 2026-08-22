@@ -68,6 +68,9 @@
 @property (nonatomic) uint32_t style;
 @property (nonatomic) uint32_t styleEx;
 @property (nonatomic) uint32_t ownerWindowId;
+@property (nonatomic) NSArray<NSNumber *> *visibilityRects;
+@property (nonatomic) uint32_t numVisibilityRects;
+@property (nonatomic) BOOL visibilityRectsTruncated;
 @property (nonatomic) uint32_t execResult;
 @property (nonatomic) uint32_t rawResult;
 @property (nonatomic) NSString *program;
@@ -77,6 +80,21 @@
 @property (nonatomic) uint64_t mappedWindowId;
 @property (nonatomic) uint32_t mappedWidth;
 @property (nonatomic) uint32_t mappedHeight;
+@property (nonatomic) NSArray<NSNumber *> *windowIds;
+@property (nonatomic) uint32_t numWindowIds;
+@property (nonatomic) BOOL windowIdsTruncated;
+@property (nonatomic) BOOL isMoveSizeStart;
+@property (nonatomic) uint16_t moveSizeType;
+@property (nonatomic) int32_t moveSizePosX;
+@property (nonatomic) int32_t moveSizePosY;
+@property (nonatomic) int32_t maxWidth;
+@property (nonatomic) int32_t maxHeight;
+@property (nonatomic) int32_t maxPosX;
+@property (nonatomic) int32_t maxPosY;
+@property (nonatomic) int32_t minTrackWidth;
+@property (nonatomic) int32_t minTrackHeight;
+@property (nonatomic) int32_t maxTrackWidth;
+@property (nonatomic) int32_t maxTrackHeight;
 @end
 
 @implementation CRDPEvent
@@ -88,6 +106,8 @@
     {
         _title = @"";
         _program = @"";
+        _visibilityRects = @[];
+        _windowIds = @[];
     }
     return self;
 }
@@ -130,6 +150,23 @@ static CRDPEvent *CRDPEventFromCrdpEvent(const CrdpEvent *ev)
             out.style = wo->style;
             out.styleEx = wo->styleEx;
             out.ownerWindowId = wo->ownerWindowId;
+            out.numVisibilityRects = wo->numVisibilityRects;
+            out.visibilityRectsTruncated = wo->visibilityRectsTruncated;
+            if (wo->numVisibilityRects > 0)
+            {
+                const uint32_t stored =
+                    (wo->numVisibilityRects > CRDPQ_MAX_VISIBILITY_RECTS) ? CRDPQ_MAX_VISIBILITY_RECTS
+                                                                           : wo->numVisibilityRects;
+                NSMutableArray<NSNumber *> *rects = [NSMutableArray arrayWithCapacity:stored * 4];
+                for (uint32_t i = 0; i < stored; i++)
+                {
+                    [rects addObject:@(wo->visibilityRects[i].left)];
+                    [rects addObject:@(wo->visibilityRects[i].top)];
+                    [rects addObject:@(wo->visibilityRects[i].right)];
+                    [rects addObject:@(wo->visibilityRects[i].bottom)];
+                }
+                out.visibilityRects = rects;
+            }
             break;
         }
         case CRDPQ_EVENT_WINDOW_DELETE:
@@ -150,10 +187,24 @@ static CRDPEvent *CRDPEventFromCrdpEvent(const CrdpEvent *ev)
             out.notifyIconId = ev->payload.notifyIcon.notifyIconId;
             break;
         case CRDPQ_EVENT_MONITORED_DESKTOP:
+        {
             out.kind = CRDPEventKindMonitoredDesktop;
-            out.fieldFlags = ev->payload.monitoredDesktop.fieldFlags;
-            out.windowId = ev->payload.monitoredDesktop.activeWindowId;
+            const crdpq_monitored_desktop_t *md = &ev->payload.monitoredDesktop;
+            out.fieldFlags = md->fieldFlags;
+            out.windowId = md->activeWindowId;
+            out.numWindowIds = md->numWindowIds;
+            out.windowIdsTruncated = md->windowIdsTruncated;
+            if (md->numWindowIds > 0)
+            {
+                const uint32_t stored =
+                    (md->numWindowIds > CRDPQ_MAX_WINDOW_IDS) ? CRDPQ_MAX_WINDOW_IDS : md->numWindowIds;
+                NSMutableArray<NSNumber *> *ids = [NSMutableArray arrayWithCapacity:stored];
+                for (uint32_t i = 0; i < stored; i++)
+                    [ids addObject:@(md->windowIds[i])];
+                out.windowIds = ids;
+            }
             break;
+        }
         case CRDPQ_EVENT_EXEC_RESULT:
             out.kind = CRDPEventKindExecResult;
             out.execResult = ev->payload.execResult.execResult;
@@ -178,6 +229,30 @@ static CRDPEvent *CRDPEventFromCrdpEvent(const CrdpEvent *ev)
         case CRDPQ_EVENT_FRAME_READY:
             out.kind = CRDPEventKindFrameReady;
             out.surfaceId = ev->payload.frameReady.surfaceId;
+            break;
+        case CRDPQ_EVENT_LOCAL_MOVE_SIZE:
+            out.kind = CRDPEventKindLocalMoveSize;
+            out.windowId = ev->payload.localMoveSize.windowId;
+            out.isMoveSizeStart = ev->payload.localMoveSize.isMoveSizeStart;
+            out.moveSizeType = ev->payload.localMoveSize.moveSizeType;
+            out.moveSizePosX = ev->payload.localMoveSize.posX;
+            out.moveSizePosY = ev->payload.localMoveSize.posY;
+            break;
+        case CRDPQ_EVENT_MIN_MAX_INFO:
+            out.kind = CRDPEventKindMinMaxInfo;
+            out.windowId = ev->payload.minMaxInfo.windowId;
+            out.maxWidth = ev->payload.minMaxInfo.maxWidth;
+            out.maxHeight = ev->payload.minMaxInfo.maxHeight;
+            out.maxPosX = ev->payload.minMaxInfo.maxPosX;
+            out.maxPosY = ev->payload.minMaxInfo.maxPosY;
+            out.minTrackWidth = ev->payload.minMaxInfo.minTrackWidth;
+            out.minTrackHeight = ev->payload.minMaxInfo.minTrackHeight;
+            out.maxTrackWidth = ev->payload.minMaxInfo.maxTrackWidth;
+            out.maxTrackHeight = ev->payload.minMaxInfo.maxTrackHeight;
+            break;
+        case CRDPQ_EVENT_ZORDER_SYNC:
+            out.kind = CRDPEventKindZOrderSync;
+            out.windowId = ev->payload.zorderSync.windowIdMarker;
             break;
         default:
             /* Landing here defensively for any future addition to crdpq_event_type_t this
@@ -383,6 +458,38 @@ static BOOL crb_window_common(rdpContext *context, const WINDOW_ORDER_INFO *orde
     if (orderInfo->fieldFlags & WINDOW_ORDER_FIELD_OWNER)
         ev.payload.windowOrder.ownerWindowId = windowState->ownerWindowId;
 
+    /* adr/0008 §2b: the visibilityRects array's existence (not just its length) is gated
+     * on WINDOW_ORDER_FIELD_VISIBILITY (0x0200) -- same discipline as the OWNER bit above,
+     * and confirmed against FreeRDP's own parser (window.c's update_read_window_state_order
+     * only touches numVisibilityRects/visibilityRects inside that bit's `if`, leaving both
+     * at WINPR_C_ARRAY_INIT's zero default otherwise). `numVisibilityRects` stores the WIRE
+     * value even when truncated (crdpq.h's own doc comment on this field explains why);
+     * `crdpq_dropped_count`-style shape for the truncation warning, per adr/0008 §4. */
+    if (orderInfo->fieldFlags & WINDOW_ORDER_FIELD_VISIBILITY)
+    {
+        ev.payload.windowOrder.numVisibilityRects = windowState->numVisibilityRects;
+        const uint32_t toCopy = (windowState->numVisibilityRects > CRDPQ_MAX_VISIBILITY_RECTS)
+                                     ? CRDPQ_MAX_VISIBILITY_RECTS
+                                     : windowState->numVisibilityRects;
+        ev.payload.windowOrder.visibilityRectsTruncated =
+            (windowState->numVisibilityRects > CRDPQ_MAX_VISIBILITY_RECTS);
+        for (uint32_t i = 0; i < toCopy; i++)
+        {
+            ev.payload.windowOrder.visibilityRects[i].left = windowState->visibilityRects[i].left;
+            ev.payload.windowOrder.visibilityRects[i].top = windowState->visibilityRects[i].top;
+            ev.payload.windowOrder.visibilityRects[i].right = windowState->visibilityRects[i].right;
+            ev.payload.windowOrder.visibilityRects[i].bottom = windowState->visibilityRects[i].bottom;
+        }
+        if (ev.payload.windowOrder.visibilityRectsTruncated)
+        {
+            WLog_WARN(TAG,
+                      "WindowOrder windowId=%" PRIu32 ": visibilityRects truncated (%" PRIu32
+                      " > %d) -- adr/0008 §4 fail-open applies (degrade to full window rect, "
+                      "never fabricate a smaller one)",
+                      orderInfo->windowId, windowState->numVisibilityRects, CRDPQ_MAX_VISIBILITY_RECTS);
+        }
+    }
+
     if (orderInfo->fieldFlags & WINDOW_ORDER_FIELD_TITLE)
     {
         char *title = rail_string_to_utf8_string(&windowState->titleInfo);
@@ -480,8 +587,35 @@ static BOOL crb_monitored_desktop(rdpContext *context, const WINDOW_ORDER_INFO *
     memset(&ev, 0, sizeof(ev));
     ev.type = CRDPQ_EVENT_MONITORED_DESKTOP;
     ev.payload.monitoredDesktop.fieldFlags = orderInfo->fieldFlags;
+    /* activeWindowId is 0xFFFFFFFF ("no active window") in the large majority of samples
+     * (adr/0008 §0) -- passed through unchanged, sentinel and all; interpreting it is the
+     * consumer's job (adr/0008 §0/§6), not this transport layer's. */
     ev.payload.monitoredDesktop.activeWindowId = monitoredDesktop->activeWindowId;
     ev.payload.monitoredDesktop.numWindowIds = monitoredDesktop->numWindowIds;
+    /* adr/0008 §2a: the windowIds array's existence (not just its length) is gated on
+     * WINDOW_ORDER_FIELD_DESKTOP_ZORDER (0x10) -- confirmed both by sample evidence (§0:
+     * every numWindowIds>0 record carries this bit, every numWindowIds==0 record doesn't)
+     * and by FreeRDP's own parser (window.c's update_read_desktop_actively_monitored_order
+     * only touches numWindowIds/windowIds inside that bit's `if`, leaving both at
+     * WINPR_C_ARRAY_INIT's zero default otherwise). */
+    if (orderInfo->fieldFlags & WINDOW_ORDER_FIELD_DESKTOP_ZORDER)
+    {
+        const uint32_t toCopy = (monitoredDesktop->numWindowIds > CRDPQ_MAX_WINDOW_IDS)
+                                     ? CRDPQ_MAX_WINDOW_IDS
+                                     : monitoredDesktop->numWindowIds;
+        ev.payload.monitoredDesktop.windowIdsTruncated =
+            (monitoredDesktop->numWindowIds > CRDPQ_MAX_WINDOW_IDS);
+        for (uint32_t i = 0; i < toCopy; i++)
+            ev.payload.monitoredDesktop.windowIds[i] = monitoredDesktop->windowIds[i];
+        if (ev.payload.monitoredDesktop.windowIdsTruncated)
+        {
+            WLog_WARN(TAG,
+                      "MonitoredDesktop: windowIds truncated (%" PRIu32 " > %d) -- adr/0008 §4 "
+                      "fail-open applies (leave out-of-array windows' relative order untouched, "
+                      "never infer they belong at the bottom)",
+                      monitoredDesktop->numWindowIds, CRDPQ_MAX_WINDOW_IDS);
+        }
+    }
     crdpq_post(crb_control(p), &ev);
 
     /* Mirrors xf_rail_monitored_desktop()/rail-probe.c's probe_monitored_desktop(): once
@@ -508,11 +642,13 @@ static BOOL crb_non_monitored_desktop(rdpContext *context, const WINDOW_ORDER_IN
 /* ==================================================================================== *
  * RAIL channel Server* handlers, T_rdp. ServerHandshake/ServerHandshakeEx have a real
  * upstream default (wired by the rail channel plugin at load time) that must be
- * forwarded to; ServerExecuteResult has none. ServerSystemParam/ServerLocalMoveSize/
- * ServerMinMaxInfo/ServerZOrderSync/ServerGetAppIdResponse are intentionally left
- * unwired in W4a -- no curated crdpq event type exists for any of them yet and none is
- * part of this phase's acceptance criteria (window move/resize interaction and
- * GetAppId support are future work).
+ * forwarded to; ServerExecuteResult/ServerLocalMoveSize/ServerMinMaxInfo/ServerZOrderSync
+ * have none (client/rail.h carries no "a default implementation exists" doc comment for
+ * any of the three, unlike ServerHandshake/ServerHandshakeEx above -- same no-forwarding
+ * shape as ServerExecuteResult already had). adr/0008 §1 wires the three of these that were
+ * previously left unwired ("no curated crdpq event type exists for any of them yet").
+ * ServerSystemParam/ServerGetAppIdResponse remain intentionally unwired -- still no curated
+ * crdpq event type for either, and neither is part of adr/0008's scope (§6: "仍不接线").
  * ==================================================================================== */
 
 static UINT crb_rail_server_handshake(RailClientContext *context, const RAIL_HANDSHAKE_ORDER *handshake)
@@ -559,6 +695,64 @@ static UINT crb_rail_server_execute_result(RailClientContext *context,
         crdpq_text_set(&ev.payload.execResult.exeOrFile, exe, strlen(exe));
         free(exe);
     }
+    crdpq_post(crb_control(p), &ev);
+    return CHANNEL_RC_OK;
+}
+
+/* adr/0008 §0's caveat: ServerLocalMoveSize was NEVER observed in any of the six
+ * samples/phase05-rail-events-2026-08-19 captures (the probe never dragged/resized a
+ * window) -- this handler's shape is verified only against client/rail.h and MS-RDPERP,
+ * not real wire bytes. W3's first live LocalMoveSize is a verification event for this
+ * struct, not an already-proven assumption. */
+static UINT crb_rail_server_local_move_size(RailClientContext *context,
+                                             const RAIL_LOCALMOVESIZE_ORDER *localMoveSize)
+{
+    CRBridgeContext *p = (CRBridgeContext *)context->custom;
+    CrdpEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = CRDPQ_EVENT_LOCAL_MOVE_SIZE;
+    ev.payload.localMoveSize.windowId = localMoveSize->windowId;
+    /* isMoveSizeStart is upstream BOOL (a typedef for int) -- normalize to a real bool with
+     * `!= 0` per adr/0008 §1; never memcpy/assign the raw int bit pattern into this bool
+     * field. */
+    ev.payload.localMoveSize.isMoveSizeStart = (localMoveSize->isMoveSizeStart != 0);
+    ev.payload.localMoveSize.moveSizeType = localMoveSize->moveSizeType;
+    ev.payload.localMoveSize.posX = localMoveSize->posX;
+    ev.payload.localMoveSize.posY = localMoveSize->posY;
+    crdpq_post(crb_control(p), &ev);
+    return CHANNEL_RC_OK;
+}
+
+static UINT crb_rail_server_min_max_info(RailClientContext *context,
+                                          const RAIL_MINMAXINFO_ORDER *minMaxInfo)
+{
+    CRBridgeContext *p = (CRBridgeContext *)context->custom;
+    CrdpEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = CRDPQ_EVENT_MIN_MAX_INFO;
+    ev.payload.minMaxInfo.windowId = minMaxInfo->windowId;
+    ev.payload.minMaxInfo.maxWidth = minMaxInfo->maxWidth;
+    ev.payload.minMaxInfo.maxHeight = minMaxInfo->maxHeight;
+    ev.payload.minMaxInfo.maxPosX = minMaxInfo->maxPosX;
+    ev.payload.minMaxInfo.maxPosY = minMaxInfo->maxPosY;
+    ev.payload.minMaxInfo.minTrackWidth = minMaxInfo->minTrackWidth;
+    ev.payload.minMaxInfo.minTrackHeight = minMaxInfo->minTrackHeight;
+    ev.payload.minMaxInfo.maxTrackWidth = minMaxInfo->maxTrackWidth;
+    ev.payload.minMaxInfo.maxTrackHeight = minMaxInfo->maxTrackHeight;
+    crdpq_post(crb_control(p), &ev);
+    return CHANNEL_RC_OK;
+}
+
+/* adr/0008 §1: despite the name, RAIL_ZORDER_SYNC carries no Z-order array -- just a
+ * boundary marker. The ordered array a consumer actually wants lives on the most recent
+ * CRDPQ_EVENT_MONITORED_DESKTOP's windowIds (§2a), not here. */
+static UINT crb_rail_server_zorder_sync(RailClientContext *context, const RAIL_ZORDER_SYNC *zorderSync)
+{
+    CRBridgeContext *p = (CRBridgeContext *)context->custom;
+    CrdpEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = CRDPQ_EVENT_ZORDER_SYNC;
+    ev.payload.zorderSync.windowIdMarker = zorderSync->windowIdMarker;
     crdpq_post(crb_control(p), &ev);
     return CHANNEL_RC_OK;
 }
@@ -842,6 +1036,13 @@ static void crb_on_channel_connected(void *context, const ChannelConnectedEventA
         rail->ServerHandshake = crb_rail_server_handshake;
         rail->ServerHandshakeEx = crb_rail_server_handshake_ex;
         rail->ServerExecuteResult = crb_rail_server_execute_result;
+        /* adr/0008 §1: previously-unwired callbacks -- see this file's own comment above
+         * crb_rail_server_local_move_size for why none of the three need an orig_* saved
+         * pointer (no upstream default exists for any of them, same shape as
+         * ServerExecuteResult just above). */
+        rail->ServerLocalMoveSize = crb_rail_server_local_move_size;
+        rail->ServerMinMaxInfo = crb_rail_server_min_max_info;
+        rail->ServerZOrderSync = crb_rail_server_zorder_sync;
     }
     else if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0)
     {

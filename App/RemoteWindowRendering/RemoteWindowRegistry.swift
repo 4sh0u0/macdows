@@ -18,6 +18,11 @@ private enum WindowOrderField {
     static let show: UInt32 = 0x0000_0010
     static let size: UInt32 = 0x0000_0400
     static let offset: UInt32 = 0x0000_0800
+    /// `WINDOW_ORDER_FIELD_DESKTOP_ZORDER` (window.h) -- MonitoredDesktop-only, gates
+    /// `CRDPEvent.windowIds` (adr/0008 §2a). Distinct bit space from the WindowCreate/
+    /// Update bits above (MonitoredDesktop's `fieldFlags` uses `WINDOW_ORDER_FIELD_DESKTOP_*`
+    /// constants, not the `WINDOW_ORDER_FIELD_*` ones those gate).
+    static let desktopZOrder: UInt32 = 0x0000_0010
 }
 
 /// Accumulated per-windowId state this registry needs to paint something and decide
@@ -69,6 +74,25 @@ private struct PendingWindowState {
     var isVisible: Bool { show != 0 }
 }
 
+/// The most recently observed `MonitoredDesktop` order, as pure data (adr/0008 §6: W1's
+/// focus-convergence/Z-order *policy* is explicitly deferred until real data has been
+/// observed live -- this struct only records what the server last said, it decides
+/// nothing). Exposed for `Tools/window-smoke`'s harness via
+/// `RemoteWindowRegistry.serverDesktopState`, not consumed by any rendering/input path yet.
+struct ServerDesktopState: Equatable {
+    /// `nil` when the server's own `activeWindowId` was the `0xFFFFFFFF` sentinel
+    /// (adr/0008 §0: "no window on this desktop currently has focus") -- the sentinel must
+    /// never be stored/compared as a literal window id.
+    var activeWindowId: UInt32?
+    /// Top-to-bottom Z order (adr/0008 §2a), gated on `WINDOW_ORDER_FIELD_DESKTOP_ZORDER`
+    /// (0x10) -- empty when the most recent order didn't carry that bit.
+    var windowIds: [UInt32] = []
+    /// The wire's own count, which may exceed `windowIds.count` if the server's array was
+    /// larger than `CRDPQEvent`'s `CRDPQ_MAX_WINDOW_IDS` (96) bound.
+    var numWindowIds: UInt32 = 0
+    var windowIdsTruncated: Bool = false
+}
+
 /// Owns every `RemoteWindow` for one `CRSession`, driven entirely by that session's
 /// drained control-lane events (adr/0005 §2/§3). `@MainActor` — this *is* T_main's window-
 /// management state, matching `CRSession`'s own threading contract (every method on
@@ -92,6 +116,9 @@ final class RemoteWindowRegistry {
     /// layer to it. Populated by .surfaceMapped, dropped alongside surfaceToWindow.
     private var surfaceMappedSize: [UInt32: CGSize] = [:]
     private var currentGeneration: UInt32?
+    /// adr/0008 §6 / task item 5: pure-data record of the last MonitoredDesktop order, no
+    /// ordering/focus policy attached. See `ServerDesktopState`'s own doc comment.
+    private var desktopState = ServerDesktopState()
 
     /// W4c review H1: *session-level* modifier state — one physical keyboard, one tracked
     /// set, not per-window. The original per-window `[UInt32: NSEvent.ModifierFlags]`
@@ -189,11 +216,34 @@ final class RemoteWindowRegistry {
             handleFrameReady(surfaceId: event.surfaceId)
         case .disconnected:
             closeAllWindows()
+        case .monitoredDesktop:
+            handleMonitoredDesktop(event)
+        case .localMoveSize, .minMaxInfo, .zOrderSync:
+            // adr/0008 §1/§6: contract-only wiring -- these three now decode and reach
+            // here, but no sync/policy code exists yet ("拿到真数据前不写策略"). LocalMoveSize
+            // in particular was never observed in any phase05 sample (adr/0008 §0's
+            // caveat); logging its first live occurrence is a verification step, not
+            // acted-upon data.
+            Self.logger.debug("received \(String(describing: event.kind), privacy: .public) windowId=\(event.windowId, privacy: .public) (recorded only, no policy attached -- adr/0008 §6)")
         case .windowIcon, .notifyIconCreate, .notifyIconUpdate, .notifyIconDelete,
-             .monitoredDesktop, .execResult, .handshakeFlags:
+             .execResult, .handshakeFlags:
             break
         @unknown default:
             break
+        }
+    }
+
+    /// adr/0008 §2a / §6: records the server's own MonitoredDesktop state as pure data --
+    /// no focus/Z-order policy. `event.windowId` carries `activeWindowId` (see
+    /// `CRDPEvent.windowId`'s own doc comment); the `0xFFFFFFFF` sentinel becomes `nil`
+    /// here, once, so nothing downstream ever has to re-derive that check.
+    private func handleMonitoredDesktop(_ event: CRDPEvent) {
+        let sentinel: UInt32 = 0xFFFF_FFFF
+        desktopState.activeWindowId = (event.windowId == sentinel) ? nil : event.windowId
+        desktopState.numWindowIds = event.numWindowIds
+        desktopState.windowIdsTruncated = event.windowIdsTruncated
+        if event.fieldFlags & WindowOrderField.desktopZOrder != 0 {
+            desktopState.windowIds = event.windowIds.map { $0.uint32Value }
         }
     }
 
@@ -499,6 +549,14 @@ final class RemoteWindowRegistry {
         windows[windowId]?.window
     }
 
+    /// Diagnostics only (adr/0008 §6 / task item 5) -- the most recently observed
+    /// MonitoredDesktop state, pure data, no ordering/focus policy. Sibling to
+    /// `windowSnapshots()` for `Tools/window-smoke`'s harness to assert against once real
+    /// activeWindowId/Z-order data is flowing.
+    func serverDesktopState() -> ServerDesktopState {
+        desktopState
+    }
+
     func windowSnapshots() -> [WindowSnapshot] {
         windows.map { windowId, window in
             WindowSnapshot(
@@ -538,6 +596,7 @@ final class RemoteWindowRegistry {
         geometry.removeAll()
         surfaceToWindow.removeAll()
         surfaceMappedSize.removeAll()
+        desktopState = ServerDesktopState()
         // No RELEASE flush here (unlike the .focusLost case) -- the connection this
         // tracked state described is already gone, so there is nothing left to send it to.
         heldModifierKeys = []

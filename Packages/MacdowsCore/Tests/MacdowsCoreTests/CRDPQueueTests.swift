@@ -492,23 +492,40 @@ struct CRDPQueueLayoutTests {
     /// surprise jump (e.g. accidental struct padding doubling the union, or a stray
     /// pointer-sized field sneaking non-POD-ness in) is exactly what this test exists to
     /// catch, since nothing else in this suite would notice a layout regression.
+    ///
+    /// adr/0008 §4/§5 grew the union: `crdpq_window_order_t` gained
+    /// `numVisibilityRects`/`visibilityRectsTruncated`/`visibilityRects[32]` (300B -> 564B,
+    /// still the union's largest member -- adr/0008 §4's deliberate "take 96, not 255" bound
+    /// on `crdpq_monitored_desktop_t.windowIds` exists specifically to keep it that way);
+    /// `crdpq_monitored_desktop_t` gained `windowIdsTruncated`/`windowIds[96]` (12B -> 400B).
+    /// The three new event structs (`crdpq_local_move_size_t`=16B,
+    /// `crdpq_min_max_info_t`=36B, `crdpq_zorder_sync_t`=4B) are all far smaller than
+    /// `crdpq_window_order_t` and don't move the union's own size. Every number below was
+    /// re-measured with clang/arm64 after adding adr/0008's fields (matching crdpq.h's own
+    /// `_Static_assert`s), not estimated from the ADR's own illustrative table (which was
+    /// written against a pre-ownerWindowId 296B `crdpq_window_order_t` baseline and doesn't
+    /// match this codebase's actual 300B-before/564B-after numbers).
     @Test("CrdpEvent and CrdpCommand match their measured, known-good sizes")
     func reportSizes() {
-        // crdpq_window_order_t (300B: 10 x 4B scalar fields, including adr/0008 §3's
-        // ownerWindowId, + crdpq_text_t's 260B, 4-byte-aligned -- see crdpq.h's own
-        // _Static_assert pinning this same number at the C layer) is the largest union
-        // member, but crdpq_event_payload_t's OWN alignment is 8 (crdpq_surface_mapped_t's
-        // uint64_t windowId, not window_order_t, sets that), so the union's size is padded
-        // up from 300 to the next multiple of 8 = 304B. CrdpEvent adds a 4B type tag + 4B
-        // generation on top = 312B total.
         #expect(MemoryLayout<crdpq_text_t>.size == 260)
-        #expect(MemoryLayout<crdpq_window_order_t>.size == 300)
-        #expect(MemoryLayout<crdpq_event_payload_t>.size == 304)
-        #expect(MemoryLayout<CrdpEvent>.size == 312)
+        #expect(MemoryLayout<crdpq_rect_t>.size == 8)
+        #expect(MemoryLayout<crdpq_window_order_t>.size == 564)
+        #expect(MemoryLayout<crdpq_monitored_desktop_t>.size == 400)
+        #expect(MemoryLayout<crdpq_local_move_size_t>.size == 16)
+        #expect(MemoryLayout<crdpq_min_max_info_t>.size == 36)
+        #expect(MemoryLayout<crdpq_zorder_sync_t>.size == 4)
+        // crdpq_window_order_t (564B) is still this union's largest member post-adr/0008;
+        // crdpq_event_payload_t's OWN alignment is 8 (crdpq_surface_mapped_t's uint64_t
+        // windowId sets that, not crdpq_window_order_t), so the union's size pads up from
+        // 564 to the next multiple of 8 = 568B. CrdpEvent adds a 4B type tag + 4B
+        // generation on top = 576B total (already 8-aligned, no further padding).
+        #expect(MemoryLayout<crdpq_event_payload_t>.size == 568)
+        #expect(MemoryLayout<CrdpEvent>.size == 576)
         #expect(MemoryLayout<CrdpEvent>.alignment == 8)
 
         // crdpq_cmd_execute_t (crdpq_text_t alone, 260B) is the largest CrdpCommand union
-        // member; CrdpCommand adds a 4B type tag = 264B total.
+        // member; CrdpCommand adds a 4B type tag = 264B total. Unaffected by adr/0008 --
+        // the outbound lane (crdpq_outbound_t) is explicitly out of this ADR's scope (§6).
         #expect(MemoryLayout<crdpq_command_payload_t>.size == 260)
         #expect(MemoryLayout<CrdpCommand>.size == 264)
     }
