@@ -203,6 +203,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// One retry of the activate+Enter sequence per cycle (observed ~1-in-20 residual
     /// miss even with focus confirmation -- a single re-arm reliably clears it).
     private var cycleCloseRetried = false
+    /// When this cycle first showed rendered content -- anchors the grace window for the
+    /// About-title target lock (the title often lands on a later WindowUpdate than the
+    /// first presented frame; observed live as ~10% of fast cycles spuriously skipping
+    /// the close leg entirely when the lock ran one drain too early).
+    private var cycleRenderedAt: Date?
     /// adr/0012 follow-up diagnostic (WINDOW_SMOKE_CLOSE_PROBE): whether the server's
     /// `activeWindow` has been observed to equal `cycleCloseTargetId` at any point since
     /// the target was (most recently) locked -- this harness's own external proxy for "the
@@ -706,8 +711,14 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 cycleCloseDeadline = Date().addingTimeInterval(6)
                 return
             }
-            // Rendered but no closable winver target (unexpected with this harness's own
-            // exec) -- record the cycle without the close leg rather than stalling.
+            // Rendered but no About-titled target yet. The title regularly arrives on a
+            // later WindowUpdate than the first presented frame, so an immediate give-up
+            // here spuriously skips the whole close leg on fast cycles -- poll within a
+            // grace window before conceding the target really is not coming.
+            if cycleRenderedAt == nil { cycleRenderedAt = Date() }
+            if let renderedAt = cycleRenderedAt, Date().timeIntervalSince(renderedAt) < 3.0 {
+                return
+            }
             finishCycle(session: session, registry: registry, rendered: true, closed: false,
                         seconds: seconds)
             return
@@ -741,6 +752,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         cycleAboutCountAtLock = 0
         cycleCloseRetried = false
         cycleTargetEverConverged = false
+        cycleRenderedAt = nil
 
         if cycleIndex >= cyclesTotal || !rendered {
             finishCycles()
@@ -835,15 +847,15 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // focus-sync work item), not harness slop. adr/0012 task item 3 replaces the manual
         // timing with the gated path (activateForClose -> FocusAuthority.localActivate,
         // keystrokes flow through the keyboard-lane gate by construction) but deliberately
-        // keeps this floor unchanged for now -- flipping it to the ADR's own ≤2% target
-        // happens only after real evidence from the gated path, not as an assumption made
-        // here. The floor still catches total breakage of the input round trip; the strict
-        // per-cycle close-leg log lines above and the failure-rate line below keep the real
-        // rate visible in the meantime.
+        // kept this floor unchanged until real gated-path evidence existed. That evidence
+        // landed 2026-08-23: after the periodic re-arm + cold-start deadline (adr/0012
+        // §4.5) and the target-lock grace fix in this harness, two consecutive healthy-host
+        // soaks closed 20/20 + 20/20 with zero retries exhausted -- so this is now the
+        // ADR's own W1 exit gate (≤2% failure), not the interim 70% floor.
         check(
-            Double(closedCount) >= Double(cycleResults.count) * 0.7,
-            "at least 70% of cycles closed their winver via the synthetic Enter round trip "
-                + "(got \(closedCount) of \(cycleResults.count))"
+            Double(cycleResults.count - closedCount) <= Double(cycleResults.count) * 0.02,
+            "close-leg failure rate is <=2% (adr/0012 §4 W1 exit gate) "
+                + "(got \(cycleResults.count - closedCount) failures of \(cycleResults.count))"
         )
         if !cycleResults.isEmpty {
             let failureRate = Double(cycleResults.count - closedCount) / Double(cycleResults.count) * 100

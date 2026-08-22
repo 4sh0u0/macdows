@@ -214,8 +214,9 @@ final class RemoteWindowRegistry {
         // adr/0012 §4 task item 2: opportunistic tick on every drained event -- cheap (a
         // no-op whenever FocusAuthority isn't `.converging`), and covers the common case
         // (events keep arriving during a convergence attempt) without a repeating timer.
-        // `armFocusAuthorityDeadlineTicks` (called from the mouseButton `.down` case)
-        // covers the complementary "server goes quiet" case with one-shot timers.
+        // `scheduleFocusAuthorityTick` (called from the mouseButton `.down` case) covers the
+        // complementary "server goes quiet" case with a self-rescheduling chain of one-shot
+        // timers (2026-08-23 follow-up: periodic re-arm, see that method's own doc comment).
         execute(focusAuthority.tick(now: CFAbsoluteTimeGetCurrent()))
 
         switch event.kind {
@@ -412,7 +413,7 @@ final class RemoteWindowRegistry {
                 // is still just a fire-and-forget no-op cost, not a correctness risk.
                 let now = CFAbsoluteTimeGetCurrent()
                 execute(focusAuthority.localActivate(windowId: windowId, at: now))
-                armFocusAuthorityDeadlineTicks(from: now)
+                scheduleFocusAuthorityTick()
             }
             let point = remotePoint(from: screenPoint)
             session.send(crMouseButton(for: button), down: down, atX: Int32(point.x), y: Int32(point.y))
@@ -557,32 +558,43 @@ final class RemoteWindowRegistry {
         }
     }
 
-    /// adr/0012 §4 task item 2: `FocusAuthority`'s soft/hard deadlines only fire when
-    /// `tick(now:)` is actually called at some point after each threshold elapses --
-    /// `handle(_:)` already does this opportunistically on every drained event, which covers
-    /// the common case (events keep arriving during a convergence attempt). This covers the
-    /// complementary *quiet* case: if the server goes completely silent for the whole
-    /// 500ms/5000ms window (no MonitoredDesktop, no window order, nothing), these one-shot
-    /// timers are what still fire the re-arm/rollback on schedule -- mirrors
-    /// `pendingTrailingMove`'s own `asyncAfter` idiom above rather than adding a new
-    /// repeating `Timer`. Safe to call redundantly (e.g. on every `localActivate`, including
-    /// the same-target nudge case that doesn't actually reset any deadline): `tick(now:)` is
-    /// a no-op whenever nothing has actually crossed a threshold yet.
-    private func armFocusAuthorityDeadlineTicks(from now: TimeInterval) {
+    /// adr/0012 §4 task item 2: `FocusAuthority`'s periodic re-arm and hard-rollback
+    /// machinery only fires when `tick(now:)` is actually called at some point after each
+    /// threshold elapses -- `handle(_:)` already does this opportunistically on every
+    /// drained event, which covers the common case (events keep arriving during a
+    /// convergence attempt). This covers the complementary *quiet* case: if the server goes
+    /// completely silent for the whole window (no MonitoredDesktop, no window order,
+    /// nothing), these timers are what still fire the periodic re-arm/rollback on schedule.
+    ///
+    /// 2026-08-23 follow-up (periodic re-arm, up to ~9-19 re-arms per epoch depending on
+    /// cold-start vs steady-state): a single pair of one-shot timers (at the old fixed
+    /// soft/hard marks) no longer covers the whole window on its own -- this now CHAINS one
+    /// `asyncAfter` every `softDeadlineInterval` (mirroring `pendingTrailingMove`'s own
+    /// `asyncAfter` idiom above, still no repeating `Timer`), re-arming itself from each
+    /// fire for as long as `focusAuthority.state` is still `.converging`, and stopping the
+    /// moment it isn't (converged, hard-rolled-back, or superseded -- whichever `tick(now:)`
+    /// itself already decided). Deliberately doesn't need to know cold-start vs
+    /// steady-state, or even the hard deadline's value at all -- `tick(now:)` in
+    /// MacdowsCore is the sole authority on when the epoch actually ends; this loop just
+    /// keeps knocking until there's nothing left to knock for. Safe to call redundantly
+    /// (e.g. from every `localActivate`, including the same-target nudge case that doesn't
+    /// reset any deadline, or with a prior chain from a just-superseded epoch still
+    /// in-flight): each fire's own `tick(now:)` call is itself a no-op whenever nothing has
+    /// actually crossed a threshold yet, and a chain that finds `state` no longer
+    /// `.converging` simply stops rescheduling itself.
+    private func scheduleFocusAuthorityTick() {
         DispatchQueue.main.asyncAfter(deadline: .now() + FocusAuthority.softDeadlineInterval) { [weak self] in
             MainActor.assumeIsolated {
-                self?.tickFocusAuthority()
-            }
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + FocusAuthority.hardDeadlineInterval) { [weak self] in
-            MainActor.assumeIsolated {
-                self?.tickFocusAuthority()
+                self?.tickFocusAuthorityAndReschedule()
             }
         }
     }
 
-    private func tickFocusAuthority() {
+    private func tickFocusAuthorityAndReschedule() {
         execute(focusAuthority.tick(now: CFAbsoluteTimeGetCurrent()))
+        if case .converging = focusAuthority.state {
+            scheduleFocusAuthorityTick()
+        }
     }
 
     /// Trailing-edge flush for the move throttle (see `pendingTrailingMove`): sends the

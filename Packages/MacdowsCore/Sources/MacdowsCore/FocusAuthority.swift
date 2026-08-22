@@ -54,11 +54,19 @@ public enum FocusState: Sendable, Equatable {
     /// lane gate is open in this state, and *only* this state.
     case converged(windowId: UInt32)
     /// A local activation (`localActivate`) is in flight toward `target`, not yet confirmed
-    /// by a matching `serverDesktopUpdate`. `softDeadline`/`hardDeadline` are absolute times
-    /// on the same clock `at:`/`now:` parameters use. `softArmed` is `true` once the single
-    /// soft-deadline re-arm (`sendActivate`) has already fired for this epoch — never fires
-    /// twice (adr/0012 §1: "单次re-arm可靠清掉残余").
-    case converging(target: UInt32, softDeadline: TimeInterval, hardDeadline: TimeInterval, softArmed: Bool)
+    /// by a matching `serverDesktopUpdate`. `epochStart`/`hardDeadline` are absolute times on
+    /// the same clock `at:`/`now:` parameters use. `reArmCount` is how many periodic
+    /// `sendActivate` re-arms have already fired for this epoch (0 until the first one) —
+    /// re-arms are periodic, not single-shot (2026-08-23 real-host soak follow-up: healthy-
+    /// host reconnect churn still saw close-legs converge *after* a single 500ms re-arm but
+    /// *before* the old 5000ms hard deadline, just later than one re-arm alone could recover
+    /// from — periodic re-arm at the same 500ms cadence keeps nudging `-activateWindow:`
+    /// throughout the whole window instead of giving up on retrying after the first miss).
+    /// `coldStart` is `true` when this is the first epoch since `generationReset()` to reach
+    /// `.converging` without any real window convergence yet observed — see `hardDeadline`'s
+    /// own two possible values on `FocusAuthority` (`hardDeadlineInterval` /
+    /// `coldStartHardDeadlineInterval`) for why that epoch alone gets a longer fuse.
+    case converging(target: UInt32, epochStart: TimeInterval, hardDeadline: TimeInterval, coldStart: Bool, reArmCount: Int)
     /// The server's `activeWindowId` is `0` — the desktop itself has focus. Gate closed (no
     /// legitimate remote window target to address keyboard input to).
     case desktopFocused
@@ -74,10 +82,14 @@ public enum FocusState: Sendable, Equatable {
 /// executes these against `CRSession`/AppKit; `FocusAuthority` itself touches neither (adr/0012
 /// §4: "纯状态机进Packages/MacdowsCore/，RemoteWindowRegistry只做消费与副作用").
 public enum FocusAuthorityEffect: Sendable, Equatable {
-    /// Re-send `-activateWindow:` for `windowId`. Fired exactly twice in the entire
-    /// lifecycle of a target: once immediately when `localActivate` starts converging toward
-    /// it, and — if convergence hasn't happened by the 500ms soft deadline — exactly once
-    /// more as the single re-arm (never a third time for the same epoch; adr/0012 §1).
+    /// Re-send `-activateWindow:` for `windowId`. Fired once immediately when
+    /// `localActivate` starts converging toward it, then again periodically every
+    /// `FocusAuthority.softDeadlineInterval` (500ms) while still converging — up to ~9 more
+    /// times in a steady-state 5000ms window, ~19 more in a cold-start 10000ms one — until
+    /// either convergence or the hard deadline (2026-08-23 soak follow-up: a single re-arm
+    /// wasn't enough for closes that converged after 500ms but before the old 5000ms
+    /// deadline; periodic re-arm keeps nudging the whole way instead of firing once and
+    /// waiting).
     case sendActivate(windowId: UInt32)
     /// Give `windowId` local key/main status — maps to `RemoteWindow.activateLocally()`.
     case makeKey(windowId: UInt32)
@@ -105,13 +117,21 @@ public enum FocusAuthorityEffect: Sendable, Equatable {
 }
 
 public enum FocusAuthorityWarning: Sendable, Equatable {
-    /// The 500ms soft deadline elapsed before converging on `target`. `totalMisses` is a
-    /// lifetime (not per-epoch) counter — useful for a harness to report an aggregate rate
-    /// without `FocusAuthority` itself needing a separate "reset stats" API.
+    /// The FIRST 500ms re-arm mark elapsed before converging on `target`. Fired once per
+    /// epoch, on the first periodic re-arm only — every subsequent 500ms re-arm in the same
+    /// epoch still fires its own `sendActivate` effect, but deliberately does *not* repeat
+    /// this warning (2026-08-23 soak follow-up: periodic re-arm can fire up to ~19 times in
+    /// a cold-start epoch; a warn on every single one would be log spam for what's already
+    /// known to be a slow-but-recovering epoch after the first miss). `totalMisses` is a
+    /// lifetime (not per-epoch) counter of *epochs* that missed their first re-arm mark —
+    /// useful for a harness to report an aggregate rate without `FocusAuthority` itself
+    /// needing a separate "reset stats" API.
     case softDeadlineMissed(target: UInt32, totalMisses: Int)
-    /// The 5000ms hard deadline elapsed before converging on `target` — the safety-valve
-    /// case adr/0012 §1 calls out as "触发率本身即bug信号（稳态目标0次）": a real occurrence
-    /// of this is worth surfacing loudly, not silently absorbing.
+    /// The hard deadline (`FocusAuthority.hardDeadlineInterval` or
+    /// `coldStartHardDeadlineInterval`, whichever this epoch used) elapsed before converging
+    /// on `target` — the safety-valve case adr/0012 §1 calls out as "触发率本身即bug信号
+    /// （稳态目标0次）": a real occurrence of this is worth surfacing loudly, not silently
+    /// absorbing.
     case hardRollback(target: UInt32)
     /// The 64-event keyboard-lane buffer was already full; this incoming event was refused
     /// (the newest, per adr/0012 §2 — the already-buffered prefix is kept intact).
@@ -136,10 +156,24 @@ public enum FocusAuthorityWarning: Sendable, Equatable {
 /// deadline elapses" — a caller silent for the whole window and one that calls `tick` on
 /// every drained event produce identical outcomes, just observed at different granularities.
 public final class FocusAuthority {
-    /// Input-gate + single-re-arm window (adr/0012 §1): covers the observed p95 (329ms).
+    /// Input-gate + periodic-re-arm cadence (adr/0012 §1): covers the observed p95 (329ms).
     public static let softDeadlineInterval: TimeInterval = 0.5
-    /// Safety-valve rollback window (adr/0012 §1): ~1.3x the observed max (3754ms).
+    /// Steady-state safety-valve rollback window (adr/0012 §1): ~1.3x the observed max
+    /// (3754ms). Used for every converging epoch except the cold-start one below.
     public static let hardDeadlineInterval: TimeInterval = 5.0
+    /// Cold-start safety-valve rollback window — 2x `hardDeadlineInterval`. 2026-08-23
+    /// real-host soak evidence (two healthy-host reconnect-churn soaks, all close-leg
+    /// failures in C-mode/reconnect cycles, zero from the close-probe A/B experiment):
+    /// immediately post-reconnect the server's own `MonitoredDesktop.activeWindowId` flaps
+    /// desktop&lt;-&gt;unmonitored for several seconds — it eats the very first `ClientActivate`
+    /// sent during session setup — and convergence, when it happens at all, lands *after*
+    /// the steady-state 5000ms deadline but comfortably before 10000ms. Applied only to the
+    /// first converging epoch since the last `generationReset()` that hasn't yet reached a
+    /// real window convergence (`FocusState.converging`'s own `coldStart` flag) — once any
+    /// epoch has actually converged on a window, the server's MonitoredDesktop channel has
+    /// proven itself settled, and every later epoch in the same connection goes back to the
+    /// tighter steady-state window.
+    public static let coldStartHardDeadlineInterval: TimeInterval = 10.0
     /// adr/0012 §2: "缓冲上限64事件".
     private static let bufferCap = 64
 
@@ -168,6 +202,12 @@ public final class FocusAuthority {
     /// `FocusAuthorityWarning.softDeadlineMissed`'s own doc comment for why this doesn't
     /// reset per epoch.
     private var lifetimeSoftMissCount = 0
+    /// Whether `state` has reached `.converged(windowId:)` (a genuine window convergence —
+    /// NOT `.desktopFocused`/`.unmonitored`, which are exactly the flapping reports
+    /// cold-start exists to stay patient through) at any point since the last
+    /// `generationReset()`. Drives `coldStartHardDeadlineInterval` vs `hardDeadlineInterval`
+    /// selection in `localActivate` — see `FocusState.converging`'s `coldStart` doc comment.
+    private var hasConvergedSinceReset = false
 
     public init() {}
 
@@ -179,7 +219,7 @@ public final class FocusAuthority {
     private var currentlyKeyedWindow: UInt32? {
         switch state {
         case .converged(let id): return id
-        case .converging(let target, _, _, _): return target
+        case .converging(let target, _, _, _, _): return target
         case .desktopFocused, .unmonitored: return nil
         }
     }
@@ -193,7 +233,7 @@ public final class FocusAuthority {
         let truth = ServerActiveWindow(rawActiveWindowId: raw)
         lastServerTruth = truth
 
-        if case .converging(let target, _, _, _) = state {
+        if case .converging(let target, _, _, _, _) = state {
             guard case .window(let id) = truth, id == target else {
                 // Transitional (adr/0012 §1 row 2): a local activation is in flight and the
                 // server reported something other than its target. Neither a rollback nor a
@@ -204,6 +244,7 @@ public final class FocusAuthority {
                 return []
             }
             state = .converged(windowId: target)
+            hasConvergedSinceReset = true
             let flushed = buffer
             buffer.removeAll()
             currentEpochDroppedCount = 0
@@ -218,6 +259,7 @@ public final class FocusAuthority {
         case .window(let id):
             guard previouslyKeyed != id else { return [] }
             state = .converged(windowId: id)
+            hasConvergedSinceReset = true
             return (previouslyKeyed.map { [FocusAuthorityEffect.resignKey(windowId: $0)] } ?? []) + [.makeKey(windowId: id)]
         case .desktopFocused:
             guard case .desktopFocused = state else {
@@ -247,7 +289,7 @@ public final class FocusAuthority {
             // no-op cost, not a correctness risk") — reaffirm without touching the gate.
             return [.sendActivate(windowId: windowId), .makeKey(windowId: windowId)]
 
-        case .converging(let target, _, _, _) where target == windowId:
+        case .converging(let target, _, _, _, _) where target == windowId:
             // A second click on a window that's merely slow to converge, not a new intent —
             // a courtesy re-nudge, not a new epoch: doesn't reset the buffer or deadlines
             // (dropping interim keystrokes and restarting the hard-rollback clock over a
@@ -268,11 +310,15 @@ public final class FocusAuthority {
             }
             buffer.removeAll()
             currentEpochDroppedCount = 0
+            // 2026-08-23 soak follow-up: cold-start gets the longer fuse -- see
+            // `coldStartHardDeadlineInterval`'s own doc comment for the evidence.
+            let coldStart = !hasConvergedSinceReset
             state = .converging(
                 target: windowId,
-                softDeadline: now + Self.softDeadlineInterval,
-                hardDeadline: now + Self.hardDeadlineInterval,
-                softArmed: false
+                epochStart: now,
+                hardDeadline: now + (coldStart ? Self.coldStartHardDeadlineInterval : Self.hardDeadlineInterval),
+                coldStart: coldStart,
+                reArmCount: 0
             )
             effects.append(.sendActivate(windowId: windowId))
             effects.append(.makeKey(windowId: windowId))
@@ -311,24 +357,41 @@ public final class FocusAuthority {
         }
     }
 
-    /// Must be called at some point after each of `.converging`'s two deadlines elapses —
-    /// no assumption is made about cadence (see this type's own doc comment). A no-op
-    /// whenever `state` isn't `.converging`, so calling this speculatively/redundantly (e.g.
-    /// once per drained event, "just in case") is always safe.
+    /// Must be called at some point after each periodic re-arm mark and the hard deadline
+    /// elapse — no assumption is made about cadence (see this type's own doc comment). A
+    /// no-op whenever `state` isn't `.converging`, so calling this speculatively/redundantly
+    /// (e.g. once per drained event, "just in case", or from more than one still-pending
+    /// scheduled timer at once) is always safe. If called late enough to have skipped
+    /// several re-arm marks at once (a genuinely quiet server, or an infrequent caller), all
+    /// the skipped `sendActivate` effects are emitted together, in order, in one call — this
+    /// keeps re-arm marks anchored to the epoch's own fixed schedule (`epochStart + N *
+    /// softDeadlineInterval`) rather than drifting to "500ms after whenever tick() actually
+    /// got called".
     public func tick(now: TimeInterval) -> [FocusAuthorityEffect] {
-        guard case .converging(let target, let soft, let hard, let softArmed) = state else { return [] }
+        guard case .converging(let target, let epochStart, let hard, let coldStart, let reArmCount) = state
+        else { return [] }
 
         if now >= hard {
             return hardRollback(target: target)
         }
-        if now >= soft, !softArmed {
-            // adr/0012 §1: "只计数与告警，不回滚任何UI" — no state/UI change beyond marking
-            // this epoch's single re-arm as spent.
-            state = .converging(target: target, softDeadline: soft, hardDeadline: hard, softArmed: true)
-            lifetimeSoftMissCount += 1
-            return [.sendActivate(windowId: target), .warn(.softDeadlineMissed(target: target, totalMisses: lifetimeSoftMissCount))]
+
+        var newReArmCount = reArmCount
+        var effects: [FocusAuthorityEffect] = []
+        while now >= epochStart + Self.softDeadlineInterval * TimeInterval(newReArmCount + 1) {
+            newReArmCount += 1
+            effects.append(.sendActivate(windowId: target))
+            if newReArmCount == 1 {
+                // adr/0012 §1 + 2026-08-23 follow-up: warn once per epoch, on the FIRST
+                // re-arm only -- see FocusAuthorityWarning.softDeadlineMissed's own doc
+                // comment for why every later periodic re-arm stays silent.
+                lifetimeSoftMissCount += 1
+                effects.append(.warn(.softDeadlineMissed(target: target, totalMisses: lifetimeSoftMissCount)))
+            }
         }
-        return []
+        if newReArmCount != reArmCount {
+            state = .converging(target: target, epochStart: epochStart, hardDeadline: hard, coldStart: coldStart, reArmCount: newReArmCount)
+        }
+        return effects
     }
 
     /// A session generation bump (adr/0005 §4) — resets to `.unmonitored` unconditionally,
@@ -338,12 +401,16 @@ public final class FocusAuthority {
     /// post-reconnect server truth can never land on stale pre-reconnect data).
     public func generationReset() -> [FocusAuthorityEffect] {
         var effects: [FocusAuthorityEffect] = []
-        if case .converging(let target, _, _, _) = state {
+        if case .converging(let target, _, _, _, _) = state {
             effects.append(.resignKey(windowId: target))
             effects.append(dropBufferAndReleaseModifiers())
         }
         state = .unmonitored
         lastServerTruth = .unmonitored
+        // 2026-08-23 follow-up: a fresh connection gets to be cold-start again -- whatever
+        // convergence this instance saw before the reset says nothing about the NEW
+        // connection's own MonitoredDesktop channel settling behavior.
+        hasConvergedSinceReset = false
         return effects
     }
 
@@ -366,6 +433,7 @@ public final class FocusAuthority {
         switch lastServerTruth {
         case .window(let id):
             state = .converged(windowId: id)
+            hasConvergedSinceReset = true
             effects.append(.makeKey(windowId: id))
         case .desktopFocused:
             state = .desktopFocused
