@@ -126,6 +126,33 @@ final class RemoteWindowRegistry {
     /// ordering/focus policy attached. See `ServerDesktopState`'s own doc comment.
     private var desktopState = ServerDesktopState()
 
+    /// Z-order diagnostics (phase2.md §2 W1's final slice) -- cumulative for this
+    /// registry's lifetime (not reset on reconnect, unlike `desktopState`: these are "how
+    /// much has this registry ever done," not per-connection state). Exposed via
+    /// `zOrderDiagnostics()` for `Tools/window-smoke`'s `[zorder]` summary line.
+    private var zOrderArraysReceivedCount = 0
+    private var zOrderAppliesPerformedCount = 0
+    private var zOrderSkippedUnknownTotal = 0
+
+    /// TEMPORARY debug instrumentation (2026-08-23 Z-order reversal investigation,
+    /// team-lead-requested -- real-host evidence: local top-down stacking observed as a
+    /// near-exact reversal of the last server windowIds array, with appliesPerformed=1
+    /// across 31 arrays received, meaning `ZOrderSync.plan` judged "already matches" 30
+    /// times in a row while the FINAL physical order disagreed with the server array).
+    /// When `true`, `applyZOrder` prints a `[zorder-trace]` line for every MonitoredDesktop
+    /// order carrying a DESKTOP_ZORDER array: exactly what `ZOrderSync.plan` compared
+    /// internally (`Plan.target`/`currentRestricted`), the physical local stacking
+    /// immediately before and after this call's apply, and -- only on the calls where the
+    /// plan itself claimed a match -- a harness-style direct recomputation cross-check.
+    /// That cross-check exists specifically to discriminate a real bug in `plan()`'s own
+    /// match logic from a shared direction/semantic assumption both `plan()` and the
+    /// harness's own final comparison would independently agree on (in which case the
+    /// cross-check agrees with `plan()` too, and nothing extra prints). Off by default --
+    /// zero cost, zero behavior change for the production app and for any window-smoke run
+    /// that doesn't explicitly opt in (`Tools/window-smoke/main.swift` sets this only for
+    /// the multi-window scenario). Remove once the investigation concludes.
+    var zOrderTraceEnabled = false
+
     /// adr/0012: server-authoritative + local-optimistic-prediction focus state machine.
     /// Pure logic lives entirely in `MacdowsCore.FocusAuthority` (no AppKit/CRSession, no
     /// `Date()`); this registry owns the one instance for the session's lifetime, feeds it
@@ -267,8 +294,164 @@ final class RemoteWindowRegistry {
         desktopState.windowIdsTruncated = event.windowIdsTruncated
         if event.fieldFlags & WindowOrderField.desktopZOrder != 0 {
             desktopState.windowIds = event.windowIds.map { $0.uint32Value }
+            zOrderArraysReceivedCount += 1
+            applyZOrder(desktopState.windowIds)
         }
         execute(focusAuthority.serverDesktopUpdate(rawActiveWindowId: event.windowId, at: CFAbsoluteTimeGetCurrent()))
+    }
+
+    /// Phase 2 W1's final slice (docs/plans/phase2.md §2 W1, §9 D3; adr/0008 §2a/§4;
+    /// adr/0012 §5's own note that Z-order was deferred until the focus gate passed --
+    /// it has). Pure ordering logic lives entirely in `MacdowsCore.ZOrderSync` (no
+    /// AppKit); this method's only job is gathering the two AppKit-side inputs it needs
+    /// (which windowIds this registry currently renders, and their current on-screen
+    /// stacking order) and executing the plan it returns -- same split as
+    /// `FocusAuthority`/`execute(_:)` above, just without a persistent effect-list type
+    /// since `ZOrderSync` is a stateless pure function, not a state machine.
+    ///
+    /// Deliberately does NOT touch key/main window status (adr/0012 §4's "只做消费与副作用"
+    /// split reserves focus for `FocusAuthority` alone) -- `NSWindow.order(_:relativeTo:)`
+    /// only changes front-to-back list position, never key/main state.
+    ///
+    /// TODO(W3, docs/plans/phase2.md W3): once local move/resize (LMS_* handshake) lands,
+    /// this must be suppressed while a local drag/interaction is in flight for the window(s)
+    /// involved -- reordering mid-drag would fight the user's own gesture. No such guard
+    /// exists yet because local move tracking isn't implemented until W3; this always
+    /// applies unconditionally for now.
+    private func applyZOrder(_ serverTopDown: [UInt32]) {
+        // Restrict to windows that are actually on screen: NSWindow.order(_:relativeTo:)
+        // INSERTS an ordered-out window into the window list, so including a hidden
+        // window here would force it visible -- bypassing both the RAIL show state and
+        // the first-frame gate (observed live as blank 136x39 helper windows popping in
+        // the moment Z-order application landed). Hidden windows take their place in the
+        // stacking order when their own visibility path orders them front.
+        //
+        // 2026-08-23 real-host trace (Z-order reversal investigation): this used to be a
+        // SEPARATE `windows.compactMap { $0.value.window.isVisible ? ... }` sweep, and it
+        // was starving `ZOrderSync.plan`'s `locallyKnown` input -- the trace showed
+        // `plan.target` staying EMPTY across 21 consecutive MonitoredDesktop arrays while
+        // `currentTopDownWindowIds()` had already grown to 7 real on-screen windows (a
+        // direct cross-check confirmed the disagreement: at the seq where a real apply
+        // finally ran, the server array actually named all 7 of those ids, but the
+        // `.isVisible` sweep had recognized only 1 of them the whole time). The exact
+        // AppKit mechanism behind that `.isVisible` disagreement is still not pinned down
+        // (a lightweight breadcrumb for it stays in `traceZOrder`, gated the same as the
+        // rest of this file's trace instrumentation) -- but it doesn't need to be, because
+        // `currentTopDownWindowIds()` is already ground truth for "on screen right now"
+        // (it's built by filtering `NSApp.orderedWindows` itself, which per Apple's own
+        // documented contract only ever lists genuinely on-screen windows): a window
+        // present in ITS output is on screen by construction, with no second, independently
+        // computed set that can silently drift out of sync with it. This still preserves
+        // the exact protection this comment opens with -- a hidden/gate-held window is
+        // never in `currentTopDownWindowIds()`'s output, so it's never in `locallyKnown`,
+        // so no instruction can ever reference it.
+        let localBefore = currentTopDownWindowIds()
+        let visibleIds = Set(localBefore)
+        let plan = ZOrderSync.plan(
+            serverTopDown: serverTopDown,
+            locallyKnown: visibleIds,
+            currentLocalTopDown: localBefore
+        )
+        if !plan.instructions.isEmpty {
+            zOrderAppliesPerformedCount += 1
+        }
+        if plan.unknownSkippedCount > 0 {
+            zOrderSkippedUnknownTotal += plan.unknownSkippedCount
+            Self.logger.debug("Z-order sync: \(plan.unknownSkippedCount, privacy: .public) server windowId(s) not locally known (filtered/not-yet-created -- adr/0008 §4, not an error)")
+        }
+        for instruction in plan.instructions {
+            guard let window = windows[instruction.windowId]?.window else { continue }
+            if let belowId = instruction.belowWindowId, let anchor = windows[belowId]?.window {
+                window.order(.below, relativeTo: anchor.windowNumber)
+            } else {
+                // ZOrderSync.Instruction's own doc comment: nil belowWindowId means "no
+                // known window belongs above this one" -- otherWin 0 with .above is
+                // AppKit's own idiom for "make this the frontmost window of the app"
+                // (NSWindow.order(_:relativeTo:)'s documented otherWin==0 behavior).
+                window.order(.above, relativeTo: 0)
+            }
+        }
+
+        if zOrderTraceEnabled {
+            traceZOrder(serverTopDown: serverTopDown, localBefore: localBefore, plan: plan)
+        }
+    }
+
+    /// TEMPORARY debug instrumentation -- see `zOrderTraceEnabled`'s own doc comment for
+    /// why this exists and what it's trying to discriminate. `seq` reuses
+    /// `zOrderArraysReceivedCount` (already incremented once per Z-array-carrying order,
+    /// in lockstep with every `applyZOrder` call) rather than a second counter.
+    private func traceZOrder(serverTopDown: [UInt32], localBefore: [UInt32], plan: ZOrderSync.Plan) {
+        let seq = zOrderArraysReceivedCount
+        let localAfter = currentTopDownWindowIds()
+        let verdict = plan.instructions.isEmpty ? "match" : "\(plan.instructions.count) instructions"
+        print("[zorder-trace] seq=\(seq) serverRestricted=\(plan.target) localBefore=\(localBefore) "
+            + "verdict=\(verdict) localAfter=\(localAfter)")
+
+        // Breadcrumb only (2026-08-23 investigation): `locallyKnown` no longer depends on
+        // `.isVisible` (applyZOrder now derives it from `localBefore` itself), but the
+        // disagreement that motivated that change -- a window confirmed present in
+        // `NSApp.orderedWindows` (i.e. in `localBefore`) whose own `.isVisible` still reads
+        // false -- is still worth surfacing if it recurs, since the underlying AppKit
+        // mechanism behind it was never pinned down, only sidestepped. Cheap (one pass over
+        // the already-small `windows` dict) and trace-gated, so this costs nothing outside
+        // the investigation.
+        let stillDisagreeing = windows.compactMap { id, remoteWindow -> UInt32? in
+            localBefore.contains(id) && !remoteWindow.window.isVisible ? id : nil
+        }
+        if !stillDisagreeing.isEmpty {
+            print("[zorder-trace] isVisible/orderedWindows disagreement at seq=\(seq): ids present in "
+                + "localBefore (on screen per NSApp.orderedWindows) but window.isVisible==false: "
+                + "\(stillDisagreeing.sorted())")
+        }
+
+        guard plan.instructions.isEmpty else { return }
+        // ONE targeted diagnostic: plan() said "already matches" -- cross-check that
+        // verdict against a harness-style DIRECT recomputation from the same localBefore
+        // snapshot (mirrors exactly what Tools/window-smoke's own finish() assertion
+        // computes: filter each side to ids present in the other, preserving each side's
+        // own relative order). If plan()'s own match logic and this direct recomputation
+        // ever disagree, that's a real bug in plan()'s comparison, not a shared direction/
+        // semantic assumption -- a shared assumption would make both sides wrong the same
+        // way, and this recomputation would then silently agree with plan() too.
+        let localBeforeSet = Set(localBefore)
+        let serverSet = Set(serverTopDown)
+        let harnessServerRestricted = serverTopDown.filter { localBeforeSet.contains($0) }
+        let harnessLocalRestricted = localBefore.filter { serverSet.contains($0) }
+        if harnessServerRestricted != harnessLocalRestricted {
+            print("[zorder-trace] MATCH-VERDICT DISAGREEMENT at seq=\(seq): plan said match (internal "
+                + "target=\(plan.target) currentRestricted=\(plan.currentRestricted)) but a harness-style direct "
+                + "recomputation disagrees (serverRestricted=\(harnessServerRestricted) "
+                + "localRestricted=\(harnessLocalRestricted))")
+        }
+    }
+
+    /// This registry's own current top-down (topmost-first) local stacking order,
+    /// restricted to the windowIds it renders. `NSApp.orderedWindows` is already
+    /// documented to return the app's window list front-to-back, so this is a single pass
+    /// over it rather than reading each window's own `NSWindow.orderedIndex` and sorting
+    /// manually -- same information, one fewer step. Shared by `applyZOrder` (as
+    /// `ZOrderSync`'s `currentLocalTopDown` input) and exposed to `Tools/window-smoke`'s
+    /// own Z-order consistency assertion, so the harness measures the exact same ordering
+    /// the sync logic itself acted on rather than a second, separately-computed notion of
+    /// "current order."
+    func currentTopDownWindowIds() -> [UInt32] {
+        let numberToId = Dictionary(uniqueKeysWithValues: windows.map { ($0.value.window.windowNumber, $0.key) })
+        return NSApp.orderedWindows.compactMap { numberToId[$0.windowNumber] }
+    }
+
+    /// Diagnostics only (Tools/window-smoke's `[zorder]` summary line) -- see the three
+    /// backing counters' own doc comment for what each one means.
+    struct ZOrderDiagnostics {
+        let arraysReceived: Int
+        let appliesPerformed: Int
+        let skippedUnknownTotal: Int
+    }
+    func zOrderDiagnostics() -> ZOrderDiagnostics {
+        ZOrderDiagnostics(
+            arraysReceived: zOrderArraysReceivedCount, appliesPerformed: zOrderAppliesPerformedCount,
+            skippedUnknownTotal: zOrderSkippedUnknownTotal
+        )
     }
 
     private func handleWindowOrder(_ event: CRDPEvent) {

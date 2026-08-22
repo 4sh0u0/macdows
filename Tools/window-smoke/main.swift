@@ -367,6 +367,13 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         let newSession = CRSession(host: host, user: user, password: pass, program: launchedProgram)
         session = newSession
         registry = RemoteWindowRegistry(session: newSession)
+        // TEMPORARY debug instrumentation (2026-08-23 Z-order reversal investigation) --
+        // see RemoteWindowRegistry.zOrderTraceEnabled's own doc comment. Only for the
+        // multi-window scenario (task requirement: "keep it cheap, only in the multiwin
+        // scenario") -- off (zero cost) for every other run, including cycle mode.
+        if !extraApps.isEmpty {
+            registry.zOrderTraceEnabled = true
+        }
         startTime = Date()
 
         // W4c review: push-style draining, replacing what used to be this timer's main
@@ -1354,6 +1361,50 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                     failedExecResults.isEmpty,
                     "no ClientExecute failed (got \(failedExecResults.isEmpty ? "none" : failedExecResults.joined(separator: ", ")))"
                 )
+
+                // Z-order assertion (phase2.md §2 W1's final slice, adr/0008 §2a/§4): once
+                // the multi-window setup has settled (this block only runs once the check
+                // above has already confirmed that), the local top-down stacking order of
+                // RAIL-mapped windows must be a subsequence-consistent match of the last
+                // MonitoredDesktop windowIds array -- comparing only ids present in BOTH
+                // sequences (adr/0008 §4's binding truncation rule: an id absent from
+                // either side is simply not part of the comparison, never treated as
+                // "should sink to the bottom"). `registry.currentTopDownWindowIds()` reads
+                // the exact same ordering `RemoteWindowRegistry.applyZOrder` itself acted
+                // on, not a second, separately-computed notion of "current order".
+                let serverZOrder = registry.serverDesktopState().windowIds
+                check(
+                    !serverZOrder.isEmpty,
+                    "the multi-window scenario observed >=1 MonitoredDesktop order carrying a DESKTOP_ZORDER "
+                        + "windowIds array (adr/0008 §2a) (got \(serverZOrder.count) id(s) in the last one)"
+                )
+                if !serverZOrder.isEmpty {
+                    let localZOrder = registry.currentTopDownWindowIds()
+                    // The topmost LOCAL window is excluded from the comparison: local
+                    // optimistic activation (adr/0012 §0 -- makeKey + orderFront on click)
+                    // legitimately floats the just-activated window above its position in
+                    // the last server array until the NEXT MonitoredDesktop lands, so the
+                    // float is a focus question, not a Z-order-application defect. The
+                    // relative order of everything beneath it must still match exactly.
+                    let localKeyId = localZOrder.first
+                    let localSet = Set(localZOrder)
+                    let serverSet = Set(serverZOrder)
+                    let serverRestricted = serverZOrder.filter { localSet.contains($0) && $0 != localKeyId }
+                    let localRestricted = localZOrder.filter { serverSet.contains($0) && $0 != localKeyId }
+                    let matched = serverRestricted == localRestricted
+                    check(
+                        matched,
+                        "local top-down window stacking is a subsequence-consistent match of the last "
+                            + "MonitoredDesktop windowIds array (adr/0008 §2a/§4: comparing only ids present in both)"
+                    )
+                    if !matched {
+                        print("[zorder] MISMATCH server=\(serverZOrder) local=\(localZOrder) "
+                            + "serverRestricted=\(serverRestricted) localRestricted=\(localRestricted)")
+                    }
+                }
+                let zOrderDiag = registry.zOrderDiagnostics()
+                print("[zorder] arraysReceived=\(zOrderDiag.arraysReceived) "
+                    + "appliesPerformed=\(zOrderDiag.appliesPerformed) skippedUnknown=\(zOrderDiag.skippedUnknownTotal)")
             }
         } else {
             print("[info] input-test mode active (\(inputTestMode!)) -- skipping the generic \"at least one "
