@@ -27,8 +27,38 @@ for arg in "$@"; do
 	esac
 done
 
+# CRDP_WITH_FFMPEG: Phase 2 W0(2) AVC caps flip (adr/0007, docs/plans/phase2.md W0 item 2).
+# Default ON as of this flip -- deps/freerdp.lock's committed flags already say WITH_FFMPEG/
+# WITH_VIDEO_FFMPEG=ON, so CRDP_WITH_FFMPEG=1 is a no-op pass-through of the lock. Set
+# CRDP_WITH_FFMPEG=0 to force those (plus the WITH_VIDEOTOOLBOX hwaccel flag that depends on
+# WITH_VIDEO_FFMPEG) back to OFF at configure time -- the pre-flip config -- without editing
+# the lock. See "--- ffmpeg (H264 decode) ---" below for why this has to fold into the config
+# hash rather than being a silent flag substitution like CMAKE_INSTALL_PREFIX/OPENSSL_ROOT_DIR.
+CRDP_WITH_FFMPEG="${CRDP_WITH_FFMPEG:-1}"
+case "$CRDP_WITH_FFMPEG" in
+0 | 1) ;;
+*) die "CRDP_WITH_FFMPEG must be 0 or 1, got: $CRDP_WITH_FFMPEG" ;;
+esac
+
 LOCK_FILE="$CRDP_REPO_ROOT/deps/freerdp.lock"
 [ -f "$LOCK_FILE" ] || die "missing $LOCK_FILE"
+
+# --- ffmpeg (H264 decode) -------------------------------------------------------------
+# adr/0007: ffmpeg dynamically linked (LGPL §6; never static) + VideoToolbox hwaccel.
+# Homebrew ffmpeg is the local-dev source (unpinned); a self-built, version-pinned ffmpeg
+# matching the OpenSSL/FreeRDP treatment above is Phase 2 W8's job, gated on external
+# distribution -- see deps/freerdp.lock's "ffmpeg" block for the full rationale.
+if [ "$CRDP_WITH_FFMPEG" = "1" ]; then
+	command -v brew >/dev/null 2>&1 || die "Homebrew not found (needed to provide ffmpeg for CRDP_WITH_FFMPEG=1). Install from https://brew.sh, or set CRDP_WITH_FFMPEG=0 to build without H264 decode."
+	require_cmd pkg-config
+	if ! brew list ffmpeg >/dev/null 2>&1; then
+		log "ffmpeg not found via Homebrew; installing (local dev only, per adr/0007)"
+		brew install ffmpeg
+	fi
+	FFMPEG_PREFIX="$(brew --prefix ffmpeg)"
+	export PKG_CONFIG_PATH="$FFMPEG_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+	log "ffmpeg: $FFMPEG_PREFIX (dynamic link only; PKG_CONFIG_PATH set for CMake's find_package(FFmpeg))"
+fi
 
 FREERDP_SRC="$CRDP_REPO_ROOT/ThirdParty/FreeRDP"
 # A submodule's .git is a *file* (a gitdir pointer), not a directory — hence -e, not -d.
@@ -70,6 +100,7 @@ compute_config_hash() {
 	{
 		printf 'submodule_sha=%s\n' "$SUBMODULE_SHA"
 		printf 'xcode_version=%s\n' "$XCODE_VERSION"
+		printf 'crdp_with_ffmpeg=%s\n' "$CRDP_WITH_FFMPEG"
 		printf -- '--- build-freerdp.sh ---\n'
 		cat "$SCRIPT_DIR/build-freerdp.sh"
 		printf -- '--- lib.sh ---\n'
@@ -155,6 +186,12 @@ while IFS= read -r flag; do
 	-DCMAKE_INSTALL_PREFIX=*) flag="-DCMAKE_INSTALL_PREFIX=$FREERDP_PREFIX_PLACEHOLDER" ;;
 	-DOPENSSL_ROOT_DIR=*) flag="-DOPENSSL_ROOT_DIR=$CRDP_DEPS_PREFIX" ;;
 	-DCMAKE_OSX_DEPLOYMENT_TARGET=*) flag="-DCMAKE_OSX_DEPLOYMENT_TARGET=$DEPLOYMENT_TARGET" ;;
+	# CRDP_WITH_FFMPEG=0 revert path (see the flag's definition above): the lock's
+	# committed flags are the new (post-flip) default of ON, so only force these OFF --
+	# never force them ON, that's what the lock's own committed values already do.
+	-DWITH_FFMPEG=*) [ "$CRDP_WITH_FFMPEG" = "1" ] || flag="-DWITH_FFMPEG=OFF" ;;
+	-DWITH_VIDEO_FFMPEG=*) [ "$CRDP_WITH_FFMPEG" = "1" ] || flag="-DWITH_VIDEO_FFMPEG=OFF" ;;
+	-DWITH_VIDEOTOOLBOX=*) [ "$CRDP_WITH_FFMPEG" = "1" ] || flag="-DWITH_VIDEOTOOLBOX=OFF" ;;
 	esac
 	FLAGS+=("$flag")
 done <<<"$FLAGS_RAW"
@@ -179,14 +216,18 @@ cmake --install "$BUILD_DIR" --prefix "$INSTALL_PREFIX"
 # --- Manifest --------------------------------------------------------------------------
 CACHE_FILE="$BUILD_DIR/CMakeCache.txt"
 # WITH_GFX_H264 is deliberately NOT here: it's a plain CMake `set()`, not a cache
-# variable (FreeRDP's top-level CMakeLists.txt derives it from WITH_OPENH264 et al.
-# without CACHE), so it never appears in CMakeCache.txt — grepping for it always came
-# back empty, which is a silent no-op, not a real reading of the build's H264 posture.
-# WITH_OPENH264 (an actual `option()`) is the real, grep-able signal for the "no H264 —
-# UI payload only" invariant adr/0004 depends on.
+# variable (FreeRDP's top-level CMakeLists.txt derives it from WITH_OPENH264/
+# WITH_VIDEO_FFMPEG/et al. without CACHE), so it never appears in CMakeCache.txt —
+# grepping for it always came back empty, which is a silent no-op, not a real reading of
+# the build's H264 posture. WITH_VIDEO_FFMPEG (a real `cmake_dependent_option()`, hence a
+# real cache variable) is the actual gate for WITH_GFX_H264 in this build (ADR-0007's
+# ffmpeg+VideoToolbox path — WITH_OPENH264 is the other input to that same derivation but
+# stays OFF here, adr/0007's rejected alternative A) and is the grep-able signal for
+# Phase 2 W0(2)'s AVC-enabled posture, same role WITH_OPENH264 played for the "no H264"
+# invariant this flip retires (adr/0004/adr/0007).
 CACHE_KEYS=(
 	CMAKE_BUILD_TYPE CMAKE_OSX_ARCHITECTURES CMAKE_OSX_DEPLOYMENT_TARGET
-	CHANNEL_URBDRC WITH_VIDEOTOOLBOX WITH_FFMPEG WITH_SWSCALE WITH_DSP_FFMPEG
+	CHANNEL_URBDRC WITH_VIDEOTOOLBOX WITH_FFMPEG WITH_VIDEO_FFMPEG WITH_SWSCALE WITH_DSP_FFMPEG
 	WITH_OPENH264 WITH_URIPARSER WITH_JSON_DISABLED
 	OPENSSL_ROOT_DIR OPENSSL_USE_STATIC_LIBS
 )
@@ -208,9 +249,10 @@ jq -n \
 	--arg builtAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 	--arg installPrefix "$INSTALL_PREFIX" \
 	--arg xcodeVersion "$XCODE_VERSION" \
+	--arg crdpWithFfmpeg "$CRDP_WITH_FFMPEG" \
 	--argjson patches "$PATCHES_JSON" \
 	--argjson cmakeCache "$CACHE_JSON" \
-	'{configHash: $configHash, submoduleSha: $submoduleSha, builtAt: $builtAt, installPrefix: $installPrefix, xcodeVersion: $xcodeVersion, patches: $patches, cmakeCache: $cmakeCache}' \
+	'{configHash: $configHash, submoduleSha: $submoduleSha, builtAt: $builtAt, installPrefix: $installPrefix, xcodeVersion: $xcodeVersion, crdpWithFfmpeg: $crdpWithFfmpeg, patches: $patches, cmakeCache: $cmakeCache}' \
 	>"$MANIFEST"
 
 ln -sfn "$CONFIG_HASH" "$CURRENT_LINK"

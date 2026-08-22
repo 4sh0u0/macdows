@@ -15,7 +15,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=Scripts/lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-REQUIRED_FORMULAS=(cmake ninja xcodegen jq)
+# ffmpeg + pkg-config: Phase 2 W0(2) AVC caps flip (adr/0007) -- Scripts/build-freerdp.sh
+# defaults CRDP_WITH_FFMPEG=1, which needs both to configure FreeRDP's H264-decode
+# ffmpeg backend (local-dev-only source; see deps/freerdp.lock's "ffmpeg" block).
+REQUIRED_FORMULAS=(cmake ninja xcodegen jq ffmpeg pkg-config)
 
 require_cmd git
 
