@@ -365,6 +365,25 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// in response (see `RemoteWindow`'s traffic-light doc comments for the full loop).
 - (void)sendSysCommand:(uint32_t)windowId command:(uint16_t)command;
 
+/// W3 (docs/plans/phase2.md §2 W3): posts a RAIL ClientWindowMove for `windowId` onto the
+/// outbound lane -- already-existing plumbing (`crb_outbound_visitor` has handled
+/// `CRDPQ_CMD_WINDOW_MOVE` since the outbound lane was implemented, this method is simply
+/// the first public, Swift-facing way to actually post one, exactly mirroring
+/// `-sendSysCommand:command:`'s own doc comment above). RECT semantics, NOT x/y/width/
+/// height: `left`/`top`/`right`/`bottom` mirror `RAIL_WINDOW_MOVE_ORDER` (freerdp/rail.h)
+/// exactly -- verified directly against that header, not assumed -- and
+/// `crdpq_cmd_window_move_t`'s own field names already match 1:1, so this method does no
+/// coordinate math of its own, the same "dumb pipe" contract every other outbound method on
+/// this header already has. The caller (`RemoteWindowRegistry`) computes these four values
+/// from the local `NSWindow` frame via `MacdowsCore.WindowGeometry.windowsRect(from:
+/// primaryMonitorHeight:)` (the exact inverse of the conversion `handleWindowOrder` already
+/// applies inbound), then `right = left + width` / `bottom = top + height` -- never handed
+/// a width/height pair directly, so a caller can't accidentally reintroduce the classic
+/// RECT-vs-x/y/w/h off-by-frame bug this method's own signature is shaped to avoid.
+/// Fire-and-forget like `-sendSysCommand:command:` -- silently does nothing if the session
+/// isn't connected.
+- (void)sendWindowMove:(uint32_t)windowId left:(int32_t)left top:(int32_t)top right:(int32_t)right bottom:(int32_t)bottom;
+
 /// W4c: one physical mouse button, in RDP's own PTR_FLAGS_BUTTON1/2/3 numbering (left/
 /// right/middle) -- deliberately not NSEvent.buttonNumber's own scheme (0/1/2), so this
 /// header never has to explain an off-by-one to a Swift caller. Extended/side buttons

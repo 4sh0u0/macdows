@@ -121,6 +121,22 @@ final class RemoteWindow {
         case zoom
     }
 
+    /// Phase 2 W3 (docs/plans/phase2.md §2 W3): fired once a local drag/resize gesture (or
+    /// a server-announced ServerLocalMoveSize modality, see
+    /// `beginServerAnnouncedMoveResize`/`endServerAnnouncedMoveResize` below) has settled,
+    /// reporting this window's final CONTENT rect (`window.contentRect(forFrameRect:
+    /// window.frame)`, NOT the raw `NSWindow.frame` -- real-host regression, 2026-08-23:
+    /// RAIL geometry describes the remote window's outer rect, which this class's content
+    /// view displays verbatim, so the content rect is what round-trips through RAIL space;
+    /// `init`'s own doc comment has the full reasoning) -- `RemoteWindowRegistry` converts
+    /// it back to RAIL space via `MacdowsCore.WindowGeometry` and calls
+    /// `CRSession.sendWindowMove(_:left:top:right:bottom:)`. This class does no Windows/Mac
+    /// coordinate math of its own, the same "dumb pipe up, policy in the registry" split
+    /// `onInput`/`onChromeAction` already establish -- reading the content rect out of its
+    /// own `window` is an AppKit-chrome fact this class already owns, not RAIL coordinate
+    /// math.
+    var onLocalGeometrySettled: ((NSRect) -> Void)?
+
     /// The chrome most recently applied to the real `NSWindow` via `applyChromeNow(_:)`, so
     /// a redundant call (e.g. a WindowUpdate that re-merges the same style bits this window
     /// already has) is a cheap no-op rather than unconditionally reassigning
@@ -214,14 +230,75 @@ final class RemoteWindow {
     /// underlying `NSWindow` closes.
     private var didResignKeyObserver: NSObjectProtocol?
 
-    /// `frame` is already in macOS screen space (post `WindowGeometry.macRect`) — this
-    /// type does no coordinate conversion of its own; that's `RemoteWindowRegistry`'s job,
-    /// using `MacdowsCore.WindowGeometry` exclusively (per the W4b task spec: no second,
-    /// ad hoc coordinate-math implementation anywhere else in this layer).
-    init(key: RemoteWindowKey, frame: NSRect, title: String) {
+    /// Phase 2 W3 (docs/plans/phase2.md §2 W3, adr/0012's optimistic-prediction principle
+    /// applied to geometry): incremented by each of the two independent local-geometry-
+    /// authority holders this window can have in flight at once -- a native titlebar
+    /// drag/live-resize (tracked via the notification observers below) and the server's own
+    /// announced ServerLocalMoveSize modality (`beginServerAnnouncedMoveResize`/
+    /// `endServerAnnouncedMoveResize`, called by `RemoteWindowRegistry`). A counter, not a
+    /// bool, specifically so the two triggers can never prematurely un-suppress each other
+    /// if they ever overlap in the same window at once. `updateFrame` below refuses to apply
+    /// inbound server geometry to this window's real `NSWindow` while this is nonzero --
+    /// the bookkeeping in `RemoteWindowRegistry.geometry[windowId]` (this window's
+    /// server-side state cache) still updates regardless; only the AppKit-visible
+    /// application is suppressed, so the server's authoritative value is never lost, just
+    /// not fought against mid-gesture.
+    private var geometryAuthoritySuppressionCount = 0
+    private var isLocalGeometrySuppressed: Bool { geometryAuthoritySuppressionCount > 0 }
+
+    /// True between `NSWindow.willStartLiveResizeNotification` and
+    /// `didEndLiveResizeNotification` -- AppKit's own clean begin/end pair for an
+    /// *interactive* resize (never posted for a programmatic `-setFrame:display:`, which is
+    /// why the move-settle debounce below exists at all: move has no equivalent pair).
+    /// Guards `handleLocalDidMove` from double-counting a resize's own incidental origin
+    /// changes (dragging a top-left resize handle moves the origin too) against the
+    /// suppression counter a second time.
+    private var isInLiveResize = false
+    /// Debounce work item for settling a native titlebar drag (see `handleLocalDidMove`'s
+    /// own doc comment for why a trailing-edge debounce, not a clean "did end move"
+    /// callback, is the only way to detect drag-end for a *move* -- AppKit has no
+    /// `windowDidEndLiveMove` counterpart to `didEndLiveResizeNotification`). Mirrors
+    /// `RemoteWindowRegistry.pendingTrailingMove`'s own trailing-flush idiom (asyncAfter,
+    /// cancelled/reissued on every new event inside the window, not a repeating `Timer`).
+    private var moveSettleWorkItem: DispatchWorkItem?
+    private static let moveSettleDebounce: TimeInterval = 0.2
+
+    private var didMoveObserver: NSObjectProtocol?
+    private var willStartLiveResizeObserver: NSObjectProtocol?
+    private var didEndLiveResizeObserver: NSObjectProtocol?
+
+    /// Phase 2 W3: set around every INTERNAL `window.setFrame`/`.styleMask` mutation this
+    /// class makes on the server's behalf (`updateFrame`'s own server-driven frame apply,
+    /// and `applyChromeNow`'s styleMask-change + frame-restore pair) -- AppKit posts
+    /// `NSWindow.didMoveNotification` for ANY origin change, programmatic or interactive,
+    /// with no way to distinguish "the server just told us to move" from "the user is
+    /// dragging" at the notification level itself. Without this flag, `updateFrame`
+    /// applying an ordinary server-driven `WindowUpdate` would trigger
+    /// `handleLocalDidMove` exactly like a real drag, and -- after the 200ms debounce --
+    /// echo that same geometry straight back to the server as a spurious
+    /// `ClientWindowMove`, on every single server-initiated move. `willStartLiveResizeNotification`/
+    /// `didEndLiveResizeNotification` need no equivalent guard: AppKit only ever posts that
+    /// pair for a genuine interactive (mouse-tracked) resize loop, never as a side effect of
+    /// a programmatic `-setFrame:`/`.styleMask` change.
+    private var isApplyingProgrammaticFrame = false
+
+    /// `contentRect` is already in macOS screen space (post `WindowGeometry.macRect`) — this
+    /// type does no Windows/Mac coordinate conversion of its own; that's
+    /// `RemoteWindowRegistry`'s job, using `MacdowsCore.WindowGeometry` exclusively (per the
+    /// W4b task spec: no second, ad hoc coordinate-math implementation anywhere else in this
+    /// layer). Real-host regression (2026-08-23, W3 first live verification): RAIL's
+    /// geometry describes the remote window's own OUTER rect as the remote desktop sees it
+    /// (the content view displays those pixels verbatim, remote titlebar included, per
+    /// adr/0005 §2's "GFX surfaces ... carry PIXEL_FORMAT_BGRX32" finding) -- so this value
+    /// is this window's CONTENT rect, never its `NSWindow.frame` directly. Constructed here
+    /// with `styleMask: [.borderless]` unconditionally (chrome, if any, is applied later via
+    /// `applyChrome`), so `contentRect == frame` at construction time regardless (zero
+    /// chrome insets) -- this only starts to matter once `applyChromeNow` below adds a
+    /// native titlebar.
+    init(key: RemoteWindowKey, contentRect: NSRect, title: String) {
         self.key = key
 
-        let win = RemoteWindowBackingWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        let win = RemoteWindowBackingWindow(contentRect: contentRect, styleMask: [.borderless], backing: .buffered, defer: false)
         win.isReleasedWhenClosed = false // this class, not AppKit, owns the window's lifetime
         win.title = title
         win.hasShadow = true
@@ -246,7 +323,7 @@ final class RemoteWindow {
         // fully-transparent) alpha value.
         layer.isOpaque = true
 
-        let contentView = RemoteWindowContentView(frame: NSRect(origin: .zero, size: frame.size))
+        let contentView = RemoteWindowContentView(frame: NSRect(origin: .zero, size: contentRect.size))
         contentView.wantsLayer = true
         contentView.layer = layer
         win.contentView = contentView
@@ -292,6 +369,30 @@ final class RemoteWindow {
             MainActor.assumeIsolated {
                 contentView?.onEvent?(.focusLost)
             }
+        }
+
+        // Phase 2 W3: native titlebar drag/resize -> server sync (see
+        // `geometryAuthoritySuppressionCount`'s own doc comment for why this needs three
+        // separate observers, not one). Uses `NSNotification.Name` constants rather than
+        // `NSWindowDelegate` for the exact same reason `didResignKeyObserver` above does --
+        // this class isn't an `NSObject` subclass, and AppKit exposes these three specific
+        // transitions as public notifications, sidestepping the need for delegate
+        // conformance entirely. [weak self]: none of these must be what keeps a closed
+        // RemoteWindow alive.
+        didMoveObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification, object: win, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleLocalDidMove() }
+        }
+        willStartLiveResizeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willStartLiveResizeNotification, object: win, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleLocalWillStartLiveResize() }
+        }
+        didEndLiveResizeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didEndLiveResizeNotification, object: win, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleLocalDidEndLiveResize() }
         }
 
         // Phase 2 W0③: arms the 2s no-paint fallback (see firstFrameTimeoutWorkItem's own
@@ -375,14 +476,135 @@ final class RemoteWindow {
         return Double(nonWhiteCount) / Double(sampled)
     }
 
-    func updateFrame(_ frame: NSRect) {
-        guard window.frame != frame else { return }
-        window.setFrame(frame, display: true)
+    /// Phase 2 W3: refuses to touch the real `NSWindow` while
+    /// `isLocalGeometrySuppressed` is true (see that property's own doc comment) -- the
+    /// server's own geometry echo for this window is simply not applied for the moment,
+    /// never queued/merged against the in-flight local gesture. Once suppression lifts
+    /// (drag/resize settles, or the server's ServerLocalMoveSize modality ends), the NEXT
+    /// call to this method with the server's current authoritative content rect applies
+    /// normally -- "server wins" from then on, exactly as before this feature existed.
+    ///
+    /// Real-host regression (2026-08-23, W3 first live verification): `contentRect` is this
+    /// window's CONTENT rect (see `init`'s own doc comment for why), NOT a frame -- converted
+    /// to the real outer frame via `NSWindow.frameRect(forContentRect:)`, which accounts for
+    /// this window's CURRENT `styleMask`'s chrome insets (zero for a still-borderless
+    /// window, matching Phase 1's exact behavior; a titlebar's height/border thickness once
+    /// `applyChromeNow` below has run). Before this fix, this method set `window.frame`
+    /// directly from RAIL-derived geometry, which was silently correct only because Phase 1
+    /// windows were always borderless (frame == content rect there) -- W2's titled chrome
+    /// made that assumption wrong by exactly the chrome inset amount (~14pt observed live).
+    func updateFrame(contentRect: NSRect) {
+        guard !isLocalGeometrySuppressed else { return }
+        let targetFrame = window.frameRect(forContentRect: contentRect)
+        guard window.frame != targetFrame else { return }
+        isApplyingProgrammaticFrame = true
+        window.setFrame(targetFrame, display: true)
+        isApplyingProgrammaticFrame = false
     }
 
     func updateTitle(_ title: String) {
         guard window.title != title else { return }
         window.title = title
+    }
+
+    // MARK: - Phase 2 W3: local move/resize -> server sync
+
+    /// Native titlebar drag: fires on every intermediate position during the drag, not just
+    /// once at the end (AppKit has no `windowDidEndLiveMove` counterpart to
+    /// `didEndLiveResizeNotification` -- this is the "standard workaround" the task spec
+    /// itself calls for: debounce on the trailing edge of repeated `didMove` notifications).
+    /// Ignored during a live *resize* (`isInLiveResize`) -- a resize's own incidental origin
+    /// changes (e.g. dragging a top-left handle) are settled by
+    /// `handleLocalDidEndLiveResize` instead, which has AppKit's own clean end signal and
+    /// doesn't need a debounce at all.
+    private func handleLocalDidMove() {
+        guard !isApplyingProgrammaticFrame else { return }
+        guard !isInLiveResize else { return }
+        if moveSettleWorkItem == nil {
+            // First didMove of a fresh gesture (no debounce already in flight) -- claim
+            // suppression exactly once per gesture, not once per didMove callback.
+            geometryAuthoritySuppressionCount += 1
+        }
+        moveSettleWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.settleLocalMove() }
+        }
+        moveSettleWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.moveSettleDebounce, execute: workItem)
+    }
+
+    /// Fires `Self.moveSettleDebounce` after the last observed `didMove` -- the drag is
+    /// presumed over (no clean end signal exists for a move, see `handleLocalDidMove`'s own
+    /// doc comment), so this releases suppression and reports the final frame upward for
+    /// `RemoteWindowRegistry` to sync to the server.
+    private func settleLocalMove() {
+        moveSettleWorkItem = nil
+        geometryAuthoritySuppressionCount = max(0, geometryAuthoritySuppressionCount - 1)
+        // Real-host regression: report the CONTENT rect, not the raw frame -- see
+        // `onLocalGeometrySettled`'s own doc comment.
+        onLocalGeometrySettled?(window.contentRect(forFrameRect: window.frame))
+    }
+
+    /// AppKit's own clean begin signal for an interactive resize -- claims suppression
+    /// immediately (unlike move, which only learns a gesture started from its first
+    /// `didMove`). Also cancels/absorbs any move-debounce already in flight: a resize that
+    /// starts mid-way through what looked like a move gesture (e.g. the user was dragging,
+    /// then grabbed a resize handle) hands settling over to
+    /// `handleLocalDidEndLiveResize`'s own clean end signal instead of the move debounce.
+    private func handleLocalWillStartLiveResize() {
+        isInLiveResize = true
+        if moveSettleWorkItem != nil {
+            moveSettleWorkItem?.cancel()
+            moveSettleWorkItem = nil
+            geometryAuthoritySuppressionCount = max(0, geometryAuthoritySuppressionCount - 1)
+        }
+        geometryAuthoritySuppressionCount += 1
+    }
+
+    /// AppKit's own clean end signal for an interactive resize -- settles immediately (no
+    /// debounce needed, unlike move: this notification only fires once, exactly when the
+    /// gesture is actually over).
+    private func handleLocalDidEndLiveResize() {
+        isInLiveResize = false
+        geometryAuthoritySuppressionCount = max(0, geometryAuthoritySuppressionCount - 1)
+        // Real-host regression: report the CONTENT rect, not the raw frame -- see
+        // `onLocalGeometrySettled`'s own doc comment.
+        onLocalGeometrySettled?(window.contentRect(forFrameRect: window.frame))
+    }
+
+    /// Phase 2 W3 task item 4 (docs/plans/phase2.md §2 W3): the server announcing a
+    /// modality-level local move/size operation for this window via ServerLocalMoveSize's
+    /// `isMoveSizeStart == true` (adr/0008 §1 -- this wire shape is unverified against any
+    /// real sample; only the two simplest semantics, start/stop, are handled this slice).
+    /// Independent trigger from the native-drag notification observers above -- both share
+    /// the same suppression counter so neither can prematurely release the other.
+    func beginServerAnnouncedMoveResize() {
+        geometryAuthoritySuppressionCount += 1
+    }
+
+    /// The matching `isMoveSizeStart == false` transition: "release + treat like settle"
+    /// (task item 4's own instruction) -- reports the current frame exactly like a native
+    /// drag settling, in case whatever the server's own gesture left this window at
+    /// diverged from this class's last-known frame.
+    func endServerAnnouncedMoveResize() {
+        geometryAuthoritySuppressionCount = max(0, geometryAuthoritySuppressionCount - 1)
+        // Real-host regression: report the CONTENT rect, not the raw frame -- see
+        // `onLocalGeometrySettled`'s own doc comment.
+        onLocalGeometrySettled?(window.contentRect(forFrameRect: window.frame))
+    }
+
+    /// Phase 2 W3 task item 3: applies `ServerMinMaxInfo`'s track-size fields
+    /// (`MacdowsCore.MinMaxInfoTranslator`'s already sentinel-filtered output) as this
+    /// window's `NSWindow.minSize`/`.maxSize`. `nil` on either side of a pair substitutes
+    /// AppKit's own "unconstrained" sentinel here -- `.zero` for min, `.greatestFiniteMagnitude`
+    /// for max -- rather than in the pure `MacdowsCore` translator, which stays free of the
+    /// AppKit boundary (adr/0006 §2).
+    func applyTrackSizeConstraints(_ constraints: WindowTrackSizeConstraints) {
+        window.minSize = NSSize(width: constraints.minWidth ?? 0, height: constraints.minHeight ?? 0)
+        window.maxSize = NSSize(
+            width: constraints.maxWidth ?? .greatestFiniteMagnitude,
+            height: constraints.maxHeight ?? .greatestFiniteMagnitude
+        )
     }
 
     /// Phase 2 W2 (docs/plans/phase2.md §2 W2 task item 3): requests one
@@ -406,21 +628,38 @@ final class RemoteWindow {
     /// WindowUpdate that re-merges unrelated fields (offset/size/show) but leaves style
     /// unchanged must not churn styleMask on every single order.
     ///
-    /// Frame preservation (task item 3's own instruction): `NSWindow.styleMask` and `.frame`
-    /// interact in AppKit -- a titled window's frame includes the titlebar strip, a
-    /// borderless one doesn't, so toggling `.titled` can shift how `.frame` relates to the
-    /// window's own content region. Capturing `window.frame` before the styleMask
-    /// assignment and unconditionally restoring it afterward keeps whatever
-    /// `RemoteWindowRegistry.macFrame(for:)` most recently computed from the RAIL order as
-    /// this window's actual on-screen frame, regardless of that internal reinterpretation --
-    /// the RAIL-provided frame meaning stays authoritative, AppKit's own chrome-driven frame
-    /// adjustment is simply overridden right back. (Open question, deliberately not guessed
-    /// at here: whether RAIL's own windowWidth/Height already accounts for a native
-    /// titlebar's height for a titled window is unconfirmed without live-host measurement --
-    /// flagged for follow-up, not silently assumed either way.)
+    /// CONTENT RECT preservation (real-host regression, 2026-08-23, corrects this method's
+    /// original "frame preservation" design): `NSWindow.styleMask` and `.frame` interact in
+    /// AppKit -- a titled window's frame includes the titlebar strip, a borderless one
+    /// doesn't, so toggling `.titled` shifts how `.frame` relates to the window's own content
+    /// region. What must survive a chrome change is the CONTENT rect (the remote pixels'
+    /// on-screen position/size, which `RemoteWindowRegistry.macContentRect(for:)` most
+    /// recently computed from the RAIL order and `updateFrame` applied) -- NOT the raw
+    /// frame. Capturing `window.contentRect(forFrameRect: window.frame)` before the
+    /// styleMask assignment, then deriving the new frame from THAT via
+    /// `window.frameRect(forContentRect:)` under the NEW styleMask, keeps the remote pixels
+    /// exactly where RAIL says they belong regardless of how much chrome this window's
+    /// outer frame gained or lost -- this method's original version instead restored the
+    /// raw frame unchanged, which was silently correct only for borderless<->borderless
+    /// (zero insets either way); going borderless->titled left the content rect shrunk by
+    /// the new titlebar's height inside the old, unchanged frame, exactly the ~14pt
+    /// real-host divergence that first exposed this whole class of bug (see
+    /// `RemoteWindow.init`'s and `updateFrame`'s own doc comments for the full finding).
+    ///
+    /// KNOWN OPEN DESIGN QUESTION (not a bug, recorded here since this is where chrome is
+    /// applied): a titled window now shows a DOUBLE titlebar -- this native macOS chrome's
+    /// own titlebar, stacked above the remote window's own Windows titlebar, which is
+    /// still present as ordinary pixels inside the content view (RAIL's geometry is the
+    /// remote window's outer rect, remote titlebar included -- see `init`'s doc comment).
+    /// A Coherence-grade experience would crop the remote titlebar out of the displayed
+    /// content and rely on native chrome as the window's only titlebar; that crop is real
+    /// design/engineering work (a new contentsRect-style crop layered on top of the
+    /// existing GFX mapped-sub-rect crop in `present(surface:mappedSize:via:)`) deliberately
+    /// left undone here -- flagged for the owner/W4, docs/plans/phase2.md W4 adjacency, not
+    /// silently accepted as finished.
     private func applyChromeNow(_ chrome: WindowChrome) {
         guard chrome != appliedChrome else { return }
-        let previousFrame = window.frame
+        let previousContentRect = window.contentRect(forFrameRect: window.frame)
 
         var mask: NSWindow.StyleMask = chrome.titled ? [.titled] : [.borderless]
         if chrome.titled {
@@ -432,8 +671,11 @@ final class RemoteWindow {
             // maps onto that one AppKit bit, not `zoomable` (WS_MAXIMIZEBOX) directly.
             if chrome.resizable { mask.insert(.resizable) }
         }
+        isApplyingProgrammaticFrame = true
         window.styleMask = mask
-        window.setFrame(previousFrame, display: window.isVisible)
+        let targetFrame = window.frameRect(forContentRect: previousContentRect)
+        window.setFrame(targetFrame, display: window.isVisible)
+        isApplyingProgrammaticFrame = false
 
         window.hasShadow = chrome.hasShadow
         window.level = chrome.level == .floating ? .floating : .normal
@@ -514,6 +756,22 @@ final class RemoteWindow {
     /// Assigns a newly leased surface to the layer and arranges for the *previously*
     /// displayed one (if any) to be recycled back to `session`'s pool once CoreAnimation
     /// has actually finished referencing it, never immediately (adr/0005 §2).
+    ///
+    /// Real-host regression investigation note (2026-08-23, W3 round 3, team-lead review):
+    /// `contentsRect` immediately below crops the SOURCE image to `mappedSize` within the
+    /// surface's own 64-aligned allocation -- it has no opinion on the DESTINATION
+    /// `contentLayer`'s own on-screen size at all. With `contentsGravity == .resize` (set in
+    /// `init`), CoreAnimation STRETCHES that cropped image to fill whatever size the layer
+    /// (hence `contentView`, hence this window's content size) currently has, regardless of
+    /// the cropped image's own native pixel dimensions -- confirmed by inspection, not
+    /// merely suspected: before `RemoteWindowRegistry.macContentRect(for:windowId:)`'s W3
+    /// round 3 fix made the content view's size GFX-mapped-canonical, a window whose content
+    /// size still tracked RAIL's `windowWidth`/`windowHeight` (which round 3's own real-host
+    /// evidence showed differs from `mappedSize` by a real, if small, per-window amount) was
+    /// silently stretching every frame by that same ratio, with nothing in this method (or
+    /// anywhere else) ever detecting or reporting it. Now that the content view's size is
+    /// kept equal to `mappedSize` whenever one is known, this stretch's ratio degrades to
+    /// 1:1 as a side effect -- not a change to this method itself.
     func present(surface: IOSurface, mappedSize: CGSize?, via session: CRSession) {
         let outgoing = displayedSurface
         CATransaction.begin()
@@ -605,6 +863,23 @@ final class RemoteWindow {
             NotificationCenter.default.removeObserver(didResignKeyObserver)
             self.didResignKeyObserver = nil
         }
+        // Phase 2 W3: same "block observers keep firing until explicitly removed" reasoning
+        // as didResignKeyObserver above, times three. moveSettleWorkItem is cancelled too --
+        // nothing left to settle once this window is closing.
+        if let didMoveObserver {
+            NotificationCenter.default.removeObserver(didMoveObserver)
+            self.didMoveObserver = nil
+        }
+        if let willStartLiveResizeObserver {
+            NotificationCenter.default.removeObserver(willStartLiveResizeObserver)
+            self.willStartLiveResizeObserver = nil
+        }
+        if let didEndLiveResizeObserver {
+            NotificationCenter.default.removeObserver(didEndLiveResizeObserver)
+            self.didEndLiveResizeObserver = nil
+        }
+        moveSettleWorkItem?.cancel()
+        moveSettleWorkItem = nil
         // A still-gated close (this window never presented/timed out before its own
         // WindowDelete arrived) leaves `pendingActivate` moot the instant `window.close()`
         // below runs -- cleared explicitly anyway, matching `pendingActivate`'s own

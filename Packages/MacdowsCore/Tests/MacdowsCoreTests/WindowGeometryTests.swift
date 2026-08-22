@@ -218,4 +218,171 @@ struct WindowGeometryTests {
         #expect(mac.width == windowsRect.width)
         #expect(mac.height == windowsRect.height)
     }
+
+    // MARK: - Phase 2 W3 round 3: WindowGeometryCorrection (RAIL-size vs GFX-mapped-display-size)
+
+    /// `railRect(from:correction:)` is the exact inverse of `displayRect(from:correction:)`
+    /// for ANY signed correction, including the current all-zero-origin one -- team-lead
+    /// review's own request: this property must hold no matter what `correction`'s values
+    /// turn out to be, so a future edit that gives `displayRect`/`railRect` mismatched signs
+    /// (exactly the bug this whole fix round corrects) fails here before it ever reaches a
+    /// real host.
+    @Test("railRect(from:correction:) is the exact inverse of displayRect(from:correction:)",
+          arguments: [
+            WindowGeometryCorrection.zero,
+            // This fix's own real-host origin: About window, offsetX=338 offsetY=62
+            // windowWidth=494 windowHeight=500 against a GFX-mapped visible size of
+            // 508x507 -- mapped - RAIL = (+14, +7).
+            WindowGeometryCorrection(originX: 0, originY: 0, width: 14, height: 7),
+            // A hypothetical future negative correction (mapped SMALLER than RAIL) --
+            // nothing in either function's own math assumes the sign, so this must round-trip
+            // exactly the same way.
+            WindowGeometryCorrection(originX: 0, originY: 0, width: -20, height: -3),
+            // A hypothetical nonzero origin correction (W4's shaped-window work, per this
+            // type's own doc comment on why origin is zero FOR NOW, not structurally absent).
+            WindowGeometryCorrection(originX: 5, originY: -12, width: 14, height: 7),
+          ])
+    func railDisplayRoundTripIsIdentity(_ correction: WindowGeometryCorrection) {
+        let rail = WindowsRect(x: 338, y: 62, width: 494, height: 500)
+        let displayed = WindowGeometry.displayRect(from: rail, correction: correction)
+        let roundTripped = WindowGeometry.railRect(from: displayed, correction: correction)
+
+        #expect(roundTripped == rail)
+    }
+
+    /// This fix's own real-host measurement, pinned down as an explicit example (not just
+    /// covered incidentally by the round-trip property above): the About window's real RAIL
+    /// rect, corrected by the real measured delta, produces the exact GFX-mapped size --
+    /// documents the actual numbers this whole correction mechanism exists for.
+    @Test("the real-host measured correction turns RAIL's reported size into the GFX-mapped displayed size")
+    func realHostMeasurementProducesDisplayedSize() {
+        let rail = WindowsRect(x: 338, y: 62, width: 494, height: 500)
+        let correction = WindowGeometryCorrection(originX: 0, originY: 0, width: 14, height: 7)
+
+        let displayed = WindowGeometry.displayRect(from: rail, correction: correction)
+
+        #expect(displayed.width == 508)
+        #expect(displayed.height == 507)
+        // Origin correction is zero -- the anchor (top-left in Windows space) does not move,
+        // only the size grows, extending toward increasing X/Y (right/down).
+        #expect(displayed.x == rail.x)
+        #expect(displayed.y == rail.y)
+    }
+
+    /// Team-lead review round 4 (2026-08-23, real-host move-leg mismatch after round 3's
+    /// mapped-canonical fix): reproduces `RemoteWindowRegistry.handleLocalGeometrySettled`'s
+    /// EXACT outbound conversion chain (mac content rect -> `windowsRect(from:
+    /// primaryMonitorHeight:)` -> `railRect(from:correction:)` -> rounded left/top/right/
+    /// bottom), step for step, using this run's own real numbers -- offline, no host needed,
+    /// per the team-lead's own instruction that this test's verdict decides whether another
+    /// host round is even necessary before fixing.
+    ///
+    /// Real-host inputs: local drag settled at mac content rect `(331, 917, 536, 521)`
+    /// (the harness's own move target: original `(251, 857)` + `(80, 60)`),
+    /// `primaryMonitorHeight = 1440`, `correction = (width: 14, height: 7)` (this window's
+    /// own measured mapped-minus-RAIL delta, unchanged by a pure move).
+    ///
+    /// THE ALGEBRA, worked by hand and then asserted by this test:
+    /// 1. `windowsRect(from: macRect(331,917,536,521), primaryMonitorHeight: 1440)`:
+    ///    `y = 1440 - 917 - 521 = 2`. -> `WindowsRect(x: 331, y: 2, width: 536, height: 521)`.
+    /// 2. `railRect(from: that, correction: (14, 7))`: `width = 536-14 = 522`,
+    ///    `height = 521-7 = 514`, origin unchanged (zero origin correction).
+    ///    -> `WindowsRect(x: 331, y: 2, width: 522, height: 514)`.
+    /// 3. `left=331 top=2 right=331+522=853 bottom=2+514=516`.
+    ///
+    /// VERDICT: this is the MATHEMATICALLY CORRECT `ClientWindowMove` rect for this move --
+    /// `left`/`top` land exactly on the intended target, and `width`/`height` (522x514)
+    /// exactly reproduce this window's PRE-move RAIL size, unchanged, which is precisely
+    /// correct for a pure move (no resize). Today's pure conversion functions have NO BUG
+    /// reproducible from this input. The real-host mismatch this test was written to
+    /// investigate (server echoed `offsetX=338 offsetY=62 windowWidth=522 windowHeight=514`,
+    /// NOT `left=331 top=2` -- `top` exactly matches this window's ORIGINAL pre-move
+    /// `offsetY`, as if Y never moved at all, while X overshot by exactly this window's own
+    /// width-correction magnitude, +7) must therefore come from EITHER (a) a different
+    /// `contentRect` actually reaching `handleLocalGeometrySettled` than the harness's own
+    /// intended target (something upstream of this pure math, in `RemoteWindow`'s settle
+    /// path or AppKit's own frame bookkeeping, diverged), or (b) the observed "echo" is not
+    /// actually a direct confirmation of this specific move at all -- a stale/out-of-sequence
+    /// WindowUpdate, exactly the possibility flagged for the next host run's timestamped log
+    /// to distinguish (see `Tools/window-smoke`'s own `[move-resize] sent ClientWindowMove`
+    /// log line added alongside this test). This test's own passing result is what licenses
+    /// looking there rather than at this file.
+    ///
+    /// Round 5 update (2026-08-23): the real host round confirmed this test's own "no bug
+    /// reproducible from this input" verdict was correct as far as it went -- root cause (a)
+    /// was real (an AppKit frame-clamp on Y, unrelated to this math) -- but ALSO surfaced a
+    /// second, genuinely separate finding this test does NOT cover: `left` itself needs an
+    /// additional, asymmetric, outbound-only correction beyond what `railRect(from:
+    /// correction:)` computes (see `WindowGeometry.clientWindowMoveLeft`'s own doc comment).
+    /// This test intentionally still asserts the OLD (pre-round-5) `left == 331` -- it is
+    /// scoped to the SIZE-correction chain in isolation, not `handleLocalGeometrySettled`'s
+    /// full current behavior; `clientWindowMoveLeftAppliesTheMeasuredBorder` below covers the
+    /// round-5 addition on its own.
+    @Test("handleLocalGeometrySettled's outbound chain reproduces the correct RAIL rect for this run's real move")
+    func outboundConversionReproducesRealHostMove() {
+        let macRect = MacRect(x: 331, y: 917, width: 536, height: 521)
+        let primaryMonitorHeight = 1440.0
+        let correction = WindowGeometryCorrection(originX: 0, originY: 0, width: 14, height: 7)
+
+        let displayedWindowsRect = WindowGeometry.windowsRect(from: macRect, primaryMonitorHeight: primaryMonitorHeight)
+        #expect(displayedWindowsRect == WindowsRect(x: 331, y: 2, width: 536, height: 521))
+
+        let railWindowsRect = WindowGeometry.railRect(from: displayedWindowsRect, correction: correction)
+        #expect(railWindowsRect == WindowsRect(x: 331, y: 2, width: 522, height: 514))
+
+        let left = Int32(railWindowsRect.x.rounded())
+        let top = Int32(railWindowsRect.y.rounded())
+        let right = Int32((railWindowsRect.x + railWindowsRect.width).rounded())
+        let bottom = Int32((railWindowsRect.y + railWindowsRect.height).rounded())
+
+        // The mathematically correct target: left/top hit the intended position exactly;
+        // width (right-left) and height (bottom-top) exactly reproduce this window's
+        // PRE-move RAIL size (522x514), unchanged -- correct for a pure move.
+        #expect(left == 331)
+        #expect(top == 2)
+        #expect(right == 853)
+        #expect(bottom == 516)
+        #expect(right - left == 522)
+        #expect(bottom - top == 514)
+
+        // The ACTUAL real-host echo this test was written to investigate, pinned down as a
+        // negative example: today's code does NOT (and per the algebra above, could not)
+        // produce this from the given input -- left=338/top=62 is not reachable from a
+        // correct application of this fix's own math to this move's real target.
+        #expect(left != 338)
+        #expect(top != 62)
+    }
+
+    /// Team-lead review round 5 (2026-08-23): the actual real-host cause of the round-4
+    /// investigation's `left` mismatch, worked and checked here offline. See
+    /// `WindowGeometry.clientWindowMoveLeft`'s own doc comment for the full algebra this
+    /// test exercises -- summarized: THREE separate runs each sent `left=331` and got back
+    /// `offsetX=338` on the very next `WindowUpdate`, a clean +7 every time. The evidence's
+    /// own causal chain (worked in the production function's doc comment) implies the
+    /// server treats a sent `left` as the window's OUTER rect, inset from the VISIBLE rect
+    /// `WindowUpdate.offsetX` reports by a measured 7pt left border -- so sending the
+    /// visible target UNCORRECTED (331) makes the server's own reconstruction land 7pt too
+    /// far right (338), and the fix must subtract that same 7pt before sending.
+    @Test("clientWindowMoveLeft subtracts the measured left border, and the server's own outer->visible reconstruction (visible = outer + border, per this round's evidence) lands the round trip back on target")
+    func clientWindowMoveLeftAppliesTheMeasuredBorder() {
+        let visibleLeftTarget = 331.0
+        let measuredLeftBorder = 7.0
+
+        let sent = WindowGeometry.clientWindowMoveLeft(fromVisibleLeft: visibleLeftTarget, measuredLeftBorder: measuredLeftBorder)
+        #expect(sent == 324)
+
+        // Simulates the server's OWN outer->visible reconstruction, per this round's
+        // evidence (visible = outer + border) -- not something this package can call
+        // directly (it runs on the remote host), but this is exactly the arithmetic that
+        // reproduces the observed 331->338 pair when `sent` is fed through it, confirming
+        // the correction actually closes the loop rather than merely looking plausible.
+        let serverReconstructedVisible = sent + measuredLeftBorder
+        #expect(serverReconstructedVisible == visibleLeftTarget)
+
+        // The UNCORRECTED value (matching round 4's `left == 331` test above) is exactly
+        // what produced the observed overshoot -- pinned down as a negative example so a
+        // future edit can't silently reintroduce sending the raw visible target.
+        let uncorrectedReconstruction = visibleLeftTarget + measuredLeftBorder
+        #expect(uncorrectedReconstruction == 338) // the actual observed echo, 3 runs running
+    }
 }

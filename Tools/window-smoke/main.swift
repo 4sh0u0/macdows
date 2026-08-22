@@ -163,6 +163,15 @@ let closeProbeEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_CLOSE_
 /// (multiwin prereq, per the task spec) -- reuses that scenario's own settling logic.
 let maximizeScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_MAXIMIZE"] == "1"
 
+/// Phase 2 W3 (docs/plans/phase2.md §2 W3): automatable local move/resize -> server sync
+/// acceptance -- no human drag is available to this harness, so this programmatically
+/// moves (then resizes) the About window's real `NSWindow` via `-setFrame:display:` and
+/// asserts the settle path this fires round-trips through `CRSession.sendWindowMove` and
+/// back via a real `WindowUpdate`. See `runMoveResizeScenario`'s own doc comment for the
+/// acknowledged honesty gap against a genuine mouse-driven drag. Requires
+/// WINDOW_SMOKE_EXTRA_APPS (multiwin prereq), same convention as WINDOW_SMOKE_MAXIMIZE.
+let moveResizeScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_MOVE"] == "1"
+
 /// MS-RDPERP `TS_RAIL_ORDER_SYSCOMMAND` `SC_*` values -- duplicated here from
 /// `App/RemoteWindowRendering/RemoteWindowRegistry.swift`'s own `SysCommand` enum (itself
 /// verified against `ThirdParty/FreeRDP/include/freerdp/rail.h:126-133`), matching this
@@ -365,6 +374,76 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private var maximizeCloseTargetId: UInt32?
     private var maximizeCloseWindowDeletedAt: TimeInterval?
 
+    // Phase 2 W3 (WINDOW_SMOKE_MOVE): programmatic move -> resize -> server-sync e2e state
+    // machine -- see `runMoveResizeScenario`'s own doc comment for the full sequence and
+    // its acknowledged honesty gap vs a real mouse-driven drag.
+    private enum MoveResizePhase: Equatable {
+        case waitingForTarget
+        case awaitingMoveSettle(windowId: UInt32, target: NSRect, sentAt: Date)
+        case awaitingResizeSettle(windowId: UInt32, target: NSRect, sentAt: Date)
+        case awaitingClose(windowId: UInt32, sentAt: Date)
+        case done
+    }
+    private var moveResizePhase: MoveResizePhase = .waitingForTarget
+    private static let moveResizePollTimeout: TimeInterval = 3.0
+    /// Team-lead review (2026-08-23 real-host run): mirrors `maximizePollTimeout`'s own 5s
+    /// budget for the close leg specifically -- WindowDelete round trips are a full RAIL
+    /// request/response, not the local settle-debounce the move/resize legs above wait on,
+    /// so it gets its own, longer timeout rather than reusing `moveResizePollTimeout`.
+    private static let moveResizeClosePollTimeout: TimeInterval = 5.0
+    private var moveResizeWindowId: UInt32?
+    /// Team-lead review round 6 (2026-08-23): the GFX-mapped size observed at the moment
+    /// the move leg's target was locked -- baseline for the move leg's own "did the server
+    /// remap the surface mid-leg" informational report (position-only matching means a size
+    /// change during the move leg is expected/legitimate, not a failure, but still worth
+    /// surfacing).
+    private var moveResizeOriginalMappedSize: CGSize?
+    /// `(matched, oscillated)` per leg -- `matched`: did any WindowUpdate-applied content
+    /// rect for the target window round-trip to that leg's target within ±1pt inside the 3s
+    /// budget. `oscillated`: did any LATER observed content rect in the same leg diverge
+    /// from the target again after the first match (a real generic ping-pong detector isn't
+    /// needed here -- this bounded window only needs "reaches the one target this leg cares
+    /// about, and stays there").
+    private var moveResult: (matched: Bool, oscillated: Bool)?
+    private var resizeResult: (matched: Bool, oscillated: Bool)?
+    /// Team-lead review round 4 (2026-08-23, no-false-red discipline): whether the real
+    /// target window's `NSWindow.styleMask` actually included `.resizable` at the moment
+    /// the resize leg was sent (About never does -- StyleTranslatorTests'
+    /// `aboutWindowsDialogShape` -- so this scenario's resize-leg round-trip assertion was
+    /// gating and failing on EVERY run by design, an assertion bug: the leg proves
+    /// "does a programmatic geometry change round-trip through ClientWindowMove", which is
+    /// meaningful regardless of resizability, but the round-trip itself failing for a
+    /// non-resizable target's wire-level move is not evidence of a real product defect the
+    /// way it would be for a genuinely resizable window). `nil` until the resize leg
+    /// actually sends (mirrors `resizeResult`'s own "not yet run" state).
+    private var moveResizeTargetIsResizable: Bool?
+    /// Team-lead review (Fix 2, 2026-08-23 real-host run): this scenario used to leave its
+    /// About window open at the end -- a subsequent `WINDOW_SMOKE_CYCLES` soak run then
+    /// locked its own close-probe target onto that leftover window (Phase 1's stale-window
+    /// contamination class), observed live as 4/20 close-leg failures whose probe target
+    /// windowId was actually THIS scenario's own window from an earlier run. `nil` until the
+    /// resize leg resolves and the close leg actually gets sent (see `runMoveResizeScenario`'s
+    /// `.awaitingResizeSettle` case) -- `finish()` only gates on `moveResizeCloseResult` when
+    /// this is non-nil, mirroring how the maximize scenario's own close leg can be skipped on
+    /// an earlier-leg failure.
+    private var moveResizeCloseTargetId: UInt32?
+    private var moveResizeCloseWindowDeletedAt: TimeInterval?
+    private var moveResizeCloseResult: Bool?
+    /// Content rects (NOT raw `NSWindow.frame` -- team-lead review, 2026-08-23 real-host
+    /// run: RAIL geometry maps to a window's CONTENT rect once it has native chrome,
+    /// `RemoteWindow.updateFrame`'s own doc comment has the full finding) observed via a
+    /// geometry-carrying WindowUpdate/WindowCreate for `moveResizeWindowId`, recorded by
+    /// `drainNow()`'s own event-kind switch, timestamped against `startTime` -- reset at the
+    /// start of each leg so a leg's own oscillation check never sees the PRIOR leg's settle
+    /// history. Each entry is `window.contentRect(forFrameRect: window.frame)` at the moment
+    /// the WindowUpdate was applied (post `registry.handle(event)`), so a suppressed
+    /// (ignored) echo during the in-flight gesture naturally never shows up here as a
+    /// spurious "match" -- and so this scenario's own comparisons stay in the SAME rect
+    /// space `RemoteWindow`/`RemoteWindowRegistry` actually round-trip through the wire,
+    /// rather than the raw outer frame (which differs from content rect by this window's
+    /// chrome insets once it's titled).
+    private var moveResizeObservedContentRects: [(contentRect: NSRect, at: TimeInterval)] = []
+
     // W4b review round 2, experiment 1: does sending RAIL ClientActivate for a
     // background/non-focused window prompt the server to (re)send content it never
     // painted for us? Resolved opportunistically to whichever plausible-title window is
@@ -421,6 +500,23 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // scenario") -- off (zero cost) for every other run, including cycle mode.
         if !extraApps.isEmpty {
             registry.zOrderTraceEnabled = true
+        }
+        // Team-lead review round 4 (2026-08-23, W3): logs the VERBATIM rect
+        // `handleLocalGeometrySettled` actually sent to `CRSession.sendWindowMove`,
+        // independent of and prior to whatever the server later echoes back -- see
+        // `RemoteWindowRegistry.onWindowMoveSent`'s own doc comment for why this exists
+        // (to distinguish "we sent the wrong thing" from "the server/timing did something
+        // unexpected" without re-deriving the outbound math a second time here). Scoped to
+        // the move-resize scenario's own target so it stays silent for every other run.
+        // `Date().timeIntervalSince(self?.startTime ?? Date())` mirrors the elapsed-seconds
+        // clock every other timestamped line in this file already uses.
+        registry.onWindowMoveSent = { [weak self] windowId, left, top, right, bottom in
+            guard let self, moveResizeScenarioEnabled, windowId == self.moveResizeWindowId else { return }
+            let elapsed = self.startTime.map { Date().timeIntervalSince($0) } ?? -1
+            print(
+                "[move-resize] sent ClientWindowMove at elapsed=\(String(format: "%.3f", elapsed))s "
+                    + "windowId=\(windowId) left=\(left) top=\(top) right=\(right) bottom=\(bottom)"
+            )
         }
         startTime = Date()
 
@@ -514,6 +610,88 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                self.maximizeCloseWindowDeletedAt == nil
             {
                 self.maximizeCloseWindowDeletedAt = Date().timeIntervalSince(self.startTime)
+            }
+            // Fix 2 (team-lead review, 2026-08-23 real-host run): same bookkeeping shape as
+            // the two cases just above, for the move-resize scenario's own close leg.
+            if event.kind == .windowDelete, let target = self.moveResizeCloseTargetId, event.windowId == target,
+               self.moveResizeCloseWindowDeletedAt == nil
+            {
+                self.moveResizeCloseWindowDeletedAt = Date().timeIntervalSince(self.startTime)
+            }
+            // Phase 2 W3 (docs/plans/phase2.md §2 W3): records this window's real CONTENT
+            // rect -- post `registry.handle(event)` above, so this reflects whatever
+            // `RemoteWindow.updateFrame` actually did, including a no-op if geometry
+            // suppression was active -- every time a geometry-carrying WindowCreate/
+            // WindowUpdate arrives for the move/resize scenario's own target. Team-lead
+            // review (2026-08-23 real-host run): reads `window.contentRect(forFrameRect:
+            // window.frame)`, NOT the raw frame -- RAIL geometry round-trips through the
+            // CONTENT rect once this window has native chrome (`RemoteWindow.updateFrame`'s
+            // own doc comment has the full finding); comparing raw frames here would be off
+            // by this window's chrome insets, exactly the bug this fix corrects.
+            // `evaluateMoveResizeLeg` reads this sequence for both the round-trip match and
+            // the no-oscillation check. Field-flag bits (SIZE=0x0400, OFFSET=0x0800)
+            // duplicated here per this file's own established per-layer-cites-source
+            // precedent (see the `SC` enum's own doc comment above for the same
+            // convention) -- canonical source is MacdowsCore's WindowModel.swift, verified
+            // there against freerdp/window.h.
+            if moveResizeScenarioEnabled, let target = self.moveResizeWindowId, event.windowId == target,
+               event.kind == .windowUpdate || event.kind == .windowCreate,
+               event.fieldFlags & 0x0C00 != 0,
+               let window = registry.window(forWindowId: target)
+            {
+                // Team-lead review (2026-08-23, W3 round 2): the RAW wire values this run's
+                // round-trip mismatch (x+7 y-53 w-14 h-7) was diagnosed from second-hand, via
+                // already-converted mac content rects -- this line exists to let the NEXT run
+                // confirm (or refute) `RemoteWindowRegistry.sizeCorrection(for:windowId:)`'s
+                // own measured value directly against the actual RAIL offsetX/offsetY/
+                // windowWidth/windowHeight and the GFX mapped (visible) size it's derived
+                // from, not re-derived arithmetic. Printed for EVERY geometry-carrying order
+                // on the target window, not just the ones this scenario's own legs care
+                // about, so a server-initiated echo outside the expected sequence is visible
+                // too. `impliedSizeCorrection` is signed `mapped - RAIL` (matching
+                // `MacdowsCore.WindowGeometryCorrection`'s own sign convention exactly, per
+                // the W3 round 3 team-lead review that found round 2's fallback had the sign
+                // backwards) -- POSITIVE means the displayed content is LARGER than what RAIL
+                // itself reports. Team-lead review round 4: `elapsed` added so this line and
+                // the new `onWindowMoveSent`-driven "sent ClientWindowMove" line above share
+                // the same clock -- reading both lines in timestamp order on the next run is
+                // what actually answers whether a given echo predates or postdates our own
+                // send (a stale/out-of-sequence WindowUpdate vs a genuine confirmation).
+                //
+                // Team-lead review round 5 (2026-08-23): `impliedSizeCorrection` used to be
+                // computed from THIS event's own raw `windowWidth`/`windowHeight` fields --
+                // garbage on any order that didn't carry `WINDOW_ORDER_FIELD_WND_SIZE`
+                // (0x0400) at all (a position-only or style-only update correctly reports
+                // these as 0, which the old line then diffed against `mapped` as if it were
+                // a real, tiny RAIL size). Now reads
+                // `registry.debugAccumulatedRailSize(forWindowId:)` -- the SAME
+                // delta-merged, accumulated state `RemoteWindowRegistry.sizeCorrection(for:
+                // windowId:)` itself actually uses -- so this line can never diverge from
+                // what the real correction logic saw. `accumulated` is printed alongside the
+                // raw per-event `windowWidth`/`windowHeight` specifically so a reader can see
+                // both at once: whether THIS event carried a size at all (raw, possibly 0)
+                // vs. what the registry's own running state currently believes (accumulated,
+                // what `impliedSizeCorrection` is actually computed from).
+                let mapped = registry.debugMappedSize(forWindowId: target)
+                let accumulated = registry.debugAccumulatedRailSize(forWindowId: target)
+                let elapsed = self.startTime.map { Date().timeIntervalSince($0) } ?? -1
+                let impliedSizeCorrection: String
+                if let mapped, let accumulated {
+                    impliedSizeCorrection = "(\(Int(mapped.width) - Int(accumulated.width)),\(Int(mapped.height) - Int(accumulated.height)))"
+                } else {
+                    impliedSizeCorrection = "n/a"
+                }
+                print(
+                    "[move-resize] raw RAIL geometry at elapsed=\(String(format: "%.3f", elapsed))s "
+                        + "for windowId=\(target) kind=\(event.kind): "
+                        + "offsetX=\(event.offsetX) offsetY=\(event.offsetY) windowWidth=\(event.windowWidth) "
+                        + "windowHeight=\(event.windowHeight) fieldFlags=0x\(String(event.fieldFlags, radix: 16)) "
+                        + "accumulatedRAILSize=\(accumulated.map { "\($0.width)x\($0.height)" } ?? "unknown") "
+                        + "GFX-mapped(visible)Size=\(mapped.map { "\(Int($0.width))x\(Int($0.height))" } ?? "unknown") "
+                        + "impliedSizeCorrection(mapped-accumulatedRAIL,w,h)=\(impliedSizeCorrection)"
+                )
+                let contentRect = window.contentRect(forFrameRect: window.frame)
+                self.moveResizeObservedContentRects.append((contentRect: contentRect, at: Date().timeIntervalSince(self.startTime)))
             }
             // Multi-window scenario bookkeeping (2026-08-22 review HIGH): a failed
             // ClientExecute (e.g. RAIL_EXEC_E_FILE_NOT_FOUND) must not hide behind
@@ -628,6 +806,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         runInputTest(elapsed: elapsed, registry: registry)
         runFocusRotation(elapsed: elapsed, session: session, registry: registry)
         runMaximizeScenario(session: session, registry: registry)
+        runMoveResizeScenario(session: session, registry: registry)
 
         // Phase 1 acceptance: launch the extra apps once the first app's own window has
         // had time to settle -- several ClientExecutes on one live connection is exactly
@@ -669,10 +848,18 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // gates the extra wait, not this fallback.
         let maximizeDeadline: TimeInterval = maximizeScenarioEnabled ? 45 : baseDeadline
         let maximizeStalled = maximizeScenarioEnabled && maximizePhase != .done && elapsed >= maximizeDeadline + 10
-        let overallDeadline = max(rotationDeadline, maximizeDeadline)
+        // Phase 2 W3: worst case is extraAppsLaunched (>=6s) + settle for the About target +
+        // two back-to-back (move, resize) legs, each up to the 3s round-trip budget plus the
+        // 200ms local settle debounce, + the close leg's own 5s WindowDelete wait (Fix 2) --
+        // 40s leaves comfortable slack, same "gated by the phase reaching .done, this is
+        // only the hard failsafe" shape `maximizeStalled` already establishes.
+        let moveResizeDeadline: TimeInterval = moveResizeScenarioEnabled ? 40 : baseDeadline
+        let moveResizeStalled = moveResizeScenarioEnabled && moveResizePhase != .done && elapsed >= moveResizeDeadline + 10
+        let overallDeadline = max(rotationDeadline, maximizeDeadline, moveResizeDeadline)
         let rotationReady = focusRotationTotal == 0 || focusRotationDone || rotationStalled
         let maximizeReady = !maximizeScenarioEnabled || maximizePhase == .done || maximizeStalled
-        if elapsed >= overallDeadline, rotationReady, maximizeReady {
+        let moveResizeReady = !moveResizeScenarioEnabled || moveResizePhase == .done || moveResizeStalled
+        if elapsed >= overallDeadline, rotationReady, maximizeReady, moveResizeReady {
             finish()
         }
     }
@@ -1138,6 +1325,248 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         case .done:
             break
         }
+    }
+
+    /// Phase 2 W3 (docs/plans/phase2.md §2 W3): drives a move-then-resize sequence against
+    /// the About window's real `NSWindow`, purely programmatically -- no human drag is
+    /// available to an automated harness. Uses `-setFrame:display:`, which AppKit confirms
+    /// posts `NSWindow.didMoveNotification` for a programmatic origin change exactly as it
+    /// would for an interactive one, so this exercises the REAL production settle path
+    /// (`RemoteWindow.handleLocalDidMove` -> 200ms debounce -> `onLocalGeometrySettled` ->
+    /// `RemoteWindowRegistry.handleLocalGeometrySettled` -> `CRSession.sendWindowMove`) end
+    /// to end, not a bypass or a direct call into any of those methods.
+    ///
+    /// HONESTY GAP (acknowledged, per the task spec's own wording): `-setFrame:display:`
+    /// does NOT post `NSWindow.willStartLiveResizeNotification`/`didEndLiveResizeNotification`
+    /// -- those fire ONLY for a genuine interactive (mouse-driven) resize, which nothing in
+    /// this headless harness can produce. Both legs below therefore exercise the SAME
+    /// didMove-debounce settle path `RemoteWindow` uses for a move, never the live-resize
+    /// begin/end path it separately implements for an interactive resize -- that path has
+    /// no automated coverage at all in this harness. The About window is additionally not
+    /// resizable (StyleTranslatorTests' `aboutWindowsDialogShape`), so even a real
+    /// interactive resize could never be driven against it regardless; `-setFrame:display:`
+    /// still changes its frame at the wire/model level regardless of `styleMask`, which is
+    /// what the resize leg actually verifies (does a programmatic geometry change round-trip
+    /// through `ClientWindowMove` and back) -- at the acknowledged cost of the live-resize
+    /// notification pair having zero coverage from any window in this run.
+    ///
+    /// Team-lead review (2026-08-23 real-host run): all target/comparison math below is in
+    /// CONTENT-RECT space (`window.contentRect(forFrameRect:)`/`window.frameRect(forContentRect:)`),
+    /// never the raw `NSWindow.frame` -- matching `RemoteWindow`/`RemoteWindowRegistry`'s own
+    /// fix for the same real-host-discovered bug (see `RemoteWindow.updateFrame`'s doc
+    /// comment). Also ends with an explicit SC_CLOSE + WindowDelete wait (Fix 2) so this
+    /// scenario doesn't leave its About window open for a later `WINDOW_SMOKE_CYCLES` soak
+    /// to mistake for a fresh target.
+    ///
+    /// OBSERVED SERVER BEHAVIOR, worth W4's shaped/popup work keeping in mind (team-lead
+    /// review round 6, 2026-08-23 real-host run): after this scenario's own move leg, the
+    /// server was observed to REMAP the window's GFX surface mid-move (536x521 -> 522x514,
+    /// i.e. down to exactly its RAIL-reported size, with no resize request from this client
+    /// at all) -- a plain move can trigger a surface remap as a server-side side effect, not
+    /// only an explicit resize. This is why the move leg's own round-trip assertion is
+    /// POSITION-only (`evaluateMoveResizeLeg`'s own doc comment) -- size is legitimately the
+    /// server's prerogative to change out from under a move, and a future feature that
+    /// assumes "size only changes on an explicit resize request" would be building on an
+    /// assumption this run's own evidence already contradicts.
+    private func runMoveResizeScenario(session: CRSession, registry: RemoteWindowRegistry) {
+        guard moveResizeScenarioEnabled else { return }
+
+        switch moveResizePhase {
+        case .waitingForTarget:
+            guard extraAppsLaunched else { return } // multiwin prereq, per the task spec
+            guard let w = registry.windowSnapshots().first(where: { snap in
+                snap.isVisible && snap.hasDisplayedContent
+                    && (snap.title.localizedCaseInsensitiveContains("about") || snap.title.contains("关于"))
+            }), let window = registry.window(forWindowId: w.windowId) else { return }
+            moveResizeWindowId = w.windowId
+            // Team-lead review round 6: baseline for the move leg's own "did the mapped
+            // size change mid-leg" informational report -- see that report's own comment.
+            moveResizeOriginalMappedSize = registry.debugMappedSize(forWindowId: w.windowId)
+            let originalContent = window.contentRect(forFrameRect: window.frame)
+            // Team-lead review round 5 (2026-08-23, real-host run): +60 in Y (moving the
+            // window's titlebar TOWARD the top of the screen) was observed to run the native
+            // titlebar off the top of the visible screen/menu-bar area, which AppKit itself
+            // clamps back down -- the settle path then HONESTLY reported the clamped (not
+            // requested) position, which briefly looked like a server-side "Y never moved"
+            // bug but was actually this harness asking for something AppKit would never
+            // grant. -60 (down, away from the screen's top edge) avoids that specific
+            // failure mode for a window that starts anywhere reasonably below the very top
+            // of the screen.
+            let targetContent = originalContent.offsetBy(dx: 80, dy: -60)
+            let targetFrame = window.frameRect(forContentRect: targetContent)
+            print("[move-resize] target locked: windowId=\(w.windowId) title=\"\(w.title)\" originalContent=\(originalContent) -> move target content=\(targetContent)")
+            moveResizeObservedContentRects.removeAll()
+            window.setFrame(targetFrame, display: true)
+            // Team-lead review round 5: assert against the ACTUAL post-setFrame content
+            // rect, not the requested one -- more honest regardless of direction chosen
+            // (AppKit is free to clamp/adjust ANY requested frame for reasons beyond just
+            // the top-of-screen case above, e.g. screen width, Spaces, multi-monitor
+            // arrangement), and this is what the real settle path (`RemoteWindow.
+            // handleLocalDidMove` -> `settleLocalMove`) itself reports too -- comparing
+            // against anything else risks this harness grading AppKit's own clamping as a
+            // server round-trip failure.
+            let actualSettledContent = window.contentRect(forFrameRect: window.frame)
+            if actualSettledContent != targetContent {
+                print("[move-resize] NOTE: AppKit did not grant the exact requested content rect -- requested=\(targetContent) actual=\(actualSettledContent) (asserting against actual, per team-lead review round 5)")
+            }
+            moveResizePhase = .awaitingMoveSettle(windowId: w.windowId, target: actualSettledContent, sentAt: Date())
+
+        case .awaitingMoveSettle(let windowId, let target, let sentAt):
+            // Team-lead review round 6: position-only match -- see evaluateMoveResizeLeg's
+            // own doc comment for why size is out of scope for a pure move.
+            guard let outcome = evaluateMoveResizeLeg(target: target, sentAt: sentAt, matchPositionOnly: true) else { return }
+            moveResult = outcome
+            print("[move-resize] move leg resolved (position-only): matched=\(outcome.matched) oscillated=\(outcome.oscillated)")
+            if let mapped = registry.debugMappedSize(forWindowId: windowId), let originalMapped = moveResizeOriginalMappedSize,
+               mapped != originalMapped
+            {
+                // Team-lead review round 6: "report size deltas informationally" -- the
+                // per-event raw-geometry line already shows mapped size at every order, but
+                // this is the one-line summary confirming whether it actually changed
+                // between lock and resolve, without requiring a reader to diff every prior
+                // line by hand.
+                print(
+                    "[move-resize] INFO: GFX-mapped size changed during the move leg "
+                        + "(server prerogative, not a client request): "
+                        + "\(Int(originalMapped.width))x\(Int(originalMapped.height)) -> "
+                        + "\(Int(mapped.width))x\(Int(mapped.height))"
+                )
+            }
+            guard let window = registry.window(forWindowId: windowId) else {
+                moveResizePhase = .done
+                return
+            }
+            // Task spec: "resize +100pt wider (if resizable -- About isn't; use setFrame
+            // anyway wire-level ... note it)" -- see this scenario's own doc comment for
+            // the acknowledged honesty gap this leg carries. Team-lead review round 4
+            // (2026-08-23, no-false-red discipline): captured HERE, at send time, not
+            // re-derived in finish() -- by finish() this window may already be closed (the
+            // scenario's own SC_CLOSE leg), so this is the only reliable moment to ask
+            // AppKit whether the real target actually supports interactive resize at all.
+            moveResizeTargetIsResizable = window.styleMask.contains(.resizable)
+            let currentContent = window.contentRect(forFrameRect: window.frame)
+            let resizeTargetContent = NSRect(
+                x: currentContent.origin.x, y: currentContent.origin.y,
+                width: currentContent.width + 100, height: currentContent.height
+            )
+            let resizeTargetFrame = window.frameRect(forContentRect: resizeTargetContent)
+            moveResizeObservedContentRects.removeAll()
+            window.setFrame(resizeTargetFrame, display: true)
+            print("[move-resize] resize leg sent (content-rect space): \(currentContent) -> \(resizeTargetContent)")
+            // Team-lead review round 5: same "assert against actual, not requested" fix as
+            // the move leg above -- a +100pt-wider request could in principle also get
+            // clamped (e.g. against screen width) even though this specific run's failure
+            // was Y-only.
+            let actualResizeSettledContent = window.contentRect(forFrameRect: window.frame)
+            if actualResizeSettledContent != resizeTargetContent {
+                print("[move-resize] NOTE: AppKit did not grant the exact requested resize content rect -- requested=\(resizeTargetContent) actual=\(actualResizeSettledContent) (asserting against actual, per team-lead review round 5)")
+            }
+            moveResizePhase = .awaitingResizeSettle(windowId: windowId, target: actualResizeSettledContent, sentAt: Date())
+
+        case .awaitingResizeSettle(let windowId, let target, let sentAt):
+            // Team-lead review round 6: full-rect match, unchanged -- this leg's whole point
+            // is size, unlike the move leg above.
+            guard let outcome = evaluateMoveResizeLeg(target: target, sentAt: sentAt, matchPositionOnly: false) else { return }
+            resizeResult = outcome
+            print("[move-resize] resize leg resolved: matched=\(outcome.matched) oscillated=\(outcome.oscillated)")
+            // Fix 2 (team-lead review): always attempt the close leg here, matching the
+            // maximize scenario's own "still exercise the close leg even after an earlier
+            // leg's failure" precedent -- cleanup shouldn't depend on the round-trip
+            // assertions above having passed.
+            session.sendSysCommand(windowId, command: SC.close)
+            print("[move-resize] sent SC_CLOSE to windowId=\(windowId)")
+            moveResizeCloseTargetId = windowId
+            moveResizePhase = .awaitingClose(windowId: windowId, sentAt: Date())
+
+        case .awaitingClose(_, let sentAt):
+            // moveResizeCloseWindowDeletedAt is set by drainNow()'s own windowDelete
+            // bookkeeping (mirrors maximizeCloseWindowDeletedAt's exact pattern).
+            if moveResizeCloseWindowDeletedAt != nil {
+                moveResizeCloseResult = true
+                print("[move-resize] WindowDelete received within 5s of SC_CLOSE")
+                moveResizePhase = .done
+            } else if Date().timeIntervalSince(sentAt) >= Self.moveResizeClosePollTimeout {
+                moveResizeCloseResult = false
+                print("[move-resize] FAILED to receive WindowDelete within 5s of SC_CLOSE")
+                moveResizePhase = .done
+            }
+
+        case .done:
+            break
+        }
+    }
+
+    /// Shared by both legs: within `Self.moveResizePollTimeout` (3s) of `sentAt`, has any
+    /// WindowUpdate-applied content rect recorded in `moveResizeObservedContentRects`
+    /// matched `target` within ±1pt per axis -- and, once matched, did any LATER recorded
+    /// content rect in the same leg diverge from `target` again (ping-pong)? Returns `nil`
+    /// while the leg is still within budget and not yet resolved either way (neither
+    /// matched-and-settled nor timed out) -- the caller polls this once per tick until it
+    /// resolves.
+    ///
+    /// Team-lead review round 6 (2026-08-23, real-host run: position round-trip PERFECT,
+    /// residual `matched=false` was size-only): `matchPositionOnly` controls whether
+    /// `width`/`height` participate in the match/oscillation check at all. The move leg
+    /// passes `true` -- for a pure move, size is legitimately the SERVER's prerogative (this
+    /// run's own evidence: the server remapped the surface mid-move, 536x521 -> 522x514,
+    /// entirely independent of anything this client asked for), so holding the move leg to
+    /// the PRE-move size would fail it on a dimension it was never actually testing. The
+    /// resize leg keeps `false` (full-rect matching) -- that leg's whole point IS size.
+    ///
+    /// Team-lead review round 7 (2026-08-23, real-host run: wire perfect AGAIN, yet
+    /// position-only still reported `matched=false`): mac-space Y ENTANGLES height --
+    /// `WindowGeometry.macRect(from:primaryMonitorHeight:)`'s own formula is
+    /// `y = primaryMonitorHeight - windowsY - height`, so when round 6's own remap-on-move
+    /// finding changes a rect's height mid-leg, its mac-space Y shifts too even though the
+    /// underlying Windows-space TOP edge never moved at all (this run: target computed at
+    /// h=521 gave mac y=797; the observed rect, remapped to h=514, gave mac y=804 for the
+    /// IDENTICAL Windows-space top=122). Comparing raw mac-space `x`/`y` for the
+    /// `matchPositionOnly` case was therefore comparing two DIFFERENT physical quantities
+    /// whenever height changed -- not a false positive from a genuine position error, but a
+    /// coordinate-representation artifact. Fixed by converting BOTH `target` and each
+    /// observed rect through the existing, already-tested `WindowGeometry.windowsRect(from:
+    /// primaryMonitorHeight:)` (never a second, ad hoc coordinate-math implementation here,
+    /// matching every other geometry boundary crossing in this project) and comparing the
+    /// resulting Windows-space `x`/`y` (top-left, height-invariant by construction: each
+    /// rect's own height is baked into ITS OWN conversion, so two rects that agree on the
+    /// Windows-space top edge always compare equal regardless of what their heights happen
+    /// to be). Scoped to `matchPositionOnly` only, per instruction ("keep everything else as
+    /// is") -- the resize leg's full-rect path is untouched, since it already separately
+    /// requires height to match, at which point the two representations agree anyway.
+    private func evaluateMoveResizeLeg(target: NSRect, sentAt: Date, matchPositionOnly: Bool) -> (matched: Bool, oscillated: Bool)? {
+        let primaryMonitorHeight = Double(NSScreen.screens.first?.frame.height ?? 0)
+        func windowsTopLeft(_ r: NSRect) -> WindowsRect {
+            WindowGeometry.windowsRect(
+                from: MacRect(x: r.origin.x, y: r.origin.y, width: r.size.width, height: r.size.height),
+                primaryMonitorHeight: primaryMonitorHeight
+            )
+        }
+        func closeEnough(_ a: NSRect) -> Bool {
+            if matchPositionOnly {
+                let aTopLeft = windowsTopLeft(a)
+                let targetTopLeft = windowsTopLeft(target)
+                return abs(aTopLeft.x - targetTopLeft.x) <= 1 && abs(aTopLeft.y - targetTopLeft.y) <= 1
+            }
+            let positionMatches = abs(a.origin.x - target.origin.x) <= 1 && abs(a.origin.y - target.origin.y) <= 1
+            return positionMatches
+                && abs(a.width - target.width) <= 1 && abs(a.height - target.height) <= 1
+        }
+        let contentRects = moveResizeObservedContentRects.map(\.contentRect)
+        guard let firstMatchIndex = contentRects.firstIndex(where: closeEnough) else {
+            if Date().timeIntervalSince(sentAt) >= Self.moveResizePollTimeout {
+                return (matched: false, oscillated: false)
+            }
+            return nil
+        }
+        let oscillated = contentRects[(firstMatchIndex + 1)...].contains { !closeEnough($0) }
+        // A brief settle window after the first match, so a late-arriving divergent
+        // WindowUpdate still has a chance to be observed as oscillation before this leg
+        // resolves -- unless oscillation has already been directly observed, in which case
+        // there's nothing left to wait for.
+        guard oscillated || Date().timeIntervalSince(sentAt) >= min(Self.moveResizePollTimeout, 1.0) else {
+            return nil
+        }
+        return (matched: true, oscillated: oscillated)
     }
 
     /// W4c deliverable 5: locates this run's own launched-app window once it's visible and
@@ -1650,7 +2079,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // this exact window by design too (its own SC_CLOSE leg) -- same reasoning, same
         // exclusion; that scenario's own gating assertions (in the maximize-scenario block
         // below) are what actually matter for it, not this generic default-path check.
-        if launchedAppKind == .winver, inputTestMode == nil, !maximizeScenarioEnabled {
+        // Team-lead review (2026-08-23, move-resize real-host run): WINDOW_SMOKE_MOVE closes
+        // its own About target the same way (its own SC_CLOSE leg, Fix 2) -- identical
+        // exclusion, extending the pattern this comment already establishes.
+        if launchedAppKind == .winver, inputTestMode == nil, !maximizeScenarioEnabled, !moveResizeScenarioEnabled {
             if let aboutWindow {
                 let w = aboutWindow.frame.width
                 let h = aboutWindow.frame.height
@@ -1697,6 +2129,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                     + "is still open at t=25s (its own close leg may still be in flight, or may have failed); the "
                     + "maximize-scenario assertions above are authoritative for this run, not this generic "
                     + "paint/size check")
+            } else if moveResizeScenarioEnabled {
+                print("[info] move-resize scenario active -- the About-Windows window (id \(aboutWindow.windowId)) "
+                    + "is still open at t=25s (its own close leg may still be in flight, or may have failed); the "
+                    + "move-resize-scenario assertions above are authoritative for this run, not this generic "
+                    + "paint/size check")
             } else {
                 print("[info] an About-Windows-titled window (id \(aboutWindow.windowId)) is present but this run "
                     + "launched \(launchedProgram), not winver.exe -- not the anchor for this run, informational only")
@@ -1716,6 +2153,21 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                     + "own close leg did not confirm success (closeResult=\(String(describing: closeResult))) -- "
                     + "this is NOT necessarily evidence of a successful close; see the maximize-scenario "
                     + "assertions above, which are authoritative here")
+            }
+        } else if moveResizeScenarioEnabled {
+            // Team-lead review (2026-08-23, move-resize real-host run): mirrors the
+            // maximizeScenarioEnabled branch immediately above, for WINDOW_SMOKE_MOVE's own
+            // SC_CLOSE leg (Fix 2) instead of maximize's.
+            if moveResizeCloseResult == true {
+                print("[info] move-resize scenario active -- no About-Windows window remains open, consistent "
+                    + "with the scenario's own SC_CLOSE leg succeeding; see the move-resize-scenario assertions "
+                    + "above, which are authoritative here")
+            } else {
+                print("[info] move-resize scenario active -- no About-Windows window remains open, but the "
+                    + "scenario's own close leg did not confirm success "
+                    + "(moveResizeCloseResult=\(String(describing: moveResizeCloseResult))) -- this is NOT "
+                    + "necessarily evidence of a successful close; see the move-resize-scenario assertions above, "
+                    + "which are authoritative here")
             }
         } else if inputTestMode != nil {
             // W4c review M2+M3: this branch used to unconditionally claim "consistent with
@@ -1921,6 +2373,77 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 )
             } else {
                 check(false, "maximize scenario: the close leg ran before the run ended")
+            }
+        }
+
+        // Phase 2 W3 (docs/plans/phase2.md §2 W3): local move/resize -> server sync
+        // automated acceptance -- gating only when WINDOW_SMOKE_MOVE was actually set for
+        // this run. See runMoveResizeScenario's own doc comment for the acknowledged
+        // honesty gap (programmatic setFrame, not a live-resize-notification-driving real
+        // drag) and why the resize leg still runs against the (non-resizable) About window
+        // anyway.
+        if moveResizeScenarioEnabled {
+            if let moveResult {
+                // Team-lead review round 6: POSITION-only, not full-rect -- see
+                // evaluateMoveResizeLeg's own doc comment for why size is out of scope for a
+                // pure move (the server's own prerogative to remap the surface mid-move,
+                // observed live this round).
+                check(
+                    moveResult.matched,
+                    "move-resize scenario: move leg's WindowUpdate round-tripped to the new POSITION (±1pt) "
+                        + "within 3s -- size is not asserted here, it is the server's own prerogative for a pure "
+                        + "move (see runMoveResizeScenario's own doc comment)"
+                )
+                check(
+                    !moveResult.oscillated,
+                    "move-resize scenario: move leg settled without POSITION oscillation (no later WindowUpdate "
+                        + "diverged from the matched target's x/y)"
+                )
+            } else {
+                check(false, "move-resize scenario: a target window was locked and the move leg was sent before the run ended")
+            }
+            // Team-lead review round 4 (no-false-red discipline): the resize leg's own
+            // round-trip is gated (counts toward pass/fail) only when the real target
+            // window was actually resizable at send time -- for a non-resizable target
+            // (About, always) a wire-level round-trip mismatch is not evidence of a real
+            // product defect the same way it would be for a genuinely resizable window
+            // (see `moveResizeTargetIsResizable`'s own doc comment), so it's reported as
+            // `[info]` only, never flipping `ok`.
+            if let resizeResult {
+                if moveResizeTargetIsResizable == true {
+                    check(
+                        resizeResult.matched,
+                        "move-resize scenario: resize leg's WindowUpdate round-tripped to the new content rect "
+                            + "within ±1pt within 3s"
+                    )
+                    check(!resizeResult.oscillated, "move-resize scenario: resize leg settled without oscillation")
+                } else {
+                    print(
+                        "[info] move-resize scenario: resize leg's target window was NOT resizable at send time "
+                            + "(About is never resizable -- StyleTranslatorTests' aboutWindowsDialogShape) -- "
+                            + "matched=\(resizeResult.matched) oscillated=\(resizeResult.oscillated), reported "
+                            + "informationally, not gated"
+                    )
+                }
+            } else {
+                check(false, "move-resize scenario: the resize leg ran before the run ended (may be skipped if the move leg itself never resolved)")
+            }
+            // Fix 2 (team-lead review, 2026-08-23 real-host run): only gated once the close
+            // leg actually got sent (`moveResizeCloseTargetId` set in the
+            // `.awaitingResizeSettle` case above) -- if the resize leg itself never resolved
+            // (already reported false above), there was no window left to reliably target a
+            // close at, matching the maximize scenario's own "leg may be skipped" precedent.
+            if let moveResizeCloseTargetId {
+                if let moveResizeCloseResult {
+                    check(
+                        moveResizeCloseResult,
+                        "move-resize scenario (Fix 2): SC_CLOSE for windowId=\(moveResizeCloseTargetId) produced a "
+                            + "WindowDelete within 5s (harness cleanup -- avoids leaving a stale About window for a "
+                            + "later WINDOW_SMOKE_CYCLES soak to lock onto)"
+                    )
+                } else {
+                    check(false, "move-resize scenario: the close leg was sent before the run ended")
+                }
             }
         }
 

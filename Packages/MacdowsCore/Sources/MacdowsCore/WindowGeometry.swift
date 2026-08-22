@@ -117,3 +117,129 @@ public enum WindowGeometry {
         MacPoint(x: windowsPoint.x, y: primaryMonitorHeight - windowsPoint.y)
     }
 }
+
+/// Phase 2 W3 round 3 (2026-08-23, real-host regression, team-lead review): a signed,
+/// per-window correction between RAIL's own reported `WINDOW_ORDER_FIELD_WND_SIZE`
+/// (`windowWidth`/`windowHeight`) and what this window's content view actually DISPLAYS
+/// (the GFX `MapSurfaceToWindow` order's `mappedWidth`/`mappedHeight` -- definitionally the
+/// displayed size, since `RemoteWindow.present`'s `contentsRect` crop already targets it).
+///
+/// Real-host evidence (About window, this fix's own origin): raw RAIL
+/// `offsetX=338 offsetY=62 windowWidth=494 windowHeight=500` against a GFX-mapped visible
+/// size of `508x507` -- `width`/`height` below are `mapped - RAIL`, so `(+14, +7)` for this
+/// window: the displayed content is LARGER than what RAIL calls this window's own size, not
+/// smaller (the earlier, inverted assumption -- "RAIL is the outer rect, visible content is
+/// inset from it" -- doubled the round-trip error instead of cancelling it once real wire
+/// data was actually checked).
+///
+/// `originX`/`originY` are ZERO in this correction, deliberately, not merely "not yet
+/// measured": `RDPGFX_MAP_SURFACE_TO_WINDOW_PDU` (`CRSession.mm`'s own
+/// `crb_gfx_map_surface_to_window`) carries ONLY `mappedWidth`/`mappedHeight` -- no
+/// position field exists on that PDU to derive an origin delta from at all, and RAIL's own
+/// `offsetX`/`offsetY` (`WINDOW_ORDER_FIELD_WND_OFFSET`) is the only position signal this
+/// client ever receives for a window, so there is no independent second measurement to
+/// diff it against the way `mappedWidth`/`mappedHeight` diffs against `windowWidth`/
+/// `windowHeight`. Modeling it as an unconditionally-zero field of a general 4-component
+/// correction (rather than omitting origin correction from the type entirely) keeps this a
+/// documented, deliberate "no evidence for a nonzero value" finding rather than a silent
+/// structural absence -- flagged for W4's shaped-window work to revisit if a future PDU or
+/// sample ever supplies an independent position measurement to correct against.
+public struct WindowGeometryCorrection: Equatable, Sendable {
+    public var originX: Double
+    public var originY: Double
+    public var width: Double
+    public var height: Double
+
+    public init(originX: Double, originY: Double, width: Double, height: Double) {
+        self.originX = originX
+        self.originY = originY
+        self.width = width
+        self.height = height
+    }
+
+    public static let zero = WindowGeometryCorrection(originX: 0, originY: 0, width: 0, height: 0)
+}
+
+extension WindowGeometry {
+    /// Applies `correction` to `railRect` (RAIL's own reported Windows-space rect),
+    /// producing the rect that should actually be displayed -- the inbound direction.
+    /// `RemoteWindowRegistry.macContentRect(for:windowId:)` calls this before the existing
+    /// `macRect(from:primaryMonitorHeight:)` conversion, so the two corrections (RAIL-size
+    /// vs display-size, then Windows-space vs mac-space) compose rather than duplicate each
+    /// other's job.
+    public static func displayRect(from railRect: WindowsRect, correction: WindowGeometryCorrection) -> WindowsRect {
+        WindowsRect(
+            x: railRect.x + correction.originX, y: railRect.y + correction.originY,
+            width: railRect.width + correction.width, height: railRect.height + correction.height
+        )
+    }
+
+    /// The exact inverse of `displayRect(from:correction:)` -- the outbound direction.
+    /// `RemoteWindowRegistry.handleLocalGeometrySettled` calls this after
+    /// `windowsRect(from:primaryMonitorHeight:)`, before turning the result into the
+    /// `left`/`top`/`right`/`bottom` `ClientWindowMove` sends. Round-tripping any
+    /// `WindowsRect` through `displayRect(from:correction:)` then this function, with the
+    /// SAME `correction`, is always the identity — verified by
+    /// `WindowGeometryTests.railDisplayRoundTripIsIdentity` using this fix's own real-host
+    /// numbers, a property that holds regardless of what `correction`'s actual values turn
+    /// out to be (including the current all-zero-origin one), so no future edit to either
+    /// function can silently reintroduce a sign mismatch between the two directions without
+    /// that test catching it.
+    public static func railRect(from displayRect: WindowsRect, correction: WindowGeometryCorrection) -> WindowsRect {
+        WindowsRect(
+            x: displayRect.x - correction.originX, y: displayRect.y - correction.originY,
+            width: displayRect.width - correction.width, height: displayRect.height - correction.height
+        )
+    }
+
+    /// Team-lead review round 5 (2026-08-23, real-host evidence: THREE separate runs each
+    /// sent `left=331` and received `338` in the immediate next `WindowUpdate`, a clean +7
+    /// every time). Deliberately NOT a `WindowGeometryCorrection.originX` applied through
+    /// `displayRect`/`railRect` above, even though that was the team lead's own first
+    /// proposal -- worked through here because the sign/placement matters and a wrong one
+    /// has already cost two prior rounds.
+    ///
+    /// THE ALGEBRA: let `V` be the true visible-space X target (this round: 331), `B` the
+    /// measured left-border amount (7). The evidence's own causal chain (self-consistent,
+    /// verified against the actual send/echo pair, not merely asserted):
+    /// 1. We sent `left = V` (331) UNCORRECTED. The server received it and set its window's
+    ///    OUTER rect's left to exactly that: `outer_left = 331`.
+    /// 2. The server's window has an invisible LEFT border of width `B`: the VISIBLE content
+    ///    sits INSET from the outer edge by `B`, i.e. `visible_left = outer_left + B`.
+    /// 3. `WindowUpdate.offsetX` reports `visible_left` directly (no further correction --
+    ///    this is the "inbound already correct" half of the finding, unchanged by this fix).
+    /// 4. `visible_left = 331 + 7 = 338` -- exactly the observed echo. Self-consistent.
+    ///
+    /// Solving forward (what SHOULD be sent so the resulting visible_left lands on `V`, not
+    /// `V+B`): `V = outer_left_to_send + B` => `outer_left_to_send = V - B`. This function
+    /// is exactly that subtraction.
+    ///
+    /// WHY NOT fold this into `WindowGeometryCorrection.originX` (the team lead's literal
+    /// instruction): `displayRect`/`railRect` apply the SAME correction symmetrically both
+    /// directions. Setting `originX` nonzero to fix outbound would ALSO shift every INBOUND
+    /// `WindowUpdate.offsetX` read by the same amount (`displayRect.x = railRect.x +
+    /// originX`) -- but step 3 above is exactly the evidence that inbound needs NO
+    /// correction at all. Applying it symmetrically would fix the send and simultaneously
+    /// break every subsequent read by re-introducing the same error in the opposite
+    /// direction. Verified by direct substitution before writing this function, not assumed
+    /// -- see `WindowGeometryTests.clientWindowMoveLeftAppliesTheMeasuredBorder` for the
+    /// worked check that this specific (asymmetric, outbound-only) shape is what actually
+    /// reconciles both the send and the read against the real numbers.
+    ///
+    /// SCOPE, deliberately narrow: only X/`left` has three consistent real-host
+    /// measurements. Y was never actually tested this round (a separate AppKit frame-clamp
+    /// bug meant Y never genuinely moved at all -- see `RemoteWindow`'s own real-host
+    /// regression notes on the harness fix), so no analogous Y adjustment is applied here;
+    /// `top`/`bottom` stay exactly as `railRect(from:correction:)` computes them. Also
+    /// deliberately does NOT touch width/right: the measured value happens to equal half of
+    /// this window's own separately-measured `sizeCorrection.width` (14/2=7), but that could
+    /// be numerical coincidence for this one window's border -- extrapolating a matching
+    /// "right also needs +7" adjustment would assume a symmetric-border model that actually
+    /// CONTRADICTS the already-validated size correction's own sign (`mapped > RAIL` for
+    /// width, the opposite direction a left+right-inflating border would imply for an
+    /// "outer" rect) -- left uncorrected pending real evidence, not silently assumed either
+    /// way.
+    public static func clientWindowMoveLeft(fromVisibleLeft visibleLeft: Double, measuredLeftBorder: Double) -> Double {
+        visibleLeft - measuredLeftBorder
+    }
+}

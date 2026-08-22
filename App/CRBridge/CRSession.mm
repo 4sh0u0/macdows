@@ -2058,6 +2058,21 @@ cleanup:
     crdpq_outbound_post(_outboundQueue, &cmd);
 }
 
+- (void)sendWindowMove:(uint32_t)windowId left:(int32_t)left top:(int32_t)top right:(int32_t)right bottom:(int32_t)bottom
+{
+    if (!_outboundQueue)
+        return;
+    CrdpCommand cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = CRDPQ_CMD_WINDOW_MOVE;
+    cmd.payload.windowMove.windowId = windowId;
+    cmd.payload.windowMove.left = left;
+    cmd.payload.windowMove.top = top;
+    cmd.payload.windowMove.right = right;
+    cmd.payload.windowMove.bottom = bottom;
+    crdpq_outbound_post(_outboundQueue, &cmd);
+}
+
 - (void)executeProgram:(NSString *)program
 {
     if (!_outboundQueue)

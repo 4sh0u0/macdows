@@ -287,7 +287,25 @@ final class RemoteWindowRegistry {
         case .windowDelete:
             handleWindowDelete(windowId: event.windowId)
         case .surfaceMapped:
-            surfaceToWindow[event.surfaceId] = UInt32(truncatingIfNeeded: event.mappedWindowId)
+            let windowId = UInt32(truncatingIfNeeded: event.mappedWindowId)
+            // Team-lead review round 5 (2026-08-23): "surfaces can remap" -- a window's
+            // surfaceId is not guaranteed stable for the window's whole lifetime (a resize
+            // or other server-side event can trigger a fresh MapSurfaceToWindow for a NEW
+            // surfaceId pointing at the SAME windowId). Without this cleanup,
+            // `surfaceToWindow` could accumulate multiple surfaceId entries all mapping to
+            // this windowId, and `mappedSize(forWindowId:)`'s own linear `.first(where:)`
+            // scan has no ordering guarantee -- it could return a STALE surface's size
+            // instead of the current one, exactly the kind of drift that made
+            // `sizeCorrection(for:windowId:)` observed live to evaluate to zero mid-session.
+            // Enforcing windowId -> surfaceId as strictly 1:1 here (removing any OTHER
+            // surfaceId this windowId was previously associated with) is what actually
+            // guarantees that scan can only ever find the current mapping.
+            let staleSurfaceIds = surfaceToWindow.filter { $0.value == windowId && $0.key != event.surfaceId }.map(\.key)
+            for staleId in staleSurfaceIds {
+                surfaceToWindow.removeValue(forKey: staleId)
+                surfaceMappedSize.removeValue(forKey: staleId)
+            }
+            surfaceToWindow[event.surfaceId] = windowId
             // The mapped sub-rect of the (64-aligned, padded) surface this window shows --
             // consumed by RemoteWindow.present's contentsRect crop; see its comment for
             // why skipping this crop was the white-edges/dead-clicks root cause.
@@ -301,13 +319,22 @@ final class RemoteWindowRegistry {
             closeAllWindows()
         case .monitoredDesktop:
             handleMonitoredDesktop(event)
-        case .localMoveSize, .minMaxInfo, .zOrderSync:
-            // adr/0008 §1/§6: contract-only wiring -- these three now decode and reach
-            // here, but no sync/policy code exists yet ("拿到真数据前不写策略"). LocalMoveSize
-            // in particular was never observed in any phase05 sample (adr/0008 §0's
-            // caveat); logging its first live occurrence is a verification step, not
-            // acted-upon data.
-            Self.logger.debug("received \(String(describing: event.kind), privacy: .public) windowId=\(event.windowId, privacy: .public) (recorded only, no policy attached -- adr/0008 §6)")
+        case .localMoveSize:
+            // Phase 2 W3 (docs/plans/phase2.md §2 W3, adr/0008 §1): the two simplest
+            // ServerLocalMoveSize semantics only -- start/stop suppression. Full LMS_*
+            // keyboard-move semantics (what moveSizeType actually encodes) stay explicitly
+            // out of scope for this slice.
+            handleLocalMoveSize(event)
+        case .minMaxInfo:
+            // Phase 2 W3 task item 3: apply track-size constraints as NSWindow.minSize/
+            // maxSize.
+            handleMinMaxInfo(event)
+        case .zOrderSync:
+            // adr/0008 §6 / adr/0012 §5: Z-order *sequencing* policy stays explicitly out
+            // of this ADR's scope -- ZOrderSync itself carries no array (see
+            // CRDPEvent.windowId's own doc comment), the real Z-order array arrives via
+            // MonitoredDesktop and is already applied in `applyZOrder` above.
+            Self.logger.debug("received zOrderSync windowIdMarker=\(event.windowId, privacy: .public) (recorded only, no policy attached -- adr/0008 §6)")
         case .windowIcon, .notifyIconCreate, .notifyIconUpdate, .notifyIconDelete,
              .execResult, .handshakeFlags:
             break
@@ -333,6 +360,53 @@ final class RemoteWindowRegistry {
             applyZOrder(desktopState.windowIds)
         }
         execute(focusAuthority.serverDesktopUpdate(rawActiveWindowId: event.windowId, at: CFAbsoluteTimeGetCurrent()))
+    }
+
+    /// Diagnostics only -- true once the first `ServerLocalMoveSize` event of this
+    /// registry's lifetime has been logged verbatim (adr/0008 §0's caveat: this wire shape
+    /// was NEVER observed in any of the six phase05 samples, so its first live receipt is a
+    /// verification event for the shape itself, not already-proven data -- team-lead
+    /// instruction to log raw values on first receipt).
+    private var loggedFirstLocalMoveSize = false
+
+    /// Phase 2 W3 task item 4 (docs/plans/phase2.md §2 W3): ServerLocalMoveSize's two
+    /// simplest semantics only -- `isMoveSizeStart` begins geometry-application suppression
+    /// for this window (the server announcing a move/size modality is the same "don't fight
+    /// an in-flight gesture" situation a native local drag creates, adr/0012's
+    /// optimistic-prediction principle applied to geometry); the stop transition releases it
+    /// and treats it like a settle (`RemoteWindow.endServerAnnouncedMoveResize`'s own doc
+    /// comment). What `moveSizeType` actually encodes (the LMS_* keyboard-move handshake)
+    /// stays explicitly out of scope for this slice -- logged verbatim, not interpreted.
+    private func handleLocalMoveSize(_ event: CRDPEvent) {
+        if !loggedFirstLocalMoveSize {
+            loggedFirstLocalMoveSize = true
+            Self.logger.debug(
+                "first ServerLocalMoveSize received (UNVERIFIED wire shape, adr/0008 §0/§1): windowId=\(event.windowId, privacy: .public) isMoveSizeStart=\(event.isMoveSizeStart, privacy: .public) moveSizeType=\(event.moveSizeType, privacy: .public) posX=\(event.moveSizePosX, privacy: .public) posY=\(event.moveSizePosY, privacy: .public)")
+        } else {
+            Self.logger.debug(
+                "ServerLocalMoveSize windowId=\(event.windowId, privacy: .public) isMoveSizeStart=\(event.isMoveSizeStart, privacy: .public) moveSizeType=\(event.moveSizeType, privacy: .public)")
+        }
+        guard let window = windows[event.windowId] else { return }
+        if event.isMoveSizeStart {
+            window.beginServerAnnouncedMoveResize()
+        } else {
+            window.endServerAnnouncedMoveResize()
+        }
+    }
+
+    /// Phase 2 W3 task item 3 (docs/plans/phase2.md §2 W3, adr/0008 §1): applies
+    /// `ServerMinMaxInfo`'s track-size fields to this window's `NSWindow.minSize`/`.maxSize`
+    /// via `MacdowsCore.MinMaxInfoTranslator` (pure sentinel-filtering logic) +
+    /// `RemoteWindow.applyTrackSizeConstraints` (the AppKit application) -- same
+    /// "translate in MacdowsCore, apply in the App target" split `isMappableWindow`/`chrome`
+    /// above already establish.
+    private func handleMinMaxInfo(_ event: CRDPEvent) {
+        guard let window = windows[event.windowId] else { return }
+        let constraints = MinMaxInfoTranslator.constraints(
+            minTrackWidth: event.minTrackWidth, minTrackHeight: event.minTrackHeight,
+            maxTrackWidth: event.maxTrackWidth, maxTrackHeight: event.maxTrackHeight
+        )
+        window.applyTrackSizeConstraints(constraints)
     }
 
     /// Phase 2 W1's final slice (docs/plans/phase2.md §2 W1, §9 D3; adr/0008 §2a/§4;
@@ -555,9 +629,9 @@ final class RemoteWindowRegistry {
             return
         }
 
-        let frame = macFrame(for: state)
+        let contentRect = macContentRect(for: state, windowId: windowId)
         if let existing = windows[windowId] {
-            existing.updateFrame(frame)
+            existing.updateFrame(contentRect: contentRect)
             existing.updateTitle(state.title)
             // Phase 2 W2 task item 3: re-derived on every order, cheap and correct either
             // way -- RemoteWindow.applyChrome's own `appliedChrome` equality check already
@@ -582,7 +656,7 @@ final class RemoteWindowRegistry {
             }
         } else {
             let key = RemoteWindowKey(windowId: windowId, generation: generation)
-            let window = RemoteWindow(key: key, frame: frame, title: state.title)
+            let window = RemoteWindow(key: key, contentRect: contentRect, title: state.title)
             window.onInput = { [weak self] event in
                 self?.handleInput(windowId: windowId, event: event)
             }
@@ -591,6 +665,14 @@ final class RemoteWindowRegistry {
             // authority -- see RemoteWindow.onChromeAction's own doc comment).
             window.onChromeAction = { [weak self] action in
                 self?.handleChromeAction(windowId: windowId, action: action)
+            }
+            // Phase 2 W3: native drag/resize settle, or the server's own
+            // ServerLocalMoveSize stop -- both route through the same
+            // RemoteWindow.onLocalGeometrySettled closure (see that property's own doc
+            // comment); this registry's only job is the coordinate conversion and the
+            // actual CRSession.sendWindowMove call.
+            window.onLocalGeometrySettled = { [weak self] contentRect in
+                self?.handleLocalGeometrySettled(windowId: windowId, contentRect: contentRect)
             }
             window.applyChrome(Self.chrome(for: state))
             windows[windowId] = window
@@ -601,15 +683,123 @@ final class RemoteWindowRegistry {
     /// The one and only place Windows-space geometry becomes an `NSRect` — always through
     /// `MacdowsCore.WindowGeometry`, per the W4b task spec's explicit instruction never
     /// to reimplement this math anywhere else in this layer.
-    private func macFrame(for state: PendingWindowState) -> NSRect {
-        let windowsRect = WindowsRect(
-            x: Double(state.offsetX),
-            y: Double(state.offsetY),
-            width: Double(state.width),
-            height: Double(state.height)
-        )
+    ///
+    /// Real-host regression (2026-08-23, W3 first live verification, formerly named
+    /// `macFrame(for:)`): RAIL's `offsetX/offsetY/width/height` describe the remote
+    /// window's own OUTER rect as the remote desktop sees it -- the content view displays
+    /// those exact remote pixels verbatim (remote titlebar included, see
+    /// `RemoteWindow.init`'s own doc comment), so this conversion's result is the target
+    /// window's CONTENT rect, never its `NSWindow.frame` directly. Renamed from `macFrame`
+    /// to make that explicit at every call site; the arithmetic itself (`WindowGeometry.
+    /// macRect(from:primaryMonitorHeight:)`) was always correct -- only the RESULT's meaning
+    /// was mislabeled. `RemoteWindow.updateFrame(contentRect:)` is what actually derives the
+    /// real outer frame from this value, via `NSWindow.frameRect(forContentRect:)`.
+    ///
+    /// Second real-host regression (2026-08-23, W3 round 2 -> round 3, team-lead review):
+    /// round 2 assumed RAIL's rect was the OUTER (larger) rect, visible content INSET from
+    /// it -- WRONG, and confirmed wrong by the very debug line that round added
+    /// (`Tools/window-smoke`'s `[move-resize] raw RAIL geometry`): a real capture showed
+    /// `offsetX=338 offsetY=62 windowWidth=494 windowHeight=500` against a GFX-mapped
+    /// (displayed) size of `508x507` -- RAIL's rect is SMALLER than what's displayed, not
+    /// larger. Subtracting a positive inset therefore moved the round-trip further from
+    /// correct, not closer (round 2's own numbers: sent a target based on 494x500-ish
+    /// content, still `matched=false`).
+    ///
+    /// Round 3 reframes around the one fact that IS unambiguous (team-lead review): the GFX
+    /// `MapSurfaceToWindow` order's `mappedWidth`/`mappedHeight` is, definitionally, what
+    /// gets displayed -- `RemoteWindow.present`'s own `contentsRect` crop already targets it
+    /// (adr/0005 §2). Before this fix, this window's actual on-screen content SIZE tracked
+    /// RAIL's `windowWidth`/`windowHeight` (494x500) while the CALayer's `contentsGravity
+    /// == .resize` stretched the (correctly cropped) `508x507`-visible image to fit that
+    /// smaller content view -- a real ~2.8%/1.4% stretch distortion, independent of and
+    /// compounding the round-trip position bug, now eliminated as a side effect of this fix
+    /// (confirmed by inspecting `present(surface:mappedSize:via:)`: `contentsRect` only
+    /// crops the SOURCE image within the surface's own 64-aligned allocation, it has no
+    /// opinion on the DESTINATION layer/content-view size at all, so a content-view size
+    /// mismatch was always silently absorbed as a stretch, never caught).
+    ///
+    /// `sizeCorrection(for:windowId:)` below returns `MacdowsCore.WindowGeometryCorrection`
+    /// (mapped-minus-RAIL, signed, `origin{X,Y} == 0`) MEASURED per-window from data already
+    /// flowing through this registry, no wire-protocol extension needed (MS-RDPERP does
+    /// carry a more direct field for exactly this concept --
+    /// `resizeMarginLeft/Top/Right/Bottom`, `WINDOW_ORDER_FIELD_RESIZE_MARGIN_X/Y`,
+    /// `freerdp/window.h:217-220` -- but adr/0008 §0's own sample survey found those bits
+    /// inconsistently present across observed WindowCreate `fieldFlags` values, `0x1100DF1E`
+    /// lacks them where `0x1900DF9E` has them; wiring a new crdpq POD field for an
+    /// inconsistently-sent value needs its own adr/0008-style sample verification pass, out
+    /// of scope for this slice). `WindowGeometry.displayRect(from:correction:)` applies it;
+    /// see that function's own doc comment for the round-trip-identity guarantee
+    /// `WindowGeometryTests` locks down offline.
+    ///
+    /// Origin is NOT corrected (`WindowGeometryCorrection.originX/Y == 0` always, this
+    /// slice): `RDPGFX_MAP_SURFACE_TO_WINDOW_PDU` (`CRSession.mm`'s
+    /// `crb_gfx_map_surface_to_window`) carries ONLY `mappedWidth`/`mappedHeight` -- no
+    /// position field exists to diff against RAIL's `offsetX`/`offsetY` the way
+    /// `mappedWidth`/`mappedHeight` diffs against `windowWidth`/`windowHeight`, and RAIL's
+    /// own offset is the only position signal this client ever receives at all, so there is
+    /// no second, independent measurement to derive an origin delta from (verified by
+    /// reading the actual PDU decode, not assumed). Zero-origin also matches the physically
+    /// simplest reading of the one real measurement available: anchoring the window's
+    /// top-left at RAIL's own `offsetX`/`offsetY` unchanged, and letting the extra
+    /// mapped-vs-RAIL size grow toward increasing X/Y (right/down) from that anchor, is
+    /// consistent with a capture surface that simply extends a few extra rows/columns past
+    /// the window's own reported client rect on those two edges -- a coherent physical
+    /// story, not merely "we had no better idea." Flagged in `WindowGeometryCorrection`'s
+    /// own doc comment for W4's shaped-window work to revisit if future evidence ever
+    /// supplies an independent position measurement.
+    private func macContentRect(for state: PendingWindowState, windowId: UInt32) -> NSRect {
+        let correction = sizeCorrection(for: state, windowId: windowId)
+        let railRect = WindowsRect(x: Double(state.offsetX), y: Double(state.offsetY), width: Double(state.width), height: Double(state.height))
+        let windowsRect = WindowGeometry.displayRect(from: railRect, correction: correction)
         let macRect = WindowGeometry.macRect(from: windowsRect, primaryMonitorHeight: Self.primaryMonitorHeight)
         return NSRect(x: macRect.x, y: macRect.y, width: macRect.width, height: macRect.height)
+    }
+
+    /// The signed, per-window `MacdowsCore.WindowGeometryCorrection` (mapped size minus
+    /// RAIL's own reported size, `origin{X,Y} == 0`) -- see `macContentRect(for:windowId:)`'s
+    /// own doc comment for the full real-host finding and reasoning this implements.
+    /// MEASURED: `mappedSize(forWindowId:)` is the GFX `MapSurfaceToWindow` order's own
+    /// `mappedWidth`/`mappedHeight` (already captured by `surfaceMappedSize` for
+    /// `RemoteWindow.present`'s `contentsRect` crop), the actual pixel dimensions the server
+    /// rendered for this window -- whatever a given DPI/theme/Windows-build combination
+    /// happens to produce, not assumed. Re-read at EVERY call (never cached) -- team-lead
+    /// review round 5 (2026-08-23): the mapped size itself changed mid-session in one real
+    /// run (536x521 -> 522x514, "surfaces can remap"), so this must reflect current state at
+    /// send/apply time, not a value captured once at window-creation time.
+    ///
+    /// Real-host regression (round 5): guard failure used to fall back to a hardcoded
+    /// nonzero constant (`(14, 7)`, cited from a single earlier run) -- observed live to
+    /// produce a WRONG, silently-wrong correction when the guard passed on stale/garbage
+    /// data that merely happened to look valid (`state.width > 0` doesn't guarantee `state`
+    /// reflects THIS window's current reality if `geometry[windowId]` was itself stale).
+    /// Changed to "skip correction (return `.zero`) and warn" per team-lead instruction: a
+    /// wrong guess is worse than no correction at all, and the warning makes a
+    /// missing/degraded measurement an OBSERVABLE event instead of a silent wrong number --
+    /// matches this codebase's established fail-open discipline (adr/0008 §4).
+    private func sizeCorrection(for state: PendingWindowState, windowId: UInt32) -> WindowGeometryCorrection {
+        guard let mapped = mappedSize(forWindowId: windowId), mapped.width > 0, mapped.height > 0,
+              state.width > 0, state.height > 0
+        else {
+            let mappedDescription = String(describing: mappedSize(forWindowId: windowId))
+            Self.logger.warning(
+                "sizeCorrection: no valid measurement for windowId=\(windowId, privacy: .public) (mappedSize=\(mappedDescription, privacy: .public) RAIL size=\(state.width, privacy: .public)x\(state.height, privacy: .public)) -- skipping correction (.zero) rather than guessing"
+            )
+            return .zero
+        }
+        return WindowGeometryCorrection(
+            originX: 0, originY: 0,
+            width: Double(mapped.width) - Double(state.width),
+            height: Double(mapped.height) - Double(state.height)
+        )
+    }
+
+    /// Reverse lookup over `surfaceToWindow` (which only maps surfaceId -> windowId) for
+    /// `sizeCorrection(for:windowId:)`'s own need to go the other way -- a linear scan, but
+    /// over at most a handful of live surfaces per session, called only on a window-order or
+    /// local-geometry-settle event, never per-frame.
+    private func mappedSize(forWindowId windowId: UInt32) -> CGSize? {
+        guard let surfaceId = surfaceToWindow.first(where: { $0.value == windowId })?.key else { return nil }
+        return surfaceMappedSize[surfaceId]
     }
 
     private func handleWindowDelete(windowId: UInt32) {
@@ -654,9 +844,9 @@ final class RemoteWindowRegistry {
     /// W4c: routes one `RemoteWindowInputEvent` from `windowId`'s `RemoteWindow` to
     /// `CRSession` (adr/0005's Phase 1 "clickable/interactive" milestone). This is the
     /// one and only place a mac-screen point becomes a Windows-space absolute desktop
-    /// coordinate for *input* — mirrors `macFrame(for:)` being the one and only place the
-    /// reverse direction happens for window geometry; `RemoteWindowContentView` never does
-    /// this conversion itself.
+    /// coordinate for *input* — mirrors `macContentRect(for:)` being the one and only place
+    /// the reverse direction happens for window geometry; `RemoteWindowContentView` never
+    /// does this conversion itself.
     private func handleInput(windowId: UInt32, event: RemoteWindowInputEvent) {
         switch event {
         case .mouseMoved(let screenPoint):
@@ -895,8 +1085,91 @@ final class RemoteWindowRegistry {
         session.sendMouseMoveTo(x: Int32(point.x), y: Int32(point.y))
     }
 
+    /// Phase 2 W3 (docs/plans/phase2.md §2 W3): the one and only place a settled local
+    /// window CONTENT rect becomes a `CRSession.sendWindowMove` call -- the exact inverse of
+    /// `macContentRect(for:)` above, through the same `MacdowsCore.WindowGeometry` conversion
+    /// every other geometry boundary crossing in this file already uses
+    /// (`WindowGeometry.windowsRect(from:primaryMonitorHeight:)` is literally
+    /// `macRect(from:primaryMonitorHeight:)`'s documented inverse). `contentRect` arrives
+    /// already converted from `NSWindow.frame` to the content rect by `RemoteWindow` itself
+    /// (`window.contentRect(forFrameRect:)`, an AppKit-chrome fact that class already owns --
+    /// see `RemoteWindow.onLocalGeometrySettled`'s own doc comment; real-host regression,
+    /// 2026-08-23: this method used to receive and convert the raw frame directly, which was
+    /// off by exactly this window's chrome insets once W2 gave it a native titlebar). RAIL's
+    /// own `RAIL_WINDOW_MOVE_ORDER`/`crdpq_cmd_window_move_t` are RECT-shaped (left/top/
+    /// right/bottom), not x/y/width/height -- `right`/`bottom` are derived here, at this one
+    /// call site, rather than trusting `CRSession.sendWindowMove` to do that arithmetic (see
+    /// that method's own doc comment for why its signature is shaped to make that mistake
+    /// impossible to reintroduce elsewhere). Values are rounded, not truncated, before
+    /// narrowing to `Int32` -- an unrounded truncation would systematically bias every
+    /// settled rect's right/bottom edge down-and-left by up to 1pt.
+    ///
+    /// Second real-host regression (2026-08-23, W3 round 2 -> round 3): `contentRect` is the
+    /// DISPLAYED (GFX-mapped-size) rect (see `macContentRect(for:windowId:)`'s own doc
+    /// comment for the full reframing) -- `ClientWindowMove` needs RAIL's own size
+    /// convention, same as `WindowUpdate` sends it inbound, so `WindowGeometry.railRect(
+    /// from:correction:)` (the exact, tested inverse of `displayRect(from:correction:)`
+    /// `macContentRect` uses inbound) converts back here, using the SAME
+    /// `sizeCorrection(for:windowId:)` value both directions share -- neither direction can
+    /// drift out of sync with the other since both call the same correction lookup and the
+    /// same pair of inverse pure functions.
+    private func handleLocalGeometrySettled(windowId: UInt32, contentRect: NSRect) {
+        guard Self.primaryMonitorHeight > 0 else { return } // L1: see macContentRect(for:)'s own guard
+        let macRect = MacRect(x: contentRect.origin.x, y: contentRect.origin.y, width: contentRect.size.width, height: contentRect.size.height)
+        let displayedWindowsRect = WindowGeometry.windowsRect(from: macRect, primaryMonitorHeight: Self.primaryMonitorHeight)
+        let correction = sizeCorrection(for: geometry[windowId] ?? PendingWindowState(), windowId: windowId)
+        let railWindowsRect = WindowGeometry.railRect(from: displayedWindowsRect, correction: correction)
+        // Team-lead review round 5 (2026-08-23): `railWindowsRect.x` above is the VISIBLE
+        // left -- `ClientWindowMove`'s own `left` needs the additional, asymmetric,
+        // outbound-only border correction `WindowGeometry.clientWindowMoveLeft`'s own doc
+        // comment works the full algebra for (three consecutive real-host runs each showed
+        // a clean +7 echo). `right` shifts by the same amount as a direct consequence of
+        // `left` shifting while `railWindowsRect.width` itself is untouched -- see that
+        // function's own doc comment for why width/right are deliberately NOT also adjusted
+        // (no matching evidence, and a naive symmetric-border guess for width would actually
+        // contradict the already-validated size-correction sign).
+        let correctedLeft = WindowGeometry.clientWindowMoveLeft(
+            fromVisibleLeft: railWindowsRect.x, measuredLeftBorder: Self.measuredClientWindowMoveLeftBorder
+        )
+        let left = Int32(correctedLeft.rounded())
+        let top = Int32(railWindowsRect.y.rounded())
+        let right = Int32((correctedLeft + railWindowsRect.width).rounded())
+        let bottom = Int32((railWindowsRect.y + railWindowsRect.height).rounded())
+        session.sendWindowMove(windowId, left: left, top: top, right: right, bottom: bottom)
+        // Team-lead review round 4 (2026-08-23): a MacdowsCoreTests-level offline
+        // reproduction of this exact call's own math (using this round's real-host numbers)
+        // already confirmed today's conversion is correct for the input it's given -- the
+        // open question is now whether a *different* input reaches this method than
+        // intended, or whether the round's observed "echo" wasn't a direct confirmation of
+        // this move at all. `onWindowMoveSent` exists so a test harness can log the VERBATIM
+        // sent rect without re-deriving this method's own math a second time (which would
+        // risk the log itself silently diverging from what's actually sent) -- `nil` (the
+        // default) is a safe no-op, matching `CRSession.onEventsAvailable`'s own precedent.
+        onWindowMoveSent?(windowId, left, top, right, bottom)
+    }
+
+    /// See `handleLocalGeometrySettled`'s own doc comment on why this exists. Diagnostics
+    /// only -- not read anywhere on the real rendering path.
+    var onWindowMoveSent: ((_ windowId: UInt32, _ left: Int32, _ top: Int32, _ right: Int32, _ bottom: Int32) -> Void)?
+
+    /// Team-lead review round 5 (2026-08-23): the outbound-only left-border amount
+    /// `handleLocalGeometrySettled` feeds `WindowGeometry.clientWindowMoveLeft` -- see that
+    /// function's own doc comment for the full algebra. NOT derived from
+    /// `sizeCorrection.width` (deliberately -- that function's own doc comment explains why
+    /// treating "7 == 14/2" as a causal relationship, rather than numerical coincidence for
+    /// this one window, isn't something this evidence actually supports) -- a standalone,
+    /// evidence-cited constant, same "coarse stand-in until per-window data says otherwise"
+    /// status the old `fallbackSizeCorrection` constant had. Unlike `sizeCorrection`, this
+    /// has NO independent per-window wire measurement available at all (see
+    /// `clientWindowMoveLeft`'s own doc comment: it is inferred purely from three repeated
+    /// send/echo deltas, not derived from two independently-known wire quantities the way
+    /// `sizeCorrection` is), so there is no "measured, not hardcoded" version of this to
+    /// build yet -- flagged for revisiting if a real-host run ever shows a different value
+    /// for a different window/DPI/Windows-build.
+    private static let measuredClientWindowMoveLeftBorder: Double = 7
+
     /// The one and only place a mac-screen point becomes a `WindowsPoint`, exactly
-    /// mirroring `macFrame(for:)` above for the reverse (Windows-rect -> mac-rect)
+    /// mirroring `macContentRect(for:)` above for the reverse (Windows-rect -> mac-rect)
     /// direction. Always through `MacdowsCore.WindowGeometry` — never a second, ad hoc
     /// coordinate-math implementation in this file or `RemoteWindowContentView`.
     private func remotePoint(from screenPoint: NSPoint) -> WindowsPoint {
@@ -993,6 +1266,35 @@ final class RemoteWindowRegistry {
     /// path, which never needs to reach back into an individual window externally.
     func window(forWindowId windowId: UInt32) -> NSWindow? {
         windows[windowId]?.window
+    }
+
+    /// Diagnostics only (Tools/window-smoke's `[move-resize]` raw-geometry debug line,
+    /// 2026-08-23 W3 round 2/3 team-lead review) -- exposes `mappedSize(forWindowId:)` (the
+    /// GFX-measured visible size `sizeCorrection(for:windowId:)` derives its correction from)
+    /// so a test harness can print the RAW RAIL size next to it and confirm/refute the
+    /// measured-correction fix directly against real wire values, rather than trusting this
+    /// registry's own already-corrected output. Not used by the real rendering path.
+    func debugMappedSize(forWindowId windowId: UInt32) -> CGSize? {
+        mappedSize(forWindowId: windowId)
+    }
+
+    /// Diagnostics only (Tools/window-smoke's `[move-resize]` raw-geometry debug line,
+    /// 2026-08-23 W3 round 5 team-lead review) -- the registry's own ACCUMULATED, delta-
+    /// merged RAIL size for this window (`geometry[windowId].width/height`, the same value
+    /// `sizeCorrection(for:windowId:)` actually reads), as opposed to a single event's own
+    /// possibly-zero `windowWidth`/`windowHeight` fields (populated only when that
+    /// particular order carries `WINDOW_ORDER_FIELD_WND_SIZE` -- a size-less order, e.g. a
+    /// position-only or style-only update, correctly reports these as 0, which is NOT the
+    /// same as "this window's size is unknown"). The debug line used to diff a raw event's
+    /// own (sometimes-zero) fields against the mapped size, producing garbage
+    /// `impliedSizeCorrection` output on any event that happened not to carry the SIZE bit
+    /// -- this accessor is what lets that line report the SAME accumulated-state value
+    /// `sizeCorrection` itself actually uses, so the diagnostic and the real code path can
+    /// never silently diverge. `nil` if this windowId has no tracked geometry at all (should
+    /// not happen for a window this registry is actively rendering).
+    func debugAccumulatedRailSize(forWindowId windowId: UInt32) -> (width: UInt32, height: UInt32)? {
+        guard let state = geometry[windowId] else { return nil }
+        return (width: state.width, height: state.height)
     }
 
     /// Diagnostics only (adr/0008 §6 / task item 5) -- the most recently observed

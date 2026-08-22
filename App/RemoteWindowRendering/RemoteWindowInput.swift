@@ -17,8 +17,8 @@ enum RemoteWindowMouseButton {
 /// traffic goes through the registry calling back into CRSession"). Points are always in this Mac's *global screen space*
 /// (bottom-left origin, Y up) — the one and only place Windows-space geometry gets computed
 /// from a mac point is `RemoteWindowRegistry`, exactly mirroring how
-/// `RemoteWindowRegistry.macFrame(for:)` is already "the one and only place" a *rect* does
-/// that conversion (W4b task spec's own instruction: no second, ad hoc coordinate-math
+/// `RemoteWindowRegistry.macContentRect(for:)` is already "the one and only place" a *rect*
+/// does that conversion (W4b task spec's own instruction: no second, ad hoc coordinate-math
 /// implementation anywhere else in this layer).
 enum RemoteWindowInputEvent {
     case mouseMoved(screenPoint: NSPoint)
