@@ -132,6 +132,13 @@ let extraApps: [String] = (ProcessInfo.processInfo.environment["WINDOW_SMOKE_EXT
 /// outbound-queue rebuild) N times back to back, with RSS growth reported at the end.
 let cyclesTotal = max(1, Int(ProcessInfo.processInfo.environment["WINDOW_SMOKE_CYCLES"] ?? "") ?? 1)
 
+/// Focus rotation scenario (W1 focus-observability slice, docs/plans/phase2.md §2 W1):
+/// number of activate-and-measure-convergence rotations to run once the
+/// WINDOW_SMOKE_EXTRA_APPS multi-window setup has settled. 0 (the default) leaves this
+/// scenario off entirely -- measurement only, no focus/Z-order policy attached ("拿到真数据前
+/// 不写策略"); the >=99% convergence gate is W1's own exit criterion, not asserted here.
+let focusRotationTotal = max(0, Int(ProcessInfo.processInfo.environment["WINDOW_SMOKE_FOCUS_ROTATION"] ?? "") ?? 0)
+
 @MainActor
 final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private let host: String
@@ -178,6 +185,47 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// One retry of the activate+Enter sequence per cycle (observed ~1-in-20 residual
     /// miss even with focus confirmation -- a single re-arm reliably clears it).
     private var cycleCloseRetried = false
+
+    // Flow evidence counters (W1 focus-observability slice, task item 1): proves the
+    // eb2e333 MonitoredDesktop/ZOrderSync/MinMaxInfo/LocalMoveSize plumbing is actually
+    // live end to end, not just compiled -- see docs/adr/0008 §0 for the sample-derived
+    // per-session shapes these counters are checked against (MonitoredDesktop ~25/session,
+    // ZOrderSync exactly 1/session). MinMaxInfo/LocalMoveSize are counted but never gated
+    // (informational only -- LocalMoveSize in particular needs a local drag, which this
+    // headless harness never performs).
+    private var monitoredDesktopEventCount = 0
+    private var zOrderSyncEventCount = 0
+    private var minMaxInfoEventCount = 0
+    private var localMoveSizeEventCount = 0
+    private var activeWindowIdTransitionCount = 0
+    /// Sentinel-normalized (via `RemoteWindowRegistry.serverDesktopState()`, adr/0008 §0)
+    /// running value used only to detect and log activeWindowId transitions -- distinct
+    /// from `lastActiveWindowId` above, which the cycle-soak driver keeps as the raw wire
+    /// value for its own unrelated target-match comparison.
+    private var flowLastActiveWindowId: UInt32?
+
+    // Focus rotation scenario state (task item 2): round-robins ClientActivate across the
+    // visible content windows the WINDOW_SMOKE_EXTRA_APPS setup produced, once settled, and
+    // measures per-rotation convergence of `serverDesktopState().activeWindowId`. See
+    // `runFocusRotation` for the state machine.
+    private struct FocusRotationResult {
+        let targetId: UInt32
+        let hit: Bool
+        let latencyMs: Double?
+        /// Only meaningful for a miss -- what activeWindowId actually was at the 500ms cap.
+        let observedActiveWindowId: UInt32?
+    }
+    private var focusRotationReady = false
+    private var focusRotationWindowIds: [UInt32] = []
+    private var focusRotationsIssued = 0
+    private var focusRotationPendingTargetId: UInt32?
+    private var focusRotationPendingSentAt: Date?
+    private var focusRotationPendingDeadline: Date?
+    /// Gates the 300ms inter-rotation settle; nil means "no wait pending" (the first
+    /// rotation fires as soon as the scenario becomes ready).
+    private var focusRotationNextAllowedAt: Date?
+    private var focusRotationDone = false
+    private var focusRotationResults: [FocusRotationResult] = []
 
     private var frameReadyCount = 0
     private var evidenceRoutineRan = false
@@ -359,11 +407,68 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             if event.kind == .monitoredDesktop {
                 self.lastActiveWindowId = event.windowId
             }
+
+            // Flow evidence counters (task item 1): counted for every drained event
+            // regardless of mode (plain run, extra-apps, cycles) -- only finish()'s
+            // gating assertions and the `[flow]` summary print are scoped to the
+            // standard (non-cycle) run.
+            switch event.kind {
+            case .monitoredDesktop:
+                self.monitoredDesktopEventCount += 1
+                // registry.handle(event) above already applied this order, so
+                // serverDesktopState() reflects it -- reads the sentinel-normalized
+                // value through the existing accessor rather than re-deriving 0xFFFFFFFF
+                // here (adr/0008 §0).
+                let currentActive = registry.serverDesktopState().activeWindowId
+                if currentActive != self.flowLastActiveWindowId {
+                    print("[flow] activeWindowId: \(self.flowLastActiveWindowId.map(String.init) ?? "nil") -> \(currentActive.map(String.init) ?? "nil")")
+                    self.activeWindowIdTransitionCount += 1
+                    self.flowLastActiveWindowId = currentActive
+                }
+            case .zOrderSync:
+                self.zOrderSyncEventCount += 1
+            case .minMaxInfo:
+                self.minMaxInfoEventCount += 1
+            case .localMoveSize:
+                self.localMoveSizeEventCount += 1
+            default:
+                break
+            }
         }
 
         if sawFrameReady {
             frameLatencySamplesMs.append(Date().timeIntervalSince(pushObservedAt) * 1000)
         }
+
+        // Focus rotation convergence poll (task item 2): checked once per drain batch
+        // ("poll every drain"), capped at 500ms from the ClientActivate send -- reuses this
+        // push-driven cadence rather than a separate timer, matching how frame delivery is
+        // already sampled above.
+        if let targetId = focusRotationPendingTargetId, let deadline = focusRotationPendingDeadline,
+           let sentAt = focusRotationPendingSentAt
+        {
+            let currentActive = registry.serverDesktopState().activeWindowId
+            if currentActive == targetId {
+                let latencyMs = Date().timeIntervalSince(sentAt) * 1000
+                focusRotationResults.append(FocusRotationResult(
+                    targetId: targetId, hit: true, latencyMs: latencyMs, observedActiveWindowId: currentActive))
+                resolveFocusRotationPending()
+            } else if Date() >= deadline {
+                focusRotationResults.append(FocusRotationResult(
+                    targetId: targetId, hit: false, latencyMs: nil, observedActiveWindowId: currentActive))
+                resolveFocusRotationPending()
+            }
+        }
+    }
+
+    /// Clears the in-flight rotation and arms the 300ms inter-rotation settle
+    /// (`focusRotationNextAllowedAt`) -- shared by both the hit and timeout-miss paths in
+    /// `drainNow()` above so neither can forget to arm it.
+    private func resolveFocusRotationPending() {
+        focusRotationPendingTargetId = nil
+        focusRotationPendingSentAt = nil
+        focusRotationPendingDeadline = nil
+        focusRotationNextAllowedAt = Date().addingTimeInterval(0.3)
     }
 
     private func tick() {
@@ -378,6 +483,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         checkFirstFrameGate(registry.windowSnapshots())
         runActivateExperiment(elapsed: elapsed, session: session, registry: registry)
         runInputTest(elapsed: elapsed, registry: registry)
+        runFocusRotation(elapsed: elapsed, session: session, registry: registry)
 
         // Phase 1 acceptance: launch the extra apps once the first app's own window has
         // had time to settle -- several ClientExecutes on one live connection is exactly
@@ -396,7 +502,18 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             captureEvidence()
         }
 
-        if elapsed >= 25 {
+        // Focus rotation (task item 2) can need more than the standard 25s budget: worst
+        // case per rotation is the 500ms convergence-poll cap plus the 300ms inter-rotation
+        // settle (see runFocusRotation/resolveFocusRotationPending), so the deadline scales
+        // with N rather than assuming the fixed window calibrated for the no-rotation case
+        // is enough. `rotationStalled` is a hard failsafe only -- normally `focusRotationDone`
+        // is what actually gates the extra wait, not this later fallback deadline.
+        let baseDeadline: TimeInterval = 25
+        let rotationDeadline = focusRotationTotal > 0
+            ? max(baseDeadline, 10 + Double(focusRotationTotal) * 1.0)
+            : baseDeadline
+        let rotationStalled = focusRotationTotal > 0 && !focusRotationDone && elapsed >= rotationDeadline + 10
+        if elapsed >= rotationDeadline, focusRotationTotal == 0 || focusRotationDone || rotationStalled {
             finish()
         }
     }
@@ -778,6 +895,61 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         window.sendEvent(up)
     }
 
+    /// Focus rotation scenario (WINDOW_SMOKE_FOCUS_ROTATION, task item 2): once the
+    /// WINDOW_SMOKE_EXTRA_APPS multi-window setup has settled, round-robins
+    /// `session.activateWindow(_:)` (the same fire-and-forget ClientActivate call the
+    /// Phase 1 cycle soak uses -- see `tickCycles`) across the visible content windows and
+    /// records whether/how fast `RemoteWindowRegistry.serverDesktopState().activeWindowId`
+    /// converges to each target. Reuses the existing "new content windows since extraApps
+    /// exec" settling check from `finish()`'s own multi-window assertion, rather than a
+    /// second, separately-tuned readiness heuristic. Measurement only -- no hit-rate gating
+    /// here (docs/plans/phase2.md §2 W1: "拿到真数据前不写策略"); `finish()` only asserts
+    /// that the scenario actually ran its full N rotations.
+    private func runFocusRotation(elapsed: TimeInterval, session: CRSession, registry: RemoteWindowRegistry) {
+        guard focusRotationTotal > 0, !focusRotationDone else { return }
+
+        if !focusRotationReady {
+            guard extraAppsLaunched else { return }
+            let candidates = focusRotationCandidateWindows(registry)
+            let newContentWindows = candidates.filter { !windowIdsBeforeExtraApps.contains($0.windowId) }
+            guard newContentWindows.count >= extraApps.count else { return }
+            focusRotationReady = true
+            focusRotationWindowIds = candidates.map(\.windowId)
+            print("[focus-rotation] ready: \(focusRotationWindowIds.count) visible content window(s): \(focusRotationWindowIds)")
+        }
+
+        // Still waiting on the current rotation's convergence poll/timeout (drainNow()
+        // resolves this) -- nothing to issue yet.
+        guard focusRotationPendingTargetId == nil else { return }
+
+        if focusRotationsIssued >= focusRotationTotal {
+            focusRotationDone = true
+            return
+        }
+        // 300ms inter-rotation settle (nil before the very first rotation -- that one
+        // fires as soon as the scenario becomes ready, no wait needed).
+        if let nextAllowedAt = focusRotationNextAllowedAt, Date() < nextAllowedAt { return }
+        guard !focusRotationWindowIds.isEmpty else { return }
+
+        let targetId = focusRotationWindowIds[focusRotationsIssued % focusRotationWindowIds.count]
+        focusRotationsIssued += 1
+        session.activateWindow(targetId)
+        focusRotationPendingTargetId = targetId
+        focusRotationPendingSentAt = Date()
+        focusRotationPendingDeadline = Date().addingTimeInterval(0.5)
+        print("[focus-rotation] rotation \(focusRotationsIssued)/\(focusRotationTotal): activating windowId=\(targetId)")
+    }
+
+    /// The round-robin candidate pool for `runFocusRotation` -- visible windows with real
+    /// displayed content, same plausible-content band (`>=150x80`) `finish()`'s own
+    /// per-window size assertion uses, sorted by windowId for a deterministic rotation
+    /// order (window creation/arrival order is not guaranteed stable across a run).
+    private func focusRotationCandidateWindows(_ registry: RemoteWindowRegistry) -> [RemoteWindowRegistry.WindowSnapshot] {
+        registry.windowSnapshots()
+            .filter { $0.isVisible && $0.hasDisplayedContent && $0.frame.width >= 150 && $0.frame.height >= 80 }
+            .sorted { $0.windowId < $1.windowId }
+    }
+
     /// Keyboard half of deliverable 5: a real `NSEvent` keyDown+keyUp pair for the Return
     /// key (mac keyCode 36, `kVK_Return`), dispatched the same way as the click case above.
     /// Deliberately exercises the real WinPR translation path
@@ -903,6 +1075,20 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             print("[assert] \(cond ? "PASS" : "FAIL"): \(message)")
             if !cond { ok = false }
         }
+
+        // Flow evidence counters (task item 1): machine-readable summary of everything
+        // eb2e333's MonitoredDesktop/ZOrderSync/MinMaxInfo/LocalMoveSize plumbing actually
+        // delivered this run -- printed regardless of pass/fail, same as every other
+        // [assert]-adjacent summary line in this function.
+        print("[flow] MonitoredDesktop=\(monitoredDesktopEventCount) activeWindowIdTransitions=\(activeWindowIdTransitionCount) "
+            + "ZOrderSync=\(zOrderSyncEventCount) MinMaxInfo=\(minMaxInfoEventCount) LocalMoveSize=\(localMoveSizeEventCount)")
+        // Gating: proves the eb2e333 contract is live against a real host, per adr/0008 §0's
+        // sample-derived per-session shapes (MonitoredDesktop observed ~25/session across
+        // six samples; ZOrderSync observed exactly once per sampled session). MinMaxInfo/
+        // LocalMoveSize stay informational-only (no gating) -- see their counters' own doc
+        // comment for why.
+        check(monitoredDesktopEventCount >= 1, "received >=1 MonitoredDesktop event this session (adr/0008 §0: ~25/session observed) (got \(monitoredDesktopEventCount))")
+        check(zOrderSyncEventCount >= 1, "received >=1 ZOrderSync event this session (adr/0008 §0: exactly 1/session observed) (got \(zOrderSyncEventCount))")
 
         // W4c: skip when an input test is active -- a *successful* click/Enter can
         // legitimately close the only window this session had open (observed in practice:
@@ -1167,6 +1353,37 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 inputTestPassed = false
                 check(false, "input test (\(inputTestMode)) found a ready target window to act on before the run ended")
             }
+        }
+
+        // Focus rotation scenario (task item 2): machine-readable summary plus one detail
+        // line per miss (target id, observed activeWindowId at the 500ms timeout) -- only
+        // printed/gated when WINDOW_SMOKE_FOCUS_ROTATION was set for this run. Gating is
+        // deliberately limited to "did the scenario actually run its N rotations" -- NOT
+        // hit rate (docs/plans/phase2.md §2 W1: "拿到真数据前不写策略"; the >=99%
+        // convergence gate is W1's own exit criterion, applied once this harness has
+        // produced real numbers to gate against). The general MonitoredDesktop>=1 check
+        // above already covers this scenario's own "and MonitoredDesktop count >= 1"
+        // requirement -- not duplicated here.
+        if focusRotationTotal > 0 {
+            let hits = focusRotationResults.filter(\.hit)
+            let misses = focusRotationResults.filter { !$0.hit }
+            let latencies = hits.compactMap(\.latencyMs).sorted()
+            func percentileMs(_ p: Double) -> Double {
+                guard !latencies.isEmpty else { return 0 }
+                let rank = max(0, min(latencies.count - 1, Int((p * Double(latencies.count)).rounded(.up)) - 1))
+                return latencies[rank]
+            }
+            print(String(
+                format: "[focus-rotation] n=%d hits=%d misses=%d p50=%.1fms p95=%.1fms maxMs=%.1fms",
+                focusRotationTotal, hits.count, misses.count, percentileMs(0.5), percentileMs(0.95), latencies.last ?? 0
+            ))
+            for miss in misses {
+                print("[focus-rotation] miss detail: target=\(miss.targetId) observedActiveWindowId=\(miss.observedActiveWindowId.map(String.init) ?? "nil")")
+            }
+            check(
+                focusRotationsIssued == focusRotationTotal,
+                "focus rotation ran all \(focusRotationTotal) rotations (issued \(focusRotationsIssued))"
+            )
         }
 
         // Phase 2 W0③: see checkFirstFrameGate's own doc comment -- every window this run
