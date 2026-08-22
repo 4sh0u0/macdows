@@ -1,0 +1,68 @@
+{
+  "$schema_note": "Not a real JSON Schema — documents the fields this file is expected to carry. See adr/0006 §2/§3.",
+  "component": "FreeRDP",
+  "submodule_path": "ThirdParty/FreeRDP",
+  "tag": "3.30.0",
+  "commit": "6b107f0aadbabc47941c5a5b893b88c01792af6d",
+  "upstream_url": "https://github.com/FreeRDP/FreeRDP.git",
+  "patches": [],
+  "deployment_target": "14.0",
+  "_deployment_target_note": "Single source for the minimum macOS version this repo targets. Scripts/build-openssl.sh reads this for -mmacosx-version-min; Scripts/build-freerdp.sh substitutes it into the -DCMAKE_OSX_DEPLOYMENT_TARGET flag below (the literal '14.0' in cmake_config.flags is a fallback/documentation value only — the running script always overrides it from this field, so the two can never drift silently).",
+  "cmake_config": {
+    "_note": "Config A' — adr/0004 config A corrected per adr/0006 §3 (absolute-path Homebrew links, URBDRC/libusb dependency, unpinned deployment target/arch).",
+    "generator": "Ninja",
+    "flags": [
+      "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+      "-DCMAKE_INSTALL_PREFIX=<computed: .build/freerdp/<config-hash>/prefix>",
+      "-DOPENSSL_ROOT_DIR=<computed: .build/deps/prefix>",
+      "-DOPENSSL_USE_STATIC_LIBS=TRUE",
+      "-DCMAKE_OSX_DEPLOYMENT_TARGET=<computed: .deployment_target>",
+      "-DCMAKE_OSX_ARCHITECTURES=arm64",
+      "-DWITH_SERVER=OFF",
+      "-DWITH_SAMPLE=OFF",
+      "-DWITH_SHADOW=OFF",
+      "-DWITH_PROXY=OFF",
+      "-DWITH_CLIENT_SDL=OFF",
+      "-DWITH_CLIENT_MAC=OFF",
+      "-DWITH_X11=OFF",
+      "-DWITH_MANPAGES=OFF",
+      "-DWITH_KRB5=OFF",
+      "-DWITH_CUPS=OFF",
+      "-DWITH_PCSC=OFF",
+      "-DWITH_PKCS11=OFF",
+      "-DWITH_MACAUDIO=ON",
+      "-DWITH_WEBVIEW=OFF",
+      "-DWITH_OPUS=OFF",
+      "-DWITH_FAAD2=OFF",
+      "-DWITH_FAAC=OFF",
+      "-DWITH_SOXR=OFF",
+      "-DWITH_GSM=OFF",
+      "-DWITH_LAME=OFF",
+      "-DWITH_VIDEOTOOLBOX=ON",
+      "-DWITH_FFMPEG=OFF",
+      "-DWITH_SWSCALE=OFF",
+      "-DWITH_DSP_FFMPEG=OFF",
+      "-DCHANNEL_URBDRC=OFF",
+      "-DWITH_URIPARSER=OFF",
+      "-DWITH_JSON_DISABLED=ON"
+    ],
+    "corrections_applied": [
+      "CHANNEL_URBDRC=OFF — v1 does not do USB redirection; upstream default pulled in a Homebrew libusb absolute-path dependency for no product benefit (adr/0006 §3 defect #2).",
+      "CMAKE_OSX_DEPLOYMENT_TARGET / CMAKE_OSX_ARCHITECTURES pinned explicitly — lab build left these empty, which is not reproducible (adr/0006 §3 defect #3).",
+      "OPENSSL_ROOT_DIR points at our self-built static OpenSSL prefix instead of Homebrew's, and OPENSSL_USE_STATIC_LIBS=TRUE — lab build hard-linked absolute Homebrew openssl/libusb paths, which is not distributable and breaks on `brew upgrade` (adr/0006 §3 defect #1).",
+      "WITH_URIPARSER=OFF and WITH_JSON_DISABLED=ON — two more Phase 1 scaffold discoveries, same defect class as #1/#2 but not caught by the original lab build (this dev machine has uriparser and jansson installed via Homebrew as transitive deps of unrelated formulae; the lab machine apparently didn't at build time). winpr/libwinpr/CMakeLists.txt auto-detects uriparser via find_package() and defaults WITH_URIPARSER to ON if found; cmake/JsonDetect.cmake does the same for whichever JSON backend (jansson/json-c/cJSON) happens to be present. Both silently link libwinpr3 against a Homebrew absolute path, which then fails hardened-runtime library validation at launch (unsigned/team-mismatched dylib -> abort trap). Surfaced by dyld's own fatal-load-failure stderr report (printed unconditionally on a hard load/validation failure, independent of DYLD_PRINT_LIBRARIES) when Scripts/sign-and-verify.sh launched the signed app — *not* by the DYLD_PRINT_LIBRARIES trace itself, which hardened runtime can suppress without the com.apple.security.cs.allow-dyld-environment-variables entitlement (an independent-review BLOCKER: the launch check as originally written could pass vacuously on an empty log for a dependency that loads successfully rather than crashing). Fixed by running that check against a separately, temporarily entitled copy — see Scripts/sign-and-verify.sh. WITH_JSON_DISABLED=ON is FreeRDP's single kill switch for all three JSON backends at once (cmake/JsonDetect.cmake:92), so this closes the whole defect class rather than fixing one backend and leaving the auto-detection landmine for the next machine that happens to have a different JSON library installed."
+    ]
+  },
+  "openssl": {
+    "version": "3.5.7",
+    "series": "3.5 (LTS)",
+    "tarball": "openssl-3.5.7.tar.gz",
+    "source_url": "https://github.com/openssl/openssl/releases/download/openssl-3.5.7/openssl-3.5.7.tar.gz",
+    "sha256": "a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8",
+    "configure_target": "darwin64-arm64-cc",
+    "configure_flags": ["no-shared", "no-module"],
+    "corrections_applied": [
+      "no-module added (W4a) — the legacy provider (needed for MD4; classic NTLM's NT-hash step, which NTLMv2 responses still depend on) was building as a separately loadable providers/legacy.dylib, discovered at runtime via a MODULESDIR baked into libcrypto at compile time from --prefix. --prefix here is a placeholder path (Scripts/build-openssl.sh's OPENSSL_PREFIX_PLACEHOLDER, deliberate per an earlier W1 fix that keeps $HOME out of compiled-in constants of a shipped binary) that gets relocated after the build, so the baked-in MODULESDIR never matched where the module file actually ended up, and OSSL_PROVIDER_load(NULL, \"legacy\") silently failed to find it at runtime. Concretely: real-host NLA/CredSSP authentication failed end to end with SEC_E_NO_CREDENTIALS, for the App target and any tool linking this build alike, discovered and root-caused while verifying W4a's CRBridge/CRSession real connection against a real host (root-caused in the project status log). `no-module` (with `legacy` left at its own default-enabled state — see providers/build.info's STATIC_LEGACY branch) makes OpenSSL compile the legacy provider's object files directly into libcrypto instead of a separate module; OSSL_PROVIDER_load then resolves it from an in-process built-in-provider table, never touching the filesystem, so the placeholder-prefix relocation can no longer break it. Side effect: .build/deps/prefix/lib/ossl-modules/ still exists as a directory (OpenSSL's `make install` creates it unconditionally) but is empty post-fix — legacy.dylib (and default.dylib, itself always built-in even before this change) never get written there — this also closes, by construction, a distribution-readiness gap that would otherwise have needed separate handling (the App target's Copy Files phase never embedded ossl-modules/*.dylib into the app bundle, so a genuinely shipped/distributed build would have hit this exact same failure on another machine; with the provider built directly into libcrypto, there is no module file that ever needed embedding)."
+    ]
+  }
+}

@@ -1,0 +1,325 @@
+name: Macdows
+
+# Optional, untracked local overlay (gitignored). Maintainers with a real signing
+# identity put it there and export MACDOWS_SIGN_LOCAL=true before running
+# `xcodegen generate` (a disabled include is never read, so contributors need neither
+# the file nor the variable — they get the ad-hoc default; see settings.base).
+include:
+  - path: project-local.yml
+    enable: ${MACDOWS_SIGN_LOCAL}
+
+# W4b: MacdowsCore.WindowGeometry is the only coordinate-conversion utility the Swift
+# rendering layer (App/RemoteWindowRendering) is allowed to use (per the W4b task spec) --
+# resolved as a local SwiftPM package rather than compiled-in sources (unlike CRDPQueue,
+# which CRBridge's own comment explains is deliberately linked as raw C sources into an
+# ObjC++ static lib) because MacdowsCore is pure Swift with no C-ABI-linkage constraint
+# forcing that split.
+packages:
+  MacdowsCore:
+    path: ../Packages/MacdowsCore
+
+options:
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: YES
+    SWIFT_VERSION: "6.0"
+    # Manual, not Automatic: Automatic signing needs Xcode's account manager to
+    # fetch/create a provisioning profile, which isn't available to a headless
+    # `xcodebuild` CLI invocation. A local-run macOS app with no restricted
+    # entitlements doesn't need a profile — and with no CODE_SIGN_IDENTITY set here,
+    # macOS's build-setting default is ad-hoc ("-"), which builds and runs everywhere
+    # with no certificate at all. Maintainers who want a stable signing identity
+    # (macOS TCC permission grants are keyed to it) supply CODE_SIGN_IDENTITY and
+    # DEVELOPMENT_TEAM via the untracked `project-local.yml` overlay — see the
+    # include at the top of this file. (The identity must NOT be set here: the main
+    # spec always overrides included specs, so a value here would defeat the overlay.)
+    CODE_SIGN_STYLE: Manual
+    ENABLE_HARDENED_RUNTIME: YES
+
+targets:
+  Macdows:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    # A single sources: list — a second `sources:` key later in this target would
+    # silently replace this one under YAML mapping semantics, not merge with it, which
+    # is exactly the bug that produced "no sources are being compiled" on the first
+    # attempt (the dylib copyFiles entries clobbered the actual Swift source path).
+    sources:
+      - path: Macdows
+        excludes:
+          - Info.plist
+      # W4b: shared with the window-smoke tool target (see that target's own sources: —
+      # direct source-file sharing, per the task spec's own suggested option, rather than
+      # a separate framework target, since neither consumer needs anything the other
+      # doesn't and a third Swift module boundary here would buy nothing).
+      - path: RemoteWindowRendering
+      # Copy Files -> Frameworks: embed the three FreeRDP dylibs the CRBridge target
+      # links against. install_name on these is already @rpath (verified against the lab
+      # build), so LD_RUNPATH_SEARCH_PATHS = @executable_path/../Frameworks below is
+      # sufficient — no install_name_tool rewriting needed (adr/0006 §2).
+      #
+      # Each entry references only the SONAME symlink (`libfoo.3.dylib`), not the
+      # fully-versioned real file (`libfoo.3.30.0.dylib`): that symlink's name is the
+      # exact `@rpath/...` load command baked into every dependent, and it's a *single*
+      # hop to the real file, which Xcode's Copy Files phase (builtin-copy
+      # -resolve-src-symlinks) fully dereferences into real bytes at the symlink's own
+      # name — verified empirically. This also means project.yml never needs to change
+      # on a FreeRDP patch-version bump (3.30.0 -> 3.30.1 etc.), only on a SONAME bump.
+      # `optional: true` lets `xcodegen generate` succeed even before FreeRDP has ever
+      # been built (see Scripts/bootstrap.sh, which now runs the FreeRDP build then
+      # `xcodegen generate` in sequence so a clean checkout only needs one command).
+      - path: ../.build/freerdp/current/prefix/lib/libfreerdp3.3.dylib
+        optional: true
+        buildPhase:
+          copyFiles:
+            destination: frameworks
+            codeSignOnCopy: true
+      - path: ../.build/freerdp/current/prefix/lib/libfreerdp-client3.3.dylib
+        optional: true
+        buildPhase:
+          copyFiles:
+            destination: frameworks
+            codeSignOnCopy: true
+      - path: ../.build/freerdp/current/prefix/lib/libwinpr3.3.dylib
+        optional: true
+        buildPhase:
+          copyFiles:
+            destination: frameworks
+            codeSignOnCopy: true
+    settings:
+      base:
+        PRODUCT_NAME: Macdows
+        PRODUCT_BUNDLE_IDENTIFIER: dev.haru.macdows.dev
+        # A hand-authored file, referenced directly rather than through XcodeGen's
+        # `info:` key — that key *generates* (overwrites) a plist at the given path
+        # rather than using an existing one as-is.
+        INFOPLIST_FILE: Macdows/Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: Macdows/Macdows-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/CRBridge
+          - $(SRCROOT)/../.build/freerdp/current/prefix/include/freerdp3
+          - $(SRCROOT)/../.build/freerdp/current/prefix/include/winpr3
+        LIBRARY_SEARCH_PATHS:
+          - $(SRCROOT)/../.build/freerdp/current/prefix/lib
+        LD_RUNPATH_SEARCH_PATHS:
+          - $(inherited)
+          - "@executable_path/../Frameworks"
+        OTHER_LDFLAGS:
+          - -lfreerdp3
+          - -lfreerdp-client3
+          - -lwinpr3
+          # CRBridge is an ObjC++ static lib (CRSession.mm) with C++ exception-unwinding
+          # scaffolding in it (__cxa_begin_catch/__gxx_personality_v0/std::terminate) even
+          # though CRSession.mm itself never throws -- ARC's own exception-safety cleanup
+          # paths emit this. Swift's own link driver doesn't pull in libc++ automatically
+          # the way clang++ does for a plain C++/ObjC++ executable target (confirmed:
+          # Tools/bridge-smoke, a "tool" product type linked via clang++, never needed
+          # this explicitly) -- only a Swift *app* target that depends on a C++-containing
+          # static lib does.
+          - -lc++
+          # W4b: CRSession.o (via CRSurfaceSlots.o) references IOSurfaceCreate/Lock/Unlock/
+          # GetBaseAddress/GetBytesPerRow -- undefined-symbol link errors otherwise, even
+          # though this app target's own Swift code doesn't call IOSurface directly yet
+          # (RemoteWindowRegistry does, once wired in).
+          - -framework
+          - IOSurface
+    # Build FreeRDP (and its OpenSSL dependency) before compiling/linking. Both scripts
+    # are idempotent — this is a fast no-op once .build/freerdp/current is populated for
+    # the current submodule SHA + patch queue + flags, so re-running it on every build
+    # (basedOnDependencyAnalysis: false) is cheap and keeps `xcodebuild build` alone
+    # sufficient to produce a working app from a clean checkout.
+    prebuildScripts:
+      - name: "Build vendored FreeRDP"
+        script: |
+          set -euo pipefail
+          "$SRCROOT/../Scripts/build-openssl.sh"
+          "$SRCROOT/../Scripts/build-freerdp.sh"
+        basedOnDependencyAnalysis: false
+    dependencies:
+      - target: CRBridge
+      - package: MacdowsCore
+        product: MacdowsCore
+
+  CRBridge:
+    type: library.static
+    platform: macOS
+    deploymentTarget: "14.0"
+    # CRDPQueue's C sources are compiled directly into this target rather than linked as
+    # a separate SwiftPM product -- Packages/MacdowsCore/Package.swift's own comment on
+    # the CRDPQueue target says as much ("meant to be linked directly into the ObjC++
+    # CRBridge target"). This keeps the Xcode build graph self-contained (no SwiftPM
+    # build invoked from within an xcodebuild target) and is exactly what W3 designed
+    # CRDPQueue's C11-only, zero-FreeRDP/AppKit-dependency shape for.
+    sources:
+      - path: CRBridge
+      - path: ../Packages/MacdowsCore/Sources/CRDPQueue
+    settings:
+      base:
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/../.build/freerdp/current/prefix/include/freerdp3
+          - $(SRCROOT)/../.build/freerdp/current/prefix/include/winpr3
+          - $(SRCROOT)/../Packages/MacdowsCore/Sources/CRDPQueue/include
+          # CRSession.mm's OpenSSL legacy-provider startup self-check (adr/0005-adjacent
+          # W4a follow-up) calls OSSL_PROVIDER_available/OSSL_PROVIDER_load directly,
+          # which needs OpenSSL's own headers -- FreeRDP's installed headers don't
+          # re-export them.
+          - $(SRCROOT)/../.build/deps/prefix/include
+        CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+        CLANG_ENABLE_OBJC_ARC: YES
+    configs:
+      Debug:
+        # W4a review H3: crb_verify_certificate_ex's insecure "accept unconditionally,
+        # this session only" behavior is Debug-only, gated on this macro. Undefined (the
+        # Release default -- no configs.Release entry here at all) means the function
+        # rejects every certificate outright until real pin UX ships (a Phase 1 follow-on
+        # ADR). Never define this for a Release/distributed build.
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CRB_ALLOW_INSECURE_CERT=1"
+    prebuildScripts:
+      - name: "Build vendored FreeRDP"
+        script: |
+          set -euo pipefail
+          "$SRCROOT/../Scripts/build-openssl.sh"
+          "$SRCROOT/../Scripts/build-freerdp.sh"
+        basedOnDependencyAnalysis: false
+
+  bridge-smoke:
+    # W4a CLI verification harness (Tools/bridge-smoke) -- an Xcode "tool" target sharing
+    # CRBridge's exact build settings/dependency graph rather than a standalone CMake
+    # build, so it never drifts from what the real App target links against. Instantiates
+    # CRSession directly, connects to a real host (credentials from
+    # ~/.config/macdows/host.env, read by main.mm itself -- never by library code),
+    # drains and prints every control-lane event, then runs the full shutdown protocol.
+    # `.app`'s own TCC identity gates local-network access behind a first-run prompt a
+    # headless CI/CLI context can't answer -- this tool, launched from an already-trusted
+    # Terminal.app, is Phase 1's actual real-host verification vehicle; the app target
+    # itself gets real-host verification later once its own TCC prompt has been granted
+    # interactively.
+    type: tool
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: ../Tools/bridge-smoke
+    settings:
+      base:
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/CRBridge
+          - $(SRCROOT)/../.build/freerdp/current/prefix/include/freerdp3
+          - $(SRCROOT)/../.build/freerdp/current/prefix/include/winpr3
+        CLANG_ENABLE_OBJC_ARC: YES
+        # This tool links the vendored FreeRDP dylibs directly at their build location
+        # (no Copy-Files-and-resign step the way the App target has) -- their original
+        # signature's Team ID doesn't match this target's, and Hardened Runtime's library
+        # validation rejects that mismatch at load time (confirmed empirically: dyld
+        # refused with "different Team IDs" until this was turned off). bridge-smoke is a
+        # dev/test harness, never a distributed artifact, so relaxing this here (and only
+        # here) is the minimal-blast-radius fix -- it does not affect the App target's own
+        # (still Hardened-Runtime, still team-matched via resigned copies) build.
+        ENABLE_HARDENED_RUNTIME: NO
+        LIBRARY_SEARCH_PATHS:
+          - $(SRCROOT)/../.build/freerdp/current/prefix/lib
+        LD_RUNPATH_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/../.build/freerdp/current/prefix/lib
+        OTHER_LDFLAGS:
+          - -lfreerdp3
+          - -lfreerdp-client3
+          - -lwinpr3
+          # W4b: same reason as the App target's identical addition -- CRSession.o/
+          # CRSurfaceSlots.o (pulled in via the CRBridge dependency) reference IOSurface
+          # symbols regardless of whether bridge-smoke's own main.mm calls into them.
+          - -framework
+          - IOSurface
+    dependencies:
+      - target: CRBridge
+
+  window-smoke:
+    # W4b's real-host pixel-path verification harness (Tools/window-smoke) -- unlike
+    # bridge-smoke (headless), this drives a real NSApplication so RemoteWindowRegistry/
+    # RemoteWindow (App/RemoteWindowRendering, shared with the Macdows app target via
+    # direct source-file sharing rather than a separate framework target) actually create
+    # and composite on-screen NSWindows. Same Terminal.app-relay real-network-access
+    # approach as bridge-smoke; see that target's own comment for why.
+    type: tool
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: ../Tools/window-smoke
+      - path: RemoteWindowRendering
+    settings:
+      base:
+        SWIFT_OBJC_BRIDGING_HEADER: Macdows/Macdows-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/CRBridge
+          - $(SRCROOT)/../.build/freerdp/current/prefix/include/freerdp3
+          - $(SRCROOT)/../.build/freerdp/current/prefix/include/winpr3
+        # Same Team-ID-mismatch issue bridge-smoke's own comment documents (the vendored
+        # FreeRDP dylibs are linked directly at their build location, not through a
+        # Copy-Files-and-resign step) -- a dev/test harness, never a distributed artifact.
+        ENABLE_HARDENED_RUNTIME: NO
+        LIBRARY_SEARCH_PATHS:
+          - $(SRCROOT)/../.build/freerdp/current/prefix/lib
+        LD_RUNPATH_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/../.build/freerdp/current/prefix/lib
+        OTHER_LDFLAGS:
+          - -lfreerdp3
+          - -lfreerdp-client3
+          - -lwinpr3
+          # Same reason as bridge-smoke's/the App target's identical addition -- CRSession.o/
+          # CRSurfaceSlots.o (pulled in via the CRBridge dependency) reference IOSurface
+          # symbols regardless of what this target's own Swift sources autolink for.
+          - -framework
+          - IOSurface
+          # Same reason as the App target's identical addition: this is a Swift-linked
+          # target (main.swift), not an ObjC++/clang++-linked one like bridge-smoke, so
+          # Swift's link driver doesn't automatically pull in libc++ for CRBridge's C++
+          # exception-unwinding scaffolding (CRSession.mm/CRSurfaceSlots.mm).
+          - -lc++
+    dependencies:
+      - target: CRBridge
+      - package: MacdowsCore
+        product: MacdowsCore
+
+# W4c review H2: explicit, so `xcodegen generate` always deterministically (re)produces
+# exactly these four schemes on any machine/checkout, rather than relying on XcodeGen's
+# implicit per-target scheme auto-generation. That implicit behavior turned out to be the
+# root cause behind a real build-flakiness episode this round: building this project's own
+# raw SwiftPM-package scheme directly (e.g. `-scheme MacdowsCore`, which XcodeGen doesn't
+# own at all -- it belongs to the *embedded* package project Xcode creates when resolving
+# `packages:` above, a logically separate project with its own build-output identity) does
+# NOT reliably populate what a `SYMROOT`-redirected build of one of *this* project's own
+# targets expects to find, causing "Unable to resolve module dependency: MacdowsCore"
+# under a from-scratch SYMROOT. Building exclusively through one of these four schemes --
+# never a bare package scheme -- goes through this project's own coherent package-
+# resolution + build graph instead and is the only supported entry point going forward
+# (`Scripts/run-window-smoke.command` already only ever invokes `-scheme window-smoke`,
+# never a package scheme, so it needed no content change once this list made that scheme
+# reproducible rather than implicit).
+#
+# `.xcodeproj` itself stays gitignored (generated output, not source); this list is what
+# makes its *schemes* reproducible from source (project.yml, which IS tracked) without
+# needing a shared, committed `.xcodeproj`.
+schemes:
+  Macdows:
+    build:
+      targets:
+        Macdows: all
+  CRBridge:
+    build:
+      targets:
+        CRBridge: all
+  bridge-smoke:
+    build:
+      targets:
+        bridge-smoke: all
+  window-smoke:
+    build:
+      targets:
+        window-smoke: all

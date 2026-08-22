@@ -1,0 +1,120 @@
+name: Tier 1
+
+# Tier 1 per adr/0006 §6: every push, ubuntu, 1x cost, 1-2 minutes. Cheap, static
+# checks only — no compilation. The macOS/FreeRDP-build Tier 2 is a separate,
+# selectively-triggered workflow (see adr/0006 §6; not yet added).
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tier1-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tier1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Pinned to commit SHA, not a mutable tag, per project policy on supply-chain
+      # pinning for third-party Actions. Version in the trailing comment for humans.
+      - name: Checkout (with submodules — needed for patch `git apply --check`)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y shellcheck
+
+      - name: shellcheck all Scripts
+        # W4c review: -S style pins the strictness level explicitly (was implicitly
+        # "warning", shellcheck's own default) rather than leaving it to whatever
+        # shellcheck ships as its default severity floor -- CI had gone red on an
+        # info-level finding (SC2015) that local ad hoc `shellcheck Scripts/foo.sh` runs
+        # never surfaced, since a bare invocation doesn't print info-level findings by
+        # default. Pinning -S style here AND using it for every local check going forward
+        # (not just this round's fix) keeps CI and local runs looking at the same set of
+        # findings, so a script can never pass locally and fail in CI again. Also widened
+        # from `Scripts/*.sh` to include `*.command` -- Scripts/run-window-smoke.command
+        # was never actually covered by this glob before.
+        run: shellcheck -S style Scripts/*.sh Scripts/*.command
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Custom sensitive-content regex scan
+        run: |
+          set -euo pipefail
+          # Windows host IPs and personal machine names must never appear in tracked
+          # files — see AGENTS.md's security red lines. gitleaks (above) catches
+          # credential-shaped secrets; this catches the host/network fingerprints that
+          # aren't secrets in the gitleaks sense but are still the safety-line "never
+          # commit a real host/hostname" rule.
+          #
+          # Scope is `git ls-files` (tracked files only), not a filesystem walk: a plain
+          # `grep -r .` previously matched the ThirdParty/FreeRDP submodule's own
+          # vendored source (protocol-spec section numbers shaped like a private IP,
+          # upstream test vectors) even though none of that content is ours, plus
+          # self-matched this very script's own pattern definitions. `git ls-files` at
+          # the superproject level only ever lists the submodule as a single gitlink
+          # entry (its path, not its contents) — filtered out below since grep can't
+          # read a directory as a file — and the patterns now live in a separate,
+          # explicitly-excluded file (.github/scan-patterns.txt) instead of inline here.
+          #
+          # -P (PCRE) doesn't support multi-pattern `-f` files ("the -P option only
+          # supports a single pattern" on this grep build) — loop one pattern at a time
+          # instead of a single -f-fed invocation.
+          PATTERNS_FILE=".github/scan-patterns.txt"
+          mapfile -t FILES < <(git ls-files | grep -vF "$PATTERNS_FILE" | while IFS= read -r f; do [ -f "$f" ] && printf '%s\n' "$f"; done)
+
+          ALL_MATCHES=""
+          while IFS= read -r pattern || [ -n "$pattern" ]; do
+            [ -z "$pattern" ] && continue
+            case "$pattern" in \#*) continue ;; esac
+            if HIT="$(grep -PIn "$pattern" "${FILES[@]}" 2>/dev/null)"; then
+              ALL_MATCHES="$ALL_MATCHES
+          $HIT"
+            fi
+          done <"$PATTERNS_FILE"
+          ALL_MATCHES="$(printf '%s' "$ALL_MATCHES" | sed '/^$/d')"
+
+          if [ -n "$ALL_MATCHES" ]; then
+            echo "::error::Sensitive-content pattern matched tracked files:"
+            echo "$ALL_MATCHES"
+            exit 1
+          fi
+          echo "No sensitive-content matches found."
+
+      - name: Patch queue validation
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(ThirdParty/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "No patches in ThirdParty/patches/ — nothing to validate."
+            exit 0
+          fi
+          for p in "${patches[@]}"; do
+            echo "Checking $p"
+            if ! grep -qE 'github\.com/FreeRDP/FreeRDP/(issues|pull)' "$p"; then
+              echo "::error file=$p::patch has no upstream issue/PR link in its header (ThirdParty/patches/README.md rule 1)"
+              exit 1
+            fi
+            # $p is repo-root-relative ("ThirdParty/patches/foo.patch"); `-C
+            # ThirdParty/FreeRDP` changes git's working directory before resolving it,
+            # so the path must be re-anchored at $GITHUB_WORKSPACE (or it resolves
+            # against ThirdParty/FreeRDP/ThirdParty/patches/... , which never exists).
+            if ! git -C ThirdParty/FreeRDP apply --check "$GITHUB_WORKSPACE/$p"; then
+              echo "::error file=$p::patch fails 'git apply --check' against the pinned FreeRDP commit"
+              exit 1
+            fi
+          done
+          echo "All ${#patches[@]} patch(es) validated."
