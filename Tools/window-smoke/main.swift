@@ -28,6 +28,7 @@
 import AppKit
 import CoreGraphics
 import Foundation
+import MacdowsCore
 
 func parseEnvFile(_ path: String) -> [String: String] {
     guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else { return [:] }
@@ -173,15 +174,19 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private var cycleCloseTargetId: UInt32?
     private var cycleCloseDeadline: Date?
     /// Keyboard input is FOCUS-addressed on the server: after a reattach the remote focus
-    /// can sit on a different window than our chosen target, so the Enter is preceded by
-    /// an explicit ClientActivate and a settle delay, and success is measured as "the
-    /// About-window population shrank", not "this exact windowId vanished" (the server
-    /// closes whichever winver actually holds focus).
+    /// can sit on a different window than our chosen target. adr/0012: the activation click
+    /// that locks/re-locks `cycleCloseTargetId` (see `activateForClose`) now routes through
+    /// the SAME real mouseDown path the production app uses -- `RemoteWindowRegistry`'s own
+    /// `FocusAuthority` gate buffers the Enter keystroke until the server actually confirms
+    /// convergence (or drops it on a hard rollback), so this no longer needs to manually
+    /// poll `MonitoredDesktop.activeWindowId` before sending it. `cycleEnterAt` is now just
+    /// a short settle between the click and the Enter (not a focus-confirmation wait --
+    /// same reasoning as `sendSyntheticClick`'s own two-stage gap). Success is still
+    /// measured as "the About-window population shrank", not "this exact windowId
+    /// vanished" (the server closes whichever winver actually holds focus).
     private var cycleEnterAt: Date?
     private var cycleEnterSent = false
     private var cycleAboutCountAtLock = 0
-    /// Latest MonitoredDesktop.activeWindowId observed -- the server's own focus truth.
-    private var lastActiveWindowId: UInt32?
     /// One retry of the activate+Enter sequence per cycle (observed ~1-in-20 residual
     /// miss even with focus confirmation -- a single re-arm reliably clears it).
     private var cycleCloseRetried = false
@@ -198,11 +203,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private var minMaxInfoEventCount = 0
     private var localMoveSizeEventCount = 0
     private var activeWindowIdTransitionCount = 0
-    /// Sentinel-normalized (via `RemoteWindowRegistry.serverDesktopState()`, adr/0008 §0)
-    /// running value used only to detect and log activeWindowId transitions -- distinct
-    /// from `lastActiveWindowId` above, which the cycle-soak driver keeps as the raw wire
-    /// value for its own unrelated target-match comparison.
-    private var flowLastActiveWindowId: UInt32?
+    /// Classified (via `RemoteWindowRegistry.serverDesktopState()`, adr/0012 §3) running
+    /// value used only to detect and log activeWindow transitions.
+    private var flowLastActiveWindow: ServerActiveWindow = .unmonitored
 
     // Focus rotation scenario state (task item 2): round-robins ClientActivate across the
     // visible content windows the WINDOW_SMOKE_EXTRA_APPS setup produced, once settled, and
@@ -210,17 +213,32 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     // `runFocusRotation` for the state machine.
     private struct FocusRotationResult {
         let targetId: UInt32
-        let hit: Bool
+        /// Converged within the 500ms soft deadline (adr/0012 §1's gating tier -- W1's own
+        /// >=99% exit criterion is measured against this, once this harness has produced
+        /// real n>=100 numbers to gate against; not asserted here).
+        let softHit: Bool
+        /// Converged at all within the eventual (`FocusAuthority.hardDeadlineInterval`,
+        /// 5000ms) window -- the observation tier (adr/0012 §4.2: "分开报软截止内命中率
+        /// （gating）与最终收敛率（观测）"). `softHit == true` implies `eventualHit == true`.
+        let eventualHit: Bool
         let latencyMs: Double?
-        /// Only meaningful for a miss -- what activeWindowId actually was at the 500ms cap.
-        let observedActiveWindowId: UInt32?
+        /// Only meaningful for an eventual miss -- what the server's activeWindowId
+        /// actually was at the eventual cap.
+        let observedActiveWindow: ServerActiveWindow
     }
     private var focusRotationReady = false
     private var focusRotationWindowIds: [UInt32] = []
     private var focusRotationsIssued = 0
     private var focusRotationPendingTargetId: UInt32?
     private var focusRotationPendingSentAt: Date?
-    private var focusRotationPendingDeadline: Date?
+    /// The 500ms soft-deadline mark (adr/0012 §1) -- convergence observed at or before this
+    /// is a `softHit`; after it (but before `focusRotationPendingEventualDeadline`), still an
+    /// `eventualHit` but not a `softHit`.
+    private var focusRotationPendingSoftDeadline: Date?
+    /// The outer poll cutoff -- `FocusAuthority.hardDeadlineInterval` (5000ms) past send,
+    /// matching adr/0012 §1's own hard-rollback safety-valve window, so "never converged" in
+    /// this harness means the same thing it means to `FocusAuthority` itself.
+    private var focusRotationPendingEventualDeadline: Date?
     /// Gates the 300ms inter-rotation settle; nil means "no wait pending" (the first
     /// rotation fires as soon as the scenario becomes ready).
     private var focusRotationNextAllowedAt: Date?
@@ -401,13 +419,6 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             if event.kind == .execResult, event.execResult != 0 {
                 self.failedExecResults.append("\(event.program) -> \(event.execResult)")
             }
-            // Cycle soak: the server's own statement of which window holds focus --
-            // the reliable precondition for a focus-addressed keystroke (see
-            // cycleEnterAt's comment).
-            if event.kind == .monitoredDesktop {
-                self.lastActiveWindowId = event.windowId
-            }
-
             // Flow evidence counters (task item 1): counted for every drained event
             // regardless of mode (plain run, extra-apps, cycles) -- only finish()'s
             // gating assertions and the `[flow]` summary print are scoped to the
@@ -416,14 +427,14 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             case .monitoredDesktop:
                 self.monitoredDesktopEventCount += 1
                 // registry.handle(event) above already applied this order, so
-                // serverDesktopState() reflects it -- reads the sentinel-normalized
-                // value through the existing accessor rather than re-deriving 0xFFFFFFFF
-                // here (adr/0008 §0).
-                let currentActive = registry.serverDesktopState().activeWindowId
-                if currentActive != self.flowLastActiveWindowId {
-                    print("[flow] activeWindowId: \(self.flowLastActiveWindowId.map(String.init) ?? "nil") -> \(currentActive.map(String.init) ?? "nil")")
+                // serverDesktopState() reflects it -- reads the classified value through
+                // the existing accessor rather than re-deriving the two sentinel checks
+                // here (adr/0012 §3).
+                let currentActive = registry.serverDesktopState().activeWindow
+                if currentActive != self.flowLastActiveWindow {
+                    print("[flow] activeWindow: \(Self.describe(self.flowLastActiveWindow)) -> \(Self.describe(currentActive))")
                     self.activeWindowIdTransitionCount += 1
-                    self.flowLastActiveWindowId = currentActive
+                    self.flowLastActiveWindow = currentActive
                 }
             case .zOrderSync:
                 self.zOrderSyncEventCount += 1
@@ -440,22 +451,31 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             frameLatencySamplesMs.append(Date().timeIntervalSince(pushObservedAt) * 1000)
         }
 
-        // Focus rotation convergence poll (task item 2): checked once per drain batch
-        // ("poll every drain"), capped at 500ms from the ClientActivate send -- reuses this
-        // push-driven cadence rather than a separate timer, matching how frame delivery is
-        // already sampled above.
-        if let targetId = focusRotationPendingTargetId, let deadline = focusRotationPendingDeadline,
-           let sentAt = focusRotationPendingSentAt
+        // Focus rotation convergence poll (task item 2/3): checked once per drain batch
+        // ("poll every drain"), reusing this push-driven cadence rather than a separate
+        // timer, matching how frame delivery is already sampled above. adr/0012 §4.2: two
+        // tiers, not one -- `softHit` (converged at/before the 500ms mark) is what W1's own
+        // >=99% exit criterion will gate on once this harness has produced real n>=100
+        // numbers; `eventualHit` (converged at all within the outer 5000ms window, matching
+        // `FocusAuthority.hardDeadlineInterval`) is the "did convergence eventually happen"
+        // observation tier adr/0012 §0's own real-capture data showed never actually fails
+        // in steady state ("收敛从未彻底失败，只是有时很慢").
+        if let targetId = focusRotationPendingTargetId, let sentAt = focusRotationPendingSentAt,
+           let softDeadline = focusRotationPendingSoftDeadline,
+           let eventualDeadline = focusRotationPendingEventualDeadline
         {
-            let currentActive = registry.serverDesktopState().activeWindowId
-            if currentActive == targetId {
-                let latencyMs = Date().timeIntervalSince(sentAt) * 1000
+            let currentActive = registry.serverDesktopState().activeWindow
+            if case .window(let active) = currentActive, active == targetId {
+                let now = Date()
+                let latencyMs = now.timeIntervalSince(sentAt) * 1000
                 focusRotationResults.append(FocusRotationResult(
-                    targetId: targetId, hit: true, latencyMs: latencyMs, observedActiveWindowId: currentActive))
+                    targetId: targetId, softHit: now <= softDeadline, eventualHit: true,
+                    latencyMs: latencyMs, observedActiveWindow: currentActive))
                 resolveFocusRotationPending()
-            } else if Date() >= deadline {
+            } else if Date() >= eventualDeadline {
                 focusRotationResults.append(FocusRotationResult(
-                    targetId: targetId, hit: false, latencyMs: nil, observedActiveWindowId: currentActive))
+                    targetId: targetId, softHit: false, eventualHit: false, latencyMs: nil,
+                    observedActiveWindow: currentActive))
                 resolveFocusRotationPending()
             }
         }
@@ -467,7 +487,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private func resolveFocusRotationPending() {
         focusRotationPendingTargetId = nil
         focusRotationPendingSentAt = nil
-        focusRotationPendingDeadline = nil
+        focusRotationPendingSoftDeadline = nil
+        focusRotationPendingEventualDeadline = nil
         focusRotationNextAllowedAt = Date().addingTimeInterval(0.3)
     }
 
@@ -502,12 +523,17 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             captureEvidence()
         }
 
-        // Focus rotation (task item 2) can need more than the standard 25s budget: worst
-        // case per rotation is the 500ms convergence-poll cap plus the 300ms inter-rotation
-        // settle (see runFocusRotation/resolveFocusRotationPending), so the deadline scales
-        // with N rather than assuming the fixed window calibrated for the no-rotation case
-        // is enough. `rotationStalled` is a hard failsafe only -- normally `focusRotationDone`
-        // is what actually gates the extra wait, not this later fallback deadline.
+        // Focus rotation (task item 2/3) can need more than the standard 25s budget. The
+        // theoretical worst case per rotation is now the eventual (5000ms,
+        // FocusAuthority.hardDeadlineInterval) convergence-poll cap plus the 300ms
+        // inter-rotation settle (adr/0012 §4.2's two-tier reporting), but the 1.0s/rotation
+        // average this budgets stays realistic in practice: adr/0012 §0's own real-capture
+        // data (p50=38ms, p95=329ms, max=3754ms across 30 rotations) means only a rare tail
+        // ever approaches the eventual cap, not every rotation -- "the deadline scaling
+        // exists" already covers n up to 100+ on that basis. `rotationStalled` is a hard
+        // failsafe only -- normally `focusRotationDone` is what actually gates the extra
+        // wait, not this later fallback deadline; a run that genuinely can't keep up fails
+        // the "ran all N rotations" assertion in `finish()` rather than hanging forever.
         let baseDeadline: TimeInterval = 25
         let rotationDeadline = focusRotationTotal > 0
             ? max(baseDeadline, 10 + Double(focusRotationTotal) * 1.0)
@@ -536,19 +562,23 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // ACTIVATION_TIMEOUT" behavior class). It also makes every cycle a full input round trip.
         if let targetId = cycleCloseTargetId, let closeDeadline = cycleCloseDeadline {
             if !cycleEnterSent {
-                // Fire the keystroke the moment the server CONFIRMS focus is on the target
-                // (MonitoredDesktop.activeWindowId), falling back to a hard timeout so a
-                // missing/battled focus notification can't stall the cycle -- the earlier
-                // fixed 0.6s settle still raced ~25% of cycles (server focus landing late,
-                // or on a leftover sibling).
-                let focusConfirmed = lastActiveWindowId == targetId
-                let fallbackDue = cycleEnterAt.map { Date() >= $0 } ?? false
-                if focusConfirmed || fallbackDue {
-                    cycleEnterSent = true
-                    if let nsWindow = registry.window(forWindowId: targetId) {
-                        nsWindow.makeKeyAndOrderFront(nil)
-                        sendSyntheticEnter(to: nsWindow)
-                    }
+                // adr/0012 task item 3: the activation click that locked (or re-locked, on
+                // retry) this target already routed through the real mouseDown path ->
+                // `FocusAuthority.localActivate` (see `activateForClose`) -- the keyboard-
+                // lane gate now owns "don't let this Enter out until the server actually
+                // confirms convergence" structurally, so there is no more manual
+                // MonitoredDesktop.activeWindowId poll/fallback dance here. `cycleEnterAt`
+                // is just a short settle separating the click from the Enter by more than
+                // one run-loop turn.
+                guard let settleAt = cycleEnterAt, Date() >= settleAt else { return }
+                cycleEnterSent = true
+                if let nsWindow = registry.window(forWindowId: targetId) {
+                    // Redundant with activateForClose's own makeKeyAndOrderFront, but
+                    // cheap and matches this file's existing "a redundant Activate/makeKey
+                    // is a fire-and-forget no-op cost" precedent -- guards against anything
+                    // else having stolen key status during the settle.
+                    nsWindow.makeKeyAndOrderFront(nil)
+                    sendSyntheticEnter(to: nsWindow)
                 }
                 return
             }
@@ -560,12 +590,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             if !shrank && Date() < closeDeadline { return }
             if !shrank && !cycleCloseRetried {
                 cycleCloseRetried = true
-                session.activateWindow(targetId)
-                cycleEnterAt = Date().addingTimeInterval(2.0)
+                if let nsWindow = registry.window(forWindowId: targetId) {
+                    activateForClose(nsWindow)
+                }
+                cycleEnterAt = Date().addingTimeInterval(0.1)
                 cycleEnterSent = false
                 cycleCloseDeadline = Date().addingTimeInterval(6)
                 return
             }
+            print("[cycles] cycle \(cycleIndex)/\(cyclesTotal) close-leg: \(shrank ? "PASS" : "FAIL")"
+                + " (retried=\(cycleCloseRetried))")
             finishCycle(session: session, registry: registry, rendered: true, closed: shrank,
                         seconds: seconds)
             return
@@ -585,13 +619,19 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             if let target = aboutWindows.first(where: \.hasDisplayedContent) {
                 cycleCloseTargetId = target.windowId
                 cycleAboutCountAtLock = aboutWindows.count
-                // Remote keyboard focus must actually be ON the target before the Enter is
-                // meaningful -- reattached sessions come up with the server's own idea of
-                // focus. ClientActivate is windowId-addressed and reliable; give it a
-                // settle window before the keystroke.
-                session.activateWindow(target.windowId)
-                cycleEnterAt = Date().addingTimeInterval(2.0) // fallback only; normally the
-                cycleEnterSent = false                        // focus event fires first
+                // adr/0012 task item 3: remote keyboard focus must actually be ON the
+                // target before the Enter is meaningful -- reattached sessions come up
+                // with the server's own idea of focus. Activation now goes through the
+                // SAME real click path the production app uses (`activateForClose` ->
+                // RemoteWindowRegistry.handleInput's mouseButton case ->
+                // FocusAuthority.localActivate), not a direct `session.activateWindow`
+                // call, so the keyboard-lane gate this arms is honored "by construction"
+                // rather than needing this driver to separately poll for confirmation.
+                if let nsWindow = registry.window(forWindowId: target.windowId) {
+                    activateForClose(nsWindow)
+                }
+                cycleEnterAt = Date().addingTimeInterval(0.1) // short settle, not a focus wait
+                cycleEnterSent = false
                 cycleCloseDeadline = Date().addingTimeInterval(6)
                 return
             }
@@ -657,18 +697,29 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             cycleResults.count == cyclesTotal && renderedCount == cyclesTotal,
             "all \(cyclesTotal) cycles reached a visible content window (got \(renderedCount) of \(cycleResults.count) attempted)"
         )
-        // Floor, not 100%: with focus confirmation (MonitoredDesktop.activeWindowId) AND a
-        // full activate+Enter retry, ~15-25% of cycles still fail to close their winver --
-        // three different strategies produced the same residual rate, so this is a real
-        // property of focus-addressed keystrokes under rapid reconnect churn (recorded as
-        // a Phase 2 focus-sync work item), not harness slop. The floor still
-        // catches total breakage of the input round trip; the strict per-cycle log lines
-        // above keep the real rate visible.
+        // Floor, not 100%: even with a full activate+Enter retry, ~15-25% of cycles have
+        // historically still failed to close their winver -- three different manual-timing
+        // strategies produced the same residual rate before adr/0012 (recorded as a Phase 2
+        // focus-sync work item), not harness slop. adr/0012 task item 3 replaces the manual
+        // timing with the gated path (activateForClose -> FocusAuthority.localActivate,
+        // keystrokes flow through the keyboard-lane gate by construction) but deliberately
+        // keeps this floor unchanged for now -- flipping it to the ADR's own ≤2% target
+        // happens only after real evidence from the gated path, not as an assumption made
+        // here. The floor still catches total breakage of the input round trip; the strict
+        // per-cycle close-leg log lines above and the failure-rate line below keep the real
+        // rate visible in the meantime.
         check(
             Double(closedCount) >= Double(cycleResults.count) * 0.7,
             "at least 70% of cycles closed their winver via the synthetic Enter round trip "
                 + "(got \(closedCount) of \(cycleResults.count))"
         )
+        if !cycleResults.isEmpty {
+            let failureRate = Double(cycleResults.count - closedCount) / Double(cycleResults.count) * 100
+            print(String(
+                format: "[cycles] close-leg failure rate: %.1f%% (%d of %d cycles failed to close)",
+                failureRate, cycleResults.count - closedCount, cycleResults.count
+            ))
+        }
         check(
             cleanCount == cycleResults.count,
             "every cycle's shutdownAndWait reported clean (got \(cleanCount) of \(cycleResults.count))"
@@ -934,9 +985,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         let targetId = focusRotationWindowIds[focusRotationsIssued % focusRotationWindowIds.count]
         focusRotationsIssued += 1
         session.activateWindow(targetId)
+        let sentAt = Date()
         focusRotationPendingTargetId = targetId
-        focusRotationPendingSentAt = Date()
-        focusRotationPendingDeadline = Date().addingTimeInterval(0.5)
+        focusRotationPendingSentAt = sentAt
+        focusRotationPendingSoftDeadline = sentAt.addingTimeInterval(FocusAuthority.softDeadlineInterval)
+        focusRotationPendingEventualDeadline = sentAt.addingTimeInterval(FocusAuthority.hardDeadlineInterval)
         print("[focus-rotation] rotation \(focusRotationsIssued)/\(focusRotationTotal): activating windowId=\(targetId)")
     }
 
@@ -978,6 +1031,35 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         }
         window.sendEvent(down)
         window.sendEvent(up)
+    }
+
+    /// adr/0012 task item 3: shared by the cycle-close leg's lock (`tickCycles` Phase A) and
+    /// its single retry -- makes `window` locally key and dispatches one real synthetic
+    /// click at a neutral background point via the shared `sendClick(to:at:)` helper. Routes
+    /// through `RemoteWindowContentView.mouseDown` -> `RemoteWindowRegistry.handleInput`'s
+    /// real mouseButton path, exactly like a genuine trackpad click, rather than the old
+    /// direct `session.activateWindow(_:)` call -- so this exercises the actual
+    /// `FocusAuthority`-gated activation the production click-to-focus path uses, "by
+    /// construction" (the keystroke sent afterward doesn't need its own separate focus
+    /// confirmation anymore; see `cycleEnterAt`'s own doc comment). Deliberately a
+    /// background point, not the OK button `sendSyntheticClick` targets -- this call's only
+    /// job is to establish focus, not to close the window.
+    private func activateForClose(_ window: NSWindow) {
+        window.makeKeyAndOrderFront(nil)
+        let size = window.contentView?.bounds.size ?? window.frame.size
+        sendClick(to: window, at: NSPoint(x: size.width * 0.5, y: size.height * 0.85))
+    }
+
+    /// Human-readable form of `MacdowsCore.ServerActiveWindow` for `[flow]`/`[focus-rotation]`
+    /// log lines -- this type has no `CustomStringConvertible` conformance of its own (kept
+    /// out of MacdowsCore's pure-logic surface deliberately; formatting is a presentation
+    /// concern, not a state-machine one).
+    private static func describe(_ truth: ServerActiveWindow) -> String {
+        switch truth {
+        case .window(let id): return String(id)
+        case .desktopFocused: return "desktop"
+        case .unmonitored: return "unmonitored"
+        }
     }
 
     /// W4c review: nearest-rank percentile (e.g. `p == 0.95` for p95), used for the
@@ -1355,30 +1437,34 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Focus rotation scenario (task item 2): machine-readable summary plus one detail
-        // line per miss (target id, observed activeWindowId at the 500ms timeout) -- only
-        // printed/gated when WINDOW_SMOKE_FOCUS_ROTATION was set for this run. Gating is
-        // deliberately limited to "did the scenario actually run its N rotations" -- NOT
-        // hit rate (docs/plans/phase2.md §2 W1: "拿到真数据前不写策略"; the >=99%
-        // convergence gate is W1's own exit criterion, applied once this harness has
-        // produced real numbers to gate against). The general MonitoredDesktop>=1 check
-        // above already covers this scenario's own "and MonitoredDesktop count >= 1"
-        // requirement -- not duplicated here.
+        // Focus rotation scenario (task item 2/3): machine-readable summary plus one detail
+        // line per eventual miss (target id, observed activeWindow at the eventual/5000ms
+        // cap) -- only printed/gated when WINDOW_SMOKE_FOCUS_ROTATION was set for this run.
+        // adr/0012 §4.2: reports BOTH tiers -- softHits (converged within the 500ms gating
+        // window) and eventualHits (converged at all within the 5000ms eventual window) --
+        // and gates on NEITHER rate (docs/plans/phase2.md §2 W1: "拿到真数据前不写策略"; the
+        // >=99% soft-hit convergence gate is W1's own exit criterion, applied once this
+        // harness has produced real n>=100 numbers to gate against). Gating here stays
+        // limited to "did the scenario actually run its N rotations". The general
+        // MonitoredDesktop>=1 check above already covers this scenario's own "and
+        // MonitoredDesktop count >= 1" requirement -- not duplicated here.
         if focusRotationTotal > 0 {
-            let hits = focusRotationResults.filter(\.hit)
-            let misses = focusRotationResults.filter { !$0.hit }
-            let latencies = hits.compactMap(\.latencyMs).sorted()
+            let softHits = focusRotationResults.filter(\.softHit)
+            let eventualHits = focusRotationResults.filter(\.eventualHit)
+            let eventualMisses = focusRotationResults.filter { !$0.eventualHit }
+            let latencies = eventualHits.compactMap(\.latencyMs).sorted()
             func percentileMs(_ p: Double) -> Double {
                 guard !latencies.isEmpty else { return 0 }
                 let rank = max(0, min(latencies.count - 1, Int((p * Double(latencies.count)).rounded(.up)) - 1))
                 return latencies[rank]
             }
             print(String(
-                format: "[focus-rotation] n=%d hits=%d misses=%d p50=%.1fms p95=%.1fms maxMs=%.1fms",
-                focusRotationTotal, hits.count, misses.count, percentileMs(0.5), percentileMs(0.95), latencies.last ?? 0
+                format: "[focus-rotation] n=%d softHits=%d eventualHits=%d eventualMisses=%d p50=%.1fms p95=%.1fms maxMs=%.1fms",
+                focusRotationTotal, softHits.count, eventualHits.count, eventualMisses.count,
+                percentileMs(0.5), percentileMs(0.95), latencies.last ?? 0
             ))
-            for miss in misses {
-                print("[focus-rotation] miss detail: target=\(miss.targetId) observedActiveWindowId=\(miss.observedActiveWindowId.map(String.init) ?? "nil")")
+            for miss in eventualMisses {
+                print("[focus-rotation] eventual miss detail: target=\(miss.targetId) observedActiveWindow=\(Self.describe(miss.observedActiveWindow))")
             }
             check(
                 focusRotationsIssued == focusRotationTotal,

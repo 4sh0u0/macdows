@@ -78,12 +78,18 @@ private struct PendingWindowState {
 /// focus-convergence/Z-order *policy* is explicitly deferred until real data has been
 /// observed live -- this struct only records what the server last said, it decides
 /// nothing). Exposed for `Tools/window-smoke`'s harness via
-/// `RemoteWindowRegistry.serverDesktopState`, not consumed by any rendering/input path yet.
+/// `RemoteWindowRegistry.serverDesktopState`, not consumed by any rendering/input path yet
+/// (the actual focus *policy* consumer is `FocusAuthority`, fed separately by
+/// `handleMonitoredDesktop` below -- this struct stays a passive observability record).
 struct ServerDesktopState: Equatable {
-    /// `nil` when the server's own `activeWindowId` was the `0xFFFFFFFF` sentinel
-    /// (adr/0008 §0: "no window on this desktop currently has focus") -- the sentinel must
-    /// never be stored/compared as a literal window id.
-    var activeWindowId: UInt32?
+    /// adr/0012 §3: `MacdowsCore.ServerActiveWindow` classifies the server's raw
+    /// `activeWindowId` into its three distinct meanings (window / desktop-focused /
+    /// unmonitored) -- see that type's own doc comment for why `0` must never be folded
+    /// into `.unmonitored` nor compared as if it were `.window(0)`. Supersedes the old
+    /// `activeWindowId: UInt32?` shape, which already kept the `0xFFFFFFFF` sentinel out of
+    /// `.some(0)` but gave callers no named way to recognize `0` as "the desktop", adr/0012
+    /// §3's own gap callout ("该处必须同时辨出0").
+    var activeWindow: ServerActiveWindow = .unmonitored
     /// Top-to-bottom Z order (adr/0008 §2a), gated on `WINDOW_ORDER_FIELD_DESKTOP_ZORDER`
     /// (0x10) -- empty when the most recent order didn't carry that bit.
     var windowIds: [UInt32] = []
@@ -119,6 +125,13 @@ final class RemoteWindowRegistry {
     /// adr/0008 §6 / task item 5: pure-data record of the last MonitoredDesktop order, no
     /// ordering/focus policy attached. See `ServerDesktopState`'s own doc comment.
     private var desktopState = ServerDesktopState()
+
+    /// adr/0012: server-authoritative + local-optimistic-prediction focus state machine.
+    /// Pure logic lives entirely in `MacdowsCore.FocusAuthority` (no AppKit/CRSession, no
+    /// `Date()`); this registry owns the one instance for the session's lifetime, feeds it
+    /// every relevant input, and executes every effect it returns via `execute(_:)` below --
+    /// adr/0012 §4's "纯状态机进MacdowsCore，RemoteWindowRegistry只做消费与副作用" split.
+    private let focusAuthority = FocusAuthority()
 
     /// W4c review H1: *session-level* modifier state — one physical keyboard, one tracked
     /// set, not per-window. The original per-window `[UInt32: NSEvent.ModifierFlags]`
@@ -198,6 +211,13 @@ final class RemoteWindowRegistry {
             currentGeneration = event.generation
         }
 
+        // adr/0012 §4 task item 2: opportunistic tick on every drained event -- cheap (a
+        // no-op whenever FocusAuthority isn't `.converging`), and covers the common case
+        // (events keep arriving during a convergence attempt) without a repeating timer.
+        // `armFocusAuthorityDeadlineTicks` (called from the mouseButton `.down` case)
+        // covers the complementary "server goes quiet" case with one-shot timers.
+        execute(focusAuthority.tick(now: CFAbsoluteTimeGetCurrent()))
+
         switch event.kind {
         case .windowCreate, .windowUpdate:
             handleWindowOrder(event)
@@ -235,16 +255,19 @@ final class RemoteWindowRegistry {
 
     /// adr/0008 §2a / §6: records the server's own MonitoredDesktop state as pure data --
     /// no focus/Z-order policy. `event.windowId` carries `activeWindowId` (see
-    /// `CRDPEvent.windowId`'s own doc comment); the `0xFFFFFFFF` sentinel becomes `nil`
-    /// here, once, so nothing downstream ever has to re-derive that check.
+    /// `CRDPEvent.windowId`'s own doc comment); `ServerActiveWindow.init(rawActiveWindowId:)`
+    /// classifies it once, here, so nothing downstream ever has to re-derive the two
+    /// sentinel checks (adr/0012 §3). Also the sole feed into `FocusAuthority`'s policy --
+    /// this is the "real MonitoredDesktop order" adr/0012 §2's reconnect discipline requires
+    /// before the keyboard-lane gate can ever reopen.
     private func handleMonitoredDesktop(_ event: CRDPEvent) {
-        let sentinel: UInt32 = 0xFFFF_FFFF
-        desktopState.activeWindowId = (event.windowId == sentinel) ? nil : event.windowId
+        desktopState.activeWindow = ServerActiveWindow(rawActiveWindowId: event.windowId)
         desktopState.numWindowIds = event.numWindowIds
         desktopState.windowIdsTruncated = event.windowIdsTruncated
         if event.fieldFlags & WindowOrderField.desktopZOrder != 0 {
             desktopState.windowIds = event.windowIds.map { $0.uint32Value }
         }
+        execute(focusAuthority.serverDesktopUpdate(rawActiveWindowId: event.windowId, at: CFAbsoluteTimeGetCurrent()))
     }
 
     private func handleWindowOrder(_ event: CRDPEvent) {
@@ -379,13 +402,17 @@ final class RemoteWindowRegistry {
             pendingTrailingMove.removeValue(forKey: windowId)
             if down {
                 // Click-to-activate (W4c task spec: "this is also where the real fix for the
-                // white-block bug lands") — both the
-                // remote ClientActivate and the local makeKeyAndOrderFront happen together,
-                // unconditionally, on every button-down, not gated on "was this window
-                // already focused" — a redundant Activate/makeKey on an already-focused
-                // window is a fire-and-forget no-op cost, not a correctness risk.
-                session.activateWindow(windowId)
-                windows[windowId]?.activateLocally()
+                // white-block bug lands") — the existing unconditional local optimistic
+                // prediction (adr/0012 §0: this ADR doesn't introduce it, it puts authority
+                // and rollback around it), now routed through FocusAuthority so the
+                // keyboard-lane gate closes for this epoch and the soft/hard deadlines start
+                // ticking. `execute` maps its `.sendActivate`/`.makeKey` effects onto the
+                // exact same `session.activateWindow`/`activateLocally()` calls this used to
+                // make directly -- a redundant Activate/makeKey on an already-focused window
+                // is still just a fire-and-forget no-op cost, not a correctness risk.
+                let now = CFAbsoluteTimeGetCurrent()
+                execute(focusAuthority.localActivate(windowId: windowId, at: now))
+                armFocusAuthorityDeadlineTicks(from: now)
             }
             let point = remotePoint(from: screenPoint)
             session.send(crMouseButton(for: button), down: down, atX: Int32(point.x), y: Int32(point.y))
@@ -410,30 +437,152 @@ final class RemoteWindowRegistry {
             }
 
         case .keyDown(let macKeyCode):
-            session.sendKeyDown(macKeyCode)
+            // adr/0012 §2: keyboard is focus-addressed (the wire message itself carries no
+            // windowId -- CRSession.h's `sendKeyDown:`/`sendKeyUp:` take only a scancode),
+            // so it must not reach the wire until FocusAuthority confirms the server's own
+            // `activeWindowId` actually matches what we're claiming key for. Routed through
+            // the gate rather than sent directly, unlike mouse (position-addressed, §2:
+            // "鼠标是位置寻址，天然免闸").
+            execute(focusAuthority.enqueueKeyboardEvent(.keyDown(macKeyCode: macKeyCode), at: CFAbsoluteTimeGetCurrent()))
 
         case .keyUp(let macKeyCode):
-            session.sendKeyUp(macKeyCode)
+            execute(focusAuthority.enqueueKeyboardEvent(.keyUp(macKeyCode: macKeyCode), at: CFAbsoluteTimeGetCurrent()))
 
         case .flagsChanged(let modifierFlags):
+            // heldModifierKeys tracks physical keyboard state at *capture* time,
+            // independent of gating -- the diff itself (which bits actually transitioned)
+            // must happen now, against the last raw observation, same as before this ADR.
+            // What's new: each individual transition is now a `KeyboardLaneEvent` routed
+            // through the gate ("闸的粒度是整条键盘车道", §2), not sent to the wire directly
+            // -- FocusAuthority buffers or passes it through exactly like keyDown/keyUp.
             let current = Self.modifierKeySet(from: modifierFlags)
             let transitions = ModifierKeyTracker.transitions(from: heldModifierKeys, to: current)
             heldModifierKeys = current
             for transition in transitions {
-                session.send(Self.crModifierKey(for: transition.key), down: transition.down)
+                execute(focusAuthority.enqueueKeyboardEvent(.modifierKey(transition.key, down: transition.down), at: CFAbsoluteTimeGetCurrent()))
             }
 
         case .focusLost:
             // W4c review H1: this window (or its content view) can no longer be trusted to
             // observe the physical keyboard -- unconditionally release every bit this
             // session-level tracker currently has marked as held, rather than leaving RDP's
-            // own modifier state stuck on a release that might never arrive.
-            let releases = ModifierKeyTracker.releaseAll(heldModifierKeys)
-            heldModifierKeys = []
-            for release in releases {
-                session.send(Self.crModifierKey(for: release.key), down: release.down)
+            // own modifier state stuck on a release that might never arrive. Deliberately
+            // NOT routed through FocusAuthority's gate: a focus-loss release is the safety
+            // mechanism itself, not the "focus-addressed input" the gate exists to protect
+            // against buffering/misdirecting -- it must fire immediately regardless of
+            // whatever convergence is in flight.
+            releaseAllHeldModifiers()
+        }
+    }
+
+    /// Executes `FocusAuthority`'s returned effects against this registry's AppKit/CRSession
+    /// machinery -- adr/0012 §4's "RemoteWindowRegistry只做消费与副作用" half of the split (the
+    /// state machine itself, in `MacdowsCore.FocusAuthority`, touches neither). Applied in
+    /// the order `FocusAuthority` returned them.
+    private func execute(_ effects: [FocusAuthorityEffect]) {
+        for effect in effects {
+            switch effect {
+            case .sendActivate(let windowId):
+                session.activateWindow(windowId)
+
+            case .makeKey(let windowId):
+                guard let window = windows[windowId] else {
+                    // adr/0012 §3: a server value naming a window unknown to this registry
+                    // (filtered out by W0 style/owner filtering, or not yet created) is
+                    // still authoritative truth -- FocusAuthority converges on it
+                    // regardless. There is simply no local NSWindow to give key status to;
+                    // this registry is the one place that knows that, so it's the one place
+                    // that warns about it, not FocusAuthority itself (which has no notion
+                    // of "windows this registry happens to render").
+                    Self.logger.warning("FocusAuthority.makeKey for windowId=\(windowId, privacy: .public) has no local RemoteWindow (adr/0012 §3: authority accepted, no local window to key)")
+                    continue
+                }
+                window.activateLocally()
+
+            case .resignKey(let windowId):
+                // Best-effort: no clean AppKit primitive exists to force an arbitrary
+                // window to give up key status while staying visible (the closest is
+                // `-resignKey` -- ObjC `resignKeyWindow`, Swift-renamed -- whose default
+                // implementation exists specifically to update a window's own visual
+                // key-appearance and post `NSWindow.didResignKeyNotification`; calling it
+                // directly here is the "existing... machinery" the task calls for, not a
+                // new mechanism). A windowId FocusAuthority tracked but this registry never
+                // had a window for is a silent no-op -- nothing to visually un-key.
+                windows[windowId]?.window.resignKey()
+
+            case .flushBufferedInput(let events):
+                for event in events {
+                    sendKeyboardLaneEvent(event)
+                }
+
+            case .dropBufferedInput(let count, let withModifierRelease):
+                if count > 0 {
+                    Self.logger.debug("FocusAuthority dropped \(count, privacy: .public) buffered keyboard-lane event(s)")
+                }
+                if withModifierRelease {
+                    // adr/0012 §2: hard rollback and epoch supersede both require a
+                    // releaseAll, independent of whatever happened to actually be sitting in
+                    // FocusAuthority's own FIFO at that moment (see FocusAuthority's own doc
+                    // comment on why it doesn't try to compute this itself) -- the same
+                    // machinery `.focusLost` above already uses.
+                    releaseAllHeldModifiers()
+                }
+
+            case .warn(let reason):
+                Self.logger.warning("FocusAuthority: \(String(describing: reason), privacy: .public)")
             }
         }
+    }
+
+    private func sendKeyboardLaneEvent(_ event: KeyboardLaneEvent) {
+        switch event {
+        case .keyDown(let macKeyCode):
+            session.sendKeyDown(macKeyCode)
+        case .keyUp(let macKeyCode):
+            session.sendKeyUp(macKeyCode)
+        case .modifierKey(let key, let down):
+            session.send(Self.crModifierKey(for: key), down: down)
+        }
+    }
+
+    /// Shared by `.focusLost` (immediate/ungated) and `.dropBufferedInput(...,
+    /// withModifierRelease: true)` (also immediate/ungated -- see that effect's own doc
+    /// comment) -- both need the exact same "release everything this session-level tracker
+    /// currently has marked as held" flow (W4c review H1).
+    private func releaseAllHeldModifiers() {
+        let releases = ModifierKeyTracker.releaseAll(heldModifierKeys)
+        heldModifierKeys = []
+        for release in releases {
+            session.send(Self.crModifierKey(for: release.key), down: release.down)
+        }
+    }
+
+    /// adr/0012 §4 task item 2: `FocusAuthority`'s soft/hard deadlines only fire when
+    /// `tick(now:)` is actually called at some point after each threshold elapses --
+    /// `handle(_:)` already does this opportunistically on every drained event, which covers
+    /// the common case (events keep arriving during a convergence attempt). This covers the
+    /// complementary *quiet* case: if the server goes completely silent for the whole
+    /// 500ms/5000ms window (no MonitoredDesktop, no window order, nothing), these one-shot
+    /// timers are what still fire the re-arm/rollback on schedule -- mirrors
+    /// `pendingTrailingMove`'s own `asyncAfter` idiom above rather than adding a new
+    /// repeating `Timer`. Safe to call redundantly (e.g. on every `localActivate`, including
+    /// the same-target nudge case that doesn't actually reset any deadline): `tick(now:)` is
+    /// a no-op whenever nothing has actually crossed a threshold yet.
+    private func armFocusAuthorityDeadlineTicks(from now: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + FocusAuthority.softDeadlineInterval) { [weak self] in
+            MainActor.assumeIsolated {
+                self?.tickFocusAuthority()
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + FocusAuthority.hardDeadlineInterval) { [weak self] in
+            MainActor.assumeIsolated {
+                self?.tickFocusAuthority()
+            }
+        }
+    }
+
+    private func tickFocusAuthority() {
+        execute(focusAuthority.tick(now: CFAbsoluteTimeGetCurrent()))
     }
 
     /// Trailing-edge flush for the move throttle (see `pendingTrailingMove`): sends the
@@ -597,6 +746,14 @@ final class RemoteWindowRegistry {
         surfaceToWindow.removeAll()
         surfaceMappedSize.removeAll()
         desktopState = ServerDesktopState()
+        // adr/0012 §2 reconnect discipline: reset to `.unmonitored` -- the gate can only
+        // reopen on a subsequent *real* MonitoredDesktop order, never by any timeout.
+        // Covers both this method's two callers: the generation-rollover branch in
+        // `handle(_:)` and the explicit `prepareForReconnect()` driver, since both route
+        // through here. Effects intentionally discarded, matching `heldModifierKeys`'
+        // own reset right below -- the connection this buffered/keyed state described is
+        // already gone, so there is nothing left to send any of it to.
+        _ = focusAuthority.generationReset()
         // No RELEASE flush here (unlike the .focusLost case) -- the connection this
         // tracked state described is already gone, so there is nothing left to send it to.
         heldModifierKeys = []
