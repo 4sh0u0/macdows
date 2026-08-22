@@ -140,6 +140,19 @@ let cyclesTotal = max(1, Int(ProcessInfo.processInfo.environment["WINDOW_SMOKE_C
 /// 不写策略"); the >=99% convergence gate is W1's own exit criterion, not asserted here.
 let focusRotationTotal = max(0, Int(ProcessInfo.processInfo.environment["WINDOW_SMOKE_FOCUS_ROTATION"] ?? "") ?? 0)
 
+/// adr/0012 follow-up diagnostic, harness-only (no product/FocusAuthority changes):
+/// discriminates between two hypotheses for why cycle-mode close-legs were observed to fail
+/// 45.5% of the time against a real host after the FocusAuthority gate landed -- (A) server
+/// focus is truly absent post-reconnect-churn (the Enter would have failed even ungated), vs
+/// (B) `MonitoredDesktop.activeWindowId` lags/misreports actual input focus during that
+/// window (the Enter would have landed -- the pre-ADR blind-send harness closed 75-85% of
+/// cycles there, which hints at B). Off by default (0 effect on any existing behavior/log
+/// line/assertion) -- only when set does a close-leg that fails *because convergence never
+/// happened* also blind-send a probe Enter directly via `CRSession`, bypassing
+/// RemoteWindowRegistry/FocusAuthority entirely, and report whether the window closed
+/// anyway. Purely informational: never changes what a cycle's close-leg gates as.
+let closeProbeEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_CLOSE_PROBE"] == "1"
+
 @MainActor
 final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private let host: String
@@ -190,6 +203,29 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// One retry of the activate+Enter sequence per cycle (observed ~1-in-20 residual
     /// miss even with focus confirmation -- a single re-arm reliably clears it).
     private var cycleCloseRetried = false
+    /// adr/0012 follow-up diagnostic (WINDOW_SMOKE_CLOSE_PROBE): whether the server's
+    /// `activeWindow` has been observed to equal `cycleCloseTargetId` at any point since
+    /// the target was (most recently) locked -- this harness's own external proxy for "the
+    /// FocusAuthority gate actually opened and the real Enter got a chance to reach the
+    /// wire," without reaching into FocusAuthority's private state. Reset only when a
+    /// *fresh* target is locked (Phase A) -- deliberately NOT reset by the one retry, so a
+    /// convergence that happened on the first attempt but not the second still correctly
+    /// counts as "convergence happened somewhere in this close-leg" and skips the probe.
+    private var cycleTargetEverConverged = false
+
+    // adr/0012 follow-up diagnostic (WINDOW_SMOKE_CLOSE_PROBE) -- in-flight probe watch
+    // state, all nil/empty when no probe is pending (the common case, and always true when
+    // closeProbeEnabled is false).
+    private struct CloseProbeResult {
+        let cycle: Int
+        let targetId: UInt32
+        let closedDespiteNonConvergence: Bool
+    }
+    private var closeProbePendingCycle: Int?
+    private var closeProbePendingTarget: UInt32?
+    private var closeProbePendingAboutCountAtSend: Int?
+    private var closeProbePendingDeadline: Date?
+    private var closeProbeResults: [CloseProbeResult] = []
 
     // Flow evidence counters (W1 focus-observability slice, task item 1): proves the
     // eb2e333 MonitoredDesktop/ZOrderSync/MinMaxInfo/LocalMoveSize plumbing is actually
@@ -436,6 +472,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                     self.activeWindowIdTransitionCount += 1
                     self.flowLastActiveWindow = currentActive
                 }
+                // adr/0012 follow-up diagnostic (WINDOW_SMOKE_CLOSE_PROBE): cheap to track
+                // unconditionally (harmless when closeProbeEnabled is false or outside
+                // cycle mode, since cycleCloseTargetId then never gets set at all) --
+                // records that the server's own truth actually matched this close-leg's
+                // target at least once since it was locked.
+                if let targetId = self.cycleCloseTargetId, case .window(let active) = currentActive,
+                   active == targetId
+                {
+                    self.cycleTargetEverConverged = true
+                }
             case .zOrderSync:
                 self.zOrderSyncEventCount += 1
             case .minMaxInfo:
@@ -554,6 +600,15 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         guard let deadline = cycleDeadline, let startedAt = cycleStartedAt else { return }
         let seconds = Date().timeIntervalSince(startedAt)
 
+        // adr/0012 follow-up diagnostic (WINDOW_SMOKE_CLOSE_PROBE): a probe is watching for
+        // a delayed close after a blind-sent Enter -- resolve that before touching any of
+        // the normal close-leg state below (frozen while this runs). Always false when
+        // closeProbeEnabled is false, since closeProbePendingTarget is then never set.
+        if closeProbePendingTarget != nil {
+            tickCloseProbe(session: session, registry: registry, seconds: seconds)
+            return
+        }
+
         // Phase B: this cycle's winver got a synthetic Enter -- wait for its WindowDelete
         // before disconnecting. Closing the window each cycle keeps the server session at
         // a steady state instead of accumulating one winver per cycle: the first 20-cycle
@@ -600,6 +655,18 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             }
             print("[cycles] cycle \(cycleIndex)/\(cyclesTotal) close-leg: \(shrank ? "PASS" : "FAIL")"
                 + " (retried=\(cycleCloseRetried))")
+            // adr/0012 follow-up diagnostic (WINDOW_SMOKE_CLOSE_PROBE): only fires on the
+            // specific failure shape the two hypotheses are about -- the close-leg failed
+            // AND the server's own truth never once matched this target across either
+            // attempt (the harness-level proxy for "FocusAuthority's gate never opened, the
+            // real Enter(s) were buffered and eventually hard-deadline-dropped"). A
+            // close-leg that failed for some other reason (convergence DID happen, the
+            // gated Enter still didn't close it) isn't this experiment's target and is left
+            // alone -- probing it wouldn't distinguish hypothesis A from B.
+            if closeProbeEnabled, !shrank, !cycleTargetEverConverged {
+                beginCloseProbe(cycle: cycleIndex, targetId: targetId, aboutCountBefore: aboutCount, session: session)
+                return
+            }
             finishCycle(session: session, registry: registry, rendered: true, closed: shrank,
                         seconds: seconds)
             return
@@ -619,6 +686,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             if let target = aboutWindows.first(where: \.hasDisplayedContent) {
                 cycleCloseTargetId = target.windowId
                 cycleAboutCountAtLock = aboutWindows.count
+                // adr/0012 follow-up diagnostic: a fresh lock starts a fresh close-leg --
+                // any convergence observed for a PRIOR cycle's target must not leak into
+                // this one's probe-eligibility check.
+                cycleTargetEverConverged = false
                 // adr/0012 task item 3: remote keyboard focus must actually be ON the
                 // target before the Enter is meaningful -- reattached sessions come up
                 // with the server's own idea of focus. Activation now goes through the
@@ -669,6 +740,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         cycleEnterSent = false
         cycleAboutCountAtLock = 0
         cycleCloseRetried = false
+        cycleTargetEverConverged = false
 
         if cycleIndex >= cyclesTotal || !rendered {
             finishCycles()
@@ -678,6 +750,66 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         cycleStartedAt = Date()
         cycleDeadline = Date().addingTimeInterval(25)
         session.start()
+    }
+
+    /// adr/0012 follow-up diagnostic (WINDOW_SMOKE_CLOSE_PROBE), harness-only: starts the
+    /// probe watch for one close-leg that failed with the target's convergence never once
+    /// observed. `aboutCountBefore` is the About-window count at the moment this fires (the
+    /// SAME count `tickCycles`' own `shrank` check just used), so `tickCloseProbe` can
+    /// detect a shrink caused specifically by this probe's own blind Enter, not stale state
+    /// from before it.
+    private func beginCloseProbe(cycle: Int, targetId: UInt32, aboutCountBefore: Int, session: CRSession) {
+        print("[close-probe] cycle=\(cycle) target=\(targetId): convergence never observed for "
+            + "this close-leg -- blind-sending a probe Enter (bypasses RemoteWindowRegistry/"
+            + "FocusAuthority entirely) to test whether it would have landed anyway")
+        sendBlindEnter(session: session)
+        closeProbePendingCycle = cycle
+        closeProbePendingTarget = targetId
+        closeProbePendingAboutCountAtSend = aboutCountBefore
+        closeProbePendingDeadline = Date().addingTimeInterval(2.0)
+    }
+
+    /// adr/0012 follow-up diagnostic: `CRSession.sendKeyDown(_:)`/`sendKeyUp(_:)` are the
+    /// same two primitives `RemoteWindowRegistry`'s own keyboard-lane gate calls once it
+    /// decides to flush -- called directly here, from the harness, they reach the wire with
+    /// no RemoteWindowContentView/RemoteWindowRegistry/FocusAuthority involvement at all
+    /// (unlike `sendSyntheticEnter`, which dispatches a real `NSEvent` through
+    /// `NSWindow.sendEvent(_:)` and so still goes through the real content-view/registry/
+    /// gate path). This is deliberately the *only* place in this harness that calls these
+    /// two methods directly -- see the module-level `closeProbeEnabled` doc comment for why.
+    private func sendBlindEnter(session: CRSession) {
+        let macReturnKeyCode: UInt16 = 36
+        session.sendKeyDown(macReturnKeyCode)
+        session.sendKeyUp(macReturnKeyCode)
+    }
+
+    /// adr/0012 follow-up diagnostic: polls up to 2s for the target's About-window count to
+    /// shrink following `beginCloseProbe`'s blind Enter, logs the required per-probe result
+    /// line, records it for the final summary, then resumes the normal cycle-finish flow
+    /// with the close-leg's own original verdict -- `closed: false` always, since this is
+    /// only ever entered from the one call site where the close-leg had already failed
+    /// (informational only: the probe's own outcome never changes cycle gating).
+    private func tickCloseProbe(session: CRSession, registry: RemoteWindowRegistry, seconds: Double) {
+        guard let targetId = closeProbePendingTarget, let cycle = closeProbePendingCycle,
+              let deadline = closeProbePendingDeadline, let aboutBefore = closeProbePendingAboutCountAtSend
+        else { return }
+
+        let aboutCount = registry.windowSnapshots().filter { snap in
+            snap.isVisible
+                && (snap.title.localizedCaseInsensitiveContains("about") || snap.title.contains("关于"))
+        }.count
+        let closedDespiteNonConvergence = aboutCount < aboutBefore
+        guard closedDespiteNonConvergence || Date() >= deadline else { return }
+
+        print("[close-probe] cycle=\(cycle) target=\(targetId) closedDespiteNonConvergence=\(closedDespiteNonConvergence)")
+        closeProbeResults.append(CloseProbeResult(
+            cycle: cycle, targetId: targetId, closedDespiteNonConvergence: closedDespiteNonConvergence))
+        closeProbePendingCycle = nil
+        closeProbePendingTarget = nil
+        closeProbePendingAboutCountAtSend = nil
+        closeProbePendingDeadline = nil
+
+        finishCycle(session: session, registry: registry, rendered: true, closed: false, seconds: seconds)
     }
 
     private func finishCycles() {
@@ -742,6 +874,15 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // (index 19) instead of the 19th-of-20 value (index 18).
             let p95 = times[max(0, Int((Double(times.count) * 0.95).rounded(.up)) - 1)]
             print(String(format: "[cycles] time-to-content: median %.1fs p95 %.1fs", times[(times.count - 1) / 2], p95))
+        }
+
+        // adr/0012 follow-up diagnostic (WINDOW_SMOKE_CLOSE_PROBE): purely informational --
+        // never folded into `ok`. `closed` here counts probes where the blind Enter closed
+        // the window despite the target having never converged, i.e. hypothesis B's own
+        // measured rate (activeWindowId lagging/misreporting real focus).
+        if closeProbeEnabled {
+            let probeClosedCount = closeProbeResults.filter(\.closedDespiteNonConvergence).count
+            print("[close-probe] probes=\(closeProbeResults.count) closed=\(probeClosedCount)")
         }
 
         print("\noverall: \(ok ? "PASS" : "FAIL")")
