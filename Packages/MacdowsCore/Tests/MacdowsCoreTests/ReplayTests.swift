@@ -216,27 +216,35 @@ struct ReplayTests {
     // the desktop-container "Program Manager" window (windowId 524454), five multi-monitor
     // "Windows 输入体验" (Text Input Experience) overlay windows, and eleven degenerate
     // 0x0/1x1/396x0/1009x4 RAIL helper windows that happen to carry the same style value.
-    // The remaining 6 are real content-class windows: four 136x39 tray-popup-class windows
-    // (style 0x800B0000), the 536x521 About-Windows-class dialog (0x80080000), and one
-    // resizable content window (0xF0000, Notepad/Registry-Editor-class, ~1000-1500px).
+    // Of the remaining 6, four are the W2 ghost-sliver windows (windowIds 983208, 132042,
+    // 132028, 66450; 136x39, style 0x800B0000, styleEx 0x08000088 = WS_EX_NOACTIVATE |
+    // WS_EX_TOOLWINDOW | WS_EX_TOPMOST, title "" — verified directly against the raw JSONL,
+    // see `WindowMappability.isGhostSliverHelper`'s own doc comment) — now ALSO dropped, by
+    // the W2 ghost-sliver rule rather than the style-equality check above. The final 2 are
+    // real content-class windows this filter still keeps: the 536x521 About-Windows-class
+    // dialog (0x80080000) and one resizable content window (0xF0000, Notepad/Registry-
+    // Editor-class, ~1000-1500px).
     //
-    // Coverage note: this fixture can only exercise `isMappableWindow`'s size-garbage and
-    // style-equality branches. adr/0008 §0 documents that none of the six samples ever
-    // sets `WINDOW_ORDER_FIELD_OWNER` on a `WindowUpdate` (only on `WindowCreate`, and
-    // `rail-probe.c` never logs `ownerWindowId`'s actual wire value at all — it always
-    // decodes as 0 here per adr/0008 §5's replay-compat rule), and no sample ever sets
-    // `WS_CHILD` on a top-level window order — so the `ownerWindowId`/`WS_CHILD` branches
-    // are exercised only by `WindowModelTests`' synthetic-event unit tests, not here.
+    // Coverage note: this fixture can only exercise `isMappableWindow`'s size-garbage,
+    // style-equality, and ghost-sliver branches. adr/0008 §0 documents that none of the six
+    // samples ever sets `WINDOW_ORDER_FIELD_OWNER` on a `WindowUpdate` (only on
+    // `WindowCreate`, and `rail-probe.c` never logs `ownerWindowId`'s actual wire value at
+    // all — it always decodes as 0 here per adr/0008 §5's replay-compat rule), and no
+    // sample ever sets `WS_CHILD` on a top-level window order — so the `ownerWindowId`/
+    // `WS_CHILD` branches (including the ghost-sliver rule's own `ownerWindowId == 0` leg)
+    // are exercised only by `WindowMappabilityTests`'/`WindowModelTests`' synthetic-event
+    // unit tests, not here; this fixture's ghost-sliver coverage is real for `styleEx`/
+    // `title` only.
     static let expectedDroppedWindowIds: [Scenario: Set<UInt32>] = [
-        .s1: [65982, 65992, 65994, 65996, 65998, 66034, 66066, 66462, 66472, 131948, 131976, 132112, 197612, 328280, 393802, 524454, 918094],
-        .s2: [65982, 65992, 65994, 65996, 65998, 66034, 66066, 66462, 66472, 131948, 131976, 132112, 197612, 393802, 524454, 917764, 1_573_240],
-        .s3: [65982, 65992, 65994, 65996, 65998, 66034, 66066, 66462, 66472, 131948, 131976, 132112, 197612, 393802, 524454, 2_425_392, 5_898_488],
-        .s4: [65982, 65992, 65994, 65996, 65998, 66034, 66066, 66462, 66472, 131948, 131976, 132112, 197612, 393802, 524454, 1_048_700, 1_704_536],
-        .s5a: [65982, 65992, 65994, 65996, 65998, 66034, 66066, 66462, 66472, 131948, 131976, 132112, 197612, 393802, 524454, 983518, 2_950_242],
-        .s5b: [65982, 65992, 65994, 65996, 65998, 66034, 66066, 66462, 66472, 131948, 131976, 132112, 197612, 393802, 524454, 1_638_650, 1_638_988],
+        .s1: [65982, 65992, 65994, 65996, 65998, 66034, 66066, 66450, 66462, 66472, 131948, 131976, 132028, 132042, 132112, 197612, 328280, 393802, 524454, 918094, 983208],
+        .s2: [65982, 65992, 65994, 65996, 65998, 66034, 66066, 66450, 66462, 66472, 131948, 131976, 132028, 132042, 132112, 197612, 393802, 524454, 917764, 983208, 1_573_240],
+        .s3: [65982, 65992, 65994, 65996, 65998, 66034, 66066, 66450, 66462, 66472, 131948, 131976, 132028, 132042, 132112, 197612, 393802, 524454, 983208, 2_425_392, 5_898_488],
+        .s4: [65982, 65992, 65994, 65996, 65998, 66034, 66066, 66450, 66462, 66472, 131948, 131976, 132028, 132042, 132112, 197612, 393802, 524454, 983208, 1_048_700, 1_704_536],
+        .s5a: [65982, 65992, 65994, 65996, 65998, 66034, 66066, 66450, 66462, 66472, 131948, 131976, 132028, 132042, 132112, 197612, 393802, 524454, 983208, 983518, 2_950_242],
+        .s5b: [65982, 65992, 65994, 65996, 65998, 66034, 66066, 66450, 66462, 66472, 131948, 131976, 132028, 132042, 132112, 197612, 393802, 524454, 983208, 1_638_650, 1_638_988],
     ]
 
-    @Test("W0① style filter drops exactly the desktop-container + IME-overlay + degenerate-helper windowId set, per scenario, not merely the right count", arguments: Scenario.allCases)
+    @Test("W0①/W2 style filter drops exactly the desktop-container + IME-overlay + degenerate-helper + ghost-sliver windowId set, per scenario, not merely the right count", arguments: Scenario.allCases)
     func w0StyleFilterDropsExpectedWindowIdSet(_ scenario: Scenario) throws {
         let replay = try Self.replay(scenario)
 
@@ -247,7 +255,7 @@ struct ReplayTests {
         let droppedWindowIds = Set(replay.model.windows.compactMap { windowId, state -> UInt32? in
             let mappable = WindowMappability.isMappableWindow(
                 width: state.width, height: state.height, style: state.style, styleEx: state.styleEx,
-                ownerWindowId: state.ownerWindowId, fieldFlags: 0
+                ownerWindowId: state.ownerWindowId, fieldFlags: 0, title: state.title
             )
             return mappable ? nil : windowId
         })

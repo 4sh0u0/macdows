@@ -2046,6 +2046,18 @@ cleanup:
     crdpq_outbound_post(_outboundQueue, &cmd);
 }
 
+- (void)sendSysCommand:(uint32_t)windowId command:(uint16_t)command
+{
+    if (!_outboundQueue)
+        return;
+    CrdpCommand cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = CRDPQ_CMD_SYS_COMMAND;
+    cmd.payload.sysCommand.windowId = windowId;
+    cmd.payload.sysCommand.command = command;
+    crdpq_outbound_post(_outboundQueue, &cmd);
+}
+
 - (void)executeProgram:(NSString *)program
 {
     if (!_outboundQueue)

@@ -349,6 +349,22 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// the initializer's `program`.
 - (void)executeProgram:(NSString *)program;
 
+/// W2 (docs/plans/phase2.md §2 W2 task item 4): posts a RAIL ClientSystemCommand for
+/// `windowId` onto the outbound lane -- already-existing plumbing (`crb_outbound_visitor`
+/// has handled `CRDPQ_CMD_SYS_COMMAND` since it was implemented, this method is simply the
+/// first public, Swift-facing way to actually post one, exactly mirroring `-activateWindow:`'s
+/// own doc comment above for `CRDPQ_CMD_ACTIVATE`). `command` is an MS-RDPERP `TS_RAIL_ORDER_
+/// SYSCOMMAND` `SC_*` value (freerdp/rail.h) -- this header intentionally stays agnostic
+/// about which `SC_*` constant means what (a raw, undecorated `uint16_t` pipe, like every
+/// other outbound method on this interface); the caller (`RemoteWindowRegistry`) owns that
+/// mapping, matching how it already owns e.g. `WindowOrderField`'s bit-flag semantics rather
+/// than this AppKit-free header knowing about them. Fire-and-forget like `-activateWindow:`
+/// -- silently does nothing if the session isn't connected. Server authority: this call
+/// alone never changes anything locally: the actual close/minimize/maximize only happens
+/// once `RemoteWindowRegistry` later observes the server's own `WindowDelete`/`WindowUpdate`
+/// in response (see `RemoteWindow`'s traffic-light doc comments for the full loop).
+- (void)sendSysCommand:(uint32_t)windowId command:(uint16_t)command;
+
 /// W4c: one physical mouse button, in RDP's own PTR_FLAGS_BUTTON1/2/3 numbering (left/
 /// right/middle) -- deliberately not NSEvent.buttonNumber's own scheme (0/1/2), so this
 /// header never has to explain an off-by-one to a Swift caller. Extended/side buttons

@@ -72,6 +72,12 @@ private struct PendingWindowState {
     var hasKnownSize: Bool { width > 0 && height > 0 }
     /// WINDOW_HIDE == 0 (freerdp/window.h); any other show value means shown in some form.
     var isVisible: Bool { show != 0 }
+    /// `WINDOW_SHOW_MAXIMIZED` (0x03, freerdp/window.h) -- Phase 2 W2 task item 3's zoom
+    /// button needs this to decide `SC_MAXIMIZE` vs `SC_RESTORE` (RemoteWindowRegistry's
+    /// `handleChromeAction`); everywhere else in this file only cares about
+    /// `isVisible`/shown-vs-hidden (adr/0005 §7: full minimize/maximize fidelity beyond
+    /// this one W2 need is still out of scope).
+    var isMaximized: Bool { show == 0x03 }
 }
 
 /// The most recently observed `MonitoredDesktop` order, as pure data (adr/0008 §6: W1's
@@ -219,8 +225,37 @@ final class RemoteWindowRegistry {
     private static func isMappableWindow(_ state: PendingWindowState, fieldFlags: UInt32) -> Bool {
         WindowMappability.isMappableWindow(
             width: state.width, height: state.height, style: state.style, styleEx: state.styleEx,
-            ownerWindowId: state.ownerWindowId, fieldFlags: fieldFlags
+            ownerWindowId: state.ownerWindowId, fieldFlags: fieldFlags, title: state.title
         )
+    }
+
+    /// Phase 2 W2 (docs/plans/phase2.md §2 W2 task item 1): thin call-site wrapper over
+    /// `MacdowsCore.StyleTranslator.chrome`, exactly mirroring `isMappableWindow` above's
+    /// own "the real decision lives in the pure MacdowsCore function, this is just field
+    /// plumbing" split.
+    private static func chrome(for state: PendingWindowState) -> WindowChrome {
+        StyleTranslator.chrome(
+            style: state.style, styleEx: state.styleEx, hasTitle: !state.title.isEmpty,
+            ownerWindowId: state.ownerWindowId
+        )
+    }
+
+    /// MS-RDPERP `TS_RAIL_ORDER_SYSCOMMAND` `SC_*` values (docs/plans/phase2.md §2 W2 task
+    /// item 4) this registry sends via `CRSession.sendSysCommand(_:command:)` for the
+    /// traffic-light actions `RemoteWindow.onChromeAction` reports -- verified directly
+    /// against `ThirdParty/FreeRDP/include/freerdp/rail.h:126-133`, not trusted from any
+    /// secondhand spec summary (team-lead's own instruction: "verify against FreeRDP rail
+    /// headers, don't trust my values blindly" -- they check out exactly). Kept local to
+    /// this file rather than exposed as a typed enum from `CRSession.h`
+    /// (`-sendSysCommand:command:` stays the same kind of raw, undecorated `uint16_t` pipe
+    /// every other outbound method on that header already is -- giving `command` a semantic
+    /// meaning is this registry's job, the same split `WindowOrderField`'s bit-flag
+    /// constants already establish for window-order fields).
+    private enum SysCommand {
+        static let minimize: UInt16 = 0xF020
+        static let maximize: UInt16 = 0xF030
+        static let close: UInt16 = 0xF060
+        static let restore: UInt16 = 0xF120
     }
 
     /// Call once per drained event, in delivery order (`session.drainEvents { registry.handle($0) }`)
@@ -333,18 +368,29 @@ final class RemoteWindowRegistry {
         // `currentTopDownWindowIds()` had already grown to 7 real on-screen windows (a
         // direct cross-check confirmed the disagreement: at the seq where a real apply
         // finally ran, the server array actually named all 7 of those ids, but the
-        // `.isVisible` sweep had recognized only 1 of them the whole time). The exact
-        // AppKit mechanism behind that `.isVisible` disagreement is still not pinned down
-        // (a lightweight breadcrumb for it stays in `traceZOrder`, gated the same as the
-        // rest of this file's trace instrumentation) -- but it doesn't need to be, because
-        // `currentTopDownWindowIds()` is already ground truth for "on screen right now"
-        // (it's built by filtering `NSApp.orderedWindows` itself, which per Apple's own
-        // documented contract only ever lists genuinely on-screen windows): a window
-        // present in ITS output is on screen by construction, with no second, independently
-        // computed set that can silently drift out of sync with it. This still preserves
-        // the exact protection this comment opens with -- a hidden/gate-held window is
-        // never in `currentTopDownWindowIds()`'s output, so it's never in `locallyKnown`,
-        // so no instruction can ever reference it.
+        // `.isVisible` sweep had recognized only 1 of them the whole time).
+        //
+        // CORRECTION (2026-08-23, W2 first-frame-gate investigation round 2): this
+        // comment used to claim `currentTopDownWindowIds()` (i.e. `NSApp.orderedWindows`
+        // filtering) was reliable ground truth for "on screen right now" on its own --
+        // DISPROVEN live (window-smoke-multiwin.log seq=27/28, window-smoke-max.log
+        // seq=25): a freshly-`WindowCreate`d window can appear in `NSApp.orderedWindows`
+        // (hence in `currentTopDownWindowIds()`'s own output) before its first-frame gate
+        // has EVER cleared -- no `applyVisibility`/`orderFront` call had run for it. Once
+        // wrongly treated as `locallyKnown`, THIS method's own `window.order(_:relativeTo:)`
+        // call below is exactly what turns that mere list presence into a real,
+        // orderFront-equivalent visibility flip -- i.e. this method was reproducing the
+        // identical bug class this comment's own opening sentence describes, just via a
+        // different route than the original ("Z-order reversal") investigation triggered
+        // it through. `currentTopDownWindowIds()` now additionally restricts to
+        // `RemoteWindow.hasClearedFirstFrameGate` (see that method's own doc comment) --
+        // a gate-held window is never in ITS output, so it's never in `locallyKnown`, so no
+        // instruction below can ever reference it. The exact AppKit mechanism behind why a
+        // `defer: false` `NSWindow` gets *some* window-server registration at construction
+        // time is still not pinned down (the `stillDisagreeing`/`[zorder-trace]` breadcrumb
+        // below was watching for exactly this shape and is what caught it) -- gate-state
+        // filtering sidesteps needing to know why, the same way this fix's predecessor
+        // sidestepped the original `.isVisible` disagreement.
         let localBefore = currentTopDownWindowIds()
         let visibleIds = Set(localBefore)
         let plan = ZOrderSync.plan(
@@ -435,8 +481,29 @@ final class RemoteWindowRegistry {
     /// own Z-order consistency assertion, so the harness measures the exact same ordering
     /// the sync logic itself acted on rather than a second, separately-computed notion of
     /// "current order."
+    ///
+    /// Real-host regression, round 2 (2026-08-23, W2 first-frame-gate investigation): this
+    /// method's own prior doc comment claimed `NSApp.orderedWindows` was reliable ground
+    /// truth for "on screen right now" -- DISPROVEN live. `window-smoke-multiwin.log`
+    /// seq=27: windowId 66354's own `localBefore` (this method's return value, sampled
+    /// BEFORE that seq's `applyZOrder` ran any instruction) already contained it, moments
+    /// after its own `WindowCreate` -- zero `applyChrome`/`applyVisibility`/`orderFront`
+    /// call had EVER run for it (no first-frame content, no first-frame timeout logged
+    /// either). A `defer: false` `NSWindow` evidently gets *some* window-server
+    /// registration at construction time this codebase's earlier Z-order-reversal trace
+    /// investigation never isolated -- the `stillDisagreeing`/`[zorder-trace]` breadcrumb
+    /// above was watching for exactly this shape and caught it, just one investigation
+    /// round too late to prevent this specific bug from shipping. Restricting to
+    /// `RemoteWindow.hasClearedFirstFrameGate` here is what actually closes the gap:
+    /// `applyZOrder`'s own `window.order(_:relativeTo:)` call is what turns a gate-held
+    /// window's mere `orderedWindows`-list presence into a real, `orderFront`-equivalent
+    /// visibility flip the moment `ZOrderSync.plan` wrongly treats it as `locallyKnown` --
+    /// a gate-held window excluded HERE can never enter `locallyKnown` in the first place,
+    /// regardless of what `NSApp.orderedWindows` itself claims.
     func currentTopDownWindowIds() -> [UInt32] {
-        let numberToId = Dictionary(uniqueKeysWithValues: windows.map { ($0.value.window.windowNumber, $0.key) })
+        let numberToId = Dictionary(uniqueKeysWithValues: windows.compactMap { windowId, remoteWindow in
+            remoteWindow.hasClearedFirstFrameGate ? (remoteWindow.window.windowNumber, windowId) : nil
+        })
         return NSApp.orderedWindows.compactMap { numberToId[$0.windowNumber] }
     }
 
@@ -492,6 +559,13 @@ final class RemoteWindowRegistry {
         if let existing = windows[windowId] {
             existing.updateFrame(frame)
             existing.updateTitle(state.title)
+            // Phase 2 W2 task item 3: re-derived on every order, cheap and correct either
+            // way -- RemoteWindow.applyChrome's own `appliedChrome` equality check already
+            // makes this a no-op unless style/styleEx/title/owner actually changed since
+            // the last time this window's chrome was applied, so no separate fieldFlags
+            // gate is needed here (unlike `setVisible` below, which has a real Z-order side
+            // effect worth gating specifically).
+            existing.applyChrome(Self.chrome(for: state))
             // Only reorder this window's front/back position when *this specific delta*
             // actually carries a show-state change — calling setVisible (hence
             // orderFront) on every unrelated geometry/title-only update was needlessly
@@ -512,6 +586,13 @@ final class RemoteWindowRegistry {
             window.onInput = { [weak self] event in
                 self?.handleInput(windowId: windowId, event: event)
             }
+            // Phase 2 W2 task item 3: traffic-light clicks/⌘W/⌘M/double-click-titlebar
+            // route here, never mutate `window`'s own NSWindow state locally (server
+            // authority -- see RemoteWindow.onChromeAction's own doc comment).
+            window.onChromeAction = { [weak self] action in
+                self?.handleChromeAction(windowId: windowId, action: action)
+            }
+            window.applyChrome(Self.chrome(for: state))
             windows[windowId] = window
             window.setVisible(state.isVisible)
         }
@@ -546,6 +627,27 @@ final class RemoteWindowRegistry {
         pendingTrailingMove.removeValue(forKey: windowId)
         if let window = windows.removeValue(forKey: windowId) {
             window.close(via: session)
+        }
+    }
+
+    /// Phase 2 W2 (docs/plans/phase2.md §2 W2 task item 3): routes one traffic-light action
+    /// from `windowId`'s `RemoteWindow` to the matching `SC_*` `CRSession.sendSysCommand`
+    /// call -- this registry, not `RemoteWindow`, decides `.zoom`'s direction (`SC_MAXIMIZE`
+    /// vs `SC_RESTORE`) because only this registry knows the window's last-known RAIL
+    /// show-state (`geometry[windowId]`); `RemoteWindow` itself has no notion of "currently
+    /// maximized" at all. Fire-and-forget, same as every other outbound call this registry
+    /// makes -- no local NSWindow mutation happens here either; the server's own
+    /// WindowDelete/WindowUpdate response is what `handleWindowDelete`/`handleWindowOrder`
+    /// eventually act on.
+    private func handleChromeAction(windowId: UInt32, action: RemoteWindow.ChromeAction) {
+        switch action {
+        case .close:
+            session.sendSysCommand(windowId, command: SysCommand.close)
+        case .minimize:
+            session.sendSysCommand(windowId, command: SysCommand.minimize)
+        case .zoom:
+            let isMaximized = geometry[windowId]?.isMaximized ?? false
+            session.sendSysCommand(windowId, command: isMaximized ? SysCommand.restore : SysCommand.maximize)
         }
     }
 

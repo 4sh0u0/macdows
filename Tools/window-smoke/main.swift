@@ -153,6 +153,28 @@ let focusRotationTotal = max(0, Int(ProcessInfo.processInfo.environment["WINDOW_
 /// anyway. Purely informational: never changes what a cycle's close-leg gates as.
 let closeProbeEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_CLOSE_PROBE"] == "1"
 
+/// Phase 2 W2 task item 5b/5c (docs/plans/phase2.md §2 W2): maximize/restore/close e2e via
+/// `CRSession.sendSysCommand(_:command:)`, direct from this harness (no synthetic NSEvent,
+/// no traffic-light button click involved) -- a pure wire-level test of the SC_* lane and
+/// the server's own response, independent of whatever local UI affordance
+/// `RemoteWindowRegistry`'s chrome happens to grant the About window (which, per
+/// phase2.md's own acceptance text, should have NO enabled zoom button at all -- see
+/// StyleTranslatorTests' `aboutWindowsDialogShape`). Requires WINDOW_SMOKE_EXTRA_APPS
+/// (multiwin prereq, per the task spec) -- reuses that scenario's own settling logic.
+let maximizeScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_MAXIMIZE"] == "1"
+
+/// MS-RDPERP `TS_RAIL_ORDER_SYSCOMMAND` `SC_*` values -- duplicated here from
+/// `App/RemoteWindowRendering/RemoteWindowRegistry.swift`'s own `SysCommand` enum (itself
+/// verified against `ThirdParty/FreeRDP/include/freerdp/rail.h:126-133`), matching this
+/// codebase's established "each layer duplicates narrowly, cites its source" precedent for
+/// small numeric constants (see e.g. `WindowOrderField`, duplicated three times over
+/// `WindowModel.swift`/`RemoteWindowRegistry.swift`/this file's own `styleDumpLine`).
+private enum SC {
+    static let maximize: UInt16 = 0xF030
+    static let restore: UInt16 = 0xF120
+    static let close: UInt16 = 0xF060
+}
+
 @MainActor
 final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private let host: String
@@ -317,6 +339,32 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     // synthetic event is sent (see runInputTest), checked in finish().
     private var keyWindowCheckResult: (passed: Bool, detail: String)?
 
+    // Phase 2 W2 task item 5b/5c (WINDOW_SMOKE_MAXIMIZE): maximize -> restore -> close e2e
+    // state machine -- see `runMaximizeScenario`'s own doc comment for the full sequence.
+    private enum MaximizePhase: Equatable {
+        case waitingForTarget
+        case awaitingMaximize(windowId: UInt32, sentAt: Date)
+        case awaitingRestore(windowId: UInt32, sentAt: Date)
+        case awaitingClose(windowId: UInt32, sentAt: Date)
+        case done
+    }
+    private var maximizePhase: MaximizePhase = .waitingForTarget
+    private static let maximizePollTimeout: TimeInterval = 5.0
+    /// `grew`: did a WindowUpdate report width >=2000pt within 5s of SC_MAXIMIZE.
+    /// `mappedWithContent`: was the window still mapped (visible, real content) at that
+    /// point -- closes W0's deferred M1 acceptance debt ("a maximized window must build",
+    /// phase2.md W0/M1) even on the failure path (checked at the 5s timeout too).
+    private var maximizeResult: (grew: Bool, mappedWithContent: Bool)?
+    /// Did a later WindowUpdate report width <1000pt within 5s of SC_RESTORE.
+    private var restoreResult: Bool?
+    /// Did WindowDelete arrive within 5s of SC_CLOSE (task item 5c's traffic-light loop
+    /// assert) -- resolved via `maximizeCloseTargetId`/`maximizeCloseWindowDeletedAt` below,
+    /// set by `drainNow()`'s own windowDelete bookkeeping, mirroring `inputTestWindowId`'s
+    /// exact pattern.
+    private var closeResult: Bool?
+    private var maximizeCloseTargetId: UInt32?
+    private var maximizeCloseWindowDeletedAt: TimeInterval?
+
     // W4b review round 2, experiment 1: does sending RAIL ClientActivate for a
     // background/non-focused window prompt the server to (re)send content it never
     // painted for us? Resolved opportunistically to whichever plausible-title window is
@@ -460,12 +508,28 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 self.inputTestWindowDeleted = true
                 self.inputTestWindowDeletedAt = Date().timeIntervalSince(self.startTime)
             }
+            // Phase 2 W2 task item 5c: same bookkeeping shape as the input-test case just
+            // above, for the maximize scenario's own close leg.
+            if event.kind == .windowDelete, let target = self.maximizeCloseTargetId, event.windowId == target,
+               self.maximizeCloseWindowDeletedAt == nil
+            {
+                self.maximizeCloseWindowDeletedAt = Date().timeIntervalSince(self.startTime)
+            }
             // Multi-window scenario bookkeeping (2026-08-22 review HIGH): a failed
             // ClientExecute (e.g. RAIL_EXEC_E_FILE_NOT_FOUND) must not hide behind
             // leftover windows from an earlier session satisfying the count -- record
             // every failure so finish() can gate on none having occurred.
             if event.kind == .execResult, event.execResult != 0 {
                 self.failedExecResults.append("\(event.program) -> \(event.execResult)")
+            }
+            // Phase 2 W2 task item 2 (docs/plans/phase2.md §2 W2, adr/0008 §3): ground
+            // truth for the ghost-sliver rule's one unverified leg (ownerWindowId --
+            // WindowMappability.isGhostSliverHelper's own doc comment explains why the six
+            // phase05 samples never captured it). One line per WindowCreate, multiwin
+            // scenario only (WINDOW_SMOKE_EXTRA_APPS) -- exactly the scenario that produces
+            // the four real 136x39 blank-sliver windows this rule targets.
+            if event.kind == .windowCreate, !extraApps.isEmpty {
+                print(Self.styleDumpLine(for: event))
             }
             // Flow evidence counters (task item 1): counted for every drained event
             // regardless of mode (plain run, extra-apps, cycles) -- only finish()'s
@@ -563,6 +627,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         runActivateExperiment(elapsed: elapsed, session: session, registry: registry)
         runInputTest(elapsed: elapsed, registry: registry)
         runFocusRotation(elapsed: elapsed, session: session, registry: registry)
+        runMaximizeScenario(session: session, registry: registry)
 
         // Phase 1 acceptance: launch the extra apps once the first app's own window has
         // had time to settle -- several ClientExecutes on one live connection is exactly
@@ -597,7 +662,17 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             ? max(baseDeadline, 10 + Double(focusRotationTotal) * 1.0)
             : baseDeadline
         let rotationStalled = focusRotationTotal > 0 && !focusRotationDone && elapsed >= rotationDeadline + 10
-        if elapsed >= rotationDeadline, focusRotationTotal == 0 || focusRotationDone || rotationStalled {
+        // Phase 2 W2 task item 5b/5c: worst case is extraAppsLaunched (>=6s) + settle for
+        // the About target + three back-to-back 5s SC_* polls (maximize/restore/close) --
+        // 45s leaves comfortable slack. `maximizeStalled` is the same kind of hard failsafe
+        // `rotationStalled` already is: normally `maximizePhase == .done` is what actually
+        // gates the extra wait, not this fallback.
+        let maximizeDeadline: TimeInterval = maximizeScenarioEnabled ? 45 : baseDeadline
+        let maximizeStalled = maximizeScenarioEnabled && maximizePhase != .done && elapsed >= maximizeDeadline + 10
+        let overallDeadline = max(rotationDeadline, maximizeDeadline)
+        let rotationReady = focusRotationTotal == 0 || focusRotationDone || rotationStalled
+        let maximizeReady = !maximizeScenarioEnabled || maximizePhase == .done || maximizeStalled
+        if elapsed >= overallDeadline, rotationReady, maximizeReady {
             finish()
         }
     }
@@ -978,6 +1053,93 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Phase 2 W2 task item 5b/5c (WINDOW_SMOKE_MAXIMIZE=1, multiwin prereq): drives the
+    /// maximize -> restore -> close sequence directly over `CRSession.sendSysCommand(_:command:)`,
+    /// never through a synthetic NSEvent or a real traffic-light button click -- this is a
+    /// wire-level test of the SC_* lane and the server's own response, independent of
+    /// whatever local UI affordance the About window's own chrome happens to grant it
+    /// (which should have no enabled zoom button at all, per the acceptance text this task
+    /// separately targets). Target-locking mirrors `runInputTest`'s own "visible +
+    /// hasDisplayedContent + About-titled" anchor.
+    ///
+    /// Advances at most one phase transition per call (mirrors `tickCycles`' own per-tick
+    /// state machine shape) -- called every `tick()` once the multiwin setup
+    /// (`extraAppsLaunched`) is ready.
+    private func runMaximizeScenario(session: CRSession, registry: RemoteWindowRegistry) {
+        guard maximizeScenarioEnabled else { return }
+
+        switch maximizePhase {
+        case .waitingForTarget:
+            guard extraAppsLaunched else { return } // multiwin prereq, per the task spec
+            guard let w = registry.windowSnapshots().first(where: { snap in
+                snap.isVisible && snap.hasDisplayedContent
+                    && (snap.title.localizedCaseInsensitiveContains("about") || snap.title.contains("关于"))
+            }) else { return }
+            print("[maximize] target locked: windowId=\(w.windowId) title=\"\(w.title)\"")
+            session.sendSysCommand(w.windowId, command: SC.maximize)
+            print("[maximize] sent SC_MAXIMIZE to windowId=\(w.windowId)")
+            maximizePhase = .awaitingMaximize(windowId: w.windowId, sentAt: Date())
+
+        case .awaitingMaximize(let windowId, let sentAt):
+            let snap = registry.windowSnapshots().first { $0.windowId == windowId }
+            if let snap, snap.frame.width >= 2000, snap.isVisible, snap.hasDisplayedContent {
+                maximizeResult = (grew: true, mappedWithContent: true)
+                print("[maximize] windowId=\(windowId) grew to \(Int(snap.frame.width))x\(Int(snap.frame.height)), still mapped with content")
+                session.sendSysCommand(windowId, command: SC.restore)
+                print("[maximize] sent SC_RESTORE to windowId=\(windowId)")
+                maximizePhase = .awaitingRestore(windowId: windowId, sentAt: Date())
+            } else if Date().timeIntervalSince(sentAt) >= Self.maximizePollTimeout {
+                let mappedWithContent = snap?.isVisible == true && snap?.hasDisplayedContent == true
+                maximizeResult = (grew: false, mappedWithContent: mappedWithContent)
+                print("[maximize] windowId=\(windowId) FAILED to reach >=2000pt width within 5s "
+                    + "(got \(snap.map { "\(Int($0.frame.width))x\(Int($0.frame.height))" } ?? "no snapshot"))")
+                // Still exercise the close leg (task item 5c) even after a maximize
+                // failure, skipping straight past the now-moot restore leg, rather than
+                // abandoning the rest of the scenario and reporting even less data.
+                session.sendSysCommand(windowId, command: SC.close)
+                print("[maximize] sent SC_CLOSE to windowId=\(windowId) (restore leg skipped after a maximize failure)")
+                maximizeCloseTargetId = windowId
+                maximizePhase = .awaitingClose(windowId: windowId, sentAt: Date())
+            }
+
+        case .awaitingRestore(let windowId, let sentAt):
+            let snap = registry.windowSnapshots().first { $0.windowId == windowId }
+            if let snap, snap.frame.width < 1000 {
+                restoreResult = true
+                print("[maximize] windowId=\(windowId) restored to \(Int(snap.frame.width))x\(Int(snap.frame.height))")
+                session.sendSysCommand(windowId, command: SC.close)
+                print("[maximize] sent SC_CLOSE to windowId=\(windowId)")
+                maximizeCloseTargetId = windowId
+                maximizePhase = .awaitingClose(windowId: windowId, sentAt: Date())
+            } else if Date().timeIntervalSince(sentAt) >= Self.maximizePollTimeout {
+                restoreResult = false
+                print("[maximize] windowId=\(windowId) FAILED to restore below 1000pt width within 5s "
+                    + "(got \(snap.map { "\(Int($0.frame.width))x\(Int($0.frame.height))" } ?? "no snapshot"))")
+                session.sendSysCommand(windowId, command: SC.close)
+                print("[maximize] sent SC_CLOSE to windowId=\(windowId)")
+                maximizeCloseTargetId = windowId
+                maximizePhase = .awaitingClose(windowId: windowId, sentAt: Date())
+            }
+
+        case .awaitingClose(_, let sentAt):
+            // maximizeCloseWindowDeletedAt is set by drainNow()'s own windowDelete
+            // bookkeeping (mirrors inputTestWindowId's exact pattern) -- checked here
+            // rather than re-deriving it from a fresh windowSnapshots() scan.
+            if maximizeCloseWindowDeletedAt != nil {
+                closeResult = true
+                print("[maximize] WindowDelete received within 5s of SC_CLOSE")
+                maximizePhase = .done
+            } else if Date().timeIntervalSince(sentAt) >= Self.maximizePollTimeout {
+                closeResult = false
+                print("[maximize] FAILED to receive WindowDelete within 5s of SC_CLOSE")
+                maximizePhase = .done
+            }
+
+        case .done:
+            break
+        }
+    }
+
     /// W4c deliverable 5: locates this run's own launched-app window once it's visible and
     /// has real painted content, sends the one synthetic input event `inputTestMode` calls
     /// for, and leaves `inputTestSentAt`/`inputTestWindowId` set for `finish()` to check
@@ -1208,6 +1370,31 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         let size = window.contentView?.bounds.size ?? window.frame.size
         sendClick(to: window, at: NSPoint(x: size.width * 0.5, y: size.height * 0.85))
+    }
+
+    /// Phase 2 W2 task item 2: `[style-dump]` line format -- id, WxH, title-or-"<empty>",
+    /// style/styleEx as hex, owner (or "unset" if `WINDOW_ORDER_FIELD_OWNER`, 0x2, wasn't
+    /// actually set on this specific order -- the field-presence bit `CRDPEvent.ownerWindowId`'s
+    /// own doc comment requires checking before treating a bare 0 as authoritative). Style/
+    /// styleEx are similarly only meaningful when `WINDOW_ORDER_FIELD_STYLE` (0x8) is set
+    /// (gates both together, per `MacdowsCore.WindowModel.swift`'s own `WindowOrderField`,
+    /// the canonical reference these bit values are duplicated from -- same "each layer
+    /// duplicates narrowly" precedent `RemoteWindowRegistry.WindowOrderField` already
+    /// follows). Per adr/0008 §0, every real WindowCreate observed in the six phase05
+    /// samples sets both bits, so `"unset"`/`"n/a"` are expected to be rare in practice, not
+    /// the common case -- printed explicitly anyway so a genuine gap is visible rather than
+    /// silently rendered as a misleading `0`/`0x0`.
+    private static func styleDumpLine(for event: CRDPEvent) -> String {
+        let ownerFieldBit: UInt32 = 0x0000_0002 // WINDOW_ORDER_FIELD_OWNER
+        let styleFieldBit: UInt32 = 0x0000_0008 // WINDOW_ORDER_FIELD_STYLE (gates style+styleEx)
+        let hasOwner = event.fieldFlags & ownerFieldBit != 0
+        let hasStyle = event.fieldFlags & styleFieldBit != 0
+        let ownerText = hasOwner ? String(event.ownerWindowId) : "unset"
+        let styleText = hasStyle ? String(format: "0x%08X", event.style) : "n/a"
+        let styleExText = hasStyle ? String(format: "0x%08X", event.styleEx) : "n/a"
+        let titleText = event.title.isEmpty ? "<empty>" : event.title
+        return "[style-dump] id=\(event.windowId) \(event.windowWidth)x\(event.windowHeight) "
+            + "title=\"\(titleText)\" style=\(styleText) styleEx=\(styleExText) owner=\(ownerText)"
     }
 
     /// Human-readable form of `MacdowsCore.ServerActiveWindow` for `[flow]`/`[focus-rotation]`
@@ -1459,7 +1646,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // it still being open at t=25s would make a passing input test look like a failure.
         // The input test's own assertion (further down, after the experiment summaries)
         // covers what actually matters in that mode: did the WindowDelete arrive in time.
-        if launchedAppKind == .winver, inputTestMode == nil {
+        // Phase 2 W2 team-lead review: the maximize scenario (WINDOW_SMOKE_MAXIMIZE) closes
+        // this exact window by design too (its own SC_CLOSE leg) -- same reasoning, same
+        // exclusion; that scenario's own gating assertions (in the maximize-scenario block
+        // below) are what actually matter for it, not this generic default-path check.
+        if launchedAppKind == .winver, inputTestMode == nil, !maximizeScenarioEnabled {
             if let aboutWindow {
                 let w = aboutWindow.frame.width
                 let h = aboutWindow.frame.height
@@ -1501,9 +1692,30 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 print("[info] input-test mode active (\(inputTestMode!)) -- the About-Windows window (id "
                     + "\(aboutWindow.windowId)) is still open at t=25s; the input-test assertion below covers "
                     + "whether it closed in time, not this generic paint/size check")
+            } else if maximizeScenarioEnabled {
+                print("[info] maximize scenario active -- the About-Windows window (id \(aboutWindow.windowId)) "
+                    + "is still open at t=25s (its own close leg may still be in flight, or may have failed); the "
+                    + "maximize-scenario assertions above are authoritative for this run, not this generic "
+                    + "paint/size check")
             } else {
                 print("[info] an About-Windows-titled window (id \(aboutWindow.windowId)) is present but this run "
                     + "launched \(launchedProgram), not winver.exe -- not the anchor for this run, informational only")
+            }
+        } else if maximizeScenarioEnabled {
+            // Phase 2 W2 team-lead review: the expected end state for a successful maximize
+            // scenario is exactly this -- SC_CLOSE's own WindowDelete already closed the
+            // About window (see closeResult, asserted in the maximize-scenario block above).
+            // Mirrors the inputTestMode branch below's own "don't sound reassuring when the
+            // close was never actually confirmed" discipline.
+            if closeResult == true {
+                print("[info] maximize scenario active -- no About-Windows window remains open, consistent with "
+                    + "the scenario's own SC_CLOSE leg succeeding; see the maximize-scenario assertions above, "
+                    + "which are authoritative here")
+            } else {
+                print("[info] maximize scenario active -- no About-Windows window remains open, but the scenario's "
+                    + "own close leg did not confirm success (closeResult=\(String(describing: closeResult))) -- "
+                    + "this is NOT necessarily evidence of a successful close; see the maximize-scenario "
+                    + "assertions above, which are authoritative here")
             }
         } else if inputTestMode != nil {
             // W4c review M2+M3: this branch used to unconditionally claim "consistent with
@@ -1674,6 +1886,42 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 focusRotationsIssued == focusRotationTotal,
                 "focus rotation ran all \(focusRotationTotal) rotations (issued \(focusRotationsIssued))"
             )
+        }
+
+        // Phase 2 W2 task item 5b/5c (docs/plans/phase2.md §2 W2): maximize/restore/close
+        // e2e over CRSession.sendSysCommand(_:command:) -- gating only when
+        // WINDOW_SMOKE_MAXIMIZE was actually set for this run. Closes W0's deferred M1
+        // acceptance debt ("a maximized window must build", phase2.md W0/M1) via the
+        // `maximizeResult.mappedWithContent` assertion, and gives task item 5c's
+        // traffic-light close loop a real, gating check via `closeResult`.
+        if maximizeScenarioEnabled {
+            if let maximizeResult {
+                check(
+                    maximizeResult.grew,
+                    "maximize scenario: SC_MAXIMIZE grew the About window to >=2000pt width within 5s"
+                )
+                check(
+                    maximizeResult.mappedWithContent,
+                    "maximize scenario: the maximized window stayed mapped with real content (closes W0/M1's "
+                        + "deferred \"a maximized window must build\" debt)"
+                )
+            } else {
+                check(false, "maximize scenario: a target window was locked and SC_MAXIMIZE was sent before the run ended")
+            }
+            if let restoreResult {
+                check(restoreResult, "maximize scenario: SC_RESTORE shrank the window back below 1000pt width within 5s")
+            } else {
+                check(false, "maximize scenario: the restore leg ran (may be skipped if the maximize leg itself already failed -- see the maximize assertions above)")
+            }
+            if let closeResult {
+                check(
+                    closeResult,
+                    "maximize scenario (task item 5c): SC_CLOSE via the same sendSysCommand path produced a "
+                        + "WindowDelete within 5s"
+                )
+            } else {
+                check(false, "maximize scenario: the close leg ran before the run ended")
+            }
         }
 
         // Phase 2 W0③: see checkFirstFrameGate's own doc comment -- every window this run

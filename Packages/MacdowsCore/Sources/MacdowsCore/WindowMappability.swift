@@ -37,18 +37,70 @@ public enum WindowMappability {
     /// discriminator here, style is.
     private static let styleDesktopContainerOnly: UInt32 = 0x8000_0000
 
+    /// `WS_EX_TOOLWINDOW` (0x00000080, `freerdp/window.h`) — per MSDN, "does not appear in
+    /// the taskbar or in the dialog that appears when the user presses ALT+TAB": the
+    /// standard Win32 signature for a floating helper/utility window, not a normal
+    /// top-level application window. Also `StyleTranslator.styleExToolWindow` — duplicated
+    /// here rather than shared, matching this file's own precedent of not cross-importing
+    /// bit constants between this package's independent pure-logic units.
+    private static let styleExToolWindow: UInt32 = 0x0000_0080
+    /// `WS_EX_NOACTIVATE` (0x08000000) — the window never receives the input focus and is
+    /// never brought to the foreground on click; per MSDN this exists specifically for
+    /// passive helper UI a user interacts with by clicking through to the window beneath.
+    private static let styleExNoActivate: UInt32 = 0x0800_0000
+
+    /// Phase 2 W2 ghost-sliver rule (`docs/plans/phase2.md` §2 W2): four blank 136x39
+    /// RAIL-shown helper windows are a live, real UX bug -- empty-title slivers that pass
+    /// this filter's exact-style desktop-container check (their `style`, `0x800B0000`, is
+    /// NOT the exact `styleDesktopContainerOnly` value) and so become real, visible-but-
+    /// blank `NSWindow`s today.
+    ///
+    /// **Grounded in real capture data, not pure speculation**: all four ghosts (windowIds
+    /// 983208/132042/132028/66450, present in every one of the six
+    /// `samples/phase05-rail-events-2026-08-19` captures) carry the EXACT same
+    /// `styleEx = 0x08000088` = `WS_EX_NOACTIVATE (0x08000000) | WS_EX_TOOLWINDOW
+    /// (0x00000080) | WS_EX_TOPMOST (0x00000008)`, and `title == ""`, verified directly
+    /// against the raw JSONL (not reconstructed from a summary). Cross-checked against
+    /// EVERY OTHER window in all six samples that carries either the TOOLWINDOW or
+    /// NOACTIVATE bit (a full grep sweep, not a spot check): every single one of them
+    /// already has `style == styleDesktopContainerOnly` exactly (the five multi-monitor
+    /// "Windows 输入体验" overlays and every degenerate 0x0/1x1/396x0/1009x4 helper) and so
+    /// is already excluded by the check above — this new rule changes the outcome for
+    /// these four windowIds ONLY across the entire sample set, zero collateral impact.
+    ///
+    /// **What is NOT sample-verified**: `ownerWindowId`'s real wire value for these four
+    /// windows — adr/0008 §0 documents that no phase05 sample ever captured
+    /// `ownerWindowId`'s actual value (rail-probe.c never logged it), so `ownerWindowId ==
+    /// 0` below is required but unconfirmed against real bits; a tray-flyout helper window
+    /// being desktop-owned (0) rather than owned by a specific parent is the reasonable
+    /// expectation, not a verified fact. This is exactly the gap `Tools/window-smoke`'s new
+    /// `[style-dump]` line (this same pass) exists to close on the next live run.
+    ///
+    /// Requires BOTH ex-style bits together (not either alone) and both the empty title AND
+    /// the unowned check — the exact three-way signature actually observed, deliberately
+    /// tighter than "any one signal," to minimize the chance of hiding some legitimate
+    /// TOOLWINDOW-only palette this rule was never meant to catch. Fails OPEN (stays
+    /// mappable) the instant any one of the three conditions doesn't hold, per the plan's
+    /// "unknown styles render visible" principle applied narrowly to this one guessed rule
+    /// — not a general allow/deny-list.
+    private static func isGhostSliverHelper(styleEx: UInt32, ownerWindowId: UInt32, title: String) -> Bool {
+        let ghostExStyle = styleExToolWindow | styleExNoActivate
+        return styleEx & ghostExStyle == ghostExStyle && title.isEmpty && ownerWindowId == 0
+    }
+
     /// Per `docs/plans/phase2.md` §2 W2's stated principle, an unrecognized style FAILS
     /// OPEN (returns `true`) — this only excludes what's actually been observed to be
     /// non-content; it is not a general allow/deny-list policy.
     ///
-    /// `styleEx`/`ownerWindowId`/`fieldFlags` are accepted now (adr/0008 §3's owner field,
-    /// wired end-to-end starting this pass) but not yet consumed by any branch below —
-    /// a forward-compatible signature for W1's Z-order/owner work and W4's IME-candidate-
-    /// window classification, both expected to need them, rather than changing this
-    /// signature a second time.
+    /// `fieldFlags` is accepted now (adr/0008 §3's owner field, wired end-to-end starting
+    /// this pass) but not yet consumed by any branch below — a forward-compatible signature
+    /// for W1's Z-order/owner work and W4's IME-candidate-window classification, both
+    /// expected to need it, rather than changing this signature a second time. `styleEx`/
+    /// `ownerWindowId` were accepted-but-unconsumed as of W0①; this W2 pass is their first
+    /// real consumer (the ghost-sliver rule above), alongside the newly added `title`.
     public static func isMappableWindow(
         width: UInt32, height: UInt32, style: UInt32, styleEx: UInt32,
-        ownerWindowId: UInt32, fieldFlags: UInt32
+        ownerWindowId: UInt32, fieldFlags: UInt32, title: String
     ) -> Bool {
         if width <= 1 || height <= 1 { return false }
         // Garbage-value guard carried over unchanged from the size-only filter: no sane
@@ -57,6 +109,7 @@ public enum WindowMappability {
         if width > 16384 || height > 16384 { return false }
         if style & styleChild != 0 { return false }
         if style == styleDesktopContainerOnly { return false }
+        if isGhostSliverHelper(styleEx: styleEx, ownerWindowId: ownerWindowId, title: title) { return false }
         return true
     }
 }

@@ -1,5 +1,6 @@
 import AppKit
 import IOSurface
+import MacdowsCore
 
 /// Identifies one `RemoteWindow`. Deliberately keyed by `windowId` **and** `generation`,
 /// not `windowId` alone — after a reconnect the RDP server is free to reuse the same
@@ -29,6 +30,40 @@ struct RemoteWindowKey: Hashable {
 private final class RemoteWindowBackingWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    /// Phase 2 W2 traffic lights (docs/plans/phase2.md §2 W2 task item 3): the server is
+    /// authoritative over close/minimize/maximize -- this backing window never performs any
+    /// of the three locally, `super` is deliberately never called. Overriding these three
+    /// AppKit action methods (rather than wiring the traffic-light buttons' target/action
+    /// individually) intercepts EVERY trigger that would normally invoke them: the
+    /// traffic-light buttons themselves (whose default actions ARE exactly these three
+    /// selectors -- `-standardWindowButton:` for `.closeButton`/`.miniaturizeButton`/
+    /// `.zoomButton` targets these by construction), the standard ⌘W/⌘M keyboard shortcuts
+    /// wherever they're bound, and a double-click on the title bar (which calls `-zoom:`) --
+    /// in one place, rather than only covering the buttons and leaving every other trigger
+    /// to fall through to AppKit's real close/miniaturize/zoom behavior. The real effect
+    /// only happens once `RemoteWindowRegistry` later observes the server's own
+    /// `WindowDelete`/`WindowUpdate` in response to the `SC_*` command these closures send
+    /// (see `RemoteWindow.onChromeAction`'s own doc comment for the full loop). All three
+    /// default to nil (a plain closure property, not `@objc`/target-action) -- safe to leave
+    /// unset for a window whose chrome never enables the corresponding style bit, since
+    /// AppKit then never surfaces the button/shortcut to trigger the override in the first
+    /// place.
+    var onPerformClose: (() -> Void)?
+    var onPerformMiniaturize: (() -> Void)?
+    var onZoom: (() -> Void)?
+
+    override func performClose(_ sender: Any?) {
+        onPerformClose?()
+    }
+
+    override func performMiniaturize(_ sender: Any?) {
+        onPerformMiniaturize?()
+    }
+
+    override func zoom(_ sender: Any?) {
+        onZoom?()
+    }
 }
 
 /// One remote RAIL window mirrored onto this Mac as an undecorated `NSWindow`, per
@@ -64,6 +99,59 @@ final class RemoteWindow {
     }
     private let contentView: RemoteWindowContentView
 
+    /// Phase 2 W2 (docs/plans/phase2.md §2 W2 task item 3): one traffic-light action,
+    /// reported upward exactly like `onInput` above -- `RemoteWindowRegistry` decides which
+    /// `SC_*` command to send (it alone knows this window's current show-state, needed to
+    /// pick `SC_MAXIMIZE` vs `SC_RESTORE` for `.zoom`) and owns the actual `CRSession` call,
+    /// the same "dumb pipe up, policy in the registry" split `onInput`/`handleInput`
+    /// already establishes. Server authority (task item 3's own instruction): `RemoteWindow`
+    /// never mutates its own `NSWindow` state in response to a traffic-light action --
+    /// `RemoteWindowBackingWindow`'s three overrides above never call `super`, so the ONLY
+    /// effect of a click/⌘W/⌘M/double-click-titlebar is this closure firing. The real
+    /// close/minimize/maximize happens later, when `RemoteWindowRegistry` observes the
+    /// server's own `WindowDelete` (close) or a `WindowUpdate` carrying a new show-state/
+    /// size (minimize/maximize) -- the exact same `handleWindowOrder`/`handleWindowDelete`
+    /// path an ordinary RAIL-driven show-state change already goes through, so a
+    /// traffic-light click and a server-initiated state change look identical downstream.
+    var onChromeAction: ((ChromeAction) -> Void)?
+
+    enum ChromeAction {
+        case close
+        case minimize
+        case zoom
+    }
+
+    /// The chrome most recently applied to the real `NSWindow` via `applyChromeNow(_:)`, so
+    /// a redundant call (e.g. a WindowUpdate that re-merges the same style bits this window
+    /// already has) is a cheap no-op rather than unconditionally reassigning
+    /// `styleMask`/`level`/`hasShadow` and re-preserving the frame on every single order.
+    /// `nil` until the first real application -- distinct from `pendingChrome` below, which
+    /// tracks "most recently requested" even while gated (see that property's own doc
+    /// comment for why the two can differ).
+    private var appliedChrome: WindowChrome?
+    /// Real-host regression (2026-08-23, post-W2 first-frame-gate investigation): mutating
+    /// `NSWindow.styleMask` (and, separately, calling `-setFrame:display:`) on a window that
+    /// has NEVER been ordered onto screen was observed live to force the window server to
+    /// register/insert the window into `NSApp.orderedWindows` as a side effect -- entirely
+    /// independent of any explicit `orderFront`/`orderOut` call. This reproduced exactly the
+    /// same "hidden window silently becomes on-screen" failure class the Z-order
+    /// investigation traced to unconditional `order(_:relativeTo:)` calls (see
+    /// `RemoteWindowRegistry.applyZOrder`'s own doc comment on the still-unexplained
+    /// `isVisible`/`orderedWindows` disagreement) -- six real windows (dxdiag/charmap) were
+    /// observed present in `NSApp.orderedWindows` with `window.isVisible == false` moments
+    /// after their first `applyChrome` call, then later flagged as first-frame gate
+    /// VIOLATIONs (visible with no content, no timeout) once something downstream started
+    /// reading them as shown.
+    ///
+    /// The fix: `applyChrome(_:)` NEVER touches AppKit while `hasClearedFirstFrameGate` is
+    /// false -- it only records the request here, exactly mirroring `setVisible`/
+    /// `pendingVisible`'s existing precedent for the identical class of "don't touch AppKit
+    /// until the gate clears" problem. `present`/`firstFrameTimeoutFired` apply whatever is
+    /// pending at the exact moment they clear the gate (right before the `orderFront`/
+    /// `orderOut` call that immediately follows makes the window's on-screen state
+    /// authoritative again either way).
+    private var pendingChrome: WindowChrome?
+
     /// Phase 2 W0③ first-frame gating: true once this window's real order/visibility gate
     /// has cleared -- either because its first GFX surface actually presented (see
     /// `present(surface:mappedSize:via:)`) or because `firstFrameTimeout` fired first (see
@@ -72,12 +160,40 @@ final class RemoteWindow {
     /// the real `NSWindow` -- this is the actual fix for the black-box gap that
     /// `win.backgroundColor = .black` below used to just document as an accepted cosmetic
     /// artifact (W4b review L3).
-    private var hasClearedFirstFrameGate = false
+    ///
+    /// `private(set)` (Phase 2 W2 real-host regression round 2): `RemoteWindowRegistry.
+    /// currentTopDownWindowIds()` reads this to exclude gate-held windows from Z-order
+    /// application -- see that method's own doc comment for why `NSApp.orderedWindows`
+    /// alone was confirmed live to be insufficient ground truth for "on screen."
+    private(set) var hasClearedFirstFrameGate = false
     /// The RAIL server's last-requested show-state for this window (see `setVisible`),
     /// captured even while gated so the correct state can be applied the instant the gate
     /// clears. Irrelevant once `hasClearedFirstFrameGate` is true -- `setVisible` applies
     /// immediately at that point, same as before this feature existed.
     private var pendingVisible = false
+    /// Real-host regression, round 3 (2026-08-23, W2 first-frame-gate investigation): the
+    /// FOURTH bypass route of the same failure class -- `activateLocally()`'s
+    /// `-makeKeyAndOrderFront:` call orders a gate-held window front exactly like the three
+    /// routes already fixed this round (Z-order's `order(_:relativeTo:)`, the chrome
+    /// styleMask/frame mutation, and construction-time window-server registration). Observed
+    /// live in the maximize scenario: the server converges focus onto a freshly-(re)created
+    /// About window via `FocusAuthority`'s server-truth-only `.makeKey` effect (no user click
+    /// involved at all -- `serverDesktopUpdate`'s own "no local activation in flight, follow
+    /// the server immediately" branch), landing on `activateLocally()` before that window's
+    /// first frame had ever presented. Mirrors `pendingVisible`/`pendingChrome`'s exact
+    /// precedent: while gated, only record the request; `present`/`firstFrameTimeoutFired`
+    /// apply it once they clear the gate. Verified against `FocusAuthority`'s own source
+    /// (Packages/MacdowsCore/Sources/MacdowsCore/FocusAuthority.swift) before relying on the
+    /// team's "it trusts effects, doesn't read key state back" claim: `FocusAuthority`'s
+    /// entire public surface (`serverDesktopUpdate`/`localActivate`/`enqueueKeyboardEvent`/
+    /// `tick`/`generationReset`) takes no AppKit/NSWindow input of any kind, and every
+    /// decision about "what's currently keyed" is derived purely from its own `state`
+    /// (`currentlyKeyedWindow`, a read of `FocusState` it set itself) plus server truth and
+    /// time -- it never reads `NSWindow.isKeyWindow` or any other real AppKit state back, so
+    /// deferring the actual `makeKeyAndOrderFront:` call in time (never in whether it
+    /// happens) cannot desync it from `FocusAuthority`'s own model. Confirmed true, not
+    /// assumed.
+    private var pendingActivate = false
     /// Diagnostics only (Tools/window-smoke's first-frame gating assertion) -- true if this
     /// window's gate cleared via `firstFrameTimeout` rather than a real presented frame,
     /// i.e. it was shown with no content yet. Not read anywhere on the real rendering path.
@@ -145,6 +261,15 @@ final class RemoteWindow {
         self.window = win
         self.contentLayer = layer
         self.contentView = contentView
+
+        // Phase 2 W2 (task item 3): wires RemoteWindowBackingWindow's three action
+        // overrides straight to `onChromeAction` -- see both types' own doc comments for
+        // why these exist and what happens (or, deliberately, doesn't happen locally) when
+        // they fire. [weak self]: these closures must not be what keeps a closed
+        // RemoteWindow alive, same reasoning as every other closure in this initializer.
+        win.onPerformClose = { [weak self] in self?.onChromeAction?(.close) }
+        win.onPerformMiniaturize = { [weak self] in self?.onChromeAction?(.minimize) }
+        win.onZoom = { [weak self] in self?.onChromeAction?(.zoom) }
 
         // W4c review H1: this window losing key status is the primary signal that this
         // client can no longer reliably observe the physical keyboard's modifier state
@@ -260,6 +385,62 @@ final class RemoteWindow {
         window.title = title
     }
 
+    /// Phase 2 W2 (docs/plans/phase2.md §2 W2 task item 3): requests one
+    /// `MacdowsCore.WindowChrome` value (from `StyleTranslator.chrome`) be applied to this
+    /// window. Real-host regression fix (see `pendingChrome`'s own doc comment): while
+    /// `hasClearedFirstFrameGate` is false, this ONLY records the request -- it must not
+    /// touch `NSWindow` at all, since mutating `styleMask`/`frame` on a window that's never
+    /// been ordered onto screen was observed live to force premature window-server
+    /// registration. Once the gate has already cleared (the common case for any style
+    /// change arriving after this window's first real frame), applies immediately.
+    func applyChrome(_ chrome: WindowChrome) {
+        pendingChrome = chrome
+        guard hasClearedFirstFrameGate else { return }
+        applyChromeNow(chrome)
+    }
+
+    /// The actual `NSWindow.styleMask`/`.level`/`.hasShadow` mutation -- only ever called
+    /// once `hasClearedFirstFrameGate` is true (from `applyChrome` once already cleared, or
+    /// from `present`/`firstFrameTimeoutFired` at the exact moment they clear it). Idempotent
+    /// against a redundant call with the same chrome (`appliedChrome` short-circuit) -- a
+    /// WindowUpdate that re-merges unrelated fields (offset/size/show) but leaves style
+    /// unchanged must not churn styleMask on every single order.
+    ///
+    /// Frame preservation (task item 3's own instruction): `NSWindow.styleMask` and `.frame`
+    /// interact in AppKit -- a titled window's frame includes the titlebar strip, a
+    /// borderless one doesn't, so toggling `.titled` can shift how `.frame` relates to the
+    /// window's own content region. Capturing `window.frame` before the styleMask
+    /// assignment and unconditionally restoring it afterward keeps whatever
+    /// `RemoteWindowRegistry.macFrame(for:)` most recently computed from the RAIL order as
+    /// this window's actual on-screen frame, regardless of that internal reinterpretation --
+    /// the RAIL-provided frame meaning stays authoritative, AppKit's own chrome-driven frame
+    /// adjustment is simply overridden right back. (Open question, deliberately not guessed
+    /// at here: whether RAIL's own windowWidth/Height already accounts for a native
+    /// titlebar's height for a titled window is unconfirmed without live-host measurement --
+    /// flagged for follow-up, not silently assumed either way.)
+    private func applyChromeNow(_ chrome: WindowChrome) {
+        guard chrome != appliedChrome else { return }
+        let previousFrame = window.frame
+
+        var mask: NSWindow.StyleMask = chrome.titled ? [.titled] : [.borderless]
+        if chrome.titled {
+            if chrome.closable { mask.insert(.closable) }
+            if chrome.miniaturizable { mask.insert(.miniaturizable) }
+            // See WindowChrome.zoomable's own doc comment: AppKit couples the zoom
+            // button's enabled state to `.resizable` itself, there is no independent
+            // "zoomable" styleMask bit -- `resizable` (WS_THICKFRAME) is what this project
+            // maps onto that one AppKit bit, not `zoomable` (WS_MAXIMIZEBOX) directly.
+            if chrome.resizable { mask.insert(.resizable) }
+        }
+        window.styleMask = mask
+        window.setFrame(previousFrame, display: window.isVisible)
+
+        window.hasShadow = chrome.hasShadow
+        window.level = chrome.level == .floating ? .floating : .normal
+
+        appliedChrome = chrome
+    }
+
     /// `show`: RAIL's WINDOW_ORDER show-state for this window collapsed to a simple
     /// visible/hidden bool (adr/0005 §7: full minimize/maximize/Z-order fidelity is Phase
     /// 2). `true` orders the window front; `false` orders it out without closing/
@@ -295,7 +476,13 @@ final class RemoteWindow {
         guard !hasClearedFirstFrameGate else { return } // present() already cleared it; stale fire
         firstFrameTimedOut = true
         hasClearedFirstFrameGate = true
+        // Real-host regression fix: apply whatever chrome was requested while gated BEFORE
+        // ordering the window, not after -- see `pendingChrome`'s own doc comment.
+        if let pendingChrome {
+            applyChromeNow(pendingChrome)
+        }
         applyVisibility(pendingVisible)
+        applyPendingActivateIfNeeded()
     }
 
     /// W4c click-to-activate's local half (the remote half is `CRSession.activateWindow(_:)`
@@ -307,7 +494,20 @@ final class RemoteWindow {
     /// a window key, since pulling keyboard focus away from whatever the user is actually
     /// typing into just because a background window's RAIL show bit flipped would be its
     /// own kind of bug.
+    ///
+    /// Real-host regression fix (see `pendingActivate`'s own doc comment): while
+    /// `hasClearedFirstFrameGate` is false, this ONLY records the request -- calling
+    /// `-makeKeyAndOrderFront:` on a window that's never been ordered onto screen was
+    /// observed live to bypass the first-frame gate exactly like the other three routes
+    /// already fixed this round. `FocusAuthority` (this method's only caller, via
+    /// `RemoteWindowRegistry.execute(_:)`'s `.makeKey` case) never reads real AppKit state
+    /// back to check whether this actually ran -- deferring it in time changes nothing it
+    /// can observe.
     func activateLocally() {
+        guard hasClearedFirstFrameGate else {
+            pendingActivate = true
+            return
+        }
         window.makeKeyAndOrderFront(nil)
     }
 
@@ -365,8 +565,31 @@ final class RemoteWindow {
             hasClearedFirstFrameGate = true
             firstFrameTimeoutWorkItem?.cancel()
             firstFrameTimeoutWorkItem = nil
+            // Real-host regression fix: apply whatever chrome was requested while gated
+            // BEFORE ordering the window, not after -- see `pendingChrome`'s own doc
+            // comment.
+            if let pendingChrome {
+                applyChromeNow(pendingChrome)
+            }
             applyVisibility(pendingVisible)
+            applyPendingActivateIfNeeded()
         }
+    }
+
+    /// Real-host regression fix (see `pendingActivate`'s own doc comment): applies a
+    /// deferred `activateLocally()` request, if one is pending, once the first-frame gate
+    /// has just cleared. Called AFTER `applyVisibility` (not before, unlike
+    /// `applyChromeNow`) so the window comes up front and key exactly as
+    /// `activateLocally()`'s own pre-existing unconditional `-makeKeyAndOrderFront:`
+    /// semantics always intended -- ordering after `applyVisibility` here is purely about
+    /// matching that existing call's own effect, not a correctness requirement the way
+    /// chrome-before-visibility was (styleMask must land before the window is judged
+    /// on-screen; `-makeKeyAndOrderFront:` orders AND keys in one call regardless of what
+    /// ran immediately before it).
+    private func applyPendingActivateIfNeeded() {
+        guard pendingActivate else { return }
+        pendingActivate = false
+        window.makeKeyAndOrderFront(nil)
     }
 
     /// Closes the window and recycles whatever surface it was last displaying (if any).
@@ -382,6 +605,12 @@ final class RemoteWindow {
             NotificationCenter.default.removeObserver(didResignKeyObserver)
             self.didResignKeyObserver = nil
         }
+        // A still-gated close (this window never presented/timed out before its own
+        // WindowDelete arrived) leaves `pendingActivate` moot the instant `window.close()`
+        // below runs -- cleared explicitly anyway, matching `pendingActivate`'s own
+        // lifecycle note ("cleared in close(via:)") rather than relying on the instance
+        // simply going out of use afterward.
+        pendingActivate = false
         window.orderOut(nil)
         window.close()
         if let displayedSurface {
