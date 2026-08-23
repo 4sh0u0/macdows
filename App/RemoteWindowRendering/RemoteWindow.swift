@@ -49,6 +49,20 @@ private final class RemoteWindowBackingWindow: NSWindow {
     /// unset for a window whose chrome never enables the corresponding style bit, since
     /// AppKit then never surfaces the button/shortcut to trigger the override in the first
     /// place.
+    ///
+    /// DORMANT under `RemoteWindow.nativeChromePolicy == .never` (owner decision,
+    /// 2026-08-23, adr/0010 §6): `applyChromeNow` never applies `.titled` (hence never
+    /// `.closable`/`.miniaturizable` either) any more, so AppKit never renders a
+    /// traffic-light button and never registers the title-bar double-click that would call
+    /// `-zoom:` -- none of these three overrides has a live AppKit-side trigger left. Kept,
+    /// not deleted: still correct if the policy ever flips back to native chrome, and
+    /// costs nothing while dormant. Cmd+W does NOT depend on this path either way -- this
+    /// app builds no `NSApp.mainMenu` at all (see `App/Macdows/main.swift`/`AppDelegate`),
+    /// so there is no menu key-equivalent to intercept Cmd+W before it reaches
+    /// `RemoteWindowContentView.keyDown`; it flows to `CommandKeyMapper`, which reports
+    /// `.closeRequest` and routes to `RemoteWindowRegistry.handleChromeAction(.close)` ->
+    /// `SC_CLOSE`, entirely independent of `performClose` above (verified by reading both
+    /// paths, not assumed).
     var onPerformClose: (() -> Void)?
     var onPerformMiniaturize: (() -> Void)?
     var onZoom: (() -> Void)?
@@ -137,6 +151,28 @@ final class RemoteWindow {
     /// math.
     var onLocalGeometrySettled: ((NSRect) -> Void)?
 
+    /// Real-host regression fix (2026-08-23, popup-scenario live battery under the
+    /// borderless-chrome flip): fired exactly once per gate-clear, from `present`'s and
+    /// `firstFrameTimeoutFired`'s own gate-clearing branches, AFTER every other pending
+    /// state (`pendingChrome`/`pendingMask`/`pendingVisible`/`pendingActivate`) has already
+    /// been applied. Exists so `RemoteWindowRegistry.updateParentChild` can defer its
+    /// `NSWindow.addChildWindow(_:ordered:)` call the same way `applyChrome`/`applyMask`/
+    /// `setVisible`/`activateLocally` already defer THEIR AppKit calls until this window's
+    /// first-frame gate has cleared -- see `updateParentChild`'s own doc comment for the
+    /// real-host finding that made this necessary: `addChildWindow` was observed to
+    /// materialize a gate-held (zero-content, never-ordered) child window on screen
+    /// immediately, independent of `setVisible`, joining the four other AppKit-call sites
+    /// (construction-time registration, Z-order's `order(_:relativeTo:)`, chrome's
+    /// styleMask/frame mutation, `activateLocally`'s `makeKeyAndOrderFront`) already known
+    /// to bypass the gate this way. This class has no reference to any OTHER `RemoteWindow`
+    /// or to the registry's `attachedChildOwner` bookkeeping, so -- unlike
+    /// `pendingChrome`/`pendingMask`/`pendingVisible`/`pendingActivate`, which this class
+    /// applies to itself -- the actual deferred action has to live in the registry; this
+    /// closure is the "dumb pipe up, policy in the registry" notification that lets it do
+    /// so, the same split `onInput`/`onChromeAction`/`onLocalGeometrySettled` already
+    /// establish.
+    var onFirstFrameGateCleared: (() -> Void)?
+
     /// The chrome most recently applied to the real `NSWindow` via `applyChromeNow(_:)`, so
     /// a redundant call (e.g. a WindowUpdate that re-merges the same style bits this window
     /// already has) is a cheap no-op rather than unconditionally reassigning
@@ -221,6 +257,25 @@ final class RemoteWindow {
     /// `firstFrameTimeoutFired` apply whatever was most recently requested, never a stale
     /// default.
     private var pendingMask: WindowShape.MaskResult?
+    /// Real-host regression fix (2026-08-23, maximize-scenario investigation, team-lead
+    /// review): the FIFTH member of the `pendingChrome`/`pendingVisible`/`pendingActivate`/
+    /// `pendingMask` family -- `updateFrame(contentRect:)` below used to call
+    /// `window.setFrame` unconditionally regardless of `hasClearedFirstFrameGate`, unlike
+    /// every other AppKit-mutating method on this class. This was latent (not yet the
+    /// mechanism behind any PRIOR real-host finding) until `RemoteWindowRegistry`'s new
+    /// `.surfaceMapped`-triggered reapply (see that handler's own doc comment for the actual
+    /// regression this closes: a window stuck at its pre-remap size forever after a
+    /// server-side resize) started calling `updateFrame` from a SECOND call site --
+    /// `.surfaceMapped` (GFX `MapSurfaceToWindow`) naturally arrives BEFORE a window's first
+    /// `.frameReady`/`present()` in the ordinary case (the server must map a surface before
+    /// it can send frame data for it), meaning nearly every window's FIRST surface map would
+    /// otherwise call `window.setFrame` on a still-gate-held window -- reproducing the exact
+    /// "hidden window silently becomes on-screen" failure class `pendingChrome`'s own doc
+    /// comment documents, on nearly every window, not as a rare race. Gating `updateFrame`
+    /// itself (rather than only the new call site) also closes what was already a
+    /// structurally-identical, just less-frequently-triggered gap in the ORIGINAL
+    /// `handleWindowOrder`-driven path.
+    private var pendingContentRect: NSRect?
     /// The `CAShapeLayer` built once and reused across mask updates (rebuilding a new layer
     /// per order would churn `contentLayer.mask` unnecessarily) -- `nil` until the first
     /// `.rects` mask is actually applied.
@@ -333,8 +388,11 @@ final class RemoteWindow {
     /// is this window's CONTENT rect, never its `NSWindow.frame` directly. Constructed here
     /// with `styleMask: [.borderless]` unconditionally (chrome, if any, is applied later via
     /// `applyChrome`), so `contentRect == frame` at construction time regardless (zero
-    /// chrome insets) -- this only starts to matter once `applyChromeNow` below adds a
-    /// native titlebar.
+    /// chrome insets). Owner decision (2026-08-23, adr/0010 §6, `nativeChromePolicy`'s own
+    /// doc comment has the full resolution): under today's `.never` policy `applyChromeNow`
+    /// below never applies `.titled` either, so this equality holds for this window's
+    /// entire lifetime, not just at construction -- the borderless<->titled divergence this
+    /// comment used to warn about only existed under W2's now-reverted native-chrome path.
     /// - Parameter firstFrameTimeout: adr/0010 §5 — `RemoteWindowRegistry` passes
     ///   `Self.popupFirstFrameTimeout` for a window whose `StyleTranslator`-derived chrome
     ///   has `titled == false`, `Self.defaultFirstFrameTimeout` otherwise. Defaults to
@@ -462,6 +520,17 @@ final class RemoteWindow {
     var isVisible: Bool { window.isVisible }
     var hasDisplayedContent: Bool { contentLayer.contents != nil }
     var title: String { window.title }
+    /// Diagnostics only (maximize-scenario real-host regression investigation, 2026-08-23):
+    /// the live value of `geometryAuthoritySuppressionCount` -- `updateFrame(contentRect:)`
+    /// silently no-ops while this is nonzero (see that method's own doc comment). Exposed so
+    /// a test harness can directly OBSERVE whether a dropped server-driven geometry update
+    /// (e.g. a maximize's own `WindowUpdate`) coincided with suppression being active,
+    /// rather than inferring it indirectly from `ServerLocalMoveSize` log lines alone --
+    /// `isMoveSizeStart`/`stop` pairing for a server-initiated operation (as opposed to a
+    /// local drag) is genuinely untested wire behavior (adr/0008 §0's own caveat: never
+    /// observed in any phase05 sample), so this makes the hypothesis directly checkable
+    /// against real wire evidence instead of staying inferential.
+    var debugGeometrySuppressionCount: Int { geometryAuthoritySuppressionCount }
 
     /// Diagnostics only (Tools/window-smoke's pixel-level assertion battery, W4b review
     /// round 2 -- the round-1 "screenshot looked fine" call was wrong, since nothing
@@ -534,13 +603,40 @@ final class RemoteWindow {
     /// Real-host regression (2026-08-23, W3 first live verification): `contentRect` is this
     /// window's CONTENT rect (see `init`'s own doc comment for why), NOT a frame -- converted
     /// to the real outer frame via `NSWindow.frameRect(forContentRect:)`, which accounts for
-    /// this window's CURRENT `styleMask`'s chrome insets (zero for a still-borderless
-    /// window, matching Phase 1's exact behavior; a titlebar's height/border thickness once
-    /// `applyChromeNow` below has run). Before this fix, this method set `window.frame`
-    /// directly from RAIL-derived geometry, which was silently correct only because Phase 1
-    /// windows were always borderless (frame == content rect there) -- W2's titled chrome
-    /// made that assumption wrong by exactly the chrome inset amount (~14pt observed live).
+    /// this window's CURRENT `styleMask`'s chrome insets -- zero under today's
+    /// `nativeChromePolicy == .never` (owner decision, 2026-08-23, adr/0010 §6: that
+    /// policy's own doc comment has the full resolution), matching Phase 1's exact
+    /// behavior for this window's entire lifetime, not just while un-styled. Before the W2
+    /// fix this comment originally documented, this method set `window.frame` directly from
+    /// RAIL-derived geometry, which was silently correct only because Phase 1 windows were
+    /// always borderless (frame == content rect there) -- W2's since-reverted titled chrome
+    /// made that assumption wrong by exactly the chrome inset amount (~14pt observed live);
+    /// the `frameRect(forContentRect:)` conversion below is kept regardless, since it stays
+    /// the correct identity transform under the current borderless-only policy and remains
+    /// correct if a future policy change ever reintroduces real insets.
+    /// Real-host regression fix (2026-08-23, maximize-scenario investigation): now gated on
+    /// `hasClearedFirstFrameGate` -- see `pendingContentRect`'s own doc comment for why.
+    /// While gated, only records the request; `present`/`firstFrameTimeoutFired` apply
+    /// whatever is pending at the exact moment they clear the gate, mirroring
+    /// `pendingChrome`/`pendingMask`'s own precedent exactly.
     func updateFrame(contentRect: NSRect) {
+        pendingContentRect = contentRect
+        guard hasClearedFirstFrameGate else { return }
+        applyContentRectNow(contentRect)
+    }
+
+    /// The actual `window.setFrame` mutation -- only ever called once
+    /// `hasClearedFirstFrameGate` is true (from `updateFrame` once already cleared, or from
+    /// `present`/`firstFrameTimeoutFired` at the exact moment they clear it), mirroring
+    /// `applyChromeNow`/`applyMaskNow`'s own "only called once already gate-cleared"
+    /// contract exactly. `isLocalGeometrySuppressed`'s own doc comment covers why THAT guard
+    /// stays here rather than moving to `updateFrame` -- suppression is a live, in-flight
+    /// concern independent of the first-frame gate (in practice a gate-held window is never
+    /// suppressed at all, since suppression only ever starts from a local drag/resize or a
+    /// `ServerLocalMoveSize` modality, neither plausible against a window the gate has never
+    /// let on screen -- but this keeps the check exactly where it always was rather than
+    /// assuming that invariant elsewhere).
+    private func applyContentRectNow(_ contentRect: NSRect) {
         guard !isLocalGeometrySuppressed else { return }
         let targetFrame = window.frameRect(forContentRect: contentRect)
         guard window.frame != targetFrame else { return }
@@ -693,30 +789,68 @@ final class RemoteWindow {
     /// real-host divergence that first exposed this whole class of bug (see
     /// `RemoteWindow.init`'s and `updateFrame`'s own doc comments for the full finding).
     ///
-    /// KNOWN OPEN DESIGN QUESTION (not a bug, recorded here since this is where chrome is
-    /// applied): a titled window now shows a DOUBLE titlebar -- this native macOS chrome's
-    /// own titlebar, stacked above the remote window's own Windows titlebar, which is
-    /// still present as ordinary pixels inside the content view (RAIL's geometry is the
-    /// remote window's outer rect, remote titlebar included -- see `init`'s doc comment).
-    /// A Coherence-grade experience would crop the remote titlebar out of the displayed
-    /// content and rely on native chrome as the window's only titlebar; that crop is real
-    /// design/engineering work (a new contentsRect-style crop layered on top of the
-    /// existing GFX mapped-sub-rect crop in `present(surface:mappedSize:via:)`) deliberately
-    /// left undone here -- flagged for the owner/W4, docs/plans/phase2.md W4 adjacency, not
-    /// silently accepted as finished.
+    /// DOUBLE TITLEBAR QUESTION -- RESOLVED (owner decision, 2026-08-23): adr/0010 §6 left
+    /// this an explicitly open question ("留成加法") between native macOS chrome stacked
+    /// above the remote window's own Windows titlebar pixels, or the Windows titlebar
+    /// alone. The owner ratified "只有 Windows 标题栏" -- remote windows keep ONLY the
+    /// remote-drawn titlebar (it's already baked into the RAIL pixels this window displays
+    /// verbatim, per `init`'s own doc comment), and the native `.titled` chrome W2
+    /// introduced here is removed. See `nativeChromePolicy` immediately below for the
+    /// actual rendering switch this resolution installs. Per adr/0010 §6's own text, this
+    /// keeps `topInset` permanently 0 (no crop of the remote titlebar out of the displayed
+    /// content is needed, since there is no second, native titlebar to make redundant) --
+    /// the crop machinery that resolving the OTHER way would have required
+    /// (`present(surface:mappedSize:via:)`'s own contentsRect crop gaining a second,
+    /// source-side titlebar crop) stays exactly the "left undone, flagged for the owner"
+    /// state this comment used to describe, just now because the owner chose the branch
+    /// that never needs it, not because the work remains outstanding.
+    ///
+    /// adr/0010 §6/W2 owner decision (2026-08-23): pick the rendered styleMask from THIS
+    /// policy, not from `chrome.titled` directly. `WindowChrome`'s semantic fields stay
+    /// computed exactly as `StyleTranslator.chrome` derives them from Win32 style bits --
+    /// `titled` in particular keeps driving `RemoteWindowRegistry`'s popup-tier
+    /// first-frame-timeout choice (adr/0010 §5), Cmd+W's SC_CLOSE routing, and any future
+    /// semantic consumer unchanged. Only the AppKit-visible RENDERING of that semantic
+    /// value is redirected here -- a single switch point so a future owner reversal (back
+    /// to native chrome, or some third option) is a one-line change, not a re-design,
+    /// mirroring the "留成加法" discipline adr/0010 §6 itself asked for, just resolved in
+    /// the other direction than that ADR left open.
+    enum NativeChromePolicy {
+        /// Never apply native `.titled` AppKit chrome, regardless of what
+        /// `WindowChrome.titled` says -- every remote window renders fully borderless,
+        /// keeping only whatever traffic-light/level/shadow affordances don't require
+        /// `.titled` itself (see `applyChromeNow`'s mask construction below for exactly
+        /// which bits survive).
+        case never
+    }
+    /// The current owner decision (2026-08-23, this doc comment's own date). Changing this
+    /// to a hypothetical future case is the entire scope of reversing today's decision --
+    /// no other line in this file encodes "should this window get a native titlebar."
+    static let nativeChromePolicy: NativeChromePolicy = .never
+
     private func applyChromeNow(_ chrome: WindowChrome) {
         guard chrome != appliedChrome else { return }
         let previousContentRect = window.contentRect(forFrameRect: window.frame)
 
-        var mask: NSWindow.StyleMask = chrome.titled ? [.titled] : [.borderless]
-        if chrome.titled {
-            if chrome.closable { mask.insert(.closable) }
-            if chrome.miniaturizable { mask.insert(.miniaturizable) }
-            // See WindowChrome.zoomable's own doc comment: AppKit couples the zoom
-            // button's enabled state to `.resizable` itself, there is no independent
-            // "zoomable" styleMask bit -- `resizable` (WS_THICKFRAME) is what this project
-            // maps onto that one AppKit bit, not `zoomable` (WS_MAXIMIZEBOX) directly.
-            if chrome.resizable { mask.insert(.resizable) }
+        // `nativeChromePolicy` decides `.titled` (today: never) -- NOT `chrome.titled`
+        // directly, per this method's own doc comment above. `.resizable` is kept
+        // independent of `.titled`: AppKit enables native edge/corner drag-resize from
+        // the `.resizable` styleMask bit alone, with no `.titled` requirement, so a
+        // borderless-but-resizable window still gets that affordance. It also adds no
+        // frame/content-rect inset either way (only `.titled`'s titlebar strip does),
+        // so keeping it here cannot reintroduce the borderless<->titled content-rect
+        // divergence this method's own "CONTENT RECT preservation" paragraph above
+        // documents -- frame == content rect stays true with or without `.resizable`
+        // under a `.never` policy, the exact "degenerate case" W3's content-rect math
+        // (`macContentRect`/`updateFrame`/`handleLocalGeometrySettled`) already handles
+        // with no changes needed on that side.
+        var mask: NSWindow.StyleMask
+        switch Self.nativeChromePolicy {
+        case .never:
+            mask = [.borderless]
+        }
+        if chrome.resizable {
+            mask.insert(.resizable)
         }
         isApplyingProgrammaticFrame = true
         window.styleMask = mask
@@ -862,8 +996,21 @@ final class RemoteWindow {
         if let pendingMask {
             applyMaskNow(pendingMask)
         }
+        // Real-host regression fix (2026-08-23): applied here, after chrome/mask but before
+        // visibility -- see `pendingContentRect`'s own doc comment. Geometry should be
+        // correct before the window is judged on-screen, matching the exact ordering
+        // reasoning `applyChromeNow`'s own "CONTENT RECT preservation" doc comment already
+        // establishes for chrome.
+        if let pendingContentRect {
+            applyContentRectNow(pendingContentRect)
+        }
         applyVisibility(pendingVisible)
         applyPendingActivateIfNeeded()
+        // See `onFirstFrameGateCleared`'s own doc comment -- fired last, after this
+        // window's own visibility/activation state is already settled, so a deferred
+        // `addChildWindow` (the registry's own response) reflects real, already-decided
+        // on-screen state rather than racing it.
+        onFirstFrameGateCleared?()
     }
 
     /// W4c click-to-activate's local half (the remote half is `CRSession.activateWindow(_:)`
@@ -971,8 +1118,25 @@ final class RemoteWindow {
             if let pendingMask {
                 applyMaskNow(pendingMask)
             }
+            // Real-host regression fix (2026-08-23): see `pendingContentRect`'s own doc
+            // comment, and `firstFrameTimeoutFired`'s identical placement (after chrome/
+            // mask, before visibility) for the ordering reasoning. In practice this call is
+            // very often a no-op here specifically -- `contentLayer.contents = surface`
+            // above already reflects this frame's mapped size, and if the LAST WindowUpdate
+            // (or `.surfaceMapped` reapply) before this first frame already set
+            // `pendingContentRect` to match, `applyContentRectNow`'s own "frame unchanged"
+            // check short-circuits -- but a genuinely still-pending mismatch (e.g. a
+            // WindowUpdate that arrived between the surface mapping and this first-paint
+            // callback) is now correctly caught here instead of silently staying gated
+            // forever.
+            if let pendingContentRect {
+                applyContentRectNow(pendingContentRect)
+            }
             applyVisibility(pendingVisible)
             applyPendingActivateIfNeeded()
+            // See `onFirstFrameGateCleared`'s own doc comment -- fired last, same
+            // reasoning as `firstFrameTimeoutFired`'s own identical call.
+            onFirstFrameGateCleared?()
         }
     }
 

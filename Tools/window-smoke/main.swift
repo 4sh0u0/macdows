@@ -397,6 +397,14 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private var closeResult: Bool?
     private var maximizeCloseTargetId: UInt32?
     private var maximizeCloseWindowDeletedAt: TimeInterval?
+    /// Team-lead review (2026-08-23, maximize-scenario real-host regression investigation):
+    /// set once the target locks (`.waitingForTarget`), so `drainNow()`'s own per-event
+    /// closure can trace every geometry-carrying order AND every `ServerLocalMoveSize` event
+    /// for this specific window from the start -- unlike `maximizeCloseTargetId`, which is
+    /// only set much later (the close leg), this needs to be live from the very first
+    /// SC_MAXIMIZE send, since the whole point is observing what happens BETWEEN that send
+    /// and the (missing/late) size WindowUpdate.
+    private var maximizeTargetWindowId: UInt32?
 
     // Phase 2 W3 (WINDOW_SMOKE_MOVE): programmatic move -> resize -> server-sync e2e state
     // machine -- see `runMoveResizeScenario`'s own doc comment for the full sequence and
@@ -790,6 +798,42 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 )
                 let contentRect = window.contentRect(forFrameRect: window.frame)
                 self.moveResizeObservedContentRects.append((contentRect: contentRect, at: Date().timeIntervalSince(self.startTime)))
+            }
+            // Team-lead review (2026-08-23, maximize-scenario real-host regression
+            // investigation): reuses the move-resize scenario's own raw-RAIL-geometry trace
+            // shape, ADDITIONALLY printing this window's live geometry-suppression counter
+            // (`RemoteWindow.debugGeometrySuppressionCount`) so a single run can show,
+            // directly, whether the maximize's own big WindowUpdate (a) never arrived at
+            // all (server-side investigation), or (b) arrived but was silently dropped
+            // because `geometryAuthoritySuppressionCount` was nonzero at that exact moment
+            // (client bug -- leading hypothesis: `ServerLocalMoveSize` firing around a
+            // server-initiated SC_MAXIMIZE, genuinely untested wire behavior per adr/0008
+            // §0's own caveat). `ServerLocalMoveSize` itself is also traced explicitly here
+            // via `print` -- `RemoteWindowRegistry.handleLocalMoveSize` already logs it, but
+            // via `Self.logger.debug` (os.Logger), which does NOT appear in this harness's
+            // own stdout-captured log the way every `[maximize]`/`[move-resize]` line does.
+            if maximizeScenarioEnabled, let target = self.maximizeTargetWindowId, event.windowId == target {
+                let elapsed = self.startTime.map { Date().timeIntervalSince($0) } ?? -1
+                if event.kind == .windowUpdate || event.kind == .windowCreate, event.fieldFlags & 0x0C00 != 0 {
+                    let suppression = registry.debugGeometrySuppressionCount(forWindowId: target)
+                    print(
+                        "[maximize] raw RAIL geometry at elapsed=\(String(format: "%.3f", elapsed))s "
+                            + "for windowId=\(target) kind=\(event.kind): offsetX=\(event.offsetX) "
+                            + "offsetY=\(event.offsetY) windowWidth=\(event.windowWidth) "
+                            + "windowHeight=\(event.windowHeight) show=\(event.show) "
+                            + "fieldFlags=0x\(String(event.fieldFlags, radix: 16)) "
+                            + "suppressionCount=\(suppression.map(String.init) ?? "no RemoteWindow")"
+                    )
+                }
+                if event.kind == .localMoveSize {
+                    let suppression = registry.debugGeometrySuppressionCount(forWindowId: target)
+                    print(
+                        "[maximize] ServerLocalMoveSize at elapsed=\(String(format: "%.3f", elapsed))s "
+                            + "for windowId=\(target): isMoveSizeStart=\(event.isMoveSizeStart) "
+                            + "moveSizeType=\(event.moveSizeType) posX=\(event.moveSizePosX) "
+                            + "posY=\(event.moveSizePosY) suppressionCountAfter=\(suppression.map(String.init) ?? "no RemoteWindow")"
+                    )
+                }
             }
             // Multi-window scenario bookkeeping (2026-08-22 review HIGH): a failed
             // ClientExecute (e.g. RAIL_EXEC_E_FILE_NOT_FOUND) must not hide behind
@@ -1406,6 +1450,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 snap.isVisible && snap.hasDisplayedContent
                     && (snap.title.localizedCaseInsensitiveContains("about") || snap.title.contains("关于"))
             }) else { return }
+            maximizeTargetWindowId = w.windowId
             print("[maximize] target locked: windowId=\(w.windowId) title=\"\(w.title)\"")
             session.sendSysCommand(w.windowId, command: SC.maximize)
             print("[maximize] sent SC_MAXIMIZE to windowId=\(w.windowId)")

@@ -462,6 +462,31 @@ final class RemoteWindowRegistry {
                 surfaceMappedSize[event.surfaceId] = CGSize(
                     width: CGFloat(event.mappedWidth), height: CGFloat(event.mappedHeight))
             }
+            // Team-lead review round 6 (2026-08-23, maximize-scenario real-host regression
+            // -- the actual root cause, after suspects 1/2/3 were each ruled out): the
+            // instrumented run showed the maximize's own big WindowUpdate (windowWidth=2560
+            // windowHeight=1440) ARRIVING with `suppressionCount==0` -- not suppressed, not
+            // dropped by suspects 1-3 -- yet the window stayed at its pre-maximize size.
+            // Root cause: `macContentRect(for:windowId:)` pins content SIZE to this
+            // window's CURRENT `mappedSize` (round 3's "mapped is canonical" fix, correct
+            // for steady state), and the WindowUpdate arrived BEFORE the server's own GFX
+            // surface remap caught up -- this handler updated `surfaceMappedSize` above but
+            // never re-triggered a frame recompute, so nothing ever re-applied the geometry
+            // once the remap actually landed. Recomputing and reapplying HERE (using the
+            // registry's own already-accumulated RAIL state -- `geometry[windowId]`, NOT
+            // this event's own fields, which carry only `mappedWidth`/`mappedHeight`/
+            // `windowId`, no RAIL offset/size at all) closes that gap: WindowUpdate-then-
+            // remap (this case) and remap-then-WindowUpdate (the ordinary case
+            // `handleWindowOrder` already handles via its own `macContentRect` call) now
+            // both converge on the identical final content rect, since both paths funnel
+            // through the exact same computation. `existing.updateFrame(contentRect:)` is
+            // itself gate-aware (`RemoteWindow.pendingContentRect`'s own doc comment) --
+            // this call site does NOT need to check `hasClearedFirstFrameGate` separately;
+            // a gate-held window just records the pending target and applies it once the
+            // gate clears, same as every other AppKit-mutating call on this class.
+            if let existing = windows[windowId], let state = geometry[windowId], Self.primaryMonitorHeight > 0 {
+                existing.updateFrame(contentRect: macContentRect(for: state, windowId: windowId))
+            }
         case .frameReady:
             handleFrameReady(surfaceId: event.surfaceId)
         case .disconnected:
@@ -886,6 +911,16 @@ final class RemoteWindowRegistry {
             window.onLocalGeometrySettled = { [weak self] contentRect in
                 self?.handleLocalGeometrySettled(windowId: windowId, contentRect: contentRect)
             }
+            // Real-host regression fix (2026-08-23, popup-scenario live battery): retries
+            // `updateParentChild` once this window's own first-frame gate clears -- see
+            // `RemoteWindow.onFirstFrameGateCleared`'s own doc comment for why
+            // `updateParentChild`'s FIRST attempt (made synchronously below, at creation) is
+            // unconditionally skipped for a still-gated child, and `retryParentAttach`'s own
+            // doc comment for why re-reading `geometry[windowId]` here (rather than
+            // recapturing `state.ownerWindowId` in this closure) is the correct source.
+            window.onFirstFrameGateCleared = { [weak self] in
+                self?.retryParentAttach(windowId: windowId)
+            }
             window.applyChrome(chrome)
             windows[windowId] = window
             if !state.isMinimized {
@@ -921,12 +956,47 @@ final class RemoteWindowRegistry {
     /// creation) since `ownerWindowId` is itself a delta-merged sub-field that could in
     /// principle change -- cheap either way (a dictionary lookup plus, at most, one
     /// AppKit call).
+    ///
+    /// GATE FIFTH BYPASS ROUTE (real-host regression, 2026-08-23, popup-scenario live
+    /// battery under the borderless-chrome flip -- confirmed against `window-smoke-popup.log`):
+    /// `NSWindow.addChildWindow(_:ordered:)` was observed to materialize a still-gated
+    /// (zero-content, never-`orderFront`'d) CHILD window on screen immediately -- the exact
+    /// same failure class as the four previously-sealed bypass routes (construction-time
+    /// registration, `applyZOrder`'s `order(_:relativeTo:)`, chrome's styleMask/frame
+    /// mutation, `activateLocally`'s `makeKeyAndOrderFront`), just a fifth AppKit call site
+    /// nobody had gated yet. The log's own event sequence nails it: windowId 66252
+    /// (`style=0x80000000`, no chrome-implying bits -- a plain popup, `owner=131174`, an
+    /// ALREADY on-screen About window) hit `[first-frame] VIOLATION` immediately after this
+    /// method's own call, strictly BEFORE `handleWindowOrder`'s subsequent
+    /// `window.setVisible(state.isVisible)` call ever ran -- so `setVisible` cannot have been
+    /// the cause; this call was the only AppKit mutation in between. This is not a rare
+    /// case: a popup's `WindowCreate` carries a fully-resolved `ownerWindowId` before any
+    /// content has ever presented (that's the entire reason the popup first-frame tier
+    /// exists at all -- adr/0010 §5), so `windows[windowId]` right below is, for a popup,
+    /// essentially ALWAYS still gate-held the very first time this method ever runs for it.
+    ///
+    /// Fix mirrors the established `pendingChrome`/`pendingMask`/`pendingVisible`/
+    /// `pendingActivate` precedent: skip the AppKit call entirely (do not touch
+    /// `attachedChildOwner` either -- attachment genuinely hasn't happened) while
+    /// `childWindow.hasClearedFirstFrameGate` is false, and retry once it clears via
+    /// `RemoteWindow.onFirstFrameGateCleared` -> `retryParentAttach` below. Deliberately
+    /// does NOT also gate on the OWNER's own gate state -- every observed and expected
+    /// popup owner is an already-displayed top-level window that predates the popup by
+    /// construction (a menu/dialog's owner is the window the user was already looking at),
+    /// and symmetrically deferring would need a second, reciprocal retry mechanism (owner
+    /// gate-clear -> re-attach every pending child) with no real-host evidence yet that it's
+    /// needed; flagged here, not silently assumed impossible, should a future run ever show
+    /// otherwise.
     private func updateParentChild(windowId: UInt32, ownerWindowId: UInt32) {
         let currentOwnerId = attachedChildOwner[windowId]
 
         if ownerWindowId != 0, let ownerWindow = windows[ownerWindowId] {
             guard currentOwnerId != ownerWindowId else { return } // already correctly attached
             guard let childWindow = windows[windowId] else { return }
+            // See this method's own "GATE FIFTH BYPASS ROUTE" doc comment above --
+            // `retryParentAttach` re-invokes this method once the child's gate clears, so
+            // this is a genuine "not yet" rather than a permanent skip.
+            guard childWindow.hasClearedFirstFrameGate else { return }
             if let currentOwnerId, let oldOwnerWindow = windows[currentOwnerId] {
                 oldOwnerWindow.window.removeChildWindow(childWindow.window)
             }
@@ -950,6 +1020,24 @@ final class RemoteWindowRegistry {
                 )
             }
         }
+    }
+
+    /// `RemoteWindow.onFirstFrameGateCleared`'s registry-side handler (see that property's
+    /// own doc comment, and `updateParentChild`'s "GATE FIFTH BYPASS ROUTE" doc comment for
+    /// the real-host finding this closes the loop on): re-evaluates `windowId`'s
+    /// parent-child attachment now that its own first-frame gate has actually cleared.
+    /// Re-reads `geometry[windowId]`'s CURRENT `ownerWindowId` rather than capturing it in
+    /// the closure at construction time -- a delta `WindowUpdate` could in principle have
+    /// changed it before the gate cleared (the same "current state, not stale capture"
+    /// discipline `handleChromeAction`'s `isMaximized` lookup already follows). A window
+    /// with no `ownerWindowId` at all (e.g. already closed, or never carried the OWNER
+    /// field) is simply not retried -- `geometry[windowId]` is `nil` after
+    /// `handleWindowDelete`, and `PendingWindowState.ownerWindowId` defaults to 0
+    /// (desktop-owned) otherwise, which `updateParentChild` already treats as "no
+    /// attachment needed" -- so this needs no separate guard for either case.
+    private func retryParentAttach(windowId: UInt32) {
+        guard let ownerWindowId = geometry[windowId]?.ownerWindowId else { return }
+        updateParentChild(windowId: windowId, ownerWindowId: ownerWindowId)
     }
 
     /// The one and only place Windows-space geometry becomes an `NSRect` — always through
@@ -1673,6 +1761,13 @@ final class RemoteWindowRegistry {
     func debugAccumulatedRailSize(forWindowId windowId: UInt32) -> (width: UInt32, height: UInt32)? {
         guard let state = geometry[windowId] else { return nil }
         return (width: state.width, height: state.height)
+    }
+
+    /// Diagnostics only (maximize-scenario real-host regression investigation, 2026-08-23)
+    /// -- see `RemoteWindow.debugGeometrySuppressionCount`'s own doc comment. `nil` if this
+    /// registry has no `RemoteWindow` for `windowId` at all.
+    func debugGeometrySuppressionCount(forWindowId windowId: UInt32) -> Int? {
+        windows[windowId]?.debugGeometrySuppressionCount
     }
 
     /// Diagnostics only (adr/0008 §6 / task item 5) -- the most recently observed

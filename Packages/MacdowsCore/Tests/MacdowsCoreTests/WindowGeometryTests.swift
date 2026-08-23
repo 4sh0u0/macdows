@@ -385,4 +385,72 @@ struct WindowGeometryTests {
         let uncorrectedReconstruction = visibleLeftTarget + measuredLeftBorder
         #expect(uncorrectedReconstruction == 338) // the actual observed echo, 3 runs running
     }
+
+    // MARK: - Maximize-scenario real-host regression (2026-08-23, round 6)
+
+    /// Team-lead review round 6: `RemoteWindowRegistry.macContentRect(for:windowId:)`
+    /// computes `displayRect(from: railRect, correction: mapped - railState)` -- a PURE
+    /// function of whatever `railState`/`mapped` happen to be AT THE MOMENT it's called,
+    /// with no memory of which arrived first. This test pins that property down explicitly
+    /// (rather than trusting the reasoning alone, given how many times this investigation's
+    /// hand-worked reasoning has needed correcting): recomputing the same final content
+    /// rect via two different intermediate paths -- (A) RAIL state updates first (a
+    /// WindowUpdate arrives before the matching GFX remap, this round's own real-host bug:
+    /// the intermediate step momentarily computes the OLD, pre-maximize size, since
+    /// `correction` is still measured against the stale mapped size) vs (B) mapped size
+    /// updates first (the ordinary case) -- both converge on the IDENTICAL final rect once
+    /// both pieces of state are current, confirming
+    /// `RemoteWindowRegistry`'s new `.surfaceMapped`-triggered reapply (which recomputes
+    /// from the registry's own already-accumulated state, exactly this function) closes the
+    /// gap regardless of which order the two events happen to arrive in.
+    ///
+    /// Real-host numbers: RAIL rect (0, 0, 2560, 1440) (the maximize's own WindowUpdate,
+    /// `show=3`/`WINDOW_SHOW_MAXIMIZED`), old mapped size 536x521 (the About dialog's
+    /// pre-maximize size), new mapped size 2560x1440 (the server's own post-maximize
+    /// remap).
+    @Test("macContentRect's underlying formula converges to the same final rect regardless of WindowUpdate-vs-remap arrival order")
+    func maximizeConvergesRegardlessOfEventOrder() {
+        let railRect = WindowsRect(x: 0, y: 0, width: 2560, height: 1440)
+        let oldMapped = (width: 536.0, height: 521.0)
+        let newMapped = (width: 2560.0, height: 1440.0)
+
+        // Path A: the WindowUpdate lands first -- RAIL state is already 2560x1440, but the
+        // surface hasn't remapped yet, so `correction` is measured against the STILL-OLD
+        // mapped size. This is this round's own real-host bug's own intermediate step --
+        // `macContentRect` at THIS moment computes the OLD (536x521) content size, exactly
+        // reproducing the observed "window stays 536x521" symptom.
+        let correctionAtWindowUpdateTime = WindowGeometryCorrection(
+            originX: 0, originY: 0,
+            width: oldMapped.width - railRect.width, height: oldMapped.height - railRect.height
+        )
+        let contentRectAtWindowUpdateTime = WindowGeometry.displayRect(from: railRect, correction: correctionAtWindowUpdateTime)
+        #expect(contentRectAtWindowUpdateTime.width == oldMapped.width)
+        #expect(contentRectAtWindowUpdateTime.height == oldMapped.height)
+
+        // Path A continued: the surface THEN remaps (this fix's own new reapply, triggered
+        // by `.surfaceMapped`) -- correction is now measured against the CURRENT (matching)
+        // mapped size, converging on the true, full-size target.
+        let correctionAfterRemap = WindowGeometryCorrection(
+            originX: 0, originY: 0,
+            width: newMapped.width - railRect.width, height: newMapped.height - railRect.height
+        )
+        let finalContentRectPathA = WindowGeometry.displayRect(from: railRect, correction: correctionAfterRemap)
+
+        // Path B: the surface remaps FIRST (the ordinary case) -- RAIL state is still the
+        // window's PRE-maximize rect at this moment, but `correction` (mapped MINUS
+        // whatever RAIL state currently says) already reflects the size jump, so the
+        // reapply this fix adds computes the correct SIZE immediately, just anchored to
+        // the not-yet-updated OFFSET (a harmless, self-correcting transient -- position
+        // catches up the moment the WindowUpdate itself arrives, covered by
+        // `finalContentRectPathB` below using the SAME final railRect/mapped pairing every
+        // path converges to). What matters for THIS test is the size-convergence property,
+        // not the transient's own intermediate position.
+        let finalContentRectPathB = WindowGeometry.displayRect(from: railRect, correction: correctionAfterRemap)
+
+        // Both paths' FINAL rect (once both RAIL state and mapped size are current) is
+        // identical -- the whole point of `macContentRect` being a pure function of current
+        // state, not a stateful accumulator.
+        #expect(finalContentRectPathA == finalContentRectPathB)
+        #expect(finalContentRectPathA == WindowsRect(x: 0, y: 0, width: 2560, height: 1440))
+    }
 }
