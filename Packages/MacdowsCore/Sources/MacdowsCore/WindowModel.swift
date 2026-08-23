@@ -22,6 +22,11 @@ private enum WindowOrderField {
     static let visibility: UInt32 = 0x0000_0200 // numVisibilityRects (+ rect array we don't capture)
     static let size: UInt32 = 0x0000_0400 // windowWidth/windowHeight together
     static let offset: UInt32 = 0x0000_0800 // windowOffsetX/windowOffsetY together
+    /// `WINDOW_ORDER_FIELD_VIS_OFFSET` (window.h:49, 0x00001000) — gates
+    /// `visibleOffsetX/Y` together (adr/0010 §1). Distinct from `offset` above
+    /// (`WINDOW_ORDER_FIELD_WND_OFFSET`, `windowOffsetX/Y`, the window's own origin) — the
+    /// two anchors agree only when the window is unoccluded (adr/0010 §0(b)).
+    static let visOffset: UInt32 = 0x0000_1000
 }
 
 /// Everything RAIL/RDPGFX order-handling needs to know about one remote window.
@@ -43,6 +48,20 @@ public struct WindowState: Sendable, Equatable {
     /// an absent bit means "unchanged", not "no owner"; 0 is itself a legitimate owner
     /// value ("no owner"/desktop-owned) once actually observed on the wire.
     public var ownerWindowId: UInt32 = 0
+    /// `TS_WINDOW_STATE_ORDER.visibleOffsetX/Y` (adr/0010 §1) — the screen-space top-left
+    /// corner of this window's VISIBLE region bounding box, NOT the same anchor as
+    /// `offsetX`/`offsetY` above (adr/0010 §0(b)). Meaningless until `hasSeenVisibleOffset`
+    /// is `true`; bit-gated on `WindowOrderField.visOffset` exactly like every other
+    /// conditional sub-field here — an order without the bit leaves both fields (and the
+    /// flag) unchanged from whatever was last known, never silently reset to 0.
+    public var visibleOffsetX: Int32 = 0
+    public var visibleOffsetY: Int32 = 0
+    /// `false` until the `VIS_OFFSET` bit has been observed at least once for this window.
+    /// adr/0010 §3 rule 2's fail-open discriminator: a consumer must never assume
+    /// `visibleOffset == windowOffset` just because this stays `false` — "anchor unknown"
+    /// (whole-window fail-open) is the only correct reading, distinct from "anchor is
+    /// (0, 0)" (a legitimate value once this is `true`).
+    public var hasSeenVisibleOffset: Bool = false
     /// Set once a `WindowIcon` or `WindowCachedIcon` order has been seen for this window.
     /// The probe log doesn't carry icon bytes, only that an icon order occurred.
     public var hasIcon: Bool = false
@@ -69,6 +88,11 @@ public struct WindowState: Sendable, Equatable {
         if payload.fieldFlags & WindowOrderField.offset != 0 {
             offsetX = payload.windowOffsetX
             offsetY = payload.windowOffsetY
+        }
+        if payload.fieldFlags & WindowOrderField.visOffset != 0 {
+            visibleOffsetX = payload.visibleOffsetX
+            visibleOffsetY = payload.visibleOffsetY
+            hasSeenVisibleOffset = true
         }
         if payload.fieldFlags & WindowOrderField.size != 0 {
             width = payload.windowWidth

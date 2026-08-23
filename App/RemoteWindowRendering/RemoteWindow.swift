@@ -210,6 +210,31 @@ final class RemoteWindow {
     /// happens) cannot desync it from `FocusAuthority`'s own model. Confirmed true, not
     /// assumed.
     private var pendingActivate = false
+    /// adr/0010 §2: the fourth member of the `pendingChrome`/`pendingVisible`/
+    /// `pendingActivate` trio above -- same precedent, same reason: mutating
+    /// `contentLayer.mask`/`window.isOpaque`/`window.backgroundColor` while
+    /// `hasClearedFirstFrameGate` is false risks the exact same premature window-server
+    /// registration those three routes were fixed against (`applyChromeNow`'s own doc
+    /// comment has the full real-host finding). `nil` means "no mask request recorded yet"
+    /// (distinct from `WindowShape.MaskResult.none`, "explicitly no mask") -- `applyMask`
+    /// always records into this before checking the gate, so `present`/
+    /// `firstFrameTimeoutFired` apply whatever was most recently requested, never a stale
+    /// default.
+    private var pendingMask: WindowShape.MaskResult?
+    /// The `CAShapeLayer` built once and reused across mask updates (rebuilding a new layer
+    /// per order would churn `contentLayer.mask` unnecessarily) -- `nil` until the first
+    /// `.rects` mask is actually applied.
+    private var maskLayer: CAShapeLayer?
+    /// Tracks whether the CURRENTLY applied mask is "material" (adr/0010 §2's own term) --
+    /// i.e. whether `window.isOpaque`/`.backgroundColor` are presently in their transparent-
+    /// mask state, so a later mask update that reverts to trivial/none can restore the
+    /// original opaque fast path rather than leaving them stuck transparent forever. See
+    /// `applyMaskNow`'s own doc comment for the full materiality definition.
+    private var appliedMaskIsMaterial = false
+    /// Diagnostics only (Tools/window-smoke's `[shape]` log line) -- the rect count of the
+    /// most recently APPLIED mask (0 for `.none`), independent of the wire's own truncated/
+    /// count bookkeeping (which `RemoteWindowRegistry.geometry` already tracks separately).
+    private(set) var appliedMaskRectCount = 0
     /// Diagnostics only (Tools/window-smoke's first-frame gating assertion) -- true if this
     /// window's gate cleared via `firstFrameTimeout` rather than a real presented frame,
     /// i.e. it was shown with no content yet. Not read anywhere on the real rendering path.
@@ -221,7 +246,22 @@ final class RemoteWindow {
     /// `RemoteWindowRegistry`'s move-throttle trailing-flush, which only ever needs the
     /// latter).
     private var firstFrameTimeoutWorkItem: DispatchWorkItem?
-    private static let firstFrameTimeout: TimeInterval = 2.0
+    /// adr/0010 §5: the ordinary tier, unchanged from Phase 2 W0③ — 2s, still the default
+    /// for every titled (non-popup) window.
+    static let defaultFirstFrameTimeout: TimeInterval = 2.0
+    /// adr/0010 §5: the popup tier — a menu/tooltip-class window (`WindowChrome.titled ==
+    /// false`, the ADR's own discriminator, NOT `WS_POPUP`) is something a user just clicked
+    /// and expects to appear immediately; 2s of blank silence reads as "broken," not
+    /// "loading," for something this transient. 250ms is plan §4 W4's own
+    /// WindowCreate→first-content p95 gate (≤100ms, LAN) times 2.5 — comfortable headroom
+    /// that the normal path never approaches, tripping only when something is genuinely
+    /// wrong (see this constant's own ADR section for the full cost/benefit argument).
+    static let popupFirstFrameTimeout: TimeInterval = 0.25
+    /// Set once at `init` (the ADR's own "构造期一次性选定，不中途 re-arm" instruction — shortening
+    /// an in-flight timeout has no well-defined semantics) from whichever of the two
+    /// constants above `RemoteWindowRegistry` picked, based on this window's own
+    /// `WindowChrome.titled` at creation time.
+    private let firstFrameTimeout: TimeInterval
 
     /// W4c review H1: token for the `NSWindow.didResignKeyNotification` observer below,
     /// removed in `close(via:)`/`deinit` — a block-based `NotificationCenter` observer
@@ -295,8 +335,15 @@ final class RemoteWindow {
     /// `applyChrome`), so `contentRect == frame` at construction time regardless (zero
     /// chrome insets) -- this only starts to matter once `applyChromeNow` below adds a
     /// native titlebar.
-    init(key: RemoteWindowKey, contentRect: NSRect, title: String) {
+    /// - Parameter firstFrameTimeout: adr/0010 §5 — `RemoteWindowRegistry` passes
+    ///   `Self.popupFirstFrameTimeout` for a window whose `StyleTranslator`-derived chrome
+    ///   has `titled == false`, `Self.defaultFirstFrameTimeout` otherwise. Defaults to
+    ///   `Self.defaultFirstFrameTimeout` so every pre-existing caller (tests, any future
+    ///   caller that doesn't yet know about the popup tier) keeps Phase 2 W0③'s original
+    ///   behavior unchanged.
+    init(key: RemoteWindowKey, contentRect: NSRect, title: String, firstFrameTimeout: TimeInterval = RemoteWindow.defaultFirstFrameTimeout) {
         self.key = key
+        self.firstFrameTimeout = firstFrameTimeout
 
         let win = RemoteWindowBackingWindow(contentRect: contentRect, styleMask: [.borderless], backing: .buffered, defer: false)
         win.isReleasedWhenClosed = false // this class, not AppKit, owns the window's lifetime
@@ -406,7 +453,7 @@ final class RemoteWindow {
             }
         }
         firstFrameTimeoutWorkItem = timeoutWorkItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.firstFrameTimeout, execute: timeoutWorkItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + firstFrameTimeout, execute: timeoutWorkItem)
     }
 
     /// Diagnostics only (Tools/window-smoke's assertion battery) — not read anywhere on
@@ -683,6 +730,95 @@ final class RemoteWindow {
         appliedChrome = chrome
     }
 
+    /// adr/0010 §2: requests `result` be applied as this window's `contentLayer.mask`.
+    /// Mirrors `applyChrome(_:)`'s own gating exactly (`pendingMask` is the fourth member
+    /// of that trio, see its own doc comment): while `hasClearedFirstFrameGate` is false,
+    /// this ONLY records the request -- it must never touch `contentLayer.mask`/
+    /// `window.isOpaque`/`.backgroundColor` before the gate clears, for the identical
+    /// premature-window-server-registration reason `applyChrome`/`setVisible`/
+    /// `activateLocally` were each fixed against. Once the gate has already cleared (the
+    /// common case for any mask change arriving after this window's first real frame),
+    /// applies immediately.
+    func applyMask(_ result: WindowShape.MaskResult) {
+        pendingMask = result
+        guard hasClearedFirstFrameGate else { return }
+        applyMaskNow(result)
+    }
+
+    /// The actual `contentLayer.mask`/`window.isOpaque`/`.backgroundColor`/
+    /// `invalidateShadow()` mutation -- only ever called once `hasClearedFirstFrameGate` is
+    /// true, mirroring `applyChromeNow`'s own "only called once already gate-cleared"
+    /// contract exactly.
+    ///
+    /// MATERIALITY (adr/0010 §2's "仅当窗口真带非平凡 mask 时" clause): a mask is "material"
+    /// when it would actually clip something visible -- `.none` never is; a single `.rects`
+    /// entry that (within a half-point epsilon, for floating-point slop) exactly covers the
+    /// current content bounds is ALSO not material (an ordinary rectangular window whose
+    /// server-reported visibility rect happens to be its own full client area, ordinary and
+    /// common per adr/0008 §0's own sample survey -- masking it would pay the transparency
+    /// cost below for zero visual effect). Everything else (0 rects -- a real full clip --
+    /// or 2+ rects, or a single rect that doesn't cover the full bounds) is material.
+    ///
+    /// Only material masks pay adr/0010 §2's "阴影与不透明" cost (`window.isOpaque = false`,
+    /// `.backgroundColor = .clear`, `invalidateShadow()`) -- a non-masked/trivially-masked
+    /// window keeps the existing all-opaque fast path (adr/0005 §2) untouched. This also
+    /// REVERTS correctly: a window that goes from material back to trivial/none (e.g.
+    /// un-maximizing restores rule 4's cleared mask, or a resize happens to land the visible
+    /// rect back on the full bounds) restores `isOpaque = true`/`.backgroundColor = .black`
+    /// (matching `init`'s own original values) rather than staying transparent forever --
+    /// the ADR's own text only describes the forward (non-masked -> masked) direction
+    /// explicitly, but leaving a window permanently paying the transparency cost after its
+    /// mask genuinely stopped mattering would itself violate the same "keep the fast path
+    /// for non-masked windows" principle the ADR states for the forward case.
+    private func applyMaskNow(_ result: WindowShape.MaskResult) {
+        let contentSize = contentView.bounds.size
+        let material = Self.isMaterialMask(result, contentSize: contentSize)
+
+        switch result {
+        case .none:
+            contentLayer.mask = nil
+            appliedMaskRectCount = 0
+        case .rects(let rects):
+            let shape = maskLayer ?? {
+                let layer = CAShapeLayer()
+                layer.fillRule = .nonZero
+                maskLayer = layer
+                return layer
+            }()
+            shape.frame = CGRect(origin: .zero, size: contentSize)
+            let path = CGMutablePath()
+            for rect in rects {
+                path.addRect(CGRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height))
+            }
+            shape.path = path
+            contentLayer.mask = shape
+            appliedMaskRectCount = rects.count
+        }
+
+        if material || appliedMaskIsMaterial {
+            window.isOpaque = !material
+            window.backgroundColor = material ? .clear : .black
+            window.invalidateShadow()
+        }
+        appliedMaskIsMaterial = material
+    }
+
+    /// See `applyMaskNow`'s own doc comment for the full materiality definition this
+    /// implements.
+    private static func isMaterialMask(_ result: WindowShape.MaskResult, contentSize: NSSize) -> Bool {
+        switch result {
+        case .none:
+            return false
+        case .rects(let rects):
+            guard rects.count == 1 else { return true } // 0 rects (a real full clip) or 2+
+            let r = rects[0]
+            let epsilon = 0.5
+            return !(abs(r.x) <= epsilon && abs(r.y) <= epsilon
+                && abs(r.width - Double(contentSize.width)) <= epsilon
+                && abs(r.height - Double(contentSize.height)) <= epsilon)
+        }
+    }
+
     /// `show`: RAIL's WINDOW_ORDER show-state for this window collapsed to a simple
     /// visible/hidden bool (adr/0005 §7: full minimize/maximize/Z-order fidelity is Phase
     /// 2). `true` orders the window front; `false` orders it out without closing/
@@ -722,6 +858,9 @@ final class RemoteWindow {
         // ordering the window, not after -- see `pendingChrome`'s own doc comment.
         if let pendingChrome {
             applyChromeNow(pendingChrome)
+        }
+        if let pendingMask {
+            applyMaskNow(pendingMask)
         }
         applyVisibility(pendingVisible)
         applyPendingActivateIfNeeded()
@@ -828,6 +967,9 @@ final class RemoteWindow {
             // comment.
             if let pendingChrome {
                 applyChromeNow(pendingChrome)
+            }
+            if let pendingMask {
+                applyMaskNow(pendingMask)
             }
             applyVisibility(pendingVisible)
             applyPendingActivateIfNeeded()

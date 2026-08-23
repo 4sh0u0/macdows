@@ -203,6 +203,20 @@ struct ReplayTests {
 
     // MARK: - Phase 2 W0① replay fixture (docs/plans/phase2.md W0①, adr/0008 §3)
     //
+    // adr/0010 W4 real-host correction (2026-08-23): `WindowMappability`'s bare-WS_POPUP
+    // desktop-container exclusion now additionally requires `ownerWindowId == 0` (a live
+    // popup menu is also bare WS_POPUP, but always OWNED -- see
+    // `WindowMappability.styleDesktopContainerOnly`'s own doc comment for the real-host
+    // evidence that forced this). Explicitly verified this fixture is UNAFFECTED, not just
+    // assumed: `grep -l ownerWindowId samples/phase05-rail-events-2026-08-19/*.jsonl` across
+    // all six files returns zero matches (exit 1, no file lists it) -- the key never appears
+    // at all, so every window in every sample decodes `ownerWindowId == 0` via
+    // `WindowOrderPayload`'s own `decodeIfPresent ?? 0` fallback (confirmed at the source,
+    // not re-derived from the coverage note below, which already stated this for a different
+    // reason). The `style == styleDesktopContainerOnly` branch's added `ownerWindowId == 0`
+    // condition is therefore trivially satisfied for every one of the 17 windowIds it drops
+    // per scenario below -- the expected set is unchanged.
+    //
     // Set-equality, not count-equality, per docs/plans/phase2.md's W0 acceptance
     // criterion — a filter that drops the wrong 17 windowIds but still drops exactly 17
     // must fail this test. Every set below was derived by direct inspection: every

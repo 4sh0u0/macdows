@@ -29,7 +29,9 @@ struct WindowModelTests {
         styleEx: UInt32 = 0,
         show: UInt32 = 0,
         title: String = "",
-        ownerWindowId: UInt32 = 0
+        ownerWindowId: UInt32 = 0,
+        visibleOffsetX: Int32 = 0,
+        visibleOffsetY: Int32 = 0
     ) -> WindowOrderPayload {
         WindowOrderPayload(
             windowId: windowId,
@@ -43,7 +45,9 @@ struct WindowModelTests {
             styleEx: styleEx,
             show: show,
             title: title,
-            ownerWindowId: ownerWindowId
+            ownerWindowId: ownerWindowId,
+            visibleOffsetX: visibleOffsetX,
+            visibleOffsetY: visibleOffsetY
         )
     }
 
@@ -63,6 +67,7 @@ struct WindowModelTests {
     static let fieldVisibility: UInt32 = 0x0000_0200 // VISIBILITY — must gate numVisibilityRects
     static let fieldSize: UInt32 = 0x0000_0400
     static let fieldOffset: UInt32 = 0x0000_0800
+    static let fieldVisOffset: UInt32 = 0x0000_1000 // VIS_OFFSET — must gate visibleOffsetX/Y
 
     // MARK: - fieldFlags anchor (M2, W4b review): App/RemoteWindowRendering/
     // RemoteWindowRegistry.swift — the Xcode-target Swift rendering layer, a separate
@@ -333,5 +338,60 @@ struct WindowModelTests {
         let reowned = Self.windowOrder(windowId: 1, fieldFlags: Self.fieldOwner, ownerWindowId: 0)
         _ = model.apply(Self.event(.windowUpdate(reowned), line: 2))
         #expect(model.windows[1]?.ownerWindowId == 0, "OWNER bit set with value 0 must overwrite, not be mistaken for 'absent'")
+    }
+
+    // MARK: - adr/0010 §1: visibleOffsetX/Y bit-gated delta-merge
+
+    @Test("a window that never carries VIS_OFFSET leaves hasSeenVisibleOffset false, not silently (0, 0)")
+    func visibleOffsetNeverSeenStaysUnflagged() {
+        var model = WindowModel()
+        _ = model.apply(Self.event(.windowCreate(Self.windowOrder(
+            windowId: 1, fieldFlags: Self.fieldSize, width: 400, height: 300
+        )), line: 1))
+
+        let state = try! #require(model.windows[1])
+        #expect(!state.hasSeenVisibleOffset, "no order has ever carried VIS_OFFSET — must not read as 'anchor is (0, 0)'")
+        #expect(state.visibleOffsetX == 0 && state.visibleOffsetY == 0, "unseen defaults to the struct's own zero, but callers must gate on hasSeenVisibleOffset first")
+    }
+
+    @Test("WindowCreate with VIS_OFFSET sets visibleOffsetX/Y and the seen flag; a later WindowUpdate without it must not clear either")
+    func visibleOffsetSurvivesUpdateWithoutVisOffsetBit() {
+        var model = WindowModel()
+
+        let created = Self.windowOrder(
+            windowId: 1, fieldFlags: Self.fieldVisOffset | Self.fieldSize,
+            width: 800, height: 600, visibleOffsetX: 338, visibleOffsetY: 62
+        )
+        _ = model.apply(Self.event(.windowCreate(created), line: 1))
+        #expect(model.windows[1]?.visibleOffsetX == 338 && model.windows[1]?.visibleOffsetY == 62)
+        #expect(model.windows[1]?.hasSeenVisibleOffset == true)
+
+        // Geometry-only update, deliberately NOT carrying VIS_OFFSET — mirrors
+        // ownerWindowIdSurvivesUpdateWithoutOwnerBit's own real-capture-grounded shape
+        // (adr/0008 §0): most orders after the first Create don't repeat every bit.
+        let moved = Self.windowOrder(windowId: 1, fieldFlags: Self.fieldOffset, offsetX: 10, offsetY: 20)
+        #expect(moved.fieldFlags & Self.fieldVisOffset == 0, "test sanity: VIS_OFFSET must not be set on this update")
+        _ = model.apply(Self.event(.windowUpdate(moved), line: 2))
+
+        let state = try! #require(model.windows[1])
+        #expect(state.offsetX == 10 && state.offsetY == 20, "the offset bit's own field must still apply")
+        #expect(state.visibleOffsetX == 338 && state.visibleOffsetY == 62, "an update without VIS_OFFSET must NOT clear the previously-known anchor")
+        #expect(state.hasSeenVisibleOffset, "the seen flag must not be reset by an unrelated update either")
+    }
+
+    @Test("a WindowUpdate that DOES carry VIS_OFFSET overwrites visibleOffsetX/Y, including to 0")
+    func visibleOffsetUpdatesWhenBitIsSet() {
+        var model = WindowModel()
+        _ = model.apply(Self.event(.windowCreate(Self.windowOrder(
+            windowId: 1, fieldFlags: Self.fieldVisOffset, visibleOffsetX: 338, visibleOffsetY: 62
+        )), line: 1))
+        #expect(model.windows[1]?.visibleOffsetX == 338 && model.windows[1]?.visibleOffsetY == 62)
+
+        // 0 is itself a legitimate wire value once the bit is set, not "field absent" — the
+        // VIS_OFFSET bit is what carries that meaning, not a non-zero check on the value.
+        let reanchored = Self.windowOrder(windowId: 1, fieldFlags: Self.fieldVisOffset, visibleOffsetX: 0, visibleOffsetY: 0)
+        _ = model.apply(Self.event(.windowUpdate(reanchored), line: 2))
+        #expect(model.windows[1]?.visibleOffsetX == 0 && model.windows[1]?.visibleOffsetY == 0, "VIS_OFFSET bit set with value 0 must overwrite, not be mistaken for 'absent'")
+        #expect(model.windows[1]?.hasSeenVisibleOffset == true)
     }
 }

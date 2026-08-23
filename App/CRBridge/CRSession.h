@@ -98,6 +98,20 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// bare 0 here as authoritative without checking the bit first.
 @property (nonatomic, readonly) uint32_t ownerWindowId;
 
+/// WindowCreate/Update only, meaningful only when `fieldFlags` sets the VIS_OFFSET bit
+/// (0x1000, `WINDOW_ORDER_FIELD_VIS_OFFSET`). `TS_WINDOW_STATE_ORDER.visibleOffsetX/Y`
+/// (adr/0010 §1) -- the screen-space top-left corner of the window's VISIBLE region
+/// bounding box, NOT the same anchor as `offsetX`/`offsetY` above (those are
+/// `windowOffsetX/Y`, the window's own origin; adr/0010 §0(b): the two agree only when the
+/// window is unoccluded). Required to correctly place `visibilityRects` for an occluded
+/// window (adr/0010 §2's shape transform) -- never assume `visibleOffset == windowOffset`
+/// when this bit is unset; adr/0010 §3 rule 2 requires treating an unseen VIS_OFFSET as
+/// "anchor unknown", not as an implicit zero or windowOffset fallback. 0 is itself a
+/// legitimate value once the bit has actually been seen -- same fieldFlags-gating caveat as
+/// `ownerWindowId` above.
+@property (nonatomic, readonly) int32_t visibleOffsetX;
+@property (nonatomic, readonly) int32_t visibleOffsetY;
+
 /// WindowCreate/Update only, meaningful only when `fieldFlags` sets the visibility bit
 /// (0x0200, `WINDOW_ORDER_FIELD_VISIBILITY`). `TS_WINDOW_STATE_ORDER.visibilityRects`
 /// (adr/0008 §2b), flattened as `[left, top, right, bottom, left, top, right, bottom, ...]`

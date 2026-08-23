@@ -16,8 +16,17 @@ private enum WindowOrderField {
     static let title: UInt32 = 0x0000_0004
     static let style: UInt32 = 0x0000_0008 // gates BOTH style and extendedStyle together
     static let show: UInt32 = 0x0000_0010
+    /// `WINDOW_ORDER_FIELD_VISIBILITY` (0x0200) -- gates `numVisibilityRects`/
+    /// `visibilityRectsTruncated`/`visibilityRects` together (adr/0010 §2). Note this is a
+    /// completely different bit than `WINDOW_ORDER_FIELD_WND_RECTS` (0x0100, `windowRects`
+    /// -- still not consumed, adr/0010 §0(a)/§7).
+    static let visibility: UInt32 = 0x0000_0200
     static let size: UInt32 = 0x0000_0400
     static let offset: UInt32 = 0x0000_0800
+    /// `WINDOW_ORDER_FIELD_VIS_OFFSET` (0x1000) -- gates `visibleOffsetX/Y` together
+    /// (adr/0010 §1). Distinct anchor from `offset` above (`windowOffsetX/Y`) -- the two
+    /// agree only when the window is unoccluded (adr/0010 §0(b)).
+    static let visOffset: UInt32 = 0x0000_1000
     /// `WINDOW_ORDER_FIELD_DESKTOP_ZORDER` (window.h) -- MonitoredDesktop-only, gates
     /// `CRDPEvent.windowIds` (adr/0008 §2a). Distinct bit space from the WindowCreate/
     /// Update bits above (MonitoredDesktop's `fieldFlags` uses `WINDOW_ORDER_FIELD_DESKTOP_*`
@@ -40,6 +49,22 @@ private struct PendingWindowState {
     var style: UInt32 = 0
     var styleEx: UInt32 = 0
     var ownerWindowId: UInt32 = 0
+    /// adr/0010 §2/§3: the window's most recently known visibility rects, wire-relative
+    /// (visibleOffset-anchored) -- `numVisibilityRects` is the WIRE's own count (may exceed
+    /// `visibilityRects.count` only in the truncated case, where `visibilityRects` itself is
+    /// already bounded to `CRDPQ_MAX_VISIBILITY_RECTS`), `visibilityRectsTruncated` mirrors
+    /// `CRDPEvent`'s own field 1:1. All three are overwritten wholesale on every order that
+    /// carries the VISIBILITY bit (MS-RDPERP resends the complete set, never a delta within
+    /// the array itself) -- matching `numVisibilityRects`' own pre-existing merge shape.
+    var visibilityRects: [WindowShape.WireRect] = []
+    var numVisibilityRects: UInt32 = 0
+    var visibilityRectsTruncated: Bool = false
+    /// adr/0010 §1: `TS_WINDOW_STATE_ORDER.visibleOffsetX/Y`, meaningless until
+    /// `hasSeenVisibleOffset` is `true` -- see that flag's own doc comment for the fail-open
+    /// discriminator it exists to make possible (adr/0010 §3 rule 2).
+    var visibleOffsetX: Int32 = 0
+    var visibleOffsetY: Int32 = 0
+    var hasSeenVisibleOffset: Bool = false
 
     /// Applies only the sub-fields `event.fieldFlags` actually flags present — a delta
     /// order's unset bit means "unchanged", not "reset to zero/empty" (same invariant
@@ -53,9 +78,19 @@ private struct PendingWindowState {
             offsetX = event.offsetX
             offsetY = event.offsetY
         }
+        if flags & WindowOrderField.visOffset != 0 {
+            visibleOffsetX = event.visibleOffsetX
+            visibleOffsetY = event.visibleOffsetY
+            hasSeenVisibleOffset = true
+        }
         if flags & WindowOrderField.size != 0 {
             width = event.windowWidth
             height = event.windowHeight
+        }
+        if flags & WindowOrderField.visibility != 0 {
+            numVisibilityRects = event.numVisibilityRects
+            visibilityRectsTruncated = event.visibilityRectsTruncated
+            visibilityRects = Self.wireRects(from: event.visibilityRects)
         }
         if flags & WindowOrderField.style != 0 {
             style = event.style
@@ -69,6 +104,25 @@ private struct PendingWindowState {
         }
     }
 
+    /// `CRDPEvent.visibilityRects` is a flattened `[left, top, right, bottom, left, top,
+    /// right, bottom, ...]` `NSNumber` array (that class's own doc comment) -- chunks it
+    /// back into `WindowShape.WireRect`s. A malformed (non-multiple-of-4) array is defensive
+    /// only (should never occur -- `CRDPEventFromCrdpEvent` always appends complete
+    /// 4-tuples): any trailing partial group is simply dropped rather than crashing.
+    private static func wireRects(from flat: [NSNumber]) -> [WindowShape.WireRect] {
+        var out: [WindowShape.WireRect] = []
+        out.reserveCapacity(flat.count / 4)
+        var i = 0
+        while i + 3 < flat.count {
+            out.append(WindowShape.WireRect(
+                left: flat[i].doubleValue, top: flat[i + 1].doubleValue,
+                right: flat[i + 2].doubleValue, bottom: flat[i + 3].doubleValue
+            ))
+            i += 4
+        }
+        return out
+    }
+
     var hasKnownSize: Bool { width > 0 && height > 0 }
     /// WINDOW_HIDE == 0 (freerdp/window.h); any other show value means shown in some form.
     var isVisible: Bool { show != 0 }
@@ -78,6 +132,11 @@ private struct PendingWindowState {
     /// `isVisible`/shown-vs-hidden (adr/0005 §7: full minimize/maximize fidelity beyond
     /// this one W2 need is still out of scope).
     var isMaximized: Bool { show == 0x03 }
+    /// `WINDOW_SHOW_MINIMIZED` (0x02, freerdp/window.h) -- adr/0010 §3 rule 5's own
+    /// discriminator: `handleWindowOrder` must NOT recompute/apply this window's mask while
+    /// this is `true` (the server shrinks a minimized window's own reported size, so its
+    /// visibility rects at that moment don't describe the restored shape at all).
+    var isMinimized: Bool { show == 0x02 }
 }
 
 /// The most recently observed `MonitoredDesktop` order, as pure data (adr/0008 §6: W1's
@@ -131,6 +190,22 @@ final class RemoteWindowRegistry {
     /// adr/0008 §6 / task item 5: pure-data record of the last MonitoredDesktop order, no
     /// ordering/focus policy attached. See `ServerDesktopState`'s own doc comment.
     private var desktopState = ServerDesktopState()
+
+    /// adr/0010 §4: windowId -> the owner windowId it is CURRENTLY attached to via a real
+    /// `NSWindow.addChildWindow(_:ordered:.above)` call. Only ever contains entries for
+    /// windows presently in that attached state -- a window whose `ownerWindowId` is 0, or
+    /// whose owner isn't (yet, or ever) a known `RemoteWindow`, is simply absent here, never
+    /// present with some other sentinel value. `Set(attachedChildOwner.keys)` is this
+    /// registry's single source of truth for "which windowIds are currently riding an
+    /// owner's Z-order" -- `currentTopDownWindowIds()` is the ONE place that subtracts it
+    /// (adr/0010 §4's own "必须同时应用到 window-smoke 的 Z 序断言" requirement is satisfied by
+    /// every consumer, including `applyZOrder` and window-smoke's own assertion, reading
+    /// through that single method rather than each re-deriving the subtraction).
+    private var attachedChildOwner: [UInt32: UInt32] = [:]
+    /// adr/0010 §4's fail-open case ("属主不在注册表... 窗口照常独立显示 + 告警一次") -- windowIds
+    /// already warned about once, so a window whose owner never resolves doesn't spam a
+    /// warning on every single subsequent order.
+    private var warnedUnresolvedOwner: Set<UInt32> = []
 
     /// Z-order diagnostics (phase2.md §2 W1's final slice) -- cumulative for this
     /// registry's lifetime (not reset on reconnect, unlike `desktopState`: these are "how
@@ -574,9 +649,21 @@ final class RemoteWindowRegistry {
     /// visibility flip the moment `ZOrderSync.plan` wrongly treats it as `locallyKnown` --
     /// a gate-held window excluded HERE can never enter `locallyKnown` in the first place,
     /// regardless of what `NSApp.orderedWindows` itself claims.
+    ///
+    /// adr/0010 §4: ALSO excludes any windowId currently attached as a child (`Set
+    /// (attachedChildOwner.keys)`) -- AppKit itself maintains "a child window is always
+    /// above its parent" for an attached window, so asking `applyZOrder` to separately
+    /// `order(_:relativeTo:)` it fights that built-in mechanism. Doing the subtraction here,
+    /// the single method both `applyZOrder` (via this method's own return value feeding both
+    /// `ZOrderSync.plan`'s `locallyKnown` and `currentLocalTopDown` inputs) and
+    /// `Tools/window-smoke`'s own Z-order assertion read, is the ADR's own explicit
+    /// resolution ("这的减法必须同时应用到 window-smoke 的 Z 序断言") -- one source of truth, not
+    /// three separately-applied subtractions that could drift apart (exactly the "可见集与
+    /// 比较快照不同源" lesson the W1 STATUS entry already paid for once).
     func currentTopDownWindowIds() -> [UInt32] {
+        let attachedChildren = Set(attachedChildOwner.keys)
         let numberToId = Dictionary(uniqueKeysWithValues: windows.compactMap { windowId, remoteWindow in
-            remoteWindow.hasClearedFirstFrameGate ? (remoteWindow.window.windowNumber, windowId) : nil
+            (remoteWindow.hasClearedFirstFrameGate && !attachedChildren.contains(windowId)) ? (remoteWindow.window.windowNumber, windowId) : nil
         })
         return NSApp.orderedWindows.compactMap { numberToId[$0.windowNumber] }
     }
@@ -654,9 +741,25 @@ final class RemoteWindowRegistry {
             if event.fieldFlags & WindowOrderField.show != 0 {
                 existing.setVisible(state.isVisible)
             }
+            // adr/0010 §2's own "重算时机" clause: any geometry-affecting order recomputes
+            // the mask, not only ones that carried the VISIBILITY bit itself -- Δ depends on
+            // the window's CURRENT offsetX/Y, which a plain move/resize order changes even
+            // without a fresh visibilityRects array. Rule 5 (skip while minimized) is this
+            // call site's own responsibility, not `WindowShape.computeMask`'s -- see
+            // `PendingWindowState.isMinimized`'s own doc comment.
+            if !state.isMinimized {
+                existing.applyMask(computeMaskResult(for: state, windowId: windowId, contentSize: contentRect.size))
+            }
+            updateParentChild(windowId: windowId, ownerWindowId: state.ownerWindowId)
         } else {
             let key = RemoteWindowKey(windowId: windowId, generation: generation)
-            let window = RemoteWindow(key: key, contentRect: contentRect, title: state.title)
+            let chrome = Self.chrome(for: state)
+            // adr/0010 §5: the popup tier is picked once, at construction, from this
+            // window's own initial chrome -- `WindowChrome.titled == false` is the ADR's own
+            // discriminator (NOT `WS_POPUP`; see `StyleTranslator`'s own doc comment for why
+            // that would be wrong -- e.g. the About dialog IS `WS_POPUP` but still titled).
+            let firstFrameTimeout = chrome.titled ? RemoteWindow.defaultFirstFrameTimeout : RemoteWindow.popupFirstFrameTimeout
+            let window = RemoteWindow(key: key, contentRect: contentRect, title: state.title, firstFrameTimeout: firstFrameTimeout)
             window.onInput = { [weak self] event in
                 self?.handleInput(windowId: windowId, event: event)
             }
@@ -674,9 +777,69 @@ final class RemoteWindowRegistry {
             window.onLocalGeometrySettled = { [weak self] contentRect in
                 self?.handleLocalGeometrySettled(windowId: windowId, contentRect: contentRect)
             }
-            window.applyChrome(Self.chrome(for: state))
+            window.applyChrome(chrome)
             windows[windowId] = window
+            if !state.isMinimized {
+                window.applyMask(computeMaskResult(for: state, windowId: windowId, contentSize: contentRect.size))
+            }
+            updateParentChild(windowId: windowId, ownerWindowId: state.ownerWindowId)
             window.setVisible(state.isVisible)
+        }
+    }
+
+    /// adr/0010 §2: gathers this window's shape inputs (visibilityRects/anchor/correction
+    /// already tracked by `geometry`/`sizeCorrection`) and calls the pure
+    /// `MacdowsCore.WindowShape.computeMask` transform -- same "translate in MacdowsCore,
+    /// apply in the App target" split `isMappableWindow`/`chrome` already establish.
+    private func computeMaskResult(for state: PendingWindowState, windowId: UInt32, contentSize: NSSize) -> WindowShape.MaskResult {
+        let correction = sizeCorrection(for: state, windowId: windowId)
+        return WindowShape.computeMask(
+            visibilityRects: state.visibilityRects,
+            wireCount: state.numVisibilityRects,
+            truncated: state.visibilityRectsTruncated,
+            windowOffset: (x: Double(state.offsetX), y: Double(state.offsetY)),
+            visibleOffset: state.hasSeenVisibleOffset ? (x: Double(state.visibleOffsetX), y: Double(state.visibleOffsetY)) : nil,
+            correction: correction,
+            topInset: 0,
+            contentSize: WindowShape.ContentSize(width: Double(contentSize.width), height: Double(contentSize.height)),
+            isMaximized: state.isMaximized
+        )
+    }
+
+    /// adr/0010 §4: resolves/updates `windowId`'s real `NSWindow.addChildWindow` attachment
+    /// against its most recently merged `ownerWindowId`. Idempotent against a redundant call
+    /// with the same, already-attached owner. Re-evaluated on every order (not just
+    /// creation) since `ownerWindowId` is itself a delta-merged sub-field that could in
+    /// principle change -- cheap either way (a dictionary lookup plus, at most, one
+    /// AppKit call).
+    private func updateParentChild(windowId: UInt32, ownerWindowId: UInt32) {
+        let currentOwnerId = attachedChildOwner[windowId]
+
+        if ownerWindowId != 0, let ownerWindow = windows[ownerWindowId] {
+            guard currentOwnerId != ownerWindowId else { return } // already correctly attached
+            guard let childWindow = windows[windowId] else { return }
+            if let currentOwnerId, let oldOwnerWindow = windows[currentOwnerId] {
+                oldOwnerWindow.window.removeChildWindow(childWindow.window)
+            }
+            ownerWindow.window.addChildWindow(childWindow.window, ordered: .above)
+            attachedChildOwner[windowId] = ownerWindowId
+            warnedUnresolvedOwner.remove(windowId)
+        } else {
+            // adr/0010 §4 fail-open: ownerWindowId == 0 (desktop-owned, adr/0012 §3's same
+            // convention), or the owner isn't (yet, or ever) a window this registry renders
+            // -- detach if previously attached, and warn once (not every order) for the
+            // "owner not registered" case specifically, since that's the one worth a human
+            // noticing (a plain 0 owner is completely ordinary and not worth logging at all).
+            if let currentOwnerId, let oldOwnerWindow = windows[currentOwnerId], let childWindow = windows[windowId] {
+                oldOwnerWindow.window.removeChildWindow(childWindow.window)
+            }
+            attachedChildOwner.removeValue(forKey: windowId)
+            if ownerWindowId != 0, !warnedUnresolvedOwner.contains(windowId) {
+                warnedUnresolvedOwner.insert(windowId)
+                Self.logger.warning(
+                    "windowId=\(windowId, privacy: .public) has ownerWindowId=\(ownerWindowId, privacy: .public) which is not (yet, or ever) a known RemoteWindow -- adr/0010 §4 fail-open: displaying independently, no parent-child attachment"
+                )
+            }
         }
     }
 
@@ -815,6 +978,28 @@ final class RemoteWindowRegistry {
         // via whatever window next receives it, or via a .focusLost flush.
         lastMoveSentAt.removeValue(forKey: windowId)
         pendingTrailingMove.removeValue(forKey: windowId)
+        warnedUnresolvedOwner.remove(windowId)
+
+        // adr/0010 §4: "父窗口 close(via:) 前必须先 removeChildWindow(_:)" -- detach BOTH
+        // directions before this window's own `close(via:)` call below runs: if this window
+        // is itself an attached CHILD, detach it from its owner; if it's an attached OWNER
+        // (of other windows), detach each of those children from it first, so none of them
+        // are left referencing a parent whose `NSWindow` is about to close.
+        if let ownerId = attachedChildOwner.removeValue(forKey: windowId),
+           let ownerWindow = windows[ownerId], let closingWindow = windows[windowId]
+        {
+            ownerWindow.window.removeChildWindow(closingWindow.window)
+        }
+        let childrenOfThis = attachedChildOwner.filter { $0.value == windowId }.map(\.key)
+        if !childrenOfThis.isEmpty, let closingWindow = windows[windowId] {
+            for childId in childrenOfThis {
+                if let childWindow = windows[childId] {
+                    closingWindow.window.removeChildWindow(childWindow.window)
+                }
+                attachedChildOwner.removeValue(forKey: childId)
+            }
+        }
+
         if let window = windows.removeValue(forKey: windowId) {
             window.close(via: session)
         }
@@ -1321,6 +1506,30 @@ final class RemoteWindowRegistry {
         windows[windowId]?.nonWhitePixelRatio(inBottomFraction: bottomFraction, sampleCount: sampleCount)
     }
 
+    /// Diagnostics only (adr/0010 §4, `Tools/window-smoke`'s popup scenario) -- `windowId`'s
+    /// CURRENTLY attached owner windowId, or `nil` if it isn't attached as a child right now
+    /// (whether because `ownerWindowId` is 0, its owner isn't a known window, or it's simply
+    /// not tracked at all). Not used by the real rendering path, which never needs to query
+    /// this externally.
+    func attachedOwner(forWindowId windowId: UInt32) -> UInt32? {
+        attachedChildOwner[windowId]
+    }
+
+    /// Diagnostics only (adr/0010 §2/§4, `Tools/window-smoke`'s `[shape]` log line) --
+    /// `windowId`'s most recently merged visibility-rect wire bookkeeping (count + truncated
+    /// flag, `PendingWindowState`'s own fields) alongside the rect count actually applied to
+    /// `RemoteWindow.contentLayer.mask` last time `applyMask`/`applyMaskNow` ran -- exposing
+    /// both together (rather than just the wire side) lets a harness catch the two silently
+    /// diverging (e.g. a fail-open rule firing and clearing the applied mask while the wire
+    /// bookkeeping still shows rects). `nil` if this windowId has no tracked geometry at all.
+    func shapeDiagnostics(forWindowId windowId: UInt32) -> (wireRectCount: Int, truncated: Bool, appliedRectCount: Int)? {
+        guard let state = geometry[windowId] else { return nil }
+        return (
+            wireRectCount: state.visibilityRects.count, truncated: state.visibilityRectsTruncated,
+            appliedRectCount: windows[windowId]?.appliedMaskRectCount ?? 0
+        )
+    }
+
     /// Explicit between-connections reset, for callers that drive reconnects themselves
     /// (window-smoke's WINDOW_SMOKE_CYCLES soak). Necessary because a `shutdownAndWait`
     /// leaves NOTHING for a drain to deliver -- its own step-4 loop consumes the
@@ -1344,6 +1553,15 @@ final class RemoteWindowRegistry {
         geometry.removeAll()
         surfaceToWindow.removeAll()
         surfaceMappedSize.removeAll()
+        // adr/0010 §4: unlike `handleWindowDelete` (one window closing while its parent/
+        // children stay live, where the ADR's own "removeChildWindow before close" ordering
+        // matters), every window here -- parents and attached children alike -- is being
+        // torn down in the same sweep; AppKit itself removes a closing child from its
+        // parent's `childWindows` list as a documented side effect of `-close`, so there is
+        // no dangling parent-child reference left to explicitly sever here. Just drop the
+        // bookkeeping.
+        attachedChildOwner.removeAll()
+        warnedUnresolvedOwner.removeAll()
         desktopState = ServerDesktopState()
         // adr/0012 §2 reconnect discipline: reset to `.unmonitored` -- the gate can only
         // reopen on a subsequent *real* MonitoredDesktop order, never by any timeout.

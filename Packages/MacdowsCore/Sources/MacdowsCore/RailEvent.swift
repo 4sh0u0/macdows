@@ -320,10 +320,19 @@ public struct WindowOrderPayload: Decodable, Sendable, Equatable {
     /// replay-compat rule ("new fields append; absent means 0/false, never a decode
     /// failure"). A future probe build that does log it decodes the real value normally.
     public let ownerWindowId: UInt32
+    /// `TS_WINDOW_STATE_ORDER.visibleOffsetX/Y` (adr/0010 §1). Never emitted by
+    /// `rail-probe.c`'s current `log_event` calls — same "zero matches across every
+    /// `samples/phase05-rail-events-2026-08-19/*.jsonl` line" situation `ownerWindowId`'s
+    /// own doc comment documents, so this decodes as 0 when the key is absent, per adr/0008
+    /// §5's replay-compat rule. A future probe build that does log it decodes the real
+    /// value normally.
+    public let visibleOffsetX: Int32
+    public let visibleOffsetY: Int32
 
     private enum CodingKeys: String, CodingKey {
         case windowId, fieldFlags, windowOffsetX, windowOffsetY, windowWidth, windowHeight
         case numVisibilityRects, style, styleEx, show, title, ownerWindowId
+        case visibleOffsetX, visibleOffsetY
     }
 
     public init(from decoder: Decoder) throws {
@@ -340,16 +349,19 @@ public struct WindowOrderPayload: Decodable, Sendable, Equatable {
         show = try container.decode(UInt32.self, forKey: .show)
         title = try container.decode(String.self, forKey: .title)
         ownerWindowId = try container.decodeIfPresent(UInt32.self, forKey: .ownerWindowId) ?? 0
+        visibleOffsetX = try container.decodeIfPresent(Int32.self, forKey: .visibleOffsetX) ?? 0
+        visibleOffsetY = try container.decodeIfPresent(Int32.self, forKey: .visibleOffsetY) ?? 0
     }
 
     /// Explicit memberwise init — a custom `init(from:)` above suppresses Swift's
     /// synthesized one, and `WindowModelTests`' `@testable`-visible construction helper
-    /// relies on calling this directly. `ownerWindowId` defaults to 0, matching this
-    /// struct's own decode-when-absent behavior.
+    /// relies on calling this directly. `ownerWindowId`/`visibleOffsetX/Y` default to 0,
+    /// matching this struct's own decode-when-absent behavior.
     init(
         windowId: UInt32, fieldFlags: UInt32, windowOffsetX: Int32, windowOffsetY: Int32,
         windowWidth: UInt32, windowHeight: UInt32, numVisibilityRects: UInt32, style: UInt32,
-        styleEx: UInt32, show: UInt32, title: String, ownerWindowId: UInt32 = 0
+        styleEx: UInt32, show: UInt32, title: String, ownerWindowId: UInt32 = 0,
+        visibleOffsetX: Int32 = 0, visibleOffsetY: Int32 = 0
     ) {
         self.windowId = windowId
         self.fieldFlags = fieldFlags
@@ -363,6 +375,8 @@ public struct WindowOrderPayload: Decodable, Sendable, Equatable {
         self.show = show
         self.title = title
         self.ownerWindowId = ownerWindowId
+        self.visibleOffsetX = visibleOffsetX
+        self.visibleOffsetY = visibleOffsetY
     }
 }
 

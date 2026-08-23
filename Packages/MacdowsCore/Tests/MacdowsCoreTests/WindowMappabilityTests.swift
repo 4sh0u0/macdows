@@ -73,6 +73,26 @@ struct WindowMappabilityTests {
         #expect(!Self.mappable(width: 2560, height: 1410, style: 0x8000_0000, styleEx: 0x0800_0088))
     }
 
+    // MARK: - adr/0010 W4 real-host correction: bare WS_POPUP is ALSO a live popup menu's
+    // exact style, not just the desktop-container/IME-overlay signature -- ownerWindowId
+    // is the actual discriminator (see `styleDesktopContainerOnly`'s own doc comment for
+    // the full real-host finding this section verifies).
+
+    @Test("an OWNED bare-WS_POPUP window (a real popup menu) is mappable, not excluded")
+    func ownedBareWS_POPUPIsMappable() {
+        // About's own real-host Alt+Space system menu, exact recorded fields (windowId
+        // 4523408, first popup-scenario run against the real Win11 host): style=0x80000000
+        // (styleDesktopContainerOnly's own exact value), styleEx=0x00000088, owned by the
+        // About window (windowId 2622898) -- must NOT be excluded now that this rule
+        // requires ownerWindowId == 0 to fire.
+        #expect(Self.mappable(width: 183, height: 50, style: 0x8000_0000, styleEx: 0x0000_0088, ownerWindowId: 2_622_898, title: ""))
+    }
+
+    @Test("an UNOWNED bare-WS_POPUP window is still excluded -- the desktop-container/IME-overlay case is unchanged")
+    func unownedBareWS_POPUPStillExcluded() {
+        #expect(!Self.mappable(width: 2560, height: 1410, style: 0x8000_0000, styleEx: 0, ownerWindowId: 0, title: ""))
+    }
+
     @Test("a real content window's style (About-dialog shape) is never excluded by the ghost rule")
     func realContentWindowNeverMatchesGhostRule() {
         #expect(Self.mappable(width: 536, height: 521, style: 0x8008_0000, styleEx: 0, ownerWindowId: 0, title: "About Windows"))

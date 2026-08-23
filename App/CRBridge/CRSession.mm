@@ -68,6 +68,8 @@
 @property (nonatomic) uint32_t style;
 @property (nonatomic) uint32_t styleEx;
 @property (nonatomic) uint32_t ownerWindowId;
+@property (nonatomic) int32_t visibleOffsetX;
+@property (nonatomic) int32_t visibleOffsetY;
 @property (nonatomic) NSArray<NSNumber *> *visibilityRects;
 @property (nonatomic) uint32_t numVisibilityRects;
 @property (nonatomic) BOOL visibilityRectsTruncated;
@@ -150,6 +152,13 @@ static CRDPEvent *CRDPEventFromCrdpEvent(const CrdpEvent *ev)
             out.style = wo->style;
             out.styleEx = wo->styleEx;
             out.ownerWindowId = wo->ownerWindowId;
+            /* adr/0010 §1: crdpq already bit-gated this copy at the transport layer (see
+             * crb_window_common's own VIS_OFFSET handling below) -- an order that didn't
+             * carry the bit left these at ev.payload's memset-zero, exactly like
+             * ownerWindowId above; this is a direct, unconditional field copy here, same as
+             * ownerWindowId's own copy one line up. */
+            out.visibleOffsetX = wo->visibleOffsetX;
+            out.visibleOffsetY = wo->visibleOffsetY;
             out.numVisibilityRects = wo->numVisibilityRects;
             out.visibilityRectsTruncated = wo->visibilityRectsTruncated;
             if (wo->numVisibilityRects > 0)
@@ -457,6 +466,18 @@ static BOOL crb_window_common(rdpContext *context, const WINDOW_ORDER_INFO *orde
      * sub-field on this struct. */
     if (orderInfo->fieldFlags & WINDOW_ORDER_FIELD_OWNER)
         ev.payload.windowOrder.ownerWindowId = windowState->ownerWindowId;
+
+    /* adr/0010 §1: bit-gated, NOT unconditional -- same discipline as the OWNER bit just
+     * above (adr/0008 §3). `ev.payload` was already memset-to-zero above, so the else case
+     * (bit absent) is simply "leave it at 0", matching this transport layer's existing
+     * convention for every other conditional sub-field on this struct; WindowModel/
+     * PendingWindowState's own delta-merge (not this transport layer) is what turns "bit
+     * absent" into "anchor still unknown" (adr/0010 §3 rule 2) rather than "anchor is 0". */
+    if (orderInfo->fieldFlags & WINDOW_ORDER_FIELD_VIS_OFFSET)
+    {
+        ev.payload.windowOrder.visibleOffsetX = windowState->visibleOffsetX;
+        ev.payload.windowOrder.visibleOffsetY = windowState->visibleOffsetY;
+    }
 
     /* adr/0008 §2b: the visibilityRects array's existence (not just its length) is gated
      * on WINDOW_ORDER_FIELD_VISIBILITY (0x0200) -- same discipline as the OWNER bit above,

@@ -35,6 +35,22 @@ public enum WindowMappability {
     /// fieldFlags signature") and found identical (0x1100DF1E) across both the excluded
     /// junk windows and the kept content windows in every sample — fieldFlags is not the
     /// discriminator here, style is.
+    ///
+    /// adr/0010 W4 real-host correction (2026-08-23, first popup-scenario run): bare
+    /// `WS_POPUP` is ALSO the exact style of a live, real menu/system-menu popup — About's
+    /// own Alt+Space system menu was observed live as windowId 4523408, 183x50,
+    /// `style=0x80000000` (this exact value), `styleEx=0x00000088`, `ownerWindowId=2622898`
+    /// (the About window itself). Style equality alone is therefore NOT the desktop-
+    /// container/IME-overlay discriminator this rule's own name claims — `isMappableWindow`
+    /// below additionally requires `ownerWindowId == 0` before excluding: every desktop-
+    /// container/IME-overlay/degenerate-helper window this rule was ever meant to catch is
+    /// desktop-owned (adr/0008 §0 documents `ownerWindowId` was never actually recorded in
+    /// any of the six phase05 samples — rail-probe.c never logged it — so all 17 of that
+    /// fixture's per-scenario excluded ids decode `ownerWindowId == 0` today regardless;
+    /// `ReplayTests.w0StyleFilterDropsExpectedWindowIdSet` is therefore unaffected by this
+    /// change, and its own comment now states that check explicitly), while a live popup
+    /// menu is always OWNED by the window whose system/context menu it is. An owned bare-
+    /// `WS_POPUP` window fails open (stays mappable) instead.
     private static let styleDesktopContainerOnly: UInt32 = 0x8000_0000
 
     /// `WS_EX_TOOLWINDOW` (0x00000080, `freerdp/window.h`) — per MSDN, "does not appear in
@@ -108,7 +124,14 @@ public enum WindowMappability {
         // 0x80000000-wide order silently misdecoding as huge-but-positive under UInt32).
         if width > 16384 || height > 16384 { return false }
         if style & styleChild != 0 { return false }
-        if style == styleDesktopContainerOnly { return false }
+        // adr/0010 W4 real-host correction: bare WS_POPUP alone is ALSO a live menu/
+        // system-menu popup's exact style (see styleDesktopContainerOnly's own doc comment
+        // for the real-host evidence) -- ownerWindowId == 0 is what actually distinguishes
+        // "desktop-container/IME-overlay/degenerate-helper" (always unowned) from "a real
+        // popup menu" (always owned by the window whose menu it is). An owned bare-WS_POPUP
+        // window fails open here, same "unknown/unexpected shape stays visible" principle
+        // every other rule in this function already follows.
+        if style == styleDesktopContainerOnly, ownerWindowId == 0 { return false }
         if isGhostSliverHelper(styleEx: styleEx, ownerWindowId: ownerWindowId, title: title) { return false }
         return true
     }

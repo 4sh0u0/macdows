@@ -192,18 +192,32 @@ typedef struct {
     uint32_t numVisibilityRects;
     bool visibilityRectsTruncated;
     crdpq_rect_t visibilityRects[CRDPQ_MAX_VISIBILITY_RECTS];
+    /** adr/0010 §1: `TS_WINDOW_STATE_ORDER.visibleOffsetX/Y` (window.h:215-216, wire INT32,
+     *  not widened further) -- the screen-space top-left corner of the window's VISIBLE
+     *  region bounding box, gated on `WINDOW_ORDER_FIELD_VIS_OFFSET` (0x00001000). This is
+     *  NOT the same anchor as `offsetX/offsetY` above (`windowOffsetX/Y`, the window's own
+     *  origin) -- adr/0010 §0(b): the two agree only when the window is unoccluded, and
+     *  adr/0010 §2's shape transform requires this one specifically to correctly place
+     *  `visibilityRects` for an occluded window. Bit-gated exactly like `ownerWindowId`
+     *  above (adr/0008 §3's same discipline, restated by adr/0010 §1): an order that
+     *  doesn't carry this bit leaves these two fields at their `ev.payload`-memset zero,
+     *  which is NOT "visibleOffset == 0" at the WindowModel/PendingWindowState delta-merge
+     *  layer -- that layer is what actually implements "absent bit -> keep prior value /
+     *  anchor still unknown" (adr/0010 §3 rule 2); this transport layer only ever carries
+     *  what a single order's own bit said, same as every other conditional sub-field here.
+     *  Appended at the end of the struct, per adr/0008 §5's "new fields append" rule. */
+    int32_t visibleOffsetX;
+    int32_t visibleOffsetY;
 } crdpq_window_order_t;
 
 /* adr/0008 §5's ABI/version discipline: no version number, no reserved padding — a struct
  * layout change must be caught by the compiler at build time, not papered over by
- * convention. 564 was measured (not estimated) with `clang`/arm64 immediately after adding
- * the three `visibilityRects`-related fields above (adr/0008 §2b/§4; up from 300 before
- * this ADR -- note this baseline already includes `ownerWindowId`, added a commit earlier
- * as W0's style/owner filter work, so it doesn't match adr/0008 §4's own illustrative table,
- * which was written against a pre-ownerWindowId 296B baseline); if this ever fires, some
+ * convention. 572 was measured (not estimated) with `clang`/arm64 immediately after adding
+ * `visibleOffsetX/Y` above (adr/0010 §1; up from 564 before this ADR -- see adr/0008 §5's
+ * own assert comment for the 300B/296B lineage before that). If this ever fires, some
  * other field in this struct (or its `crdpq_text_t`/`crdpq_rect_t` member) changed shape and
  * every consumer needs re-auditing, not just this assert updating. */
-_Static_assert(sizeof(crdpq_window_order_t) == 564, "crdpq_window_order_t layout changed -- re-measure and audit consumers (adr/0008 §5)");
+_Static_assert(sizeof(crdpq_window_order_t) == 572, "crdpq_window_order_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0010 §1)");
 
 /** WindowDelete, WindowIcon. */
 typedef struct {
@@ -356,13 +370,13 @@ typedef union {
      * DISCONNECTED(gen)") is everything a consumer needs. */
 } crdpq_event_payload_t;
 
-/* adr/0008 §5: measured (not estimated) with clang/arm64. `crdpq_window_order_t` (564) is
- * still this union's largest member post-ADR (adr/0008 §4's deliberate "take 96, not 255"
- * bound choice for CRDPQ_MAX_WINDOW_IDS exists specifically to keep it that way); the
- * union's own alignment is 8 (from `crdpq_surface_mapped_t`'s `uint64_t windowId`, not from
- * `crdpq_window_order_t`), so 564 pads up to the next multiple of 8. Up from 304 before this
- * ADR. */
-_Static_assert(sizeof(crdpq_event_payload_t) == 568, "crdpq_event_payload_t layout changed -- re-measure and audit consumers (adr/0008 §5)");
+/* adr/0008 §5: measured (not estimated) with clang/arm64. `crdpq_window_order_t` (572,
+ * adr/0010 §1) is still this union's largest member post-ADR (adr/0008 §4's deliberate
+ * "take 96, not 255" bound choice for CRDPQ_MAX_WINDOW_IDS exists specifically to keep it
+ * that way); the union's own alignment is 8 (from `crdpq_surface_mapped_t`'s `uint64_t
+ * windowId`, not from `crdpq_window_order_t`), so 572 pads up to the next multiple of 8 =
+ * 576. Up from 568 before this ADR. */
+_Static_assert(sizeof(crdpq_event_payload_t) == 576, "crdpq_event_payload_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0010 §1)");
 
 /** One control-lane event. POD, no pointers, safe to memcpy — this is the whole point
  *  (adr/0005 §1/§3). `generation` is stamped by crdpq_post itself at enqueue time from
@@ -376,10 +390,10 @@ typedef struct {
     crdpq_event_payload_t payload;
 } CrdpEvent;
 
-/* adr/0008 §5: measured (not estimated) with clang/arm64. type(4)+generation(4)+payload(568)
- * = 576, already an exact multiple of the struct's own 8-byte alignment, so no further
- * padding. Up from 312 before this ADR. */
-_Static_assert(sizeof(CrdpEvent) == 576, "CrdpEvent layout changed -- re-measure and audit consumers (adr/0008 §5)");
+/* adr/0008 §5: measured (not estimated) with clang/arm64. type(4)+generation(4)+payload(576)
+ * = 584, already an exact multiple of the struct's own 8-byte alignment, so no further
+ * padding. Up from 576 before this ADR. */
+_Static_assert(sizeof(CrdpEvent) == 584, "CrdpEvent layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0010 §1)");
 
 typedef struct crdpq_control crdpq_control_t;
 

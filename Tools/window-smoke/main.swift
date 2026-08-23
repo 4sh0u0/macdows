@@ -172,6 +172,14 @@ let maximizeScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_
 /// WINDOW_SMOKE_EXTRA_APPS (multiwin prereq), same convention as WINDOW_SMOKE_MAXIMIZE.
 let moveResizeScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_MOVE"] == "1"
 
+/// adr/0010 W4 first slice: menu-popup end-to-end acceptance -- activates the About window
+/// (via the real, gated `FocusAuthority` click path, same as `activateForClose`), sends
+/// Alt+Space (About's system menu shortcut on Windows), and asserts a NEW child window
+/// appears within 5s carrying a real `ownerWindowId` attachment (adr/0010 §4), then that
+/// Escape closes it within 3s. Requires `WINDOW_SMOKE_EXTRA_APPS` (multiwin prereq), same
+/// convention as `WINDOW_SMOKE_MAXIMIZE`/`WINDOW_SMOKE_MOVE`.
+let popupScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_POPUP"] == "1"
+
 /// MS-RDPERP `TS_RAIL_ORDER_SYSCOMMAND` `SC_*` values -- duplicated here from
 /// `App/RemoteWindowRendering/RemoteWindowRegistry.swift`'s own `SysCommand` enum (itself
 /// verified against `ThirdParty/FreeRDP/include/freerdp/rail.h:126-133`), matching this
@@ -275,6 +283,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private var minMaxInfoEventCount = 0
     private var localMoveSizeEventCount = 0
     private var activeWindowIdTransitionCount = 0
+    /// windowId -> this run's own elapsed-seconds clock at the moment its `WindowCreate` was
+    /// drained -- unconditional (every run, not just WINDOW_SMOKE_POPUP), cheap (one dict
+    /// entry per window this run ever creates), and what `runPopupScenario`'s own
+    /// WindowCreate→first-content latency measurement reads (adr/0010 §5's acceptance text).
+    private var windowCreateTimestamps: [UInt32: TimeInterval] = [:]
     /// Classified (via `RemoteWindowRegistry.serverDesktopState()`, adr/0012 §3) running
     /// value used only to detect and log activeWindow transitions.
     private var flowLastActiveWindow: ServerActiveWindow = .unmonitored
@@ -443,6 +456,66 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// rather than the raw outer frame (which differs from content rect by this window's
     /// chrome insets once it's titled).
     private var moveResizeObservedContentRects: [(contentRect: NSRect, at: TimeInterval)] = []
+
+    // adr/0010 W4 first slice (WINDOW_SMOKE_POPUP): menu-popup e2e state machine -- see
+    // `runPopupScenario`'s own doc comment for the full sequence.
+    private enum PopupPhase: Equatable {
+        case waitingForTarget
+        case awaitingActivateSettle(sentAt: Date)
+        case awaitingPopupCreate(sentAt: Date)
+        case awaitingEscapeSettle(popupWindowId: UInt32, sentAt: Date)
+        case awaitingEscapeClose(popupWindowId: UInt32, sentAt: Date)
+        /// Team-lead review (2026-08-23, real-host run): the About window used to stay open
+        /// at the end of this scenario -- THIRD occurrence of the same stale-window
+        /// contamination class `moveResizeCloseTargetId`'s own doc comment already documents
+        /// (Fix 2 there; this run's own cycles 2/20-with-probes=0 was this exact class again,
+        /// not a regression). Every terminal path (popup appeared and closed cleanly, popup
+        /// appeared but never closed, popup never appeared at all) now funnels through this
+        /// one cleanup phase before `.done`.
+        case awaitingAboutClose(sentAt: Date)
+        case done
+    }
+    private var popupPhase: PopupPhase = .waitingForTarget
+    private static let popupCreatePollTimeout: TimeInterval = 5.0
+    private static let popupEscapeClosePollTimeout: TimeInterval = 3.0
+    private static let popupAboutClosePollTimeout: TimeInterval = 5.0
+    /// The About window's own windowId -- this scenario's Alt+Space target and the expected
+    /// `ownerWindowId` on the popup that (should) appear in response.
+    private var popupOwnerWindowId: UInt32?
+    /// windowIds already present the instant before Alt+Space was sent -- mirrors
+    /// `windowIdsBeforeExtraApps`' own "only count what appeared AFTER" discipline (2026-08-22
+    /// review HIGH), applied here to distinguish the popup this scenario itself opened from
+    /// any unrelated window that happened to already exist.
+    private var popupWindowIdsBeforeKeystroke: Set<UInt32> = []
+    /// Populated once the popup is actually located (owner match among the newly-appeared
+    /// windowIds) -- `nil` means "not found yet" throughout `.awaitingPopupCreate`.
+    private var popupWindowId: UInt32?
+    /// `WindowCreate`'s own elapsed-seconds timestamp for `popupWindowId`, read from
+    /// `windowCreateTimestamps` (populated unconditionally in `drainNow()`, not just for
+    /// this scenario) the moment the popup is located.
+    private var popupCreatedAt: TimeInterval?
+    /// Set once `popupWindowId`'s own snapshot first reports `hasDisplayedContent == true`
+    /// -- `[popup] WindowCreate→first-content` latency is `popupFirstContentAt -
+    /// popupCreatedAt`, informational this run (plan §4 W4's ≤100ms p95 gate needs real n>1
+    /// data before it can be enforced, per adr/0010 §5's own acceptance text).
+    private var popupFirstContentAt: TimeInterval?
+    /// Whether `popupWindowId`, once located, actually carried a nonzero `ownerWindowId`
+    /// AND was observed attached as a child of `popupOwnerWindowId` (adr/0010 §4) --
+    /// via `RemoteWindowRegistry.attachedOwner(forWindowId:)`, checked once at the moment
+    /// the popup is located (attachment is applied synchronously inside the same
+    /// `handleWindowOrder` call that creates the window, per `updateParentChild`'s own
+    /// call site, so there's no separate settle window needed for this check).
+    private var popupAttachedAsChild: Bool?
+    /// `true`/`false` once resolved; `nil` means "the 5s poll never located a new,
+    /// owner-attached window at all."
+    private var popupAppeared: Bool?
+    private var popupEscapeSent = false
+    private var popupClosedAt: TimeInterval?
+    /// Team-lead review: the About-window cleanup leg's own close bookkeeping, same
+    /// bookkeeping shape as `maximizeCloseTargetId`/`moveResizeCloseTargetId`.
+    private var popupAboutCloseTargetId: UInt32?
+    private var popupAboutClosedAt: TimeInterval?
+    private var popupAboutCloseResult: Bool?
 
     // W4b review round 2, experiment 1: does sending RAIL ClientActivate for a
     // background/non-focused window prompt the server to (re)send content it never
@@ -618,6 +691,20 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             {
                 self.moveResizeCloseWindowDeletedAt = Date().timeIntervalSince(self.startTime)
             }
+            // adr/0010 §5: same bookkeeping shape as the two cases just above, for the
+            // popup scenario's own Escape-close leg.
+            if event.kind == .windowDelete, let target = self.popupWindowId, event.windowId == target,
+               self.popupClosedAt == nil
+            {
+                self.popupClosedAt = Date().timeIntervalSince(self.startTime)
+            }
+            // Team-lead review: same bookkeeping shape, for the popup scenario's own
+            // About-window cleanup leg.
+            if event.kind == .windowDelete, let target = self.popupAboutCloseTargetId, event.windowId == target,
+               self.popupAboutClosedAt == nil
+            {
+                self.popupAboutClosedAt = Date().timeIntervalSince(self.startTime)
+            }
             // Phase 2 W3 (docs/plans/phase2.md §2 W3): records this window's real CONTENT
             // rect -- post `registry.handle(event)` above, so this reflects whatever
             // `RemoteWindow.updateFrame` actually did, including a no-op if geometry
@@ -706,8 +793,39 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // phase05 samples never captured it). One line per WindowCreate, multiwin
             // scenario only (WINDOW_SMOKE_EXTRA_APPS) -- exactly the scenario that produces
             // the four real 136x39 blank-sliver windows this rule targets.
-            if event.kind == .windowCreate, !extraApps.isEmpty {
+            //
+            // adr/0010 W4 real-host correction: EXPLICITLY also fires for the popup
+            // scenario (`|| popupScenarioEnabled`) -- this line is exactly what surfaced
+            // the WindowMappability owner-gating bug in the first place (windowId 4523408,
+            // style=0x80000000, owner=2622898), and until now it only fired there because
+            // WINDOW_SMOKE_POPUP's own "multiwin prereq" happened to make `extraApps`
+            // non-empty too, not because this condition said so on its own -- a future
+            // change to that prereq could silently go dark here. Kept as an explicit `||`
+            // rather than relying on the coincidence, so a future WindowCreate/owner miss
+            // during the popup wait window stays self-diagnosing regardless of whether the
+            // multiwin prereq still holds.
+            if event.kind == .windowCreate, !extraApps.isEmpty || popupScenarioEnabled {
                 print(Self.styleDumpLine(for: event))
+            }
+            // adr/0010 §5: unconditional WindowCreate timestamp bookkeeping (see
+            // windowCreateTimestamps' own doc comment) -- every run, not just
+            // WINDOW_SMOKE_POPUP.
+            if event.kind == .windowCreate {
+                self.windowCreateTimestamps[event.windowId] = Date().timeIntervalSince(self.startTime)
+            }
+            // adr/0010 §2/§4: per-MASKED-window shape diagnostic -- rect count + truncated
+            // flag, read post `registry.handle(event)` (already applied above) so this
+            // reflects whatever PendingWindowState/RemoteWindow actually settled on for this
+            // order. Scoped to the popup scenario (the one path this pass actually exercises
+            // real visibilityRects/mask data against) so every other run stays silent, and
+            // further scoped to windows that actually carry wire OR applied rect data --
+            // "per masked window," not every window regardless of whether it has any
+            // visibility-rect data at all.
+            if popupScenarioEnabled, event.kind == .windowCreate || event.kind == .windowUpdate,
+               let diag = registry.shapeDiagnostics(forWindowId: event.windowId),
+               diag.wireRectCount > 0 || diag.appliedRectCount > 0
+            {
+                print("[shape] windowId=\(event.windowId) wireRectCount=\(diag.wireRectCount) truncated=\(diag.truncated) appliedRectCount=\(diag.appliedRectCount)")
             }
             // Flow evidence counters (task item 1): counted for every drained event
             // regardless of mode (plain run, extra-apps, cycles) -- only finish()'s
@@ -807,6 +925,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         runFocusRotation(elapsed: elapsed, session: session, registry: registry)
         runMaximizeScenario(session: session, registry: registry)
         runMoveResizeScenario(session: session, registry: registry)
+        runPopupScenario(session: session, registry: registry)
 
         // Phase 1 acceptance: launch the extra apps once the first app's own window has
         // had time to settle -- several ClientExecutes on one live connection is exactly
@@ -855,11 +974,21 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // only the hard failsafe" shape `maximizeStalled` already establishes.
         let moveResizeDeadline: TimeInterval = moveResizeScenarioEnabled ? 40 : baseDeadline
         let moveResizeStalled = moveResizeScenarioEnabled && moveResizePhase != .done && elapsed >= moveResizeDeadline + 10
-        let overallDeadline = max(rotationDeadline, maximizeDeadline, moveResizeDeadline)
+        // adr/0010 W4 first slice: worst case is extraAppsLaunched (>=6s) + settle for the
+        // About target + 0.3s activate settle + the popup-appear poll (5s) + a 0.3s
+        // first-content-latency settle + the Escape-close poll (3s) + team-lead review's
+        // About-window cleanup leg (defensive Escape + SC_CLOSE + up to 5s WindowDelete
+        // poll) -- worst case ~19.6s, 30s leaves comfortable slack, same "gated by the phase
+        // reaching .done, this is only the hard failsafe" shape
+        // `maximizeStalled`/`moveResizeStalled` already establish.
+        let popupDeadline: TimeInterval = popupScenarioEnabled ? 30 : baseDeadline
+        let popupStalled = popupScenarioEnabled && popupPhase != .done && elapsed >= popupDeadline + 10
+        let overallDeadline = max(rotationDeadline, maximizeDeadline, moveResizeDeadline, popupDeadline)
         let rotationReady = focusRotationTotal == 0 || focusRotationDone || rotationStalled
         let maximizeReady = !maximizeScenarioEnabled || maximizePhase == .done || maximizeStalled
         let moveResizeReady = !moveResizeScenarioEnabled || moveResizePhase == .done || moveResizeStalled
-        if elapsed >= overallDeadline, rotationReady, maximizeReady, moveResizeReady {
+        let popupReady = !popupScenarioEnabled || popupPhase == .done || popupStalled
+        if elapsed >= overallDeadline, rotationReady, maximizeReady, moveResizeReady, popupReady {
             finish()
         }
     }
@@ -985,7 +1114,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // here spuriously skips the whole close leg on fast cycles -- poll within a
             // grace window before conceding the target really is not coming.
             if cycleRenderedAt == nil { cycleRenderedAt = Date() }
-            if let renderedAt = cycleRenderedAt, Date().timeIntervalSince(renderedAt) < 3.0 {
+            // 6s: a 3s grace still lost one cycle in ~40 to a late title (observed live
+            // 2026-08-23, cycle 2/20 giving up at rendered+3s with the About title
+            // arriving after) -- the title is a WindowUpdate the server batches at its
+            // own pace under churn.
+            if let renderedAt = cycleRenderedAt, Date().timeIntervalSince(renderedAt) < 6.0 {
                 return
             }
             finishCycle(session: session, registry: registry, rendered: true, closed: false,
@@ -1494,6 +1627,223 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         case .done:
             break
         }
+    }
+
+    /// adr/0010 W4 first slice (WINDOW_SMOKE_POPUP=1): menu-popup end-to-end acceptance --
+    /// About has a system menu (its `WS_SYSMENU` bit, `StyleTranslatorTests.
+    /// aboutWindowsDialogShape`), and Alt+Space is the standard Windows shortcut that opens
+    /// any top-level window's system menu regardless of whether it has a visible titlebar
+    /// icon to click -- chosen over a titlebar-icon click (no synthesizable target coordinate
+    /// this harness could rely on across DPI/theme) and over charmap/dxdiag's own menu bars
+    /// (About is already this run's own locked, real-content-anchored target every other
+    /// scenario uses; reusing it avoids adding a second target-lock heuristic).
+    ///
+    /// Sequence: (1) lock the About window as target (multiwin prereq, mirrors
+    /// `runMaximizeScenario`/`runMoveResizeScenario`'s own target-lock shape); (2) activate
+    /// it via the REAL gated path (`activateForClose`'s own click-to-focus helper -- adr/0012
+    /// §2's "keyboard is focus-addressed" means the keystroke below must not race a focus
+    /// convergence that hasn't happened yet); (3) after a 0.3s settle (mirrors
+    /// `sendSyntheticClick`'s own two-stage gap reasoning), send Alt+Space; (4) poll up to 5s
+    /// for a NEW windowId (not present before the keystroke) that resolves via
+    /// `RemoteWindowRegistry.attachedOwner(forWindowId:)` to the About window's own id
+    /// (adr/0010 §4's own parent-child attachment, the authoritative "this really is a
+    /// popup of that owner" signal -- more reliable than guessing at title emptiness, which
+    /// this scenario still logs but does not gate on); (5) once located, send Escape and poll
+    /// up to 3s for its `WindowDelete`; (6) team-lead review: EVERY terminal path (popup
+    /// closed cleanly, popup located but never closed, popup never located at all) funnels
+    /// through `beginAboutCleanup` -- SC_CLOSE on the About window itself, so this scenario
+    /// never leaves it open for a later `WINDOW_SMOKE_CYCLES` soak to mistake for a fresh
+    /// target (the exact same stale-window contamination class `moveResizeCloseTargetId`'s
+    /// own doc comment already documents as Fix 2 there, observed a third time this round).
+    private func runPopupScenario(session: CRSession, registry: RemoteWindowRegistry) {
+        guard popupScenarioEnabled else { return }
+
+        switch popupPhase {
+        case .waitingForTarget:
+            guard extraAppsLaunched else { return } // multiwin prereq, per the task spec
+            guard let w = registry.windowSnapshots().first(where: { snap in
+                snap.isVisible && snap.hasDisplayedContent
+                    && (snap.title.localizedCaseInsensitiveContains("about") || snap.title.contains("关于"))
+            }), let window = registry.window(forWindowId: w.windowId) else { return }
+            popupOwnerWindowId = w.windowId
+            popupWindowIdsBeforeKeystroke = Set(registry.windowSnapshots().map(\.windowId))
+            print("[popup] target locked: windowId=\(w.windowId) title=\"\(w.title)\"")
+            // adr/0012: the SAME real mouseDown path `activateForClose` already establishes
+            // for the cycle-mode close leg -- routes through FocusAuthority so the keyboard
+            // lane's gate actually opens before the Alt+Space keystroke below tries to use it.
+            activateForClose(window)
+            popupPhase = .awaitingActivateSettle(sentAt: Date())
+
+        case .awaitingActivateSettle(let sentAt):
+            guard Date().timeIntervalSince(sentAt) >= 0.3 else { return }
+            guard let ownerId = popupOwnerWindowId, let window = registry.window(forWindowId: ownerId) else {
+                beginAboutCleanup(session: session, registry: registry)
+                return
+            }
+            sendAltSpace(to: window)
+            print("[popup] sent Alt+Space to windowId=\(ownerId)")
+            popupPhase = .awaitingPopupCreate(sentAt: Date())
+
+        case .awaitingPopupCreate(let sentAt):
+            let currentIds = Set(registry.windowSnapshots().map(\.windowId))
+            let newIds = currentIds.subtracting(popupWindowIdsBeforeKeystroke)
+            if let located = newIds.first(where: { registry.attachedOwner(forWindowId: $0) == popupOwnerWindowId }) {
+                popupWindowId = located
+                popupAppeared = true
+                popupAttachedAsChild = true
+                popupCreatedAt = windowCreateTimestamps[located]
+                let snap = registry.windowSnapshots().first { $0.windowId == located }
+                print("[popup] popup appeared: windowId=\(located) title=\"\(snap?.title ?? "")\" ownerWindowId=\(registry.attachedOwner(forWindowId: located).map(String.init) ?? "nil")")
+                popupPhase = .awaitingEscapeSettle(popupWindowId: located, sentAt: Date())
+            } else if Date().timeIntervalSince(sentAt) >= Self.popupCreatePollTimeout {
+                popupAppeared = false
+                print("[popup] FAILED: no new owner-attached window appeared within 5s of Alt+Space (new windowIds observed: \(newIds.sorted()))")
+                beginAboutCleanup(session: session, registry: registry)
+            }
+
+        case .awaitingEscapeSettle(let popupWindowId, let sentAt):
+            // adr/0010 §5: the popup's own first-content latency is informational this run
+            // (plan §4 W4's ≤100ms p95 gate needs real n>1 data) -- recorded once, here,
+            // rather than blocking this phase on it ever actually becoming true (a popup
+            // that never paints, e.g. an empty separator-only menu, must not stall the whole
+            // scenario waiting for content that may legitimately never arrive).
+            if popupFirstContentAt == nil,
+               registry.windowSnapshots().first(where: { $0.windowId == popupWindowId })?.hasDisplayedContent == true
+            {
+                popupFirstContentAt = Date().timeIntervalSince(startTime)
+                if let created = popupCreatedAt, let firstContent = popupFirstContentAt {
+                    let latencyMs = (firstContent - created) * 1000
+                    print("[popup] WindowCreate→first-content latency: \(String(format: "%.1f", latencyMs))ms (informational -- plan §4 W4's ≤100ms p95 gate needs n>1 data)")
+                }
+            }
+            guard Date().timeIntervalSince(sentAt) >= 0.3 else { return }
+            guard let window = registry.window(forWindowId: popupWindowId) else {
+                beginAboutCleanup(session: session, registry: registry)
+                return
+            }
+            sendEscape(to: window)
+            print("[popup] sent Escape to windowId=\(popupWindowId)")
+            popupEscapeSent = true
+            popupPhase = .awaitingEscapeClose(popupWindowId: popupWindowId, sentAt: Date())
+
+        case .awaitingEscapeClose(_, let sentAt):
+            if popupClosedAt != nil {
+                print("[popup] WindowDelete received within 3s of Escape")
+                beginAboutCleanup(session: session, registry: registry)
+            } else if Date().timeIntervalSince(sentAt) >= Self.popupEscapeClosePollTimeout {
+                print("[popup] FAILED to receive WindowDelete within 3s of Escape")
+                beginAboutCleanup(session: session, registry: registry)
+            }
+
+        case .awaitingAboutClose(let sentAt):
+            if popupAboutClosedAt != nil {
+                popupAboutCloseResult = true
+                print("[popup] About-window cleanup: WindowDelete received within 5s of SC_CLOSE")
+                popupPhase = .done
+            } else if Date().timeIntervalSince(sentAt) >= Self.popupAboutClosePollTimeout {
+                popupAboutCloseResult = false
+                print("[popup] About-window cleanup FAILED: no WindowDelete within 5s of SC_CLOSE")
+                popupPhase = .done
+            }
+
+        case .done:
+            break
+        }
+    }
+
+    /// Team-lead review: funnels every terminal path in `runPopupScenario` through one
+    /// About-window cleanup leg. Sends a defensive Escape to the About window FIRST --
+    /// team-lead's own instruction: "a lingering menu could eat the close" (a still-open
+    /// system menu is effectively modal on the desktop; an SC_CLOSE sent to the owner while
+    /// its own popup menu is still up risks being swallowed by the menu instead of reaching
+    /// the window). This Escape targets the ABOUT window's own `RemoteWindow`, not the
+    /// popup's -- deliberately: the popup may already be closed, may have never been
+    /// located, or may reference a `RemoteWindow` this harness no longer has a handle to by
+    /// the time a terminal path is reached, but keyboard input is FOCUS-addressed on the
+    /// wire (adr/0012 §2, `CRSession.sendKeyDown`/`sendKeyUp` carry no windowId at all) --
+    /// dispatching the Escape via ANY currently-valid local `RemoteWindow` produces the
+    /// identical wire effect, and About is guaranteed to still exist at this point (its own
+    /// close hasn't been requested yet). Idempotent/safe to call even if the popup already
+    /// closed cleanly on its own (a redundant Escape with nothing open to dismiss is a
+    /// harmless no-op, matching every other fire-and-forget outbound call this harness
+    /// already makes).
+    private func beginAboutCleanup(session: CRSession, registry: RemoteWindowRegistry) {
+        guard let ownerId = popupOwnerWindowId else {
+            popupPhase = .done
+            return
+        }
+        if let window = registry.window(forWindowId: ownerId) {
+            sendEscape(to: window)
+            print("[popup] sent defensive Escape to windowId=\(ownerId) before cleanup close (a lingering menu could eat the close)")
+        }
+        session.sendSysCommand(ownerId, command: SC.close)
+        print("[popup] sent SC_CLOSE to windowId=\(ownerId) (cleanup -- avoids leaving a stale About window for a later WINDOW_SMOKE_CYCLES soak to lock onto)")
+        popupAboutCloseTargetId = ownerId
+        popupPhase = .awaitingAboutClose(sentAt: Date())
+    }
+
+    /// Alt+Space: About's system-menu shortcut. `RemoteWindowContentView.flagsChanged`/
+    /// `keyDown`/`keyUp` are the same real AppKit dispatch path `sendSyntheticEnter`/
+    /// `sendClick` already exercise (never a direct call into
+    /// `RemoteWindowRegistry.handleInput`) -- macKeyCode 49 is `kVK_Space`; the wire
+    /// translation (`CRSession.sendKeyDown`/`sendModifierKey`) only ever consumes the raw
+    /// keyCode/CRModifierKey, never `NSEvent.characters`, so the exact character string
+    /// carried by these synthetic events is inert (kept as literal spaces/empty for
+    /// readability only).
+    private func sendAltSpace(to window: NSWindow) {
+        let macSpaceKeyCode: UInt16 = 49
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        func flagsEvent(_ flags: NSEvent.ModifierFlags) -> NSEvent? {
+            NSEvent.keyEvent(
+                with: .flagsChanged, location: .zero, modifierFlags: flags, timestamp: timestamp,
+                windowNumber: window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "",
+                isARepeat: false, keyCode: 0
+            )
+        }
+        func keyEvent(_ type: NSEvent.EventType, flags: NSEvent.ModifierFlags) -> NSEvent? {
+            NSEvent.keyEvent(
+                with: type, location: .zero, modifierFlags: flags, timestamp: timestamp,
+                windowNumber: window.windowNumber, context: nil, characters: " ", charactersIgnoringModifiers: " ",
+                isARepeat: false, keyCode: macSpaceKeyCode
+            )
+        }
+        guard
+            let optionDown = flagsEvent(.option),
+            let spaceDown = keyEvent(.keyDown, flags: .option),
+            let spaceUp = keyEvent(.keyUp, flags: .option),
+            let optionUp = flagsEvent([])
+        else {
+            print("[popup] failed to construct synthetic Alt+Space events")
+            return
+        }
+        window.sendEvent(optionDown)
+        window.sendEvent(spaceDown)
+        window.sendEvent(spaceUp)
+        window.sendEvent(optionUp)
+    }
+
+    /// Escape: closes the popup. Same real-dispatch shape as `sendSyntheticEnter` (mac
+    /// keyCode 53, `kVK_Escape`).
+    private func sendEscape(to window: NSWindow) {
+        let macEscapeKeyCode: UInt16 = 53
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        guard
+            let down = NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: timestamp,
+                windowNumber: window.windowNumber, context: nil, characters: "\u{1B}",
+                charactersIgnoringModifiers: "\u{1B}", isARepeat: false, keyCode: macEscapeKeyCode
+            ),
+            let up = NSEvent.keyEvent(
+                with: .keyUp, location: .zero, modifierFlags: [], timestamp: timestamp,
+                windowNumber: window.windowNumber, context: nil, characters: "\u{1B}",
+                charactersIgnoringModifiers: "\u{1B}", isARepeat: false, keyCode: macEscapeKeyCode
+            )
+        else {
+            print("[popup] failed to construct synthetic Escape events")
+            return
+        }
+        window.sendEvent(down)
+        window.sendEvent(up)
     }
 
     /// Shared by both legs: within `Self.moveResizePollTimeout` (3s) of `sentAt`, has any
@@ -2082,7 +2432,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // Team-lead review (2026-08-23, move-resize real-host run): WINDOW_SMOKE_MOVE closes
         // its own About target the same way (its own SC_CLOSE leg, Fix 2) -- identical
         // exclusion, extending the pattern this comment already establishes.
-        if launchedAppKind == .winver, inputTestMode == nil, !maximizeScenarioEnabled, !moveResizeScenarioEnabled {
+        // Team-lead review (2026-08-23, popup real-host run): WINDOW_SMOKE_POPUP now closes
+        // its own About target too (`beginAboutCleanup`'s SC_CLOSE cleanup leg) -- same
+        // exclusion, same reasoning.
+        if launchedAppKind == .winver, inputTestMode == nil, !maximizeScenarioEnabled, !moveResizeScenarioEnabled, !popupScenarioEnabled {
             if let aboutWindow {
                 let w = aboutWindow.frame.width
                 let h = aboutWindow.frame.height
@@ -2134,6 +2487,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                     + "is still open at t=25s (its own close leg may still be in flight, or may have failed); the "
                     + "move-resize-scenario assertions above are authoritative for this run, not this generic "
                     + "paint/size check")
+            } else if popupScenarioEnabled {
+                print("[info] popup scenario active -- the About-Windows window (id \(aboutWindow.windowId)) is "
+                    + "still open at t=25s (its own cleanup close leg may still be in flight, or may have failed); "
+                    + "the popup-scenario assertions above are authoritative for this run, not this generic "
+                    + "paint/size check")
             } else {
                 print("[info] an About-Windows-titled window (id \(aboutWindow.windowId)) is present but this run "
                     + "launched \(launchedProgram), not winver.exe -- not the anchor for this run, informational only")
@@ -2168,6 +2526,20 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                     + "(moveResizeCloseResult=\(String(describing: moveResizeCloseResult))) -- this is NOT "
                     + "necessarily evidence of a successful close; see the move-resize-scenario assertions above, "
                     + "which are authoritative here")
+            }
+        } else if popupScenarioEnabled {
+            // Team-lead review: mirrors the maximizeScenarioEnabled/moveResizeScenarioEnabled
+            // branches immediately above, for WINDOW_SMOKE_POPUP's own cleanup SC_CLOSE leg.
+            if popupAboutCloseResult == true {
+                print("[info] popup scenario active -- no About-Windows window remains open, consistent with the "
+                    + "scenario's own cleanup SC_CLOSE leg succeeding; see the popup-scenario assertions above, "
+                    + "which are authoritative here")
+            } else {
+                print("[info] popup scenario active -- no About-Windows window remains open, but the scenario's "
+                    + "own cleanup close leg did not confirm success "
+                    + "(popupAboutCloseResult=\(String(describing: popupAboutCloseResult))) -- this is NOT "
+                    + "necessarily evidence of a successful close; see the popup-scenario assertions above, which "
+                    + "are authoritative here")
             }
         } else if inputTestMode != nil {
             // W4c review M2+M3: this branch used to unconditionally claim "consistent with
@@ -2444,6 +2816,50 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 } else {
                     check(false, "move-resize scenario: the close leg was sent before the run ended")
                 }
+            }
+        }
+
+        // adr/0010 W4 first slice (WINDOW_SMOKE_POPUP=1): menu-popup end-to-end acceptance
+        // -- gated on the ADR's own three assertions: the popup appeared within 5s, it
+        // carried a real owner attachment (adr/0010 §4), and Escape closed it within 3s.
+        if popupScenarioEnabled {
+            if let popupAppeared {
+                check(popupAppeared, "popup scenario: a new window appeared within 5s of Alt+Space")
+            } else {
+                check(false, "popup scenario: a target window was locked and Alt+Space was sent before the run ended")
+            }
+            if popupAppeared == true {
+                check(
+                    popupAttachedAsChild == true,
+                    "popup scenario: the new window carried a real ownerWindowId and was observed attached as a "
+                        + "child of the About window (adr/0010 §4)"
+                )
+                if let created = popupCreatedAt, let firstContent = popupFirstContentAt {
+                    print(String(
+                        format: "[popup] WindowCreate→first-content: %.1fms (informational -- plan §4 W4's ≤100ms p95 gate needs n>1 data)",
+                        (firstContent - created) * 1000
+                    ))
+                } else {
+                    print("[popup] WindowCreate→first-content: no content ever observed for the popup (informational -- some popup classes, e.g. a separator-only menu, may legitimately never present a GFX frame)")
+                }
+                check(
+                    popupClosedAt != nil,
+                    "popup scenario: Escape produced a WindowDelete within 3s"
+                        + (popupEscapeSent ? "" : " (Escape was never actually sent -- the popup was never located in time)")
+                )
+            }
+            // Team-lead review: the About-window cleanup leg (`beginAboutCleanup`) always
+            // runs, regardless of how the earlier legs resolved -- harness cleanup, avoids
+            // leaving a stale About window for a later WINDOW_SMOKE_CYCLES soak to lock onto
+            // (Fix 2's own precedent, `moveResizeCloseTargetId`'s doc comment).
+            if let popupAboutCloseTargetId {
+                check(
+                    popupAboutCloseResult == true,
+                    "popup scenario (cleanup): SC_CLOSE for windowId=\(popupAboutCloseTargetId) produced a "
+                        + "WindowDelete within 5s (harness cleanup)"
+                )
+            } else {
+                check(false, "popup scenario: the About-window cleanup close leg was sent before the run ended")
             }
         }
 
