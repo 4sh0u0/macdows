@@ -665,4 +665,77 @@ struct FocusAuthorityTests {
         #expect(authority.state == .unmonitored)
         #expect(!effects.contains { if case .makeKey(let id) = $0 { return id == 999 }; return false })
     }
+
+    // MARK: - unicodeText (adr/0011 §1): same lane, same gate, same buffer, no special-casing
+
+    @Test("converged: a unicodeText event passes straight through immediately, same as keyDown")
+    func unicodeTextPassesThroughWhenConverged() {
+        let authority = FocusAuthority()
+        _ = authority.serverDesktopUpdate(rawActiveWindowId: 5, at: 0)
+        let effects = authority.enqueueKeyboardEvent(.unicodeText("你好"), at: 0.1)
+        #expect(effects == [.flushBufferedInput([.unicodeText("你好")])])
+    }
+
+    @Test("converging: a mixed scancode+unicodeText+modifier sequence buffers and flushes in exact arrival order")
+    func mixedSequenceBuffersAndFlushesInOrder() {
+        let authority = FocusAuthority()
+        _ = authority.localActivate(windowId: 3, at: 0)
+        _ = authority.enqueueKeyboardEvent(.keyDown(macKeyCode: 10), at: 0.01)
+        _ = authority.enqueueKeyboardEvent(.keyUp(macKeyCode: 10), at: 0.02)
+        _ = authority.enqueueKeyboardEvent(.unicodeText("你好"), at: 0.03)
+        _ = authority.enqueueKeyboardEvent(.modifierKey(.shift, down: true), at: 0.04)
+        _ = authority.enqueueKeyboardEvent(.unicodeText("world"), at: 0.05)
+
+        let effects = authority.serverDesktopUpdate(rawActiveWindowId: 3, at: 0.1)
+        #expect(effects == [.flushBufferedInput([
+            .keyDown(macKeyCode: 10),
+            .keyUp(macKeyCode: 10),
+            .unicodeText("你好"),
+            .modifierKey(.shift, down: true),
+            .unicodeText("world"),
+        ])])
+    }
+
+    @Test("a unicodeText commit occupies exactly ONE buffer slot, regardless of string length")
+    func unicodeTextIsOneBufferSlotRegardlessOfLength() {
+        let authority = FocusAuthority()
+        _ = authority.localActivate(windowId: 3, at: 0)
+
+        // A 50-character commit, adr/0011 §1's own worked example ("一次50字提交占1槽而非
+        // 100槽") -- fill the buffer with 63 single-key events plus this one commit, which
+        // must NOT overflow (64 total: 63 + 1, at exactly the cap).
+        for i in 0..<63 {
+            let effects = authority.enqueueKeyboardEvent(.keyDown(macKeyCode: UInt16(i)), at: 0.001 * Double(i))
+            #expect(effects.isEmpty)
+        }
+        let commitEffects = authority.enqueueKeyboardEvent(
+            .unicodeText(String(repeating: "字", count: 50)), at: 0.9
+        )
+        #expect(commitEffects.isEmpty) // no overflow warning -- fits exactly at the 64 cap
+
+        // The NEXT event overflows (65th), proving the commit really did cost only 1 slot.
+        let overflow = authority.enqueueKeyboardEvent(.keyDown(macKeyCode: 999), at: 1.0)
+        #expect(overflow == [.warn(.bufferOverflow(totalDropped: 1))])
+    }
+
+    @Test("a unicodeText commit either flushes whole or drops whole -- never partially")
+    func unicodeTextFlushesOrDropsAtomically() {
+        let authority = FocusAuthority()
+        _ = authority.localActivate(windowId: 3, at: 0)
+        _ = authority.enqueueKeyboardEvent(.unicodeText("atomic"), at: 0.01)
+
+        // Hard rollback drops the whole buffer as one unit -- the commit string is never
+        // split or partially forwarded.
+        let effects = authority.tick(now: 0 + FocusAuthority.coldStartHardDeadlineInterval)
+        #expect(effects.contains { if case .dropBufferedInput(let count, let withRelease) = $0 {
+            return count == 1 && withRelease
+        }; return false })
+    }
+
+    @Test("unmonitored/desktopFocused: an orphaned unicodeText is dropped immediately, same as a keystroke")
+    func unicodeTextDroppedWhenNoLegitimateTarget() {
+        let authority = FocusAuthority()
+        let effects = authority.enqueueKeyboardEvent(.unicodeText("orphaned"), at: 0)
+        #expect(effects == [.dropBufferedInput(count: 1, withModifierRelease: false)])
+    }
 }

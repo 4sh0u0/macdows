@@ -1,4 +1,5 @@
 import AppKit
+import Carbon
 
 /// W4c: the three mouse buttons this rendering layer forwards to the remote session (mirrors
 /// `CRMouseButton` in CRBridge's `CRSession.h`, kept as an independent Swift-side enum rather
@@ -26,8 +27,16 @@ enum RemoteWindowInputEvent {
     case scrollWheel(deltaX: Double, deltaY: Double, screenPoint: NSPoint)
     /// `macKeyCode`: raw `NSEvent.keyCode`, untranslated — `CRSession.sendKeyDown(_:)`/
     /// `sendKeyUp(_:)` do the WinPR translation (see their doc comments in CRSession.h).
-    case keyDown(macKeyCode: UInt16)
-    case keyUp(macKeyCode: UInt16)
+    /// `characters`/`charactersIgnoringModifiers` (adr/0011 §2): the matching `NSEvent`
+    /// fields, verbatim, empty for dead keys and pure function/modifier keys (never `nil`
+    /// -- `RemoteWindowContentView` substitutes `""` for AppKit's own optional `nil` case).
+    /// Not consumed by `RemoteWindowRegistry`'s ISO-keycode correction (adr/0011 §0a: that
+    /// depends only on keyboard type, never on characters) -- this pipeline's real
+    /// consumer is adr/0011 §3's `CommandKeyMapper` (keyed on
+    /// `charactersIgnoringModifiers.lowercased()`, never on `macKeyCode` -- AZERTY
+    /// evidence, see that type's own doc comment).
+    case keyDown(macKeyCode: UInt16, characters: String, charactersIgnoringModifiers: String)
+    case keyUp(macKeyCode: UInt16, characters: String, charactersIgnoringModifiers: String)
     /// Already masked to `.deviceIndependentFlagsMask` — `RemoteWindowRegistry` diffs this
     /// against the *session-level* (W4c review H1, not per-window) modifier state it
     /// tracks and calls `CRSession.send(_:down:)` once per bit that actually flipped,
@@ -42,6 +51,11 @@ enum RemoteWindowInputEvent {
     /// rather than waiting for a release event that might never arrive on this window
     /// again — see `MacdowsCore.ModifierKeyTracker.releaseAll(_:)`.
     case focusLost
+    /// adr/0011 §1/§2: an already-composed IME commit string, from
+    /// `RemoteWindowContentView`'s `NSTextInputClient -insertText:` conformance --
+    /// dispatched only when the current input source is non-ASCII-capable (see
+    /// `RemoteWindowContentView.keyDown(with:)`'s own routing).
+    case unicodeText(String)
 }
 
 /// W4c: `RemoteWindow`'s content view. Captures the full range of mouse/keyboard/scroll
@@ -59,6 +73,11 @@ final class RemoteWindowContentView: NSView {
     var onEvent: ((RemoteWindowInputEvent) -> Void)?
 
     private var trackingArea: NSTrackingArea?
+    /// adr/0011 §2: the current IME composition's marked (not-yet-committed) text, tracked
+    /// only to keep `NSTextInputClient`'s own state machine (backspace-during-composition,
+    /// `hasMarkedText()`/`markedRange()`) internally consistent -- deliberately never drawn
+    /// (the inline marked-text overlay is Phase 2's documented v1 gap, adr/0011 §2/§6).
+    private var markedText = ""
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -179,16 +198,159 @@ final class RemoteWindowContentView: NSView {
         // nothing actually changed (RemoteWindowRegistry's diff against session-level state
         // produces zero transitions), so this is always safe to send.
         onEvent?(.flagsChanged(modifierFlags: event.modifierFlags.intersection(.deviceIndependentFlagsMask)))
-        onEvent?(.keyDown(macKeyCode: event.keyCode))
+
+        // adr/0011 §1's mixing rule: modifier/function/arrow/Enter/Tab/Esc keys always go
+        // scancode regardless of input source; everything else defers to whether the
+        // *current* input source is ASCII-capable -- a non-ASCII-capable (CJK/合成型)
+        // source hands its work back via NSTextInputClient (insertText:/setMarkedText:
+        // below), not scancodes.
+        if !Self.isAlwaysScancodeKey(macKeyCode: event.keyCode), !Self.isCurrentInputSourceASCIICapable() {
+            interpretKeyEvents([event])
+            return
+        }
+        onEvent?(.keyDown(
+            macKeyCode: event.keyCode,
+            characters: event.characters ?? "",
+            charactersIgnoringModifiers: event.charactersIgnoringModifiers ?? ""
+        ))
     }
 
     override func keyUp(with event: NSEvent) {
         // Same reconciliation as keyDown above -- MRDPView.m's own keyUp: does this too.
         onEvent?(.flagsChanged(modifierFlags: event.modifierFlags.intersection(.deviceIndependentFlagsMask)))
-        onEvent?(.keyUp(macKeyCode: event.keyCode))
+
+        // Mirrors keyDown's own routing: while composing under a non-ASCII-capable source,
+        // the physical key that produced this keyUp was already fully consumed locally by
+        // interpretKeyEvents on the matching keyDown (adr/0011 §1/§2: only the final
+        // committed string ever crosses the wire for that path) -- no scancode keyUp for
+        // it either, except for the same always-scancode carve-out.
+        if !Self.isAlwaysScancodeKey(macKeyCode: event.keyCode), !Self.isCurrentInputSourceASCIICapable() {
+            return
+        }
+        onEvent?(.keyUp(
+            macKeyCode: event.keyCode,
+            characters: event.characters ?? "",
+            charactersIgnoringModifiers: event.charactersIgnoringModifiers ?? ""
+        ))
     }
 
     override func flagsChanged(with event: NSEvent) {
         onEvent?(.flagsChanged(modifierFlags: event.modifierFlags.intersection(.deviceIndependentFlagsMask)))
+    }
+
+    /// adr/0011 §1's table: "修饰键、功能键、方向键、Enter/Tab/Esc——无论输入源" always take the
+    /// scancode path. Modifier keys never reach this method at all (AppKit delivers them as
+    /// `flagsChanged:`, not `keyDown:`/`keyUp:`), so this only needs to name the rest:
+    /// function keys, arrows, Return/Enter, Tab, Escape. Standard, stable AppKit virtual
+    /// keycodes (physical position, not layout-dependent -- same numbering space
+    /// `CommandKeyMapper`'s fixed-VK table uses). Deliberately does NOT include Delete/
+    /// ForwardDelete: adr/0011 §2 says marked text is tracked "以维持输入法状态与退格"
+    /// (backspace included) -- backspace needs to reach `interpretKeyEvents` while
+    /// composing so it can edit the marked (not-yet-committed) text, exactly like every
+    /// other Cocoa text-input client.
+    private static func isAlwaysScancodeKey(macKeyCode: UInt16) -> Bool {
+        switch macKeyCode {
+        case 36, 76: return true // Return, numpad Enter
+        case 48: return true // Tab
+        case 53: return true // Escape
+        case 123, 124, 125, 126: return true // Left, Right, Down, Up
+        case 115, 116, 117, 119, 121: return true // Home, PageUp, ForwardDelete, End, PageDown
+        case 122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106: return true // F1-F16
+        case 114: return true // Help
+        default: return false
+        }
+    }
+
+    /// adr/0011 §1/§2: whether the *currently active* keyboard input source is ASCII-
+    /// capable (`TISCopyCurrentKeyboardInputSource`'s `kTISPropertyInputSourceIsASCIICapable`
+    /// property) -- the mixing rule's own decision point, re-evaluated on every keystroke
+    /// (a user can switch input sources mid-session). Defaults to `true` (today's exact
+    /// scancode-only behavior) whenever the source or property can't be read -- mirrors
+    /// adr/0011 §4's own "探测失败/符号缺席时不猜测，退回今天的行为" discipline: never silently
+    /// route an unrecognized source into the (per-keystroke-fidelity-losing) IME lane it
+    /// never asked for.
+    private static func isCurrentInputSourceASCIICapable() -> Bool {
+        guard let source = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else { return true }
+        guard let rawProperty = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsASCIICapable) else {
+            return true
+        }
+        let cfBoolean = Unmanaged<CFBoolean>.fromOpaque(rawProperty).takeUnretainedValue()
+        return CFBooleanGetValue(cfBoolean)
+    }
+}
+
+// MARK: - NSTextInputClient (adr/0011 §2)
+
+/// v1 only consumes the fully-composed commit (`insertText(_:replacementRange:)`) --
+/// marked (in-progress composition) text is tracked internally, purely to keep this
+/// protocol's own state machine consistent (backspace-during-composition,
+/// `hasMarkedText()`), but is deliberately never drawn (the inline marked-text overlay is
+/// Phase 2's documented v1 gap: CJK users composing inside an app-inline-IME-style remote
+/// application see nothing locally until the whole string commits at once, adr/0011 §2/§6).
+// `@preconcurrency`: `NSTextInputClient`'s requirements are all `nonisolated` as imported
+// from its unannotated ObjC header, while every implementation below is (implicitly, this
+// target's default actor isolation) main-actor-isolated like the rest of this
+// `NSView` subclass -- exactly the documented case for `@preconcurrency` on a protocol
+// conformance (Swift 6 #ConformanceIsolation), not a real cross-actor hazard: AppKit only
+// ever calls these from the main thread in the first place.
+extension RemoteWindowContentView: @preconcurrency NSTextInputClient {
+    func insertText(_ string: Any, replacementRange: NSRange) {
+        markedText = ""
+        let text: String
+        switch string {
+        case let attributed as NSAttributedString: text = attributed.string
+        case let plain as String: text = plain
+        default: text = ""
+        }
+        guard !text.isEmpty else { return }
+        onEvent?(.unicodeText(text))
+    }
+
+    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        switch string {
+        case let attributed as NSAttributedString: markedText = attributed.string
+        case let plain as String: markedText = plain
+        default: markedText = ""
+        }
+    }
+
+    func unmarkText() {
+        markedText = ""
+    }
+
+    func selectedRange() -> NSRange {
+        // No local text storage to report a real selection against -- NSNotFound is the
+        // conventional "unknown" answer Cocoa text-input clients give here.
+        NSRange(location: NSNotFound, length: 0)
+    }
+
+    func markedRange() -> NSRange {
+        guard !markedText.isEmpty else { return NSRange(location: NSNotFound, length: 0) }
+        return NSRange(location: 0, length: (markedText as NSString).length)
+    }
+
+    func hasMarkedText() -> Bool {
+        !markedText.isEmpty
+    }
+
+    func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
+        nil // no local text storage (v1: only the committed-string path is consumed)
+    }
+
+    func validAttributesForMarkedText() -> [NSAttributedString.Key] {
+        []
+    }
+
+    func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
+        // Best-effort candidate-window anchor: this view's own frame in screen space --
+        // not glyph-accurate (no local text storage to measure against), but a reasonable,
+        // never-crashing default. Real candidate-window anchoring is the remote-IME path
+        // adr/0011 §6 explicitly defers.
+        guard let window else { return .zero }
+        return window.convertToScreen(NSRect(origin: .zero, size: bounds.size))
+    }
+
+    func characterIndex(for point: NSPoint) -> Int {
+        NSNotFound
     }
 }

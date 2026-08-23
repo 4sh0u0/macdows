@@ -562,10 +562,23 @@ typedef struct {
 typedef enum {
     CRDPQ_INPUT_KEYBOARD = 0,
     CRDPQ_INPUT_MOUSE,
+    /** adr/0011 §1/§0c: one UTF-16 code unit's down/release pair, bound for
+     *  freerdp_input_send_unicode_keyboard_event(input, flags, code) -- same two-argument
+     *  shape as CRDPQ_INPUT_KEYBOARD (`x`/`y` unused here too), `flags` is 0 for down or
+     *  KBD_FLAGS_RELEASE for release (verified against
+     *  ThirdParty/FreeRDP/client/X11/xf_client.c's xf_inject_keypress, the only in-tree
+     *  reference for this pairing), `code` is the raw UTF-16 code unit -- a surrogate pair
+     *  (e.g. an emoji) is two separate CRDPQ_INPUT_UNICODE down/release pairs, never one.
+     *  Added with zero struct/ABI impact (§0c: crdpq_cmd_input_t.code is already
+     *  uint16_t) -- see this file's own _Static_assert block, none of which cover the
+     *  outbound lane (crdpq_cmd_input_t/crdpq_command_payload_t/CrdpCommand have never had
+     *  one), confirming this really is enum-only. */
+    CRDPQ_INPUT_UNICODE,
 } crdpq_input_kind_t;
 
-/** Keyboard or mouse input bound for FreeRDP's ClientSendKeyboardEvent/ClientSendMouseEvent-
- *  shaped APIs. `x`/`y` are unused for CRDPQ_INPUT_KEYBOARD. */
+/** Keyboard, unicode, or mouse input bound for FreeRDP's
+ *  ClientSendKeyboardEvent/ClientSendMouseEvent/freerdp_input_send_unicode_keyboard_event-
+ *  shaped APIs. `x`/`y` are unused for CRDPQ_INPUT_KEYBOARD and CRDPQ_INPUT_UNICODE. */
 typedef struct {
     crdpq_input_kind_t kind;
     uint16_t flags;

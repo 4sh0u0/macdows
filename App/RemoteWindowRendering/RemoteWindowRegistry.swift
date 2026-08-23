@@ -1,6 +1,28 @@
 import AppKit
+import Carbon
 import MacdowsCore
 import os
+
+/// adr/0011 §4: `KBGetLayoutType`'s return type (`OSType`, a four-char code) and the
+/// three keyboard-type constants it returns -- self-declared because, per the ADR's own
+/// verification, the function and these constants exist only in HIToolbox's exported
+/// symbol table (`HIToolbox.tbd`/`Carbon.tbd`), with zero header declaration anywhere in
+/// the current SDK. `@_silgen_name` links directly against the real exported symbol by
+/// name without needing a bridging header -- required here specifically because
+/// `RemoteWindowRegistry.swift` is compiled into BOTH the Macdows app target (which has
+/// one, `Macdows-Bridging-Header.h`) AND the window-smoke tool target (which does not);
+/// `LMGetKbdType()` itself needs no such treatment -- it IS still declared (HIToolbox's
+/// `Events.h`, confirmed in the current SDK), reachable via the plain `import Carbon`
+/// above.
+@_silgen_name("KBGetLayoutType")
+private func KBGetLayoutType(_ keyboardType: Int16) -> OSType
+
+/// 'ANSI', 'ISO ', 'JIS ' as `OSType` four-char codes (verified against an older SDK's
+/// `Keyboards.h`, since the current SDK carries no header declaration at all -- see
+/// `KBGetLayoutType`'s own doc comment above).
+private let kKeyboardANSIType: OSType = 0x414E_5349
+private let kKeyboardISOType: OSType = 0x4953_4F20
+private let kKeyboardJISType: OSType = 0x4A49_5320
 
 /// Local re-derivation of TS_WINDOW_STATE_ORDER's field-presence bits actually needed for
 /// rendering (offset/size/show/title). MacdowsCore's WindowModel.swift is the canonical
@@ -251,9 +273,34 @@ final class RemoteWindowRegistry {
     /// does the actual diff/release-sequence computation (unit-tested there, offline, no
     /// AppKit/CRSession needed); this var is the one piece of mutable state it's diffed
     /// against. Cleared (not "flushed" — the connection this state described is already
-    /// gone) on `closeAllWindows`, and force-flushed via `ModifierKeyTracker.releaseAll`
-    /// on a `.focusLost` event (see `handleInput`'s own case).
+    /// gone) on `closeAllWindows`.
+    ///
+    /// adr/0011 §3: this tracks **physical** keyboard truth ONLY, for `ModifierKeyTracker`'s
+    /// diff source — it is deliberately no longer the release source (see
+    /// `wireHeldModifiers` below for that, and `releaseAllHeldModifiers()`'s own doc
+    /// comment for the bug this split fixes).
     private var heldModifierKeys: ModifierKeySet = []
+    /// adr/0011 §3's new ledger: which `ModifierKeySet` bits are ACTUALLY held on the wire
+    /// right now — updated ONLY at the single point a `.modifierKey` `KeyboardLaneEvent`
+    /// actually leaves this process (`sendKeyboardLaneEvent`), never at capture time. This
+    /// is the authoritative source for `releaseAllHeldModifiers()`: "线上按住了什么只有出线才
+    /// 算数" (adr/0011 §3). Distinct from `heldModifierKeys` above (physical truth) precisely
+    /// because the two can now legitimately diverge — a physically-held Cmd may be
+    /// represented on the wire as Ctrl (via `CommandKeyMapper`'s remap), as LWIN
+    /// (passthrough), or as nothing at all (still withheld) — releasing based on physical
+    /// truth instead of this ledger would send the WRONG scancode's RELEASE.
+    private var wireHeldModifiers: ModifierKeySet = []
+    /// adr/0011 §3: the Cmd<->Ctrl remap state machine — one session-level instance,
+    /// mirroring `heldModifierKeys`'/`wireHeldModifiers`' own "one physical keyboard, one
+    /// tracked state" precedent. Pure `MacdowsCore` logic; this registry only feeds it
+    /// events and executes what it returns (`execute(commandKeyMapperOutput:windowId:)`).
+    private let commandKeyMapper = CommandKeyMapper()
+    /// adr/0011 §4: this Mac's physical keyboard type, detected once via
+    /// `KBGetLayoutType(LMGetKbdType())` at registry construction — feeds
+    /// `MacdowsCore.IsoKeyCodeCorrection.correct(macKeyCode:keyboardType:)`, applied to
+    /// every physical `macKeyCode` before it's used for anything else (both the ordinary
+    /// scancode path and `CommandKeyMapper`'s own passthrough forwarding).
+    private let macKeyboardType: MacKeyboardType
     /// W4c: last time a `.mouseMoved` event was actually forwarded for each window, for the
     /// move-event throttle in `handleInput` (task spec: "move events may be throttled at 8ms" — AppKit's
     /// native mouseMoved/mouseDragged rate is far higher than the outbound lane needs).
@@ -276,6 +323,24 @@ final class RemoteWindowRegistry {
 
     init(session: CRSession) {
         self.session = session
+        self.macKeyboardType = Self.detectKeyboardType()
+    }
+
+    /// adr/0011 §4: `KBGetLayoutType(LMGetKbdType())`, once. Deliberately NOT the
+    /// IOHIDManager full-device enumeration `ThirdParty/FreeRDP/client/Mac/Keyboard.m`'s
+    /// own `mac_detect_keyboard_type()` uses (adr/0011 §4: "沙箱下的HID访问是另一场决策") — one
+    /// call, no enumeration, no extra permission surface. "探测失败或符号缺席 → 一律按ANSI处
+    /// 理" (adr/0011 §4): never guess when the symbol table lookup or the returned value is
+    /// unrecognized — falling back to ANSI is exactly today's pre-adr/0011 behavior (the
+    /// ISO gap stays open, rather than risking a WRONG correction on a keyboard this
+    /// couldn't actually identify).
+    private static func detectKeyboardType() -> MacKeyboardType {
+        let layoutType = KBGetLayoutType(Int16(LMGetKbdType()))
+        switch layoutType {
+        case kKeyboardISOType: return .iso
+        case kKeyboardJISType: return .jis
+        default: return .ansi // includes kKeyboardANSIType and any unrecognized value
+        }
     }
 
     /// adr/0005 §2 / W4b task spec: "primaryMonitorHeight takes NSScreen.screens' primary screen" —
@@ -1097,17 +1162,39 @@ final class RemoteWindowRegistry {
                 session.sendMouseHorizontalWheelDelta(deltaX, atX: Int32(point.x), y: Int32(point.y))
             }
 
-        case .keyDown(let macKeyCode):
+        case .keyDown(let rawMacKeyCode, _, let charactersIgnoringModifiers):
             // adr/0012 §2: keyboard is focus-addressed (the wire message itself carries no
             // windowId -- CRSession.h's `sendKeyDown:`/`sendKeyUp:` take only a scancode),
             // so it must not reach the wire until FocusAuthority confirms the server's own
             // `activeWindowId` actually matches what we're claiming key for. Routed through
             // the gate rather than sent directly, unlike mouse (position-addressed, §2:
             // "鼠标是位置寻址，天然免闸").
-            execute(focusAuthority.enqueueKeyboardEvent(.keyDown(macKeyCode: macKeyCode), at: CFAbsoluteTimeGetCurrent()))
+            //
+            // adr/0011 §4: ISO Grave/Section correction applies to EVERY physical key,
+            // independent of Cmd handling -- done first, here, before either downstream
+            // path (CommandKeyMapper's own passthrough forwarding needs the corrected code
+            // too).
+            let macKeyCode = IsoKeyCodeCorrection.correct(macKeyCode: rawMacKeyCode, keyboardType: macKeyboardType)
+            if commandKeyMapper.isActive {
+                // adr/0011 §3: translation happens BEFORE the gate -- whatever
+                // CommandKeyMapper returns is already line-shape, so it's what actually
+                // gets enqueued, not the raw keyDown.
+                execute(commandKeyMapperOutput: commandKeyMapper.key(
+                    down: true, macKeyCode: macKeyCode, charactersIgnoringModifiers: charactersIgnoringModifiers
+                ), windowId: windowId)
+            } else {
+                execute(focusAuthority.enqueueKeyboardEvent(.keyDown(macKeyCode: macKeyCode), at: CFAbsoluteTimeGetCurrent()))
+            }
 
-        case .keyUp(let macKeyCode):
-            execute(focusAuthority.enqueueKeyboardEvent(.keyUp(macKeyCode: macKeyCode), at: CFAbsoluteTimeGetCurrent()))
+        case .keyUp(let rawMacKeyCode, _, let charactersIgnoringModifiers):
+            let macKeyCode = IsoKeyCodeCorrection.correct(macKeyCode: rawMacKeyCode, keyboardType: macKeyboardType)
+            if commandKeyMapper.isActive {
+                execute(commandKeyMapperOutput: commandKeyMapper.key(
+                    down: false, macKeyCode: macKeyCode, charactersIgnoringModifiers: charactersIgnoringModifiers
+                ), windowId: windowId)
+            } else {
+                execute(focusAuthority.enqueueKeyboardEvent(.keyUp(macKeyCode: macKeyCode), at: CFAbsoluteTimeGetCurrent()))
+            }
 
         case .flagsChanged(let modifierFlags):
             // heldModifierKeys tracks physical keyboard state at *capture* time,
@@ -1120,7 +1207,19 @@ final class RemoteWindowRegistry {
             let transitions = ModifierKeyTracker.transitions(from: heldModifierKeys, to: current)
             heldModifierKeys = current
             for transition in transitions {
-                execute(focusAuthority.enqueueKeyboardEvent(.modifierKey(transition.key, down: transition.down), at: CFAbsoluteTimeGetCurrent()))
+                // adr/0011 §3: Cmd's own wire representation is entirely owned by
+                // CommandKeyMapper -- withheld until resolved, never a direct
+                // `.modifierKey(.command,...)` passthrough. Shift is intercepted too, but
+                // ONLY while a Cmd gesture is undecided/mapped (the only shift-sensitive
+                // row, Cmd+Shift+Z); idle-state Shift, and every other modifier bit
+                // regardless of state, keeps flowing through the ordinary path unchanged.
+                if transition.key == .command {
+                    execute(commandKeyMapperOutput: commandKeyMapper.commandChanged(down: transition.down), windowId: windowId)
+                } else if transition.key == .shift, commandKeyMapper.isActive {
+                    execute(commandKeyMapperOutput: commandKeyMapper.shiftChanged(down: transition.down), windowId: windowId)
+                } else {
+                    execute(focusAuthority.enqueueKeyboardEvent(.modifierKey(transition.key, down: transition.down), at: CFAbsoluteTimeGetCurrent()))
+                }
             }
 
         case .focusLost:
@@ -1133,6 +1232,31 @@ final class RemoteWindowRegistry {
             // against buffering/misdirecting -- it must fire immediately regardless of
             // whatever convergence is in flight.
             releaseAllHeldModifiers()
+            // adr/0011 §3: abandon any in-flight Cmd gesture too -- its own internal state
+            // (e.g. "a chord is open") would otherwise survive focus loss stale; the wire
+            // side is already correctly closed out by releaseAllHeldModifiers() above via
+            // wireHeldModifiers, independent of whatever CommandKeyMapper still thinks.
+            commandKeyMapper.reset()
+
+        case .unicodeText(let text):
+            // adr/0011 §1/§2: an IME commit -- same gate as every other keyboard-lane
+            // event (adr/0012 §2 unchanged), atomic (whole string, one buffer slot).
+            execute(focusAuthority.enqueueKeyboardEvent(.unicodeText(text), at: CFAbsoluteTimeGetCurrent()))
+        }
+    }
+
+    /// adr/0011 §3: routes one `CommandKeyMapper` result into either the ordinary
+    /// `FocusAuthority` gate (`.wire`) or the existing SC_CLOSE traffic-light path
+    /// (`.closeRequest`, Cmd+W) -- mirrors `execute(_:)` below's "translate effects into
+    /// side effects" shape, one level up the pipeline.
+    private func execute(commandKeyMapperOutput output: CommandKeyMapperOutput, windowId: UInt32) {
+        switch output {
+        case .wire(let events):
+            for event in events {
+                execute(focusAuthority.enqueueKeyboardEvent(event, at: CFAbsoluteTimeGetCurrent()))
+            }
+        case .closeRequest:
+            handleChromeAction(windowId: windowId, action: .close)
         }
     }
 
@@ -1195,6 +1319,11 @@ final class RemoteWindowRegistry {
         }
     }
 
+    /// The single wire-exit point for the keyboard lane (adr/0011 §3: "只在真正出线的那一个出
+    /// 口(sendKeyboardLaneEvent)更新" -- this is that outlet). Every `.modifierKey` sent from
+    /// HERE, regardless of source (the ordinary per-bit diff, or a `CommandKeyMapper`-
+    /// translated Ctrl/LWIN/Shift event), updates `wireHeldModifiers` -- the ledger
+    /// `releaseAllHeldModifiers()` below now reads from instead of physical truth.
     private func sendKeyboardLaneEvent(_ event: KeyboardLaneEvent) {
         switch event {
         case .keyDown(let macKeyCode):
@@ -1203,16 +1332,36 @@ final class RemoteWindowRegistry {
             session.sendKeyUp(macKeyCode)
         case .modifierKey(let key, let down):
             session.send(Self.crModifierKey(for: key), down: down)
+            if down {
+                wireHeldModifiers.insert(key)
+            } else {
+                wireHeldModifiers.remove(key)
+            }
+        case .unicodeText(let text):
+            session.sendUnicodeText(text)
         }
     }
 
     /// Shared by `.focusLost` (immediate/ungated) and `.dropBufferedInput(...,
     /// withModifierRelease: true)` (also immediate/ungated -- see that effect's own doc
-    /// comment) -- both need the exact same "release everything this session-level tracker
-    /// currently has marked as held" flow (W4c review H1).
+    /// comment) -- both need the exact same "release everything actually on the wire right
+    /// now" flow (W4c review H1).
+    ///
+    /// adr/0011 §3: reads `wireHeldModifiers`, NOT `heldModifierKeys` -- this is the fix for
+    /// a latent bug the ADR documents: `heldModifierKeys` used to double as both "physical
+    /// truth" AND "release source", updated at *capture* time (§3's own Registry:1121
+    /// citation) while releases were computed from it at a LATER point (§3's own
+    /// Registry:1213-1218 citation) -- any DOWN captured but then discarded (buffer
+    /// dropped, gate never opened) had never actually reached the wire, yet still produced
+    /// a RELEASE for it. Pre-adr/0011 that was merely an extra harmless RELEASE; post-
+    /// adr/0011, with Cmd able to be remapped to a DIFFERENT wire scancode (Ctrl) than its
+    /// physical identity (Cmd/LWIN), the same bug would send the WRONG key's RELEASE --
+    /// physical Cmd lifting would RELEASE LWIN while Ctrl is what's actually held on the
+    /// wire, leaving Ctrl stuck (exactly the shape adr/0012 §2 and W4c review H1 both
+    /// already call out as unacceptable).
     private func releaseAllHeldModifiers() {
-        let releases = ModifierKeyTracker.releaseAll(heldModifierKeys)
-        heldModifierKeys = []
+        let releases = ModifierKeyTracker.releaseAll(wireHeldModifiers)
+        wireHeldModifiers = []
         for release in releases {
             session.send(Self.crModifierKey(for: release.key), down: release.down)
         }
@@ -1574,6 +1723,10 @@ final class RemoteWindowRegistry {
         // No RELEASE flush here (unlike the .focusLost case) -- the connection this
         // tracked state described is already gone, so there is nothing left to send it to.
         heldModifierKeys = []
+        // adr/0011 §3: same "no flush, connection is gone" reasoning extends to the new
+        // ledger and the Cmd remap state machine.
+        wireHeldModifiers = []
+        commandKeyMapper.reset()
         lastMoveSentAt.removeAll()
         pendingTrailingMove.removeAll()
     }

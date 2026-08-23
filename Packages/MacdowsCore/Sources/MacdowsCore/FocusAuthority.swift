@@ -43,6 +43,17 @@ public enum KeyboardLaneEvent: Sendable, Equatable {
     case keyDown(macKeyCode: UInt16)
     case keyUp(macKeyCode: UInt16)
     case modifierKey(ModifierKeySet, down: Bool)
+    /// adr/0011 §1: an already-fully-composed IME commit string (an `NSTextInputClient
+    /// -insertText:` result), carried whole rather than as individual code-unit events --
+    /// deliberate, not a shortcut: adr/0012 §2's 64-event buffer cap stays meaningful this
+    /// way (a 50-character commit costs 1 slot, not 50), and a single commit either lands
+    /// on the wire atomically or is dropped atomically, never half-sent. Per-UTF-16-code-
+    /// unit expansion happens at the single point this whole lane actually goes out the
+    /// door (`RemoteWindowRegistry.sendKeyboardLaneEvent` -> `CRSession.sendUnicodeText:`),
+    /// not here and not at capture time. Flows through this same FIFO -- same gate, same
+    /// buffer, same drop/flush semantics as the other three cases; `FocusAuthority` itself
+    /// needs no special-casing for it (adr/0011 §1: "与既有三个case同队列、同闸门、同缓冲上限").
+    case unicodeText(String)
 }
 
 /// `FocusAuthority`'s four states (adr/0012 §3, exactly — "不新增第五态"). A server value

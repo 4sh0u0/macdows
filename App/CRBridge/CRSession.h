@@ -473,21 +473,50 @@ typedef NS_ENUM(NSInteger, CRModifierKey) {
 /// ThirdParty/FreeRDP/client/Mac/MRDPView.m's own `-keyDown:`/`-keyUp:` call, already
 /// linked into this target via winpr3 -- so no keycode table needed porting here.
 ///
-/// Does not implement `fixKeyCode()`'s ISO-keyboard Section/Grave swap (a MRDPView.m
-/// detail gated on `mac_detect_keyboard_type() == APPLE_KEYBOARD_TYPE_ISO`). W4c review
-/// M5: this is a bigger gap than "port one more translation function" -- `fixKeyCode()`'s
-/// own signature is `fixKeyCode(DWORD keyCode, unichar keyChar, enum APPLE_KEYBOARD_TYPE
-/// type)`, and that `keyChar` (from `[event charactersIgnoringModifiers] characterAtIndex:0]`,
-/// MRDPView.m's own `-keyDown:`) is exactly what tells it whether a given key code needs
-/// correcting. This method's own signature only carries `macKeyCode` -- no character data
-/// at all -- so supporting `fixKeyCode()` would need `RemoteWindowInputEvent.keyDown`/
-/// `.keyUp` (App/RemoteWindowRendering/RemoteWindowInput.swift) to carry the event's
-/// characters too, and this method's own signature to grow a parameter for them: a real
-/// pipeline change, not a drop-in call at the bottom of an existing function. Documented
-/// here as a deliberate, narrow W4c gap rather than either half-implemented or ported
-/// speculatively.
+/// Does not implement `fixKeyCode()`'s ISO-keyboard Section/Grave swap here -- that
+/// correction now lives in `MacdowsCore.IsoKeyCodeCorrection` (adr/0011 §4), applied by
+/// `RemoteWindowRegistry` to `macKeyCode` BEFORE it ever reaches this method, not inside
+/// this "dumb pipe" translation layer. adr/0011 §0a corrects this comment's own prior
+/// claim (W4c review M5), which was wrong: `fixKeyCode(DWORD keyCode, unichar keyChar,
+/// enum APPLE_KEYBOARD_TYPE type)`'s `keyChar` parameter does NOT drive the correction --
+/// the only branch of `fixKeyCode()` that's actually live in the vendored source is the
+/// pure `type == APPLE_KEYBOARD_TYPE_ISO` Grave<->Section swap (MRDPView.m:468-476); the
+/// Hungarian branch that reads `keyChar` is `#if 0`'d out entirely (MRDPView.m:448-466),
+/// so `keyChar` there only ever gates "is this call worth making at all" (non-empty
+/// `characters`), never which correction to apply. The ISO gap is closed by keyboard
+/// *type* alone, never by character data -- adr/0011 §2 still adds `characters`/
+/// `charactersIgnoringModifiers` to `RemoteWindowInputEvent.keyDown`/`.keyUp`
+/// (App/RemoteWindowRendering/RemoteWindowInput.swift), but that pipeline change's real
+/// third consumer is adr/0011 §3's Cmd-chord recognition, not this ISO correction.
 - (void)sendKeyDown:(uint16_t)macKeyCode;
 - (void)sendKeyUp:(uint16_t)macKeyCode;
+
+/// adr/0011 §2: sends `text` as a sequence of Unicode keyboard events -- one down/release
+/// pair per UTF-16 code unit (adr/0011 §0b/§1: FreeRDP's own unicode wire message carries
+/// exactly one UTF-16 code unit per event, so a surrogate pair, e.g. an emoji, becomes two
+/// pairs, never one), posted through the same outbound lane every other input method here
+/// uses. Fire-and-forget, silently does nothing if the session isn't connected or `text`
+/// is empty -- same contract as every other method on this interface. This is the v1
+/// "local IME composition, Unicode-only commit" path (adr/0011 §2): callers only ever pass
+/// an already-fully-composed string here (an `NSTextInputClient -insertText:` commit), not
+/// per-keystroke romanization input. Does nothing to check `-unicodeInputSupported` itself
+/// -- degradation policy (adr/0011 §2: "为假时IME通路整体停用、告警一次") belongs to the
+/// caller (`RemoteWindowRegistry`), which is also where every other input-forwarding
+/// *policy* decision on this interface already lives; this method stays the same kind of
+/// undecorated pipe `-sendKeyDown:`/`-sendModifierKey:down:` already are.
+- (void)sendUnicodeText:(NSString *)text;
+
+/// adr/0011 §2's degradation gate: `FreeRDP_UnicodeInput`, read from the server's
+/// negotiated Input Capability Set exactly once, immediately after a successful
+/// `-start` connection attempt (adr/0011 §2: "连接建立后读一次"). `NO` before the first
+/// successful connect and reset to `NO` at the top of every `-start` call, so a caller
+/// never sees a stale answer from a prior connection generation. When this is `NO`,
+/// `-sendUnicodeText:` would otherwise silently fail per-event (FreeRDP's own
+/// `freerdp_input_send_unicode_keyboard_event` just `WLog_WARN`s and returns `FALSE`,
+/// adr/0011 §0b) -- this property exists so `RemoteWindowRegistry` can check it ONCE and
+/// disable the whole IME lane with a single visible warning instead (adr/0011 §2: "不静默
+/// 丢字, §0b的默认行为不可接受").
+@property (nonatomic, readonly) BOOL unicodeInputSupported;
 
 /// One `CRModifierKey`'s pressed state changed (from diffing
 /// `NSEvent.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask` against its

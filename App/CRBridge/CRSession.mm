@@ -394,6 +394,10 @@ typedef NS_ENUM(NSInteger, CRSessionState) {
  * internal lock" the review offered as the alternative -- cheap enough for a
  * once-per-connect-attempt property that it isn't worth hand-rolling. */
 @property (nullable) NSError *lastConnectError;
+/* adr/0011 §2: same cross-thread publish reasoning as -lastConnectError above --
+ * written once from T_rdp (crb_rdp_thread_main, immediately after a successful
+ * freerdp_connect) and read from T_main. Deliberately NOT nonatomic for the same reason. */
+@property BOOL unicodeInputSupported;
 @end
 
 /* ------------------------------------------------------------------------------------ */
@@ -1452,6 +1456,20 @@ static void crb_outbound_visitor(const CrdpCommand *cmd, void *vctx)
                 freerdp_input_send_keyboard_event(context->input, cmd->payload.input.flags,
                                                    (UINT8)cmd->payload.input.code);
             }
+            else if (cmd->payload.input.kind == CRDPQ_INPUT_UNICODE)
+            {
+                /* adr/0011 §1/§0b: one UTF-16 code unit per call, flags is 0 (down) or
+                 * KBD_FLAGS_RELEASE (release) -- -sendUnicodeText: already did the
+                 * per-code-unit expansion before this ever reached the outbound queue.
+                 * FreeRDP itself gates on FreeRDP_UnicodeInput (input.c) and just WLog_WARNs
+                 * + returns FALSE when unsupported -- RemoteWindowRegistry is expected to
+                 * check -unicodeInputSupported before ever calling -sendUnicodeText: at all
+                 * (adr/0011 §2), so this call is not expected to fail in practice; the
+                 * return value is intentionally unchecked here, matching every other
+                 * fire-and-forget call in this visitor. */
+                freerdp_input_send_unicode_keyboard_event(context->input, cmd->payload.input.flags,
+                                                           cmd->payload.input.code);
+            }
             else
             {
                 freerdp_input_send_mouse_event(context->input, cmd->payload.input.flags,
@@ -1518,6 +1536,15 @@ static void *crb_rdp_thread_main(void *arg)
 
         return NULL;
     }
+
+    /* adr/0011 §2: read the server's negotiated FreeRDP_UnicodeInput capability exactly
+     * once, right here -- the Input Capability Set is exchanged during the Connection
+     * Sequence's capability-exchange phase, which completes strictly before
+     * freerdp_connect() returns TRUE, so context->settings already reflects the server's
+     * real answer by this point. Never re-read after this -- a mid-session change isn't a
+     * real protocol event this class needs to react to, and adr/0011 §2 only calls for a
+     * one-time post-connect check. */
+    session.unicodeInputSupported = freerdp_settings_get_bool(instance->context->settings, FreeRDP_UnicodeInput);
 
     while (!freerdp_shall_disconnect_context(instance->context))
     {
@@ -1739,6 +1766,9 @@ static void crb_schedule_drain(void *ctx)
         return;
     }
     self.lastConnectError = nil;
+    /* adr/0011 §2: reset before every fresh attempt, same reasoning as -lastConnectError
+     * above -- a caller must never see a prior connection generation's answer. */
+    self.unicodeInputSupported = NO;
     _state = CRSessionStateConnecting;
 
     if (!crb_openssl_legacy_provider_available())
@@ -2269,6 +2299,44 @@ static void crb_send_key(crdpq_outbound_t *queue, uint16_t macKeyCode, DWORD key
 - (void)sendKeyUp:(uint16_t)macKeyCode
 {
     crb_send_key(_outboundQueue, macKeyCode, KBD_FLAGS_RELEASE);
+}
+
+/* adr/0011 §1/§2/§0b: per-UTF-16-code-unit down/release pairs, matching
+ * ThirdParty/FreeRDP/client/X11/xf_client.c's xf_inject_keypress (the only in-tree
+ * reference for this wire pairing) -- down is flags=0, release is flags=KBD_FLAGS_RELEASE,
+ * no KBDEXT/scancode translation involved at all (unicode events carry a raw UTF-16 code
+ * unit, not a scancode). `-characterAtIndex:` iterates NSString's own native UTF-16
+ * storage directly, so a surrogate pair (e.g. an emoji) naturally becomes two separate
+ * down/release pairs here, and an empty string sends nothing -- both match adr/0011 §5
+ * item 3's offline acceptance shape (mirrored, for pure-Swift offline testability, by
+ * `MacdowsCore.UnicodeTextExpansion.events(for:)`; this loop and that function must stay
+ * in lock-step by inspection, since this method itself cannot run under `swift test`). */
+- (void)sendUnicodeText:(NSString *)text
+{
+    if (!_outboundQueue || text.length == 0)
+        return;
+
+    NSUInteger length = text.length;
+    for (NSUInteger i = 0; i < length; i++)
+    {
+        UINT16 code = (UINT16)[text characterAtIndex:i];
+
+        CrdpCommand down;
+        memset(&down, 0, sizeof(down));
+        down.type = CRDPQ_CMD_INPUT;
+        down.payload.input.kind = CRDPQ_INPUT_UNICODE;
+        down.payload.input.flags = 0;
+        down.payload.input.code = code;
+        crdpq_outbound_post(_outboundQueue, &down);
+
+        CrdpCommand up;
+        memset(&up, 0, sizeof(up));
+        up.type = CRDPQ_CMD_INPUT;
+        up.payload.input.kind = CRDPQ_INPUT_UNICODE;
+        up.payload.input.flags = KBD_FLAGS_RELEASE;
+        up.payload.input.code = code;
+        crdpq_outbound_post(_outboundQueue, &up);
+    }
 }
 
 - (void)sendModifierKey:(CRModifierKey)key down:(BOOL)down

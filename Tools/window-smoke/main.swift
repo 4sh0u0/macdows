@@ -114,6 +114,17 @@ let launchedAppKind = LaunchedAppKind(programPath: launchedProgram)
 enum InputTestMode: String {
     case click
     case enter
+    /// adr/0011 §5 item 5's env-gated SCAFFOLD only (this round is offline-scope, adr/0011
+    /// §5's live-host items 5-7 are deferred per adr/0012 §4.7's host-freshness condition):
+    /// synthesizes a real Cmd+C `NSEvent` sequence against the target window, exercising
+    /// `CommandKeyMapper`'s wiring end to end (`RemoteWindowContentView.keyDown`/
+    /// `flagsChanged` -> `RemoteWindowRegistry.handleInput` -> `CommandKeyMapper` -> the
+    /// wire), but asserts nothing about the result -- the real assertion ("真机Word复制粘贴
+    ///往返一致") needs a live host and is explicitly out of scope this round. See
+    /// `runInputTest`'s and `finish()`'s own handling: this mode is deliberately excluded
+    /// from the generic WindowDelete-based pass/fail gate every other `InputTestMode` uses,
+    /// since Cmd+C has no reason to close any window.
+    case cmdmap
 }
 let inputTestMode = ProcessInfo.processInfo.environment["WINDOW_SMOKE_INPUT_TEST"]
     .flatMap(InputTestMode.init(rawValue:))
@@ -1975,7 +1986,51 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             sendSyntheticClick(to: window)
         case .enter:
             sendSyntheticEnter(to: window)
+        case .cmdmap:
+            sendSyntheticCmdMap(to: window)
         }
+    }
+
+    /// adr/0011 §5 item 5's SCAFFOLD (offline scope this round -- see `InputTestMode.cmdmap`'s
+    /// own doc comment): a real Cmd-down flagsChanged, then a 'c' keyDown/keyUp pair (with
+    /// `charactersIgnoringModifiers: "c"`), then Cmd-up flagsChanged -- exactly the physical
+    /// event sequence `CommandKeyMapper` expects for the Cmd+C row of adr/0011 §3's table.
+    /// Dispatched via `NSWindow.sendEvent(_:)`, same as `sendClick(to:at:)`/
+    /// `sendSyntheticEnter(to:)` above, so it exercises the real capture path end to end.
+    private func sendSyntheticCmdMap(to window: NSWindow) {
+        print("[input-test] synthesizing Cmd+C (mac keyCode 8) -- scaffold only, no live assertion this round")
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        let macCKeyCode: UInt16 = 8 // kVK_ANSI_C
+
+        guard
+            let cmdDown = NSEvent.keyEvent(
+                with: .flagsChanged, location: .zero, modifierFlags: [.command], timestamp: timestamp,
+                windowNumber: window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "",
+                isARepeat: false, keyCode: 55 // kVK_Command
+            ),
+            let cKeyDown = NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [.command], timestamp: timestamp,
+                windowNumber: window.windowNumber, context: nil, characters: "c", charactersIgnoringModifiers: "c",
+                isARepeat: false, keyCode: macCKeyCode
+            ),
+            let cKeyUp = NSEvent.keyEvent(
+                with: .keyUp, location: .zero, modifierFlags: [.command], timestamp: timestamp,
+                windowNumber: window.windowNumber, context: nil, characters: "c", charactersIgnoringModifiers: "c",
+                isARepeat: false, keyCode: macCKeyCode
+            ),
+            let cmdUp = NSEvent.keyEvent(
+                with: .flagsChanged, location: .zero, modifierFlags: [], timestamp: timestamp,
+                windowNumber: window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "",
+                isARepeat: false, keyCode: 55
+            )
+        else {
+            print("[input-test] failed to construct synthetic Cmd+C events")
+            return
+        }
+        window.sendEvent(cmdDown)
+        window.sendEvent(cKeyDown)
+        window.sendEvent(cKeyUp)
+        window.sendEvent(cmdUp)
     }
 
     /// Mouse half of deliverable 5: a real `NSEvent` mouseDown+mouseUp pair, dispatched via
@@ -2651,7 +2706,13 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // normal run that ends with zero tracked windows for some unrelated reason still
         // gets the unconditional, strict withContent check it always has.
         var inputTestPassed = false
-        if let inputTestMode {
+        if let inputTestMode, inputTestMode != .cmdmap {
+            // adr/0011 §5 item 5: `.cmdmap` is a scaffold-only mode this round (see
+            // `InputTestMode.cmdmap`'s own doc comment) -- Cmd+C has no reason to close any
+            // window, so it's deliberately excluded from this WindowDelete-based gate
+            // (`.click`/`.enter` both close the About-Windows dialog by design). The real
+            // `.cmdmap` assertion (adr/0011 §5 item 5: real-host Word copy/paste round
+            // trip) is out of scope until a live host run.
             if let sentAt = inputTestSentAt, let windowId = inputTestWindowId {
                 if inputTestWindowDeleted, let deletedAt = inputTestWindowDeletedAt {
                     let delta = deletedAt - sentAt
