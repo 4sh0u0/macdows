@@ -263,6 +263,15 @@ final class RemoteWindowRegistry {
     /// adr/0012 §4's "纯状态机进MacdowsCore，RemoteWindowRegistry只做消费与副作用" split.
     private let focusAuthority = FocusAuthority()
 
+    /// Phase 2 W6 (docs/plans/phase2.md §2 W6 / §4 W6): owns every `NSStatusItem` this
+    /// session's RAIL notify icons map to. Session-scoped, same lifetime discipline
+    /// `focusAuthority` above already establishes -- `closeAllWindows()` tears it down via
+    /// `removeAll()`, same as every other per-connection resource this registry owns. See
+    /// `TrayStatusController`'s own doc comment for the two real wire-contract gaps this
+    /// round found (no icon pixel/title data, no outbound click lane) and why neither is
+    /// worked around here.
+    private let trayStatusController = TrayStatusController()
+
     /// W4c review H1: *session-level* modifier state — one physical keyboard, one tracked
     /// set, not per-window. The original per-window `[UInt32: NSEvent.ModifierFlags]`
     /// dictionary had a real bug: a modifier pressed while window A was focused, then
@@ -475,8 +484,23 @@ final class RemoteWindowRegistry {
             // CRDPEvent.windowId's own doc comment), the real Z-order array arrives via
             // MonitoredDesktop and is already applied in `applyZOrder` above.
             Self.logger.debug("received zOrderSync windowIdMarker=\(event.windowId, privacy: .public) (recorded only, no policy attached -- adr/0008 §6)")
-        case .windowIcon, .notifyIconCreate, .notifyIconUpdate, .notifyIconDelete,
-             .execResult, .handshakeFlags:
+        // Phase 2 W6 (docs/plans/phase2.md §2 W6): the three notify-icon event cases route
+        // to `trayStatusController` -- previously part of the unconditional `break` case
+        // below alongside `.windowIcon`/`.execResult`/`.handshakeFlags` (still genuinely
+        // ignored; no consumer wants them yet).
+        case .notifyIconCreate:
+            trayStatusController.handleNotifyIconCreate(
+                windowId: event.windowId, notifyIconId: event.notifyIconId,
+                ownerWindowTitle: ownerWindowTitle(for: event.windowId)
+            )
+        case .notifyIconUpdate:
+            trayStatusController.handleNotifyIconUpdate(
+                windowId: event.windowId, notifyIconId: event.notifyIconId,
+                ownerWindowTitle: ownerWindowTitle(for: event.windowId)
+            )
+        case .notifyIconDelete:
+            trayStatusController.handleNotifyIconDelete(windowId: event.windowId, notifyIconId: event.notifyIconId)
+        case .windowIcon, .execResult, .handshakeFlags:
             break
         @unknown default:
             break
@@ -500,6 +524,18 @@ final class RemoteWindowRegistry {
             applyZOrder(desktopState.windowIds)
         }
         execute(focusAuthority.serverDesktopUpdate(rawActiveWindowId: event.windowId, at: CFAbsoluteTimeGetCurrent()))
+    }
+
+    /// Phase 2 W6 (docs/plans/phase2.md §2 W6): the tray degradation form's only source of a
+    /// human-readable label -- see `TrayStatusController`'s own doc comment (gap 1) for why
+    /// this is the OWNER WINDOW's title, not a notify-icon-specific tooltip (nothing beyond
+    /// `windowId`/`notifyIconId` crosses the CRBridge boundary for a notify icon order today).
+    /// `nil` (not `""`) when the owner window is unknown or its title is empty, matching
+    /// `NSStatusItem.button.toolTip`'s own "no tooltip" convention -- an empty-string tooltip
+    /// would still show a (blank) tooltip bubble on hover, which isn't the same thing.
+    private func ownerWindowTitle(for windowId: UInt32) -> String? {
+        guard let title = geometry[windowId]?.title, !title.isEmpty else { return nil }
+        return title
     }
 
     /// Diagnostics only -- true once the first `ServerLocalMoveSize` event of this
@@ -745,6 +781,14 @@ final class RemoteWindowRegistry {
             arraysReceived: zOrderArraysReceivedCount, appliesPerformed: zOrderAppliesPerformedCount,
             skippedUnknownTotal: zOrderSkippedUnknownTotal
         )
+    }
+
+    /// Diagnostics only (Tools/window-smoke's `[tray]` summary line, phase2.md §4 W6
+    /// acceptance) -- thin passthrough to `trayStatusController.diagnostics()`, same
+    /// "Registry exposes, controller/state owns" split `zOrderDiagnostics()` above already
+    /// establishes for its own counters.
+    func trayDiagnostics() -> TrayStatusController.Diagnostics {
+        trayStatusController.diagnostics()
     }
 
     private func handleWindowOrder(_ event: CRDPEvent) {
@@ -1711,6 +1755,12 @@ final class RemoteWindowRegistry {
         // bookkeeping.
         attachedChildOwner.removeAll()
         warnedUnresolvedOwner.removeAll()
+        // Phase 2 W6 (docs/plans/phase2.md §4 W6 acceptance: "delete 清零"): every live
+        // NSStatusItem this session created is session-scoped, same as every RemoteWindow
+        // above -- torn down unconditionally on both this method's callers (generation
+        // rollover, explicit prepareForReconnect()). createsSeen/updatesSeen/deletesSeen are
+        // NOT reset by this (see TrayStatusController.statusItems' own doc comment).
+        trayStatusController.removeAll()
         desktopState = ServerDesktopState()
         // adr/0012 §2 reconnect discipline: reset to `.unmonitored` -- the gate can only
         // reopen on a subsequent *real* MonitoredDesktop order, never by any timeout.

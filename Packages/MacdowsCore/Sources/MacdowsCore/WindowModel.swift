@@ -121,6 +121,17 @@ public struct WindowState: Sendable, Equatable {
 public struct NotifyIconState: Sendable, Equatable, Hashable {
     public var windowId: UInt32
     public var notifyIconId: UInt32
+
+    /// Phase 2 W6: the implicit memberwise init Swift synthesizes for a struct with no
+    /// explicit `init` is only as visible as the struct's LEAST visible stored property --
+    /// here that's `public`, but the synthesized init itself is still only `internal` (a
+    /// Swift access-control quirk, not a visibility bug in the properties themselves), so
+    /// `TrayModel`/`TrayStatusController` (a different module, the App target) couldn't
+    /// construct this type as a dictionary key without this explicit `public init`.
+    public init(windowId: UInt32, notifyIconId: UInt32) {
+        self.windowId = windowId
+        self.notifyIconId = notifyIconId
+    }
 }
 
 public struct ExecResult: Sendable, Equatable {

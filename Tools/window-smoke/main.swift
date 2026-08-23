@@ -2353,6 +2353,32 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         check(monitoredDesktopEventCount >= 1, "received >=1 MonitoredDesktop event this session (adr/0008 §0: ~25/session observed) (got \(monitoredDesktopEventCount))")
         check(zOrderSyncEventCount >= 1, "received >=1 ZOrderSync event this session (adr/0008 §0: exactly 1/session observed) (got \(zOrderSyncEventCount))")
 
+        // Phase 2 W6 (docs/plans/phase2.md §2 W6 / §4 W6 acceptance: "NSStatusItem 数量 ==
+        // create−delete"): printed unconditionally, like [flow]/[zorder] above, regardless of
+        // pass/fail. Unlike `finishCycle` (which explicitly calls `registry.prepareForReconnect()`
+        // right after its own `shutdownAndWait()`), this single-run `finish()` never resets the
+        // registry -- `session.shutdownAndWait()` above tears down the CONNECTION but leaves
+        // `registry`'s own bookkeeping (including `trayStatusController`'s live items) exactly
+        // as this session's drain loop last left it, so `liveCount` below is real, undisturbed
+        // evidence of this session's create/delete balance, not a trivially-zeroed post-teardown
+        // read.
+        //
+        // The count==create−delete assertion itself is gated ONLY when this session actually
+        // saw >=1 notify-icon event at all -- most scenarios this harness runs (winver, Word,
+        // Edge, popups) never trigger a systray icon, and asserting 0==0−0 on a session that
+        // never exercised this path would be a vacuous pass, not real evidence. No scenario in
+        // this harness currently launches a tray-icon-bearing app (adr/0012 §4.7: host
+        // degraded, live tray verification deferred), so this line is expected to print all
+        // zeros and stay ungated on every run until such a scenario exists.
+        let trayDiag = registry.trayDiagnostics()
+        print("[tray] creates=\(trayDiag.createsSeen) updates=\(trayDiag.updatesSeen) deletes=\(trayDiag.deletesSeen) liveCount=\(trayDiag.liveCount)")
+        if trayDiag.createsSeen > 0 || trayDiag.updatesSeen > 0 || trayDiag.deletesSeen > 0 {
+            check(
+                trayDiag.liveCount == trayDiag.createsSeen - trayDiag.deletesSeen,
+                "NSStatusItem count == create−delete (phase2.md §4 W6 acceptance) (got liveCount=\(trayDiag.liveCount) creates=\(trayDiag.createsSeen) deletes=\(trayDiag.deletesSeen))"
+            )
+        }
+
         // W4c: skip when an input test is active -- a *successful* click/Enter can
         // legitimately close the only window this session had open (observed in practice:
         // a lab session with nothing else left over from a prior round), which is the win
