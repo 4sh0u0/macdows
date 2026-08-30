@@ -368,6 +368,96 @@ struct CRDPQueueOutboundSingleThreadedTests {
         #expect(!crdpq_outbound_post(q, &rejected))
     }
 
+    /// adr/0014 §4: the outbound lane's FIRST payload round-trip test -- every outbound case
+    /// above this one exercises ordering, sealing, wakeup coalescing and capacity, i.e. the
+    /// queue's mechanics, and none of them ever looks at what a drained command actually
+    /// CONTAINS. `CRDPQ_CMD_NOTIFY_EVENT` is where that gap stops being acceptable: it is the
+    /// only outbound command whose payload is three raw wire scalars with no `crdpq_text_set`
+    /// (or equivalent) sanity-checking them on the way in.
+    ///
+    /// This is the RUNTIME half of the `message` width pin; `reportSizes`'s
+    /// `MemoryLayout<crdpq_cmd_notify_event_t>.size == 12` is the static half. The value
+    /// choices are what make it a real check rather than a tautology:
+    ///
+    /// - `message = 0xFFFF_FFFF` is precisely the value that survives a `uint16_t` narrowing
+    ///   as `0x0000_FFFF` (the predicted bug for this command -- its
+    ///   `crdpq_cmd_sys_command_t` sibling genuinely IS UINT16 at rail.h:430, while
+    ///   `RAIL_NOTIFY_EVENT_ORDER.message` is UINT32 at rail.h:437). A 16-bit `message` field
+    ///   would leave `crdpq_command_payload_t`'s own 260B size untouched, so nothing else in
+    ///   this file would go red for it.
+    /// - `windowId`/`notifyIconId` are asymmetric, byte-distinct patterns, so a field swap, a
+    ///   byte-order mistake, or a memcpy that shifted the payload cannot produce a passing
+    ///   result by symmetry -- each assertion below can only hold for its own field's bytes.
+    @Test("adr/0014: a NOTIFY_EVENT command's three fields survive post/drain bit-exact")
+    func notifyEventRoundTrip() {
+        let q = crdpq_outbound_create(nil, nil)
+        defer { crdpq_outbound_destroy(q) }
+
+        var cmd = CrdpCommand()
+        cmd.type = CRDPQ_CMD_NOTIFY_EVENT
+        cmd.payload.notifyEvent.windowId = 0xAABB_CCDD
+        cmd.payload.notifyEvent.notifyIconId = 0x1122_3344
+        cmd.payload.notifyEvent.message = 0xFFFF_FFFF
+        #expect(crdpq_outbound_post(q, &cmd))
+
+        var drained: [CrdpCommand] = []
+        let visited = withUnsafeMutablePointer(to: &drained) { outPtr in
+            crdpq_outbound_drain(
+                q,
+                { cmd, vctx in
+                    vctx!.assumingMemoryBound(to: [CrdpCommand].self).pointee.append(cmd!.pointee)
+                },
+                UnsafeMutableRawPointer(outPtr)
+            )
+        }
+        #expect(visited == 1)
+        #expect(drained.count == 1)
+        guard let seen = drained.first else { return }
+        #expect(seen.type == CRDPQ_CMD_NOTIFY_EVENT)
+        #expect(seen.payload.notifyEvent.windowId == 0xAABB_CCDD)
+        #expect(seen.payload.notifyEvent.notifyIconId == 0x1122_3344)
+        #expect(seen.payload.notifyEvent.message == 0xFFFF_FFFF)
+    }
+
+    /// The other half of the seal contract (crdpq.h:934-937; post side at :918-924), which `basicSemantics` above
+    /// only pins from the post side (`crdpq_outbound_post` returning false). A rejected post
+    /// must also leave NOTHING behind for a later drain to hand to `crb_outbound_visitor` --
+    /// otherwise a command issued after `-shutdownAndWait` could still reach a RAIL context
+    /// that teardown has already torn down. Cheap to state, and the tray-click lane
+    /// (adr/0014) depends on it: a click landing during shutdown must be dropped, not queued.
+    @Test("a post rejected by seal leaves nothing for a later drain")
+    func sealedPostDrainsNothing() {
+        let q = crdpq_outbound_create(nil, nil)
+        defer { crdpq_outbound_destroy(q) }
+
+        crdpq_outbound_seal(q)
+        #expect(crdpq_outbound_is_sealed(q))
+
+        var cmd = CrdpCommand()
+        cmd.type = CRDPQ_CMD_NOTIFY_EVENT
+        cmd.payload.notifyEvent.windowId = 7
+        cmd.payload.notifyEvent.notifyIconId = 1
+        cmd.payload.notifyEvent.message = 0x0000_0201
+        #expect(!crdpq_outbound_post(q, &cmd))
+
+        var drained: [CrdpCommand] = []
+        let visited = withUnsafeMutablePointer(to: &drained) { outPtr in
+            crdpq_outbound_drain(
+                q,
+                { cmd, vctx in
+                    vctx!.assumingMemoryBound(to: [CrdpCommand].self).pointee.append(cmd!.pointee)
+                },
+                UnsafeMutableRawPointer(outPtr)
+            )
+        }
+        #expect(visited == 0)
+        #expect(drained.isEmpty)
+        // A seal-rejected post is expected post-shutdown behavior, not an overflow --
+        // crdpq.h:941-942 excludes it from this counter deliberately, and CRSession's
+        // `outboundPostDroppedCount` doc comment depends on that exclusion being real.
+        #expect(crdpq_outbound_dropped_count(q) == 0)
+    }
+
     @Test("wakeup fires at most once per undrained batch")
     func wakeupCoalesced() {
         let counter = CRDPQAtomicCounter()
