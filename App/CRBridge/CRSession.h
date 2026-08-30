@@ -95,6 +95,22 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// consumer can count deferred-protocol evidence separately from genuine converter/store
 /// failures.
 @property (nonatomic, readonly) BOOL iconCached;
+/// NotifyIconCreate/Update only. `NOTIFY_ICON_STATE_ORDER.version` (freerdp/window.h:242),
+/// meaningful only when `notifyIconVersionPresent` is `YES` — the order's
+/// `WINDOW_ORDER_FIELD_NOTIFY_VERSION` (0x8) bit; upstream only parses the field inside that
+/// bit's `if` (libfreerdp/core/window.c:948-954), so a bare 0 here without the flag means
+/// "the order said nothing about the version", never "version 0".
+///
+/// **Observation only (adr/0014 §7)**: nothing in this client's behavior depends on it. It
+/// exists because MS-RDPERP attaches a version precondition to the `NIN_*`/`WM_CONTEXTMENU`
+/// notify messages, and adr/0014 §1 deliberately ships the version-free
+/// `WM_LBUTTONDOWN`/`WM_LBUTTONUP` pair instead precisely because that precondition was
+/// invisible to us. Counting what real servers actually send is the evidence a later round
+/// needs before that choice can be revisited.
+@property (nonatomic, readonly) uint32_t notifyIconVersion;
+/// NotifyIconCreate/Update only. `YES` iff this order carried
+/// `WINDOW_ORDER_FIELD_NOTIFY_VERSION` — see `notifyIconVersion` above.
+@property (nonatomic, readonly) BOOL notifyIconVersionPresent;
 /// WindowCreate/Update.fieldFlags; MonitoredDesktop.fieldFlags. Gates which of
 /// offsetX/offsetY (together), width/height (together), and show below are actually
 /// meaningful for a given WindowUpdate — an unset bit means "unchanged from this window's
@@ -361,6 +377,38 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// `TrayStatusController.Diagnostics.storeOverflowCount`.
 @property (nonatomic, readonly) uint64_t iconStoreOverflowCount;
 
+/// Cumulative count of OUTBOUND commands `crb_outbound_visitor` threw away because the RAIL
+/// channel wasn't connected when T_rdp drained them (W4a review M3 — it has counted and
+/// `WLog_WARN`ed this since then; adr/0014 §5 is simply the first reader). Real, visible data
+/// loss, not a soft signal: a whole batch posted before RAIL connects drops every command in
+/// it. Cumulative for this instance's whole lifetime, same shape and same
+/// survives-a-reconnect semantics as `droppedEventsCount`/`iconStoreOverflowCount` above.
+/// An acceptance gate that asserts a send actually reached the wire layer must read this
+/// before and after and require a zero delta — a `crdpq_outbound_post` returning true only
+/// says the command was enqueued, never that RAIL was there to receive it.
+@property (nonatomic, readonly) uint64_t outboundDroppedNoRailCount;
+
+/// Passthrough of the outbound lane's own `crdpq_outbound_dropped_count` — the POST-side
+/// counterpart to `outboundDroppedNoRailCount` above (which is a DRAIN-side count). Counts
+/// `crdpq_outbound_post` calls rejected because the back buffer was at its configured
+/// capacity ceiling and full, or because growth failed under memory pressure. Cumulative and
+/// monotonic, same dropped-count-for-alerting shape as `droppedEventsCount` on the inbound
+/// lane.
+///
+/// Deliberately does NOT count posts rejected for having already been sealed
+/// (`crdpq_outbound_seal`, i.e. after `-shutdownAndWait`) — crdpq.h treats that as expected
+/// post-shutdown behavior rather than an overflow, so a send issued after shutdown vanishes
+/// from BOTH outbound counters. Only the two live-session causes above are visible here.
+///
+/// Every outbound method on this interface is `void`: a caller cannot otherwise tell an
+/// enqueued command from a rejected one. Reading this before and after a send and requiring a
+/// zero delta establishes that the command was not rejected for capacity or allocation — the
+/// strongest post-side claim available, given the seal exclusion above — which is what makes
+/// it the necessary companion to `outboundDroppedNoRailCount`: the two counters bracket the
+/// queue, and a gate that checks only the drain-side one passes green on zero commands ever
+/// having been enqueued at all.
+@property (nonatomic, readonly) uint64_t outboundPostDroppedCount;
+
 /// Set (non-nil) if the most recent `-start` call's connection attempt failed before any
 /// protocol traffic occurred (DNS/TCP/TLS/NLA/activation failure) — read this after
 /// observing no HandshakeFlags event within a reasonable timeout. Cleared at the start of
@@ -452,6 +500,35 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// Fire-and-forget like `-sendSysCommand:command:` -- silently does nothing if the session
 /// isn't connected.
 - (void)sendWindowMove:(uint32_t)windowId left:(int32_t)left top:(int32_t)top right:(int32_t)right bottom:(int32_t)bottom;
+
+/// adr/0014 §1 (Phase 2 W6's outbound tray-click lane): posts a RAIL ClientNotifyEvent for
+/// one notification-area icon onto the outbound lane -- `RAIL_NOTIFY_EVENT_ORDER
+/// { windowId, notifyIconId, message }` (freerdp/rail.h:433-438), sent via
+/// `RailClientContext.ClientNotifyEvent` (freerdp/client/rail.h:58-59) by
+/// `crb_outbound_visitor` when T_rdp drains it, exactly like every other outbound method on
+/// this header. `windowId`/`notifyIconId` are the icon's own wire identity, verbatim from the
+/// `NotifyIconCreate`/`Update` order that introduced it -- a notify event is SELF-ADDRESSED
+/// (the server routes it by this pair), which is why sending one requires no activation or
+/// focus change of any kind.
+///
+/// **`message` is `uint32_t`, NOT `uint16_t`.** Its `-sendSysCommand:command:` sibling above
+/// takes a `uint16_t` because `RAIL_SYSCOMMAND_ORDER.command` is UINT16 (rail.h:430); this
+/// wire field is UINT32 (rail.h:437). The two methods are otherwise near-identical, so the
+/// width is called out here rather than left to be rediscovered: a `NIN_*` message
+/// (NIN_SELECT = 0x400, rail.h:145) still fits 16 bits, but nothing about the protocol
+/// promises that for future values, and silently narrowing a wire UINT32 is not this
+/// transport's call to make. Constant-agnostic like `-sendSysCommand:command:` -- the caller
+/// (`RemoteWindowRegistry`, via `MacdowsCore.TrayNotifyEvent`) owns which `WM_*`/`NIN_*`
+/// value means what.
+///
+/// Fire-and-forget, and more emphatically so than its siblings: MS-RDPERP 3.3.5.2.5.4 gives
+/// the Client Notification Event PDU **zero delivery acknowledgement** -- no response PDU, no
+/// error code, no ExecResult-style late verdict. There is no observable difference between
+/// "the server acted on it" and "the server discarded it"; a caller may only ever conclude
+/// that it was SENT. Silently does nothing if the session isn't connected, and (like every
+/// other outbound command) is dropped and counted in `outboundDroppedNoRailCount` if the RAIL
+/// channel isn't up yet.
+- (void)sendNotifyEvent:(uint32_t)windowId notifyIconId:(uint32_t)notifyIconId message:(uint32_t)message;
 
 /// W4c: one physical mouse button, in RDP's own PTR_FLAGS_BUTTON1/2/3 numbering (left/
 /// right/middle) -- deliberately not NSEvent.buttonNumber's own scheme (0/1/2), so this

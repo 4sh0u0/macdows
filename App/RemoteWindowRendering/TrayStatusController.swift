@@ -29,27 +29,28 @@ import os
 /// exhaustion/the deferred `CACHED_ICON` variant, adr/0013 §2) still falls back to the same
 /// placeholder, counted via `Diagnostics.iconSkippedCount` -- fail-open, not silent.
 ///
-/// **One real gap remains, flagged rather than worked around:**
-///
-/// 2. **No outbound wire lane for tray clicks exists in CRBridge today.** FreeRDP DOES define
-///    one at the RAIL layer -- `RAIL_NOTIFY_EVENT_ORDER { windowId, notifyIconId, message }`
-///    (`ThirdParty/FreeRDP/include/freerdp/rail.h:437`) sent via
-///    `RailClientContext.ClientNotifyEvent` (`freerdp/client/rail.h:58-59`), with `message`
-///    values like `WM_LBUTTONDOWN`/`WM_LBUTTONUP`/`NIN_SELECT` (`rail.h:135-150`) -- but
-///    `CRSession.h` exposes no `-sendNotifyEvent:...` method for it, unlike the
-///    `-sendSysCommand:command:` lane `RemoteWindowRegistry.handleChromeAction` already uses
-///    for traffic-light actions. `handleLeftClick(notifyIconId:ownerWindowId:)` below only
-///    LOGS a click for now, rather than inventing wire behavior this round — adding the
-///    CRBridge-side send method is the natural next step once that contract change is made
-///    (mirroring `sendSysCommand`'s own shape almost exactly), but it's a CRBridge-boundary
-///    change, out of scope for this round's App/MacdowsCore-only assignment.
+/// **Gap 2 (no outbound wire lane for tray clicks) is CLOSED by adr/0014.** It used to read:
+/// FreeRDP defines `RAIL_NOTIFY_EVENT_ORDER { windowId, notifyIconId, message }`
+/// (`ThirdParty/FreeRDP/include/freerdp/rail.h:433-438`) sent via
+/// `RailClientContext.ClientNotifyEvent` (`freerdp/client/rail.h:58-59`), but `CRSession.h`
+/// exposed no `-sendNotifyEvent:...` method for it, so a click could only be LOGGED. adr/0014
+/// added that method (and `CRDPQ_CMD_NOTIFY_EVENT` behind it, appended to the same outbound
+/// queue every other outbound command already rides — no new mechanism); `handleLeftClick(
+/// tag:)` below now hands the unpacked key to `onLeftClick`, which `RemoteWindowRegistry`
+/// wires to two `CRSession.sendNotifyEvent` calls: `WM_LBUTTONDOWN` then `WM_LBUTTONUP`
+/// (`MacdowsCore.TrayNotifyEvent.leftClickSequence`). What remains intentionally out of
+/// scope, per adr/0014 §1: `NIN_SELECT` and the rest of the `NIN_*` family (their MS-RDPERP
+/// version precondition is unverifiable from here — see `TrayNotifyEvent`'s own doc comment),
+/// right-click/`WM_CONTEXTMENU`, double-click, and balloons. The W6 degradation form is
+/// otherwise unchanged.
 @MainActor
 final class TrayStatusController {
     private var model = TrayModel()
     /// One `NSStatusItem` per live notify icon, keyed the same way `model.icons` is (adr/0008-
     /// aligned `(windowId, notifyIconId)` composite identity — see `TrayModel`'s own doc
     /// comment for why `notifyIconId` alone isn't a safe key). Reset (along with `model`) by
-    /// `removeAll()`; `createsSeen`/`updatesSeen`/`deletesSeen` below are NOT reset by it —
+    /// `removeAll()`; EVERY counter below (`createsSeen`/`updatesSeen`/`deletesSeen`, the
+    /// adr/0013 icon counters, and adr/0014's own click/PDU/version counters) is NOT reset —
     /// same "cumulative for this registry's lifetime, not reset on reconnect" precedent
     /// `RemoteWindowRegistry`'s own `zOrderArraysReceivedCount`/`zOrderAppliesPerformedCount`/
     /// `zOrderSkippedUnknownTotal` already establish (see those ivars' own doc comment) — a
@@ -97,6 +98,50 @@ final class TrayStatusController {
     /// reference) on every notify-icon order rather than pulled from here, keeping this type's
     /// dependency surface at "AppKit + values handed to it", exactly as before.
     private(set) var storeOverflowCount = 0
+    /// adr/0014 §1: left clicks this controller actually handed to `onLeftClick` -- one per
+    /// CLICK, not per PDU (see `notifyEventsSent`). Cumulative, NOT reset by `removeAll()`,
+    /// same post-shutdown-read reasoning as `createsSeen` above.
+    private(set) var clicksForwarded = 0
+    /// adr/0014 §4: left clicks dropped because the icon's `NSStatusItem` was already gone by
+    /// the time the click handler ran. Expected to stay 0 in steady state -- AppKit removes a
+    /// status item's button along with the item, so a click arriving for a key this
+    /// controller no longer tracks means the two got out of sync, which is a BUG SIGNAL, not
+    /// a routine race. Deliberately logged at `.warning` EVERY time rather than once
+    /// (unlike the log-once budgets elsewhere in this file): if this ever fires, the
+    /// frequency and the keys involved are the diagnosis. Cumulative, same discipline as
+    /// every counter above.
+    private(set) var clicksDroppedIconGone = 0
+    /// adr/0014 §1/§5: individual ClientNotifyEvent PDUs `RemoteWindowRegistry` reported
+    /// having posted, pushed in per PDU (this type never touches `CRSession` itself -- same
+    /// "values handed to it" split `storeOverflowCount` above already establishes).
+    ///
+    /// v1 invariant: `notifyEventsSent == 2 * clicksForwarded`, since one click is exactly
+    /// the `WM_LBUTTONDOWN`/`WM_LBUTTONUP` pair. Carrying BOTH counters is a deliberate,
+    /// documented exception to adr/0013 §6.9's "diagnostics don't carry derivable values"
+    /// rule: the derivation IS the assertion. The day the sequence changes (a `NIN_*`
+    /// message, a double-click, a right-click lane), that identity breaks in an acceptance
+    /// gate instead of silently redefining what a "click" costs on the wire.
+    private(set) var notifyEventsSent = 0
+    /// adr/0014 §7: every distinct `NOTIFY_ICON_STATE_ORDER.version` this controller has been
+    /// told about, up to `maxObservedVersions`. Observation only -- nothing branches on it; it
+    /// exists so the MS-RDPERP precondition that ruled `NIN_SELECT` out of v1 stops being
+    /// invisible. Cumulative like every counter above (a post-shutdown diagnostics read must
+    /// still see what the session actually sent), which also makes the
+    /// log-once-per-distinct-version budget in `noteNotifyIconVersion` exactly once per value
+    /// for this controller's lifetime.
+    private(set) var observedNotifyIconVersions: Set<UInt32> = []
+    /// adr/0014 §9.1: hard cap on the set above. This is a `UInt32` straight off the wire and
+    /// the server chooses it -- an unbounded `Set` keyed on server-controlled data grows once
+    /// per distinct value a peer feels like sending, which is a memory-growth surface, not a
+    /// diagnostic. 16 is far past any plausible number of real notify-icon versions (the
+    /// protocol's own are single digits) while staying small enough that reaching it is
+    /// itself the signal: a session at the cap is sending values this observation was never
+    /// designed to characterize, and its diagnostics line says `(capped)` so a reader knows
+    /// the set is a prefix of what arrived rather than the whole of it. Values past the cap
+    /// are neither stored nor logged -- the log budget is the set membership check, so
+    /// dropping the insert drops the log with it, deliberately: an uncapped LOG of
+    /// server-chosen values is the same unbounded surface one indirection further out.
+    static let maxObservedVersions = 16
 
     private static let logger = Logger(subsystem: "dev.haru.macdows", category: "TrayStatusController")
 
@@ -149,6 +194,23 @@ final class TrayStatusController {
         /// Cumulative; the C side-store's slot-exhaustion counter (adr/0013 §1), as last
         /// pushed in by `RemoteWindowRegistry`.
         let storeOverflowCount: Int
+        /// Cumulative; see `clicksForwarded`'s own doc comment (adr/0014 §5).
+        let clicksForwarded: Int
+        /// Cumulative; see `clicksDroppedIconGone`'s own doc comment -- an acceptance gate
+        /// asserts this is 0, because a nonzero value is a status-item bookkeeping bug, not
+        /// a tolerated race.
+        let clicksDroppedIconGone: Int
+        /// Cumulative; see `notifyEventsSent`'s own doc comment, including why this and
+        /// `clicksForwarded` are BOTH carried despite `notifyEventsSent == 2 *
+        /// clicksForwarded` holding in v1 (adr/0014 §5: the identity is the assertion).
+        let notifyEventsSent: Int
+        /// adr/0014 §7 observation: the distinct notify-icon versions seen this run, sorted
+        /// so a diagnostics line is stable across runs. Empty when no order ever carried the
+        /// `WINDOW_ORDER_FIELD_NOTIFY_VERSION` bit -- which is itself the observation. Bounded
+        /// by `TrayStatusController.maxObservedVersions` (adr/0014 §9.1); a reader seeing
+        /// exactly that many values must treat this as a PREFIX of what arrived, not the whole
+        /// set (`Tools/window-smoke` prints `(capped)` for exactly that case).
+        let observedNotifyIconVersions: [UInt32]
     }
     func diagnostics() -> Diagnostics {
         Diagnostics(
@@ -156,7 +218,10 @@ final class TrayStatusController {
             liveCount: statusItems.count, realIconCount: realIconKeys.count,
             iconSkippedCount: iconSkippedCount, cachedIconCount: cachedIconCount,
             realIconMaxObserved: realIconMaxObserved,
-            storeOverflowCount: storeOverflowCount
+            storeOverflowCount: storeOverflowCount,
+            clicksForwarded: clicksForwarded, clicksDroppedIconGone: clicksDroppedIconGone,
+            notifyEventsSent: notifyEventsSent,
+            observedNotifyIconVersions: observedNotifyIconVersions.sorted()
         )
     }
 
@@ -165,6 +230,34 @@ final class TrayStatusController {
     /// the C side, so this is a plain assignment rather than an accumulation.
     func noteStoreOverflowCount(_ count: Int) {
         storeOverflowCount = count
+    }
+
+    /// adr/0014 §1/§5: one ClientNotifyEvent PDU was posted for a click this controller
+    /// forwarded. Pushed in by `RemoteWindowRegistry` (the `CRSession` owner) once per PDU,
+    /// same "Registry sends, controller counts" split `noteStoreOverflowCount` above already
+    /// establishes -- this type never touches the session. Counting the POST, not a delivery:
+    /// MS-RDPERP 3.3.5.2.5.4 acknowledges nothing (see `CRSession.sendNotifyEvent`'s own doc
+    /// comment), so "sent" is the strongest fact any counter here could ever hold.
+    func noteNotifyEventSent() {
+        notifyEventsSent += 1
+    }
+
+    /// adr/0014 §7: one `NotifyIconCreate`/`Update` order carried
+    /// `WINDOW_ORDER_FIELD_NOTIFY_VERSION`. Latches the value and logs at `.info` exactly once
+    /// per distinct version (the set membership check IS the budget -- no separate
+    /// warned-once flag), since the interesting event is "a version we hadn't seen", not the
+    /// per-order repetition of one the server sends on every update.
+    func noteNotifyIconVersion(_ version: UInt32) {
+        // adr/0014 §9.1: stop at the cap. Checked BEFORE the insert (never by trimming
+        // afterwards), so the set is bounded at every instant rather than on average. Once at
+        // the cap this returns for EVERY value, new or already-seen -- which costs nothing,
+        // since an already-seen value's only effect would have been the second guard below
+        // rejecting it anyway (it was logged the first time).
+        guard observedNotifyIconVersions.count < Self.maxObservedVersions else { return }
+        guard observedNotifyIconVersions.insert(version).inserted else { return }
+        Self.logger.info(
+            "notify icon order carried version=\(version, privacy: .public) (adr/0014 §7 observation only -- MS-RDPERP makes the NIN_ message family conditional on this; v1 sends the version-free WM_LBUTTONDOWN/WM_LBUTTONUP pair regardless)"
+        )
     }
 
     /// The wire payload one NotifyIconCreate/Update order carries for rendering purposes
@@ -268,8 +361,8 @@ final class TrayStatusController {
     /// `.disconnected` case, and the explicit `prepareForReconnect()` driver), matching how
     /// that method already tears down every
     /// other per-connection resource it owns. Clears the LIVE model/items only -- see
-    /// `statusItems`'s own doc comment for why `createsSeen`/`updatesSeen`/`deletesSeen` are
-    /// deliberately NOT reset here.
+    /// `statusItems`'s own doc comment for why none of this type's counters (including
+    /// adr/0014's `clicksForwarded`/`notifyEventsSent`) are reset here.
     func removeAll() {
         for (_, item) in statusItems {
             NSStatusBar.system.removeStatusItem(item)
@@ -381,7 +474,12 @@ final class TrayStatusController {
     /// `UInt32` field widths for the same "this codebase's one and only target" reasoning).
     /// `windowId` occupies the high 32 bits, `notifyIconId` the low 32 -- an arbitrary but
     /// internally consistent choice, `unpackTag` is this function's exact inverse.
-    private static func packTag(windowId: UInt32, notifyIconId: UInt32) -> Int {
+    ///
+    /// Internal (not `private`) since adr/0014: `RemoteWindowRegistry.debugSimulateTrayClick`
+    /// builds its tag with THIS function so the offline harness path and the real
+    /// `NSStatusBarButton.tag` path can never encode the key differently -- a second,
+    /// hand-rolled packing in the harness would test its own arithmetic instead of this one's.
+    static func packTag(windowId: UInt32, notifyIconId: UInt32) -> Int {
         Int(bitPattern: UInt(UInt64(windowId) << 32 | UInt64(notifyIconId)))
     }
 
@@ -390,14 +488,52 @@ final class TrayStatusController {
         return (UInt32(truncatingIfNeeded: raw >> 32), UInt32(truncatingIfNeeded: raw))
     }
 
+    /// Called by `RemoteWindowRegistry` (which owns the `CRSession`) for each forwarded left
+    /// click, with the clicked icon's own `(windowId, notifyIconId)` wire identity. `nil` (the
+    /// default) is a safe no-op -- nothing here requires it ever being set, matching
+    /// `CRSession.onEventsAvailable`'s own precedent.
+    var onLeftClick: ((_ windowId: UInt32, _ notifyIconId: UInt32) -> Void)?
+
     /// Left-click handler (degradation form: no right-click menu is ever installed, see
-    /// `upsertStatusItem`'s own comment on why that alone excludes right-click). See this
-    /// type's own doc comment, gap 2, for why this only LOGS rather than forwarding a real
-    /// `RAIL_NOTIFY_EVENT_ORDER` to the session.
+    /// `upsertStatusItem`'s own comment on why that alone excludes right-click). AppKit entry
+    /// point only -- everything that isn't "get the key out of the sender" lives in
+    /// `handleLeftClick(tag:)`, so the offline harness path can exercise the identical logic
+    /// (`RemoteWindowRegistry.debugSimulateTrayClick`) with AppKit event delivery as the ONLY
+    /// missing piece.
     @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
-        let (windowId, notifyIconId) = Self.unpackTag(sender.tag)
+        handleLeftClick(tag: sender.tag)
+    }
+
+    /// adr/0014 §1: unpacks the button tag, re-checks that the icon is still live, and hands
+    /// the key to `onLeftClick`. The liveness re-check is not ceremony: a click is dispatched
+    /// by AppKit, so a `NotifyIconDelete` drained between the press and this call would
+    /// otherwise send a notify event addressed at an icon the server has already destroyed.
+    ///
+    /// **This path deliberately does NOT touch `FocusAuthority`** (adr/0014 §3): no
+    /// `activateWindow`, no `focusAuthority.localActivate`, no keyboard-lane interaction of
+    /// any kind. A notify event is SELF-ADDRESSED -- the server routes it by the PDU's own
+    /// `windowId`/`notifyIconId` pair, so no window has to be focused for it to land. Adding
+    /// an activation here would open a focus-convergence window (adr/0012 §2) against an
+    /// icon's owner, which for a tray-only app is typically a message-only window that never
+    /// becomes the server's active window at all -- gating the keyboard lane for the full
+    /// 5-10s deadline every time the user clicks a tray icon, in exchange for nothing this
+    /// PDU needs.
+    func handleLeftClick(tag: Int) {
+        let (windowId, notifyIconId) = Self.unpackTag(tag)
+        let key = NotifyIconState(windowId: windowId, notifyIconId: notifyIconId)
+        guard statusItems[key] != nil else {
+            clicksDroppedIconGone += 1
+            // Every time, not once (see `clicksDroppedIconGone`'s own doc comment): this is
+            // a bug signal, and its rate and its keys are the diagnosis.
+            Self.logger.warning(
+                "tray icon left-clicked notifyIconId=\(notifyIconId, privacy: .public) ownerWindowId=\(windowId, privacy: .public) -- but no live NSStatusItem is tracked for that key; dropping the click rather than addressing a ClientNotifyEvent at a destroyed icon (droppedIconGone=\(self.clicksDroppedIconGone, privacy: .public))"
+            )
+            return
+        }
+        clicksForwarded += 1
         Self.logger.info(
-            "tray icon left-clicked notifyIconId=\(notifyIconId, privacy: .public) ownerWindowId=\(windowId, privacy: .public) -- NOT forwarded to the session: CRBridge exposes no outbound RAIL_NOTIFY_EVENT_ORDER lane yet (see TrayStatusController's own doc comment, gap 2 -- FreeRDP's RailClientContext.ClientNotifyEvent exists at the wire layer, but CRSession.h has no send method for it, unlike -sendSysCommand:command: for window chrome actions)"
+            "tray icon left-clicked notifyIconId=\(notifyIconId, privacy: .public) ownerWindowId=\(windowId, privacy: .public) -- forwarding as a ClientNotifyEvent WM_LBUTTONDOWN/WM_LBUTTONUP pair (adr/0014 §1; no focus/activation is involved, §3)"
         )
+        onLeftClick?(windowId, notifyIconId)
     }
 }

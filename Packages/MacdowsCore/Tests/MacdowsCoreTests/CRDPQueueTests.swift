@@ -528,5 +528,19 @@ struct CRDPQueueLayoutTests {
         // the outbound lane (crdpq_outbound_t) is explicitly out of this ADR's scope (§6).
         #expect(MemoryLayout<crdpq_command_payload_t>.size == 260)
         #expect(MemoryLayout<CrdpCommand>.size == 264)
+        // adr/0014 §4: three UINT32s = 12B. Pinned separately because the two union-level
+        // expectations above CANNOT see this member at all -- it is nowhere near the 260B
+        // `crdpq_cmd_execute_t` maximum. The size pin alone is NOT enough to catch the
+        // predicted bug for this command -- narrowing `message` to `uint16_t` (plausible,
+        // since its `crdpq_cmd_sys_command_t` sibling really is UINT16 at rail.h:430 while
+        // `RAIL_NOTIFY_EVENT_ORDER.message` is UINT32 at rail.h:437) leaves sizeof at 12
+        // too, the two lost bytes absorbed by tail padding to the struct's 4B alignment.
+        // The member-width expectation below is the one that goes red on a narrowing:
+        // Swift imports a narrowed field as UInt16, and size(ofValue:) reports 2, not 4.
+        #expect(MemoryLayout<crdpq_cmd_notify_event_t>.size == 12)
+        let notifyEventProbe = crdpq_cmd_notify_event_t()
+        #expect(MemoryLayout.size(ofValue: notifyEventProbe.message) == 4)
+        #expect(MemoryLayout.size(ofValue: notifyEventProbe.windowId) == 4)
+        #expect(MemoryLayout.size(ofValue: notifyEventProbe.notifyIconId) == 4)
     }
 }

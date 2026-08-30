@@ -66,6 +66,9 @@
 @property (nonatomic) uint32_t iconHeight;
 @property (nonatomic) BOOL iconSkipped;
 @property (nonatomic) BOOL iconCached;
+/* adr/0014 §7: observation only -- see CRSession.h's own doc comments. */
+@property (nonatomic) uint32_t notifyIconVersion;
+@property (nonatomic) BOOL notifyIconVersionPresent;
 @property (nonatomic) uint32_t fieldFlags;
 @property (nonatomic) NSString *title;
 @property (nonatomic) int32_t offsetX;
@@ -212,6 +215,12 @@ static CRDPEvent *CRDPEventFromCrdpEvent(const CrdpEvent *ev, crdpq_icon_store_t
             out.notifyIconId = ni->notifyIconId;
             out.iconSkipped = ni->iconSkipped ? YES : NO;
             out.iconCached = ni->iconCached ? YES : NO;
+            /* adr/0014 §7: pure passthrough of the bit-gated version field -- the flag rides
+             * along so a consumer can tell "the order said nothing" from "the order said 0",
+             * the same distinction toolTipPresent carries below. No behavior anywhere reads
+             * this; TrayStatusController only latches and logs the distinct values seen. */
+            out.notifyIconVersion = ni->version;
+            out.notifyIconVersionPresent = ni->versionPresent ? YES : NO;
             /* adr/0013 §1: toolTipPresent distinguishes "the order didn't mention the
              * tooltip" from "the order set it to the empty string" -- the property stays
              * nil in the first case (see CRSession.h), so a delta-merging consumer can keep
@@ -641,6 +650,19 @@ static BOOL crb_notify_icon_common(rdpContext *context, const WINDOW_ORDER_INFO 
     ev.type = isCreate ? CRDPQ_EVENT_NOTIFY_ICON_CREATE : CRDPQ_EVENT_NOTIFY_ICON_UPDATE;
     ev.payload.notifyIcon.windowId = orderInfo->windowId;
     ev.payload.notifyIcon.notifyIconId = orderInfo->notifyIconId;
+
+    /* adr/0014 §7: NOTIFY_ICON_STATE_ORDER.version (freerdp/window.h:242), bit-gated on
+     * WINDOW_ORDER_FIELD_NOTIFY_VERSION (0x8) exactly like the tooltip below -- upstream
+     * only reads the field inside that same bit's `if` (libfreerdp/core/window.c:948-954),
+     * so reading it unconditionally would surface whatever the memset left behind. Carried
+     * for COUNTING/LOGGING only: MS-RDPERP makes the NIN_ family's availability conditional
+     * on this value, which is exactly why adr/0014 §1's v1 sends the version-free
+     * WM_LBUTTONDOWN/WM_LBUTTONUP pair instead -- nothing downstream branches on it. */
+    if (orderInfo->fieldFlags & WINDOW_ORDER_FIELD_NOTIFY_VERSION)
+    {
+        ev.payload.notifyIcon.version = notifyIconState->version;
+        ev.payload.notifyIcon.versionPresent = 1;
+    }
 
     /* adr/0013 §1: bit-gated exactly like crb_window_common's TITLE handling one function
      * group up -- WINDOW_ORDER_FIELD_NOTIFY_TIP absent means "this order says nothing about
@@ -1612,6 +1634,21 @@ static void crb_outbound_visitor(const CrdpCommand *cmd, void *vctx)
                 rail->ClientSystemCommand(rail, &sc);
             break;
         }
+        case CRDPQ_CMD_NOTIFY_EVENT:
+        {
+            RAIL_NOTIFY_EVENT_ORDER notify;
+            memset(&notify, 0, sizeof(notify));
+            notify.windowId = cmd->payload.notifyEvent.windowId;
+            notify.notifyIconId = cmd->payload.notifyEvent.notifyIconId;
+            /* No narrowing cast, deliberately (adr/0014 §4): RAIL_NOTIFY_EVENT_ORDER::message
+             * is UINT32 (freerdp/rail.h:437), unlike RAIL_SYSCOMMAND_ORDER::command's UINT16
+             * one case up -- the two cases look alike enough that copying that case's
+             * (UINT16) cast down here would silently truncate every NIN_ value. */
+            notify.message = cmd->payload.notifyEvent.message;
+            if (rail->ClientNotifyEvent)
+                rail->ClientNotifyEvent(rail, &notify);
+            break;
+        }
         case CRDPQ_CMD_INPUT:
         {
             rdpContext *context = (rdpContext *)rail->custom;
@@ -2255,6 +2292,18 @@ cleanup:
     return _iconStore ? (uint64_t)crdpq_icon_store_overflow_count(_iconStore) : 0;
 }
 
+- (uint64_t)outboundDroppedNoRailCount
+{
+    return atomic_load(&_outboundDroppedNoRailCount);
+}
+
+- (uint64_t)outboundPostDroppedCount
+{
+    /* Passthrough, same shape as -droppedEventsCount above for the inbound lane -- the
+     * counter lives in the queue itself, this is not a second tally. */
+    return _outboundQueue ? (uint64_t)crdpq_outbound_dropped_count(_outboundQueue) : 0;
+}
+
 - (nullable IOSurfaceRef)copyPublishedSurface:(uint32_t)surfaceId
 {
     if (!_surfaceSlots)
@@ -2315,6 +2364,21 @@ cleanup:
     cmd.type = CRDPQ_CMD_SYS_COMMAND;
     cmd.payload.sysCommand.windowId = windowId;
     cmd.payload.sysCommand.command = command;
+    crdpq_outbound_post(_outboundQueue, &cmd);
+}
+
+- (void)sendNotifyEvent:(uint32_t)windowId notifyIconId:(uint32_t)notifyIconId message:(uint32_t)message
+{
+    if (!_outboundQueue)
+        return;
+    CrdpCommand cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = CRDPQ_CMD_NOTIFY_EVENT;
+    cmd.payload.notifyEvent.windowId = windowId;
+    cmd.payload.notifyEvent.notifyIconId = notifyIconId;
+    /* uint32_t all the way through -- RAIL_NOTIFY_EVENT_ORDER::message is UINT32
+     * (freerdp/rail.h:437), unlike -sendSysCommand:command:'s UINT16 (rail.h:430). */
+    cmd.payload.notifyEvent.message = message;
     crdpq_outbound_post(_outboundQueue, &cmd);
 }
 

@@ -689,9 +689,12 @@ struct IconStoreTests {
 struct NotifyIconPayloadTests {
     @Test("adr/0013 §1: the grown notify-icon payload stays well under the union's largest member")
     func notifyIconStaysSmallerThanWindowOrder() {
-        // 276 after the R1-finding-3 iconCached append (was 272; crdpq.h's own assert
-        // comment carries the arithmetic).
-        #expect(MemoryLayout<crdpq_notify_icon_t>.size == 276)
+        // 280 after adr/0014 §7's versionPresent/version append (was 276 after the
+        // R1-finding-3 iconCached append, 272 before it; crdpq.h's own assert comment carries
+        // the arithmetic and how the value was measured). The union's own sizes below are
+        // deliberately re-asserted unchanged: the whole point of adr/0013 §1's side-store
+        // split is that growing this event type must not move crdpq_event_payload_t.
+        #expect(MemoryLayout<crdpq_notify_icon_t>.size == 280)
         #expect(MemoryLayout<crdpq_window_order_t>.size == 572)
         #expect(MemoryLayout<crdpq_event_payload_t>.size == 576)
         #expect(MemoryLayout<CrdpEvent>.size == 584)
@@ -713,6 +716,11 @@ struct NotifyIconPayloadTests {
         ev.payload.notifyIcon.iconSkipped = 0
         ev.payload.notifyIcon.iconCached = 1
         ev.payload.notifyIcon.toolTipPresent = 1
+        // adr/0014 §7's appended observation fields. 4 is a deliberately non-zero, non-1
+        // value: `versionPresent` alone can't catch a POD copy that zeroed the payload, and a
+        // 1 would survive being confused with the flag byte sitting immediately before it.
+        ev.payload.notifyIcon.versionPresent = 1
+        ev.payload.notifyIcon.version = 4
         let tip = "Remote tray icon"
         tip.withCString { c in
             crdpq_text_set(&ev.payload.notifyIcon.toolTip, c, strlen(c))
@@ -738,6 +746,8 @@ struct NotifyIconPayloadTests {
         #expect(seen.iconSkipped == 0)
         #expect(seen.iconCached == 1)
         #expect(seen.toolTipPresent == 1)
+        #expect(seen.versionPresent == 1)
+        #expect(seen.version == 4)
         var copy = seen.toolTip
         let text = withUnsafeBytes(of: &copy.bytes) { raw in
             String(cString: raw.bindMemory(to: CChar.self).baseAddress!)

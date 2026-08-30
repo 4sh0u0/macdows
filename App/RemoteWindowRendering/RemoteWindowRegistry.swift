@@ -266,10 +266,12 @@ final class RemoteWindowRegistry {
     /// Phase 2 W6 (docs/plans/phase2.md §2 W6 / §4 W6): owns every `NSStatusItem` this
     /// session's RAIL notify icons map to. Session-scoped, same lifetime discipline
     /// `focusAuthority` above already establishes -- `closeAllWindows()` tears it down via
-    /// `removeAll()`, same as every other per-connection resource this registry owns. See
-    /// `TrayStatusController`'s own doc comment for the two real wire-contract gaps this
-    /// round found (no icon pixel/title data, no outbound click lane) and why neither is
-    /// worked around here.
+    /// `removeAll()`, same as every other per-connection resource this registry owns. Both of
+    /// the wire-contract gaps that type's doc comment used to flag are now closed (icon
+    /// pixels/tooltip by adr/0013, the outbound click lane by adr/0014) -- this registry is
+    /// the AppKit-side half of the second one: it owns the `CRSession`, so it (not the
+    /// controller) performs the `sendNotifyEvent` calls a click turns into, via
+    /// `handleTrayIconClick` below.
     private let trayStatusController = TrayStatusController()
 
     /// W4c review H1: *session-level* modifier state — one physical keyboard, one tracked
@@ -341,6 +343,14 @@ final class RemoteWindowRegistry {
     init(session: CRSession) {
         self.session = session
         self.macKeyboardType = Self.detectKeyboardType()
+        // adr/0014 §1: the tray's only outbound edge. Wired once, here, rather than on every
+        // notify-icon order -- `trayStatusController` outlives every individual icon, and a
+        // per-order assignment would silently depend on an order having arrived before a
+        // click could be handled. `[weak self]` because the controller is owned BY this
+        // registry: a strong capture would be a retain cycle through a stored closure.
+        trayStatusController.onLeftClick = { [weak self] windowId, notifyIconId in
+            self?.handleTrayIconClick(windowId: windowId, notifyIconId: notifyIconId)
+        }
     }
 
     /// adr/0011 §4: `KBGetLayoutType(LMGetKbdType())`, once. Deliberately NOT the
@@ -523,6 +533,7 @@ final class RemoteWindowRegistry {
         // ignored; no consumer wants them yet).
         case .notifyIconCreate:
             trayStatusController.noteStoreOverflowCount(Int(session.iconStoreOverflowCount))
+            noteNotifyIconVersion(from: event)
             trayStatusController.handleNotifyIconCreate(
                 windowId: event.windowId, notifyIconId: event.notifyIconId,
                 ownerWindowTitle: ownerWindowTitle(for: event.windowId),
@@ -530,6 +541,7 @@ final class RemoteWindowRegistry {
             )
         case .notifyIconUpdate:
             trayStatusController.noteStoreOverflowCount(Int(session.iconStoreOverflowCount))
+            noteNotifyIconVersion(from: event)
             trayStatusController.handleNotifyIconUpdate(
                 windowId: event.windowId, notifyIconId: event.notifyIconId,
                 ownerWindowTitle: ownerWindowTitle(for: event.windowId),
@@ -877,6 +889,17 @@ final class RemoteWindowRegistry {
         trayStatusController.diagnostics()
     }
 
+    /// adr/0014 §7: forwards a NotifyIconCreate/Update order's `NOTIFY_ICON_STATE_ORDER.version`
+    /// to the tray controller's observation latch, and ONLY when the order actually carried
+    /// `WINDOW_ORDER_FIELD_NOTIFY_VERSION` -- `CRDPEvent.notifyIconVersion` is 0 both for
+    /// "version 0" and for "no version field", and recording the second as an observation would
+    /// manufacture evidence. Observation only: nothing in the click path reads this (v1 sends
+    /// the version-free WM_LBUTTONDOWN/WM_LBUTTONUP pair unconditionally, adr/0014 §1).
+    private func noteNotifyIconVersion(from event: CRDPEvent) {
+        guard event.notifyIconVersionPresent else { return }
+        trayStatusController.noteNotifyIconVersion(event.notifyIconVersion)
+    }
+
     /// adr/0013 §3: repackages one drained NotifyIconCreate/Update event's icon fields into
     /// the shape `TrayStatusController` consumes. A pure field transcription -- no policy,
     /// which is why it is `static` and lives beside the two call sites rather than inside the
@@ -892,6 +915,52 @@ final class RemoteWindowRegistry {
             skipped: event.iconSkipped,
             cached: event.iconCached,
             toolTip: event.toolTip
+        )
+    }
+
+    /// adr/0014 §1: one left click on a tray icon becomes TWO RAIL ClientNotifyEvent PDUs --
+    /// `WM_LBUTTONDOWN` then `WM_LBUTTONUP` -- posted as two independent outbound commands.
+    /// Their order on the wire is the outbound queue's own FIFO guarantee (adr/0005 §3), not
+    /// anything either PDU encodes, which is why this loops `TrayNotifyEvent.leftClickSequence`
+    /// (an ordered array, see its own doc comment) rather than sending a single compound
+    /// message. `windowId`/`notifyIconId` are the icon's wire identity, forwarded verbatim: a
+    /// notify event is self-addressed, so nothing here consults geometry, focus, or the
+    /// window table at all.
+    ///
+    /// No focus/activation call belongs in this path (adr/0014 §3) -- see
+    /// `TrayStatusController.handleLeftClick(tag:)`'s own doc comment for the full argument;
+    /// the prohibition is stated at the click handler because that is where an "activate the
+    /// owner window first" reflex would land.
+    private func handleTrayIconClick(windowId: UInt32, notifyIconId: UInt32) {
+        for message in TrayNotifyEvent.leftClickSequence {
+            session.sendNotifyEvent(windowId, notifyIconId: notifyIconId, message: message)
+            trayStatusController.noteNotifyEventSent()
+            // Fired per PDU, from the one place a PDU is actually posted, for the same reason
+            // `onWindowMoveSent` exists (see its own doc comment): a harness that re-derived
+            // "what a click sends" from `TrayNotifyEvent` on its own side would be asserting
+            // against its own copy of the sequence, not against what left this process.
+            // `nil` (the default) is a safe no-op.
+            onTrayNotifyEventSent?(windowId, notifyIconId, message)
+        }
+    }
+
+    /// See `handleTrayIconClick`'s own doc comment on why this exists. Diagnostics only --
+    /// not read anywhere on the real rendering path.
+    var onTrayNotifyEventSent: ((_ windowId: UInt32, _ notifyIconId: UInt32, _ message: UInt32) -> Void)?
+
+    /// Diagnostics only (`Tools/window-smoke`'s `WINDOW_SMOKE_TRAY_CLICK` scenario, adr/0014
+    /// §6): drives a tray left click for `(windowId, notifyIconId)` through the REAL path --
+    /// `TrayStatusController.handleLeftClick(tag:)`, entered with the same packed tag
+    /// `upsertStatusItem` writes into the live `NSStatusBarButton`, so the liveness re-check,
+    /// the counters, and this registry's own two-PDU send all execute exactly as they do for a
+    /// user's click. The ONLY thing skipped is AppKit's own event delivery (there is no
+    /// supported way to synthesize a real menu-bar click for another process's status item),
+    /// which is also why this is deliberately not a shortcut straight to `handleTrayIconClick`:
+    /// a harness bypassing the controller would stop covering the drop-if-gone branch that
+    /// makes `clicksDroppedIconGone == 0` a meaningful assertion.
+    func debugSimulateTrayClick(windowId: UInt32, notifyIconId: UInt32) {
+        trayStatusController.handleLeftClick(
+            tag: TrayStatusController.packTag(windowId: windowId, notifyIconId: notifyIconId)
         )
     }
 

@@ -273,7 +273,16 @@ typedef struct {
  *    Win11 sessions re-send their own tray icons as cache references as a matter of
  *    course) so a consumer can count deferred-protocol evidence separately from genuine
  *    converter/store failures — the two demand opposite reactions from an acceptance
- *    gate. Appended per adr/0008 §5's append-only rule. */
+ *    gate. Appended per adr/0008 §5's append-only rule.
+ *  - `versionPresent` / `version`: `NOTIFY_ICON_STATE_ORDER.version` (freerdp/window.h:242),
+ *    gated on `WINDOW_ORDER_FIELD_NOTIFY_VERSION` (0x8) exactly like `toolTipPresent` gates
+ *    the tooltip — upstream only writes the field inside that bit's `if`
+ *    (libfreerdp/core/window.c:948-954), so a 0 with `versionPresent == 0` means "the order
+ *    said nothing about the version", never "version 0". OBSERVATION ONLY (adr/0014 §7):
+ *    nothing in this project reads it for behavior, it is counted/logged so the precondition
+ *    MS-RDPERP attaches to the NIN_ and WM_CONTEXTMENU notify messages stops being invisible
+ *    to us. Appended per adr/0008 §5, with the 1-byte flag before the 4-byte value so it
+ *    lands in `iconCached`'s existing tail padding instead of adding a second padded word. */
 typedef struct {
     uint32_t windowId;
     uint32_t notifyIconId;
@@ -283,17 +292,24 @@ typedef struct {
     uint8_t toolTipPresent;
     crdpq_text_t toolTip;
     uint8_t iconCached;
+    uint8_t versionPresent;
+    uint32_t version;
 } crdpq_notify_icon_t;
 
 /* adr/0008 §5 / adr/0013 §1: measured (not estimated) with clang/arm64 — same discipline as
  * crdpq_window_order_t's own assert comment above. 12 bytes of scalars + crdpq_text_t's 260
  * (256 + uint16_t length + bool truncated, padded to the text struct's own 2-byte alignment)
  * + iconCached's 1 byte, rounded up to the struct's 4-byte alignment = 276 (was 272 before
- * the R1-finding-3 iconCached append, 8 before this ADR). Deliberately well under
- * crdpq_window_order_t's 572 — adr/0013 §1's whole "pixels go to a side store, the event
- * carries a reference" decision exists to keep this event type from becoming the union's
- * largest member. */
-_Static_assert(sizeof(crdpq_notify_icon_t) == 276, "crdpq_notify_icon_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0013 §1)");
+ * the R1-finding-3 iconCached append, 8 before this ADR). adr/0014 §7's version observation
+ * appends versionPresent (1 byte, taken out of iconCached's existing tail padding at offset
+ * 273, costing nothing) + version (4 bytes, aligned to offset 276) = 280 — re-MEASURED, not
+ * predicted (adr/0013 §6.2's discipline): the assert below was compiled at the old value
+ * first and clang reported "expression evaluates to '280 == 276'", then confirmed by a
+ * runtime sizeof/offsetof probe (iconCached@272, versionPresent@273, version@276).
+ * Deliberately still well under crdpq_window_order_t's 572, which remains the union's
+ * largest member — adr/0013 §1's whole "pixels go to a side store, the event carries a
+ * reference" decision exists to keep this event type from becoming that. */
+_Static_assert(sizeof(crdpq_notify_icon_t) == 280, "crdpq_notify_icon_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0013 §1 / adr/0014 §7)");
 
 /** adr/0008 §2a: upper bound on `crdpq_monitored_desktop_t.windowIds`. The protocol's own
  *  hard ceiling is 255 (window.c:1068, a `Stream_Read_UINT8` -- genuinely 1 byte, unlike
@@ -439,10 +455,11 @@ typedef union {
  * adr/0010 §1) is still this union's largest member post-ADR (adr/0008 §4's deliberate
  * "take 96, not 255" bound choice for CRDPQ_MAX_WINDOW_IDS exists specifically to keep it
  * that way, and adr/0013 §1's side-store decision keeps the freshly-grown
- * `crdpq_notify_icon_t` at 272 — under half of it — for the same reason); the union's own
- * alignment is 8 (from `crdpq_surface_mapped_t`'s `uint64_t windowId`, not from
+ * `crdpq_notify_icon_t` at 280 — still under half of it — for the same reason); the union's
+ * own alignment is 8 (from `crdpq_surface_mapped_t`'s `uint64_t windowId`, not from
  * `crdpq_window_order_t`), so 572 pads up to the next multiple of 8 = 576. Unchanged by
- * adr/0013; up from 568 before adr/0010. */
+ * adr/0013 (which grew the notify-icon member to 276) or by adr/0014 §7 (280, re-measured
+ * at both steps — see that struct's own assert comment); up from 568 before adr/0010. */
 _Static_assert(sizeof(crdpq_event_payload_t) == 576, "crdpq_event_payload_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0010 §1)");
 
 /** One control-lane event. POD, no pointers, safe to memcpy — this is the whole point
@@ -779,6 +796,10 @@ typedef enum {
     CRDPQ_CMD_WINDOW_MOVE,
     CRDPQ_CMD_SYS_COMMAND,
     CRDPQ_CMD_INPUT,
+    /** adr/0014 §2: ClientNotifyEvent, the outbound tray-click lane. Appended at the END
+     *  (adr/0008 §5's append-only rule, applied to this enum exactly as it is to the
+     *  inbound one) so no existing command type's numeric value moves. */
+    CRDPQ_CMD_NOTIFY_EVENT,
 } crdpq_command_type_t;
 
 /** ClientExecute (launching/re-launching the RemoteApp program). */
@@ -806,6 +827,20 @@ typedef struct {
     uint32_t windowId;
     uint16_t command;
 } crdpq_cmd_sys_command_t;
+
+/** ClientNotifyEvent (adr/0014 §2): one notify-message PDU addressed at a tray icon, i.e.
+ *  `RAIL_NOTIFY_EVENT_ORDER` (freerdp/rail.h:433-438) field for field. `message` is a
+ *  `uint32_t`, NOT the `uint16_t` its `crdpq_cmd_sys_command_t` sibling above uses — the
+ *  wire field really is UINT32 here (rail.h:437) and UINT16 there (rail.h:430); the two
+ *  commands look alike enough that narrowing this by reflex is the obvious way to corrupt
+ *  a `NIN_*` (>= 0x400) value later, so the width difference is deliberate and load-bearing.
+ *  v1 sends only WM_LBUTTONDOWN (0x201) then WM_LBUTTONUP (0x202) as two independent posts
+ *  (the lane is FIFO, so their order is the queue's guarantee, not a per-command field). */
+typedef struct {
+    uint32_t windowId;
+    uint32_t notifyIconId;
+    uint32_t message;
+} crdpq_cmd_notify_event_t;
 
 typedef enum {
     CRDPQ_INPUT_KEYBOARD = 0,
@@ -841,6 +876,7 @@ typedef union {
     crdpq_cmd_window_move_t windowMove;
     crdpq_cmd_sys_command_t sysCommand;
     crdpq_cmd_input_t input;
+    crdpq_cmd_notify_event_t notifyEvent;
 } crdpq_command_payload_t;
 
 /** No generation field, deliberately: outbound commands don't carry the same

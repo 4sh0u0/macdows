@@ -301,6 +301,33 @@ let popupSamplesTotal = max(1, Int(ProcessInfo.processInfo.environment["WINDOW_S
 /// finding 2: a poll-based sample would miss a create+delete landing in one drain batch).
 let trayScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_TRAY"] == "1"
 
+/// adr/0014 §6 acceptance (W6's outbound tray-click lane): on top of `WINDOW_SMOKE_TRAY`'s own
+/// icon-display gates, drive ONE left click through the real click path once a live icon has
+/// actually been observed, and gate on what left this process -- `clicksForwarded >= 1`, the
+/// `notifyEventsSent == 2 * clicksForwarded` v1 identity, `clicksDroppedIconGone == 0`, the
+/// exact `[WM_LBUTTONDOWN, WM_LBUTTONUP]` message sequence in order, the clicked key echoed
+/// back bit-for-bit, and a zero `CRSession.outboundDroppedNoRailCount` delta across the click.
+///
+/// Requires `WINDOW_SMOKE_TRAY=1` (it reuses that scenario's whole "point this run at a
+/// tray-icon-bearing program" setup and its `realIconMaxObserved`/`liveCount` evidence as the
+/// arming condition) -- same "requires its own prereq switch" convention
+/// `WINDOW_SMOKE_POPUP_SAMPLES` already follows. Requested without it, this stays off and says
+/// so, rather than silently arming a scenario whose subject never appears.
+///
+/// **What this does NOT prove**: that the server did anything. MS-RDPERP 3.3.5.2.5.4
+/// acknowledges the Client Notification Event PDU with nothing at all -- no response, no error
+/// code, no late verdict -- so every assertion below is about what this client SENT. That is
+/// the strongest claim available here, and stating it plainly is better than an assertion
+/// shaped to look like an end-to-end one.
+let trayClickScenarioEnabled: Bool = {
+    guard ProcessInfo.processInfo.environment["WINDOW_SMOKE_TRAY_CLICK"] == "1" else { return false }
+    if !trayScenarioEnabled {
+        print("[config] WINDOW_SMOKE_TRAY_CLICK=1 ignored -- it requires WINDOW_SMOKE_TRAY=1 (the tray scenario's own icon evidence is this scenario's arming condition)")
+        return false
+    }
+    return true
+}()
+
 /// MS-RDPERP `TS_RAIL_ORDER_SYSCOMMAND` `SC_*` values -- duplicated here from
 /// `App/RemoteWindowRendering/RemoteWindowRegistry.swift`'s own `SysCommand` enum (itself
 /// verified against `ThirdParty/FreeRDP/include/freerdp/rail.h:126-133`), matching this
@@ -746,6 +773,42 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private var popupAboutClosedAt: TimeInterval?
     private var popupAboutCloseResult: Bool?
 
+    // adr/0014 §6 (WINDOW_SMOKE_TRAY_CLICK): one tray left click, driven through the real
+    // click path, asserted against what actually left this process -- see
+    // `runTrayClickScenario`'s own doc comment for the sequence.
+
+    /// One notify icon's wire identity, exactly as `TrayStatusController` keys its own status
+    /// items. Tracked here (create/update insert, delete remove -- from the harness's own
+    /// drain loop, not read out of the registry) so this scenario can name a LIVE key to
+    /// click: the registry deliberately exposes counts, not the key set, and duplicating the
+    /// lifecycle from the same events it consumes keeps that boundary intact.
+    private struct NotifyIconKey: Hashable {
+        let windowId: UInt32
+        let notifyIconId: UInt32
+    }
+    /// Insertion-ordered, so "pick one live key" is deterministic across runs rather than
+    /// dependent on `Set` iteration order -- a flaky choice of target would make a failure
+    /// report ambiguous about which icon it referred to.
+    private var liveNotifyIconKeys: [NotifyIconKey] = []
+    private var trayClickTarget: NotifyIconKey?
+    private var trayClickDone = false
+    /// Every `(windowId, notifyIconId, message)` triple `RemoteWindowRegistry` reported having
+    /// posted, in post order -- collected via `onTrayNotifyEventSent` from the one place a PDU
+    /// is actually sent, deliberately NOT re-derived from `TrayNotifyEvent` on this side (that
+    /// would assert the harness's own copy of the sequence against itself).
+    private var trayNotifyEventsSent: [(windowId: UInt32, notifyIconId: UInt32, message: UInt32)] = []
+    /// `CRSession.outboundDroppedNoRailCount` read immediately before the click. A nonzero
+    /// delta at `finish()` means the outbound lane threw the click's own PDUs away because
+    /// RAIL wasn't connected -- the one failure mode a post-side counter alone cannot see.
+    private var outboundDroppedNoRailBeforeClick: UInt64?
+    /// `CRSession.outboundPostDroppedCount` read at the same instant -- the queue's OWN
+    /// post-side rejection counter (capacity ceiling, allocation failure; seal rejections are
+    /// invisible to BOTH outbound counters by crdpq contract). The mirror image of the field
+    /// above: that one proves the PDUs weren't discarded on the way out of the queue, this
+    /// one proves they weren't rejected on the way in for either countable cause. Asserting
+    /// only the first would let "the click posted nothing at all" pass green.
+    private var outboundPostDroppedBeforeClick: UInt64?
+
     // W4b review round 2, experiment 1: does sending RAIL ClientActivate for a
     // background/non-focused window prompt the server to (re)send content it never
     // painted for us? Resolved opportunistically to whichever plausible-title window is
@@ -863,6 +926,20 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             print(
                 "[move-resize] sent ClientWindowMove at elapsed=\(String(format: "%.3f", elapsed))s "
                     + "windowId=\(windowId) left=\(left) top=\(top) right=\(right) bottom=\(bottom)"
+            )
+        }
+        // adr/0014 §6: the VERBATIM triple each ClientNotifyEvent PDU carried, recorded from
+        // the one place a PDU is actually posted -- same reasoning as `onWindowMoveSent`
+        // directly above (a harness that recomputed the expected sequence on its own side
+        // would be checking its own arithmetic, not the send path's). Scoped to the tray-click
+        // scenario so every other run stays silent, exactly like the move-resize line.
+        registry.onTrayNotifyEventSent = { [weak self] windowId, notifyIconId, message in
+            guard let self, trayClickScenarioEnabled else { return }
+            self.trayNotifyEventsSent.append((windowId: windowId, notifyIconId: notifyIconId, message: message))
+            let elapsed = self.startTime.map { Date().timeIntervalSince($0) } ?? -1
+            print(
+                "[tray-click] sent ClientNotifyEvent at elapsed=\(String(format: "%.3f", elapsed))s "
+                    + "windowId=\(windowId) notifyIconId=\(notifyIconId) message=0x\(String(message, radix: 16, uppercase: false))"
             )
         }
         startTime = Date()
@@ -1137,6 +1214,25 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             {
                 print("[shape] windowId=\(event.windowId) wireRectCount=\(diag.wireRectCount) truncated=\(diag.truncated) appliedRectCount=\(diag.appliedRectCount)")
             }
+            // adr/0014 §6: notify-icon lifecycle tracking for the tray-click scenario's
+            // "pick one LIVE key" step. Mirrors `TrayStatusController`'s own create/update/
+            // delete bookkeeping (update inserts too -- an update-before-create ordering is
+            // tolerated there, see `TrayModel.update`'s doc comment, so assuming create-first
+            // here could leave this list empty for an icon that really exists). Scoped to the
+            // scenario so every other run pays nothing.
+            if trayClickScenarioEnabled {
+                let key = NotifyIconKey(windowId: event.windowId, notifyIconId: event.notifyIconId)
+                switch event.kind {
+                case .notifyIconCreate, .notifyIconUpdate:
+                    if !self.liveNotifyIconKeys.contains(key) {
+                        self.liveNotifyIconKeys.append(key)
+                    }
+                case .notifyIconDelete:
+                    self.liveNotifyIconKeys.removeAll { $0 == key }
+                default:
+                    break
+                }
+            }
             // Flow evidence counters (task item 1): counted for every drained event
             // regardless of mode (plain run, extra-apps, cycles) -- only finish()'s
             // gating assertions and the `[flow]` summary print are scoped to the
@@ -1242,6 +1338,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         runMaximizeScenario(session: session, registry: registry)
         runMoveResizeScenario(session: session, registry: registry)
         runPopupScenario(session: session, registry: registry)
+        runTrayClickScenario(session: session, registry: registry)
 
         // Phase 1 acceptance: launch the extra apps once the first app's own window has
         // had time to settle -- several ClientExecutes on one live connection is exactly
@@ -1318,16 +1415,29 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         let inputScriptDeadline: TimeInterval = inputScriptScenarioActive ? 30 : baseDeadline
         let inputScriptStalled = inputScriptScenarioActive && !inputScriptComplete
             && elapsed >= inputScriptDeadline + 10
+        // adr/0014 §6: the click itself is instantaneous (two posts onto an in-process queue);
+        // the whole wait is for the tray driver to launch and produce a live icon, which the
+        // tray scenario's own runs have shown happening within the standard budget. 30s keeps
+        // the same comfortable-slack convention as every scenario above, and
+        // `trayClickStalled` is the same hard-failsafe shape: normally `trayClickDone` gates
+        // the wait, and a run whose icon never appears fails the tray scenario's OWN
+        // `realIconMaxObserved >= 1` gate (plus this scenario's `clicksForwarded >= 1`) rather
+        // than hanging.
+        let trayClickDeadline: TimeInterval = trayClickScenarioEnabled ? 30 : baseDeadline
+        let trayClickStalled = trayClickScenarioEnabled && !trayClickDone && elapsed >= trayClickDeadline + 10
         let overallDeadline = max(
             max(rotationDeadline, maximizeDeadline),
-            max(moveResizeDeadline, max(popupDeadline, inputScriptDeadline))
+            max(moveResizeDeadline, max(popupDeadline, max(inputScriptDeadline, trayClickDeadline)))
         )
         let rotationReady = focusRotationTotal == 0 || focusRotationDone || rotationStalled
         let maximizeReady = !maximizeScenarioEnabled || maximizePhase == .done || maximizeStalled
         let moveResizeReady = !moveResizeScenarioEnabled || moveResizePhase == .done || moveResizeStalled
         let popupReady = !popupScenarioEnabled || popupPhase == .done || popupStalled
         let inputScriptReady = !inputScriptScenarioActive || inputScriptComplete || inputScriptStalled
-        if elapsed >= overallDeadline, rotationReady, maximizeReady, moveResizeReady, popupReady, inputScriptReady {
+        let trayClickReady = !trayClickScenarioEnabled || trayClickDone || trayClickStalled
+        if elapsed >= overallDeadline, rotationReady, maximizeReady, moveResizeReady, popupReady,
+           inputScriptReady, trayClickReady
+        {
             finish()
         }
     }
@@ -1494,6 +1604,34 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         cycleCloseRetried = false
         cycleTargetEverConverged = false
         cycleRenderedAt = nil
+        // adr/0014 §6: the tray-click scenario's per-connection state dies with the
+        // connection. `registry.prepareForReconnect()` above tore down every live
+        // `NSStatusItem`, so every key in `liveNotifyIconKeys` now names an icon that no
+        // longer exists -- and notify-icon ids are per-session, so the next cycle's server may
+        // legitimately reuse the same numbers for different icons, which is how a stale key
+        // turns into a click addressed at the wrong icon (or at nothing, failing
+        // `clicksDroppedIconGone == 0` for a reason that is the harness's fault, not the
+        // code's). Clearing here (rather than intersecting the chosen key against registry
+        // state at lock time) matches how every other per-cycle field on this driver is
+        // handled, and keeps "pick one live key" honest at its source instead of filtering a
+        // knowingly-stale list later.
+        //
+        // Defensive today, deliberately: `tick()` routes cycle-mode runs to `tickCycles` and
+        // returns before `runTrayClickScenario` ever gets called, while the drain-side
+        // tracking below IS mode-independent -- so the list can go stale in this mode even
+        // though nothing consumes it yet. That asymmetry is exactly the kind that stops being
+        // harmless the moment the click driver is taught about cycles.
+        //
+        // `trayClickDone` is deliberately NOT reset: this scenario clicks once per RUN, not
+        // once per cycle -- re-arming would make `notifyEventsSent == 2 * clicksForwarded`
+        // span every cycle's clicks while the collected message list holds only the last
+        // one's, breaking the identity the gate exists to check.
+        liveNotifyIconKeys.removeAll()
+        if !trayClickDone {
+            trayClickTarget = nil
+            outboundDroppedNoRailBeforeClick = nil
+            outboundPostDroppedBeforeClick = nil
+        }
 
         if cycleIndex >= cyclesTotal || !rendered {
             finishCycles()
@@ -2148,6 +2286,49 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         case .done:
             break
         }
+    }
+
+    /// adr/0014 §6 (`WINDOW_SMOKE_TRAY_CLICK=1`, tray-scenario prereq): one left click on one
+    /// live tray icon, once per run.
+    ///
+    /// Arming condition: the tray scenario's own icon evidence -- `realIconMaxObserved >= 1`
+    /// AND `liveCount >= 1` -- plus a live key in this harness's own `liveNotifyIconKeys`.
+    /// Read these precisely: `realIconMaxObserved` is a SESSION-WIDE latch ("at least one icon
+    /// in this session held a real remote bitmap at some point", possibly a different icon,
+    /// possibly already deleted), and `liveCount` says a status item exists right now. Neither
+    /// says the icon actually clicked below is currently showing a real bitmap, and this
+    /// scenario does not need it to: what it asserts is the SEND path (message sequence, key
+    /// fidelity, queue admission), none of which depends on the clicked icon's pixels. The
+    /// pair is used only to keep the click away from a session where the tray pipeline never
+    /// worked at all -- that stricter, per-icon claim is `WINDOW_SMOKE_TRAY`'s own gate, not
+    /// this one's.
+    ///
+    /// The click goes through `RemoteWindowRegistry.debugSimulateTrayClick`, which enters
+    /// `TrayStatusController.handleLeftClick(tag:)` with the same packed tag the live
+    /// `NSStatusBarButton` carries -- the real path, with AppKit's own event delivery as the
+    /// ONLY thing skipped (there is no supported way to synthesize a menu-bar click for
+    /// another process's status item). The liveness re-check, the counters, and the registry's
+    /// two-PDU send all run exactly as they would for a user's click.
+    private func runTrayClickScenario(session: CRSession, registry: RemoteWindowRegistry) {
+        guard trayClickScenarioEnabled, !trayClickDone else { return }
+        let diag = registry.trayDiagnostics()
+        guard diag.realIconMaxObserved >= 1, diag.liveCount >= 1, let target = liveNotifyIconKeys.first else { return }
+
+        trayClickTarget = target
+        // Read BEFORE the click, so the delta `finish()` asserts on is attributable to this
+        // click's own two posts and not to anything the session dropped earlier (e.g. an early
+        // ClientExecute posted before the RAIL channel came up, which is a real and expected
+        // occurrence this gate must not be confused by).
+        outboundDroppedNoRailBeforeClick = session.outboundDroppedNoRailCount
+        // adr/0014 §5/§6: the POST-side counter, snapshotted at the same instant and for the
+        // same reason. The drain-side counter above can only see commands that reached the
+        // drain -- a click whose two posts were rejected at the queue's door increments
+        // nothing there, so on its own that gate stays green on zero PDUs ever enqueued.
+        outboundPostDroppedBeforeClick = session.outboundPostDroppedCount
+        print("[tray-click] target locked: windowId=\(target.windowId) notifyIconId=\(target.notifyIconId) "
+            + "(liveCount=\(diag.liveCount) realIconMaxObserved=\(diag.realIconMaxObserved))")
+        registry.debugSimulateTrayClick(windowId: target.windowId, notifyIconId: target.notifyIconId)
+        trayClickDone = true
     }
 
     /// Closes out the round currently in flight (`WINDOW_SMOKE_POPUP_SAMPLES`) -- called from
@@ -3091,6 +3272,15 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
 
         let snapshots = registry.windowSnapshots()
         let visibleWindows = snapshots.filter(\.isVisible)
+        // adr/0014 §6: read the outbound lane's two drop counters BEFORE the shutdown below.
+        // `-shutdownAndWait` DESTROYS the outbound queue (CRSession.mm step 5), and
+        // `outboundPostDroppedCount` is a passthrough to that queue's own counter -- after
+        // teardown it necessarily reports 0, which would turn this session's real post-side
+        // total into a backwards-moving reading. `outboundDroppedNoRailCount` is ivar-backed
+        // and survives, but is snapshotted at the same instant so both sides of the click's
+        // bracket are measured against the same moment.
+        let outboundDroppedNoRailAtEnd = session.outboundDroppedNoRailCount
+        let outboundPostDroppedAtEnd = session.outboundPostDroppedCount
         let cleanShutdown = session.shutdownAndWait()
 
         var ok = true
@@ -3169,6 +3359,100 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 "no wire icon was skipped for a NON-cached cause (converter rejection or store exhaustion; got iconSkipped=\(trayDiag.iconSkippedCount) of which cached=\(trayDiag.cachedIconCount))"
             )
             check(trayDiag.storeOverflowCount == 0, "icon store never overflowed (got storeOverflow=\(trayDiag.storeOverflowCount))")
+            // adr/0014 §7 observation, printed on every tray run (not gated): which
+            // NOTIFY_ICON_STATE_ORDER versions this session's server actually sent. An empty
+            // list is itself the observation -- it means no order carried
+            // WINDOW_ORDER_FIELD_NOTIFY_VERSION at all, which is exactly the state of
+            // knowledge that made adr/0014 §1 pick the version-free WM_LBUTTONDOWN/
+            // WM_LBUTTONUP pair over NIN_SELECT.
+            // adr/0014 §9.1: the set is capped, so a full one is a PREFIX of what the server
+            // sent, not the whole of it -- say so rather than letting a reader draw a
+            // completeness conclusion the data doesn't support.
+            let versionsCapped = trayDiag.observedNotifyIconVersions.count >= TrayStatusController.maxObservedVersions
+            print("[tray] observedNotifyIconVersions=\(trayDiag.observedNotifyIconVersions)\(versionsCapped ? " (capped)" : "")")
+        }
+        // adr/0014 §6 acceptance (WINDOW_SMOKE_TRAY_CLICK=1): everything below is about what
+        // this client SENT. MS-RDPERP 3.3.5.2.5.4 acknowledges a Client Notification Event PDU
+        // with nothing at all, so there is no server-side leg to assert on here -- unlike the
+        // SC_* traffic-light scenarios, whose WindowUpdate/WindowDelete echoes are real
+        // server evidence. Seven checks, so a red run says which stage broke: the click never
+        // fired, the icon vanished under it, the PDU count diverged from the click count, the
+        // wrong messages went out, the wrong key went out, the outbound lane threw the PDUs
+        // away because RAIL wasn't connected, or the queue refused to admit them in the first
+        // place. The last two bracket the queue deliberately (adr/0014 §5): outbound sends are
+        // `void`, so post-side admission and drain-side delivery are separately invisible, and
+        // checking only one of them leaves the other's failure mode green.
+        if trayClickScenarioEnabled {
+            let messages = trayNotifyEventsSent.map(\.message)
+            let expectedMessages: [UInt32] = [0x0000_0201, 0x0000_0202]
+            let droppedAfter = outboundDroppedNoRailAtEnd
+            let postDroppedAfter = outboundPostDroppedAtEnd
+            // Both counters are monotonic within a session and both readings above were taken
+            // pre-teardown, so `after < before` is impossible today -- `nil` means it happened
+            // anyway (a future refactor moving either read past `shutdownAndWait`, say), which
+            // is reported as a FAILED check rather than crashing the harness on a `UInt64`
+            // underflow trap or, worse, being silently clamped to a passing 0.
+            func deltaSinceClick(_ before: UInt64?, _ after: UInt64) -> UInt64? {
+                guard let before else { return 0 } // click never armed: the gates below say so
+                guard after >= before else { return nil }
+                return after - before
+            }
+            let droppedDelta = deltaSinceClick(outboundDroppedNoRailBeforeClick, droppedAfter)
+            let postDroppedDelta = deltaSinceClick(outboundPostDroppedBeforeClick, postDroppedAfter)
+            print("[tray-click] clicksForwarded=\(trayDiag.clicksForwarded) notifyEventsSent=\(trayDiag.notifyEventsSent) "
+                + "droppedIconGone=\(trayDiag.clicksDroppedIconGone) "
+                + "messages=[\(messages.map { "0x" + String($0, radix: 16) }.joined(separator: ", "))] "
+                + "outboundDroppedNoRail=\(outboundDroppedNoRailBeforeClick.map(String.init) ?? "n/a")->\(droppedAfter) "
+                + "outboundPostDropped=\(outboundPostDroppedBeforeClick.map(String.init) ?? "n/a")->\(postDroppedAfter)")
+            check(
+                trayDiag.clicksForwarded >= 1,
+                "the tray-click scenario forwarded at least one left click (got clicksForwarded=\(trayDiag.clicksForwarded); 0 means no live real-bitmap icon was ever available to click)"
+            )
+            check(
+                trayDiag.clicksDroppedIconGone == 0,
+                "no click was dropped for a vanished NSStatusItem (got clicksDroppedIconGone=\(trayDiag.clicksDroppedIconGone) -- nonzero means the status-item table and the click path disagreed about what is live)"
+            )
+            // adr/0014 §5's deliberately-redundant pair: one click is exactly two PDUs in v1,
+            // and the day that stops being true this identity is what says so.
+            check(
+                trayDiag.notifyEventsSent == 2 * trayDiag.clicksForwarded,
+                "v1 invariant notifyEventsSent == 2 * clicksForwarded (got \(trayDiag.notifyEventsSent) vs 2 * \(trayDiag.clicksForwarded))"
+            )
+            check(
+                messages == expectedMessages,
+                "the ClientNotifyEvent message sequence is exactly [WM_LBUTTONDOWN, WM_LBUTTONUP] in that order (got [\(messages.map { "0x" + String($0, radix: 16) }.joined(separator: ", "))])"
+            )
+            // Bit-equality against the key this harness itself chose -- not against whatever
+            // the send path happened to report -- so a truncation/repacking bug in the tag's
+            // pack -> unpack round trip (truncation-detecting) cannot pass by being
+            // self-consistent. Note this simulated path never touches `NSButton.tag` itself:
+            // `debugSimulateTrayClick` packs the tag and hands it straight to
+            // `handleLeftClick(tag:)`, so what is covered is the packing arithmetic, not
+            // AppKit's storage of it.
+            if let target = trayClickTarget {
+                let keysMatch = !trayNotifyEventsSent.isEmpty && trayNotifyEventsSent.allSatisfy {
+                    $0.windowId == target.windowId && $0.notifyIconId == target.notifyIconId
+                }
+                check(
+                    keysMatch,
+                    "every ClientNotifyEvent carried the clicked icon's own (windowId=\(target.windowId), notifyIconId=\(target.notifyIconId)) key verbatim (got \(trayNotifyEventsSent.map { "(\($0.windowId), \($0.notifyIconId))" }.joined(separator: ", ")))"
+                )
+            } else {
+                check(false, "the tray-click scenario locked a target icon to click (none was ever live with a real bitmap)")
+            }
+            check(
+                droppedDelta == 0,
+                "no outbound command was dropped for a missing RAIL channel across the click (got outboundDroppedNoRailCount delta=\(droppedDelta.map(String.init) ?? "not comparable -- the counter moved backwards"))"
+            )
+            // adr/0014 §5/§6's seventh gate: the post side. Without it, the six checks above
+            // are all satisfiable by a click whose PDUs the queue rejected outright --
+            // `clicksForwarded`, `notifyEventsSent` and the collected triples are all recorded
+            // by the SENDER, before `crdpq_outbound_post` gets a say, and the drain-side
+            // counter above cannot count a command that never made it into the queue.
+            check(
+                postDroppedDelta == 0,
+                "no outbound command was rejected at post time across the click -- capacity ceiling or allocation failure (got outboundPostDroppedCount delta=\(postDroppedDelta.map(String.init) ?? "not comparable -- the counter moved backwards, i.e. it was read after the outbound queue was destroyed"))"
+            )
         }
 
         // W4c: skip when an input test is active -- a *successful* click/Enter can
