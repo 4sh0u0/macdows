@@ -1,0 +1,34 @@
+{
+  "entries": [
+    {
+      "id": "charmap",
+      "name": "Character Map",
+      "path": "%SystemRoot%\\System32\\charmap.exe",
+      "args": []
+    },
+    {
+      "id": "dxdiag",
+      "name": "DirectX Diagnostic Tool",
+      "path": "%SystemRoot%\\System32\\dxdiag.exe",
+      "args": []
+    },
+    {
+      "id": "msinfo32",
+      "name": "System Information",
+      "path": "%SystemRoot%\\System32\\msinfo32.exe",
+      "args": []
+    },
+    {
+      "id": "winver",
+      "name": "About Windows",
+      "path": "%SystemRoot%\\System32\\winver.exe",
+      "args": []
+    },
+    {
+      "id": "notepad",
+      "name": "Notepad",
+      "path": "%SystemRoot%\\System32\\notepad.exe",
+      "args": []
+    }
+  ]
+}
