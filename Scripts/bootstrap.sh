@@ -15,10 +15,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=Scripts/lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-# ffmpeg + pkg-config: Phase 2 W0(2) AVC caps flip (adr/0007) -- Scripts/build-freerdp.sh
-# defaults CRDP_WITH_FFMPEG=1, which needs both to configure FreeRDP's H264-decode
-# ffmpeg backend (local-dev-only source; see deps/freerdp.lock's "ffmpeg" block).
-REQUIRED_FORMULAS=(cmake ninja xcodegen jq ffmpeg pkg-config)
+# pkg-config: Scripts/build-freerdp.sh defaults CRDP_WITH_FFMPEG=1, and FreeRDP's
+# find_package(FFmpeg) (ThirdParty/FreeRDP/cmake/FindFFmpeg.cmake) resolves the H264-decode
+# backend through pkg-config; ffmpeg's own configure uses it too.
+#
+# The `ffmpeg` formula is deliberately NOT here (Phase 2 W8): Homebrew builds it
+# --enable-gpl --enable-version3, i.e. GPL-3.0, which cannot be redistributed inside this
+# Apache-2.0 app, and it links by absolute /opt/homebrew path. Scripts/build-ffmpeg.sh
+# builds a pinned, LGPL-only replacement instead -- see deps/freerdp.lock's "ffmpeg" block
+# and LGPL_RELINK.md.
+REQUIRED_FORMULAS=(cmake ninja xcodegen jq pkg-config)
 
 require_cmd git
 
@@ -65,6 +71,19 @@ log "submodule SHA matches deps/freerdp.lock ($ACTUAL_SHA)"
 
 log "Building OpenSSL (idempotent, no-op if already built)"
 "$SCRIPT_DIR/build-openssl.sh"
+
+# Must precede build-freerdp.sh: that script dies if the self-built ffmpeg prefix is
+# missing (it no longer falls back to Homebrew's GPL build).
+#
+# Honour the same CRDP_WITH_FFMPEG toggle build-freerdp.sh reads: with H264 decode turned
+# off, build-freerdp.sh never looks at the ffmpeg prefix, so spending several minutes
+# compiling one here would be pure waste.
+if [ "${CRDP_WITH_FFMPEG:-1}" = "0" ]; then
+	log "CRDP_WITH_FFMPEG=0 -- skipping the FFmpeg build (FreeRDP will be configured without H264 decode)"
+else
+	log "Building FFmpeg (idempotent, no-op if already built)"
+	"$SCRIPT_DIR/build-ffmpeg.sh"
+fi
 
 log "Building FreeRDP (idempotent, no-op if already built)"
 "$SCRIPT_DIR/build-freerdp.sh"

@@ -55,7 +55,13 @@ if [ -f "$TARBALL_PATH" ]; then
 	log "Using cached tarball $TARBALL_PATH"
 else
 	log "Downloading $OPENSSL_URL"
-	curl -fL --retry 3 -o "${TARBALL_PATH}.partial" "$OPENSSL_URL"
+	# --proto '=https' --proto-redir '=https': the sha256 below is the real integrity
+	# control, but there is no reason to let a redirect (or a typo'd URL) silently downgrade
+	# the transport to plain HTTP first. Constrains both the initial request and anything it
+	# is redirected to. (github.com release URLs redirect to objects.githubusercontent.com,
+	# so --proto-redir specifically matters here.)
+	curl -fL --proto '=https' --proto-redir '=https' --retry 3 \
+		-o "${TARBALL_PATH}.partial" "$OPENSSL_URL"
 	mv "${TARBALL_PATH}.partial" "$TARBALL_PATH"
 fi
 

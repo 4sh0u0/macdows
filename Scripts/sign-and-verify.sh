@@ -166,6 +166,46 @@ log "Verifying signature (codesign --verify --deep --strict)"
 codesign --verify --deep --strict "$APP_PATH"
 log "Signature verification: OK"
 
+# --- 4b. Release artifacts must not ship com.apple.security.get-task-allow -------------
+# That entitlement lets any process attach a debugger to the app and read/write its memory,
+# which in a shipped build means an attacker on the machine can extract RDP credentials and
+# session keys straight out of a running Macdows. Xcode adds it automatically to Debug
+# builds, and step 0 above deliberately *preserves* whatever entitlements are already on the
+# bundle across the re-sign — so without this check a Debug-configuration artifact that got
+# signed for distribution would carry it silently. (Apple's notary service also rejects it,
+# but that rejection arrives minutes later, only when notarizing, and never at all for the
+# --offline path — so this is the earlier, always-on gate.)
+#
+# Why here and not in Scripts/gen-notices.sh: this is a *release* property, not a licence
+# property, and this script is the release gate — it is already the one place that models
+# the Debug-vs-release distinction (see the notarization skip below, same $APP_PATH test).
+# gen-notices.sh is deliberately run against Debug bundles as routine verification, so a
+# hard failure there would break the normal development loop for a condition that is correct
+# and expected in Debug. Here, Debug gets a warning and release gets a hard failure.
+GTA_ENTITLEMENT="com.apple.security.get-task-allow"
+GTA_PLIST="$(mktemp -t macdows-gta-check).plist"
+HAS_GET_TASK_ALLOW=0
+if codesign -d --entitlements ":$GTA_PLIST" "$APP_PATH" >/dev/null 2>&1 && [ -s "$GTA_PLIST" ]; then
+	if /usr/libexec/PlistBuddy -c "Print :$GTA_ENTITLEMENT" "$GTA_PLIST" >/dev/null 2>&1; then
+		HAS_GET_TASK_ALLOW=1
+	fi
+fi
+rm -f "$GTA_PLIST"
+
+if [ "$HAS_GET_TASK_ALLOW" -eq 1 ]; then
+	if [[ "$APP_PATH" == */Debug/* ]]; then
+		log "NOTE: $GTA_ENTITLEMENT is present — expected for a Debug-configuration build, and harmless locally. A Release build carrying it is a hard failure here."
+	else
+		die "$GTA_ENTITLEMENT is present on $APP_PATH.
+This entitlement permits arbitrary debugger attachment (memory read/write) and must never
+ship: for Macdows that means live RDP credentials and session keys are readable by any
+local process. It is added automatically to Debug builds and preserved across re-signing.
+Build with -configuration Release (or strip the entitlement) before signing for distribution."
+	fi
+else
+	log "No $GTA_ENTITLEMENT entitlement on the signed bundle"
+fi
+
 # --- 5. DYLD load check, run against a throwaway, separately-entitled copy -----------
 # Hardened runtime can suppress DYLD_* environment variables (including
 # DYLD_PRINT_LIBRARIES) unless the process carries
@@ -252,7 +292,11 @@ notarize() {
 	# notarytool's --wait exit code alone is not a trustworthy Accepted signal — gate the
 	# staple on the explicit terminal status, so an Invalid/rejected submission never gets
 	# a ticket stapled over it (recorded debt from the W4a review round).
-	if ! printf '%s' "$submit_out" | grep -q 'status: Accepted'; then
+	# grep -c >/dev/null, not grep -q: under `set -o pipefail` a -q early-exits and SIGPIPEs
+	# its producer, making the pipeline status 141 instead of grep's answer. Harmless for a
+	# short string like this today, but the repo's rule is that no pipeline decides a gate
+	# with -q, precisely so nobody has to re-derive "is this one short enough to be safe?".
+	if ! printf '%s' "$submit_out" | grep -c 'status: Accepted' >/dev/null; then
 		die "notarization did not reach 'Accepted' — NOT stapling. Inspect: xcrun notarytool log <submission-id> --keychain-profile $NOTARY_PROFILE"
 	fi
 

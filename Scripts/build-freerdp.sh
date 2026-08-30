@@ -45,19 +45,47 @@ LOCK_FILE="$CRDP_REPO_ROOT/deps/freerdp.lock"
 
 # --- ffmpeg (H264 decode) -------------------------------------------------------------
 # adr/0007: ffmpeg dynamically linked (LGPL §6; never static) + VideoToolbox hwaccel.
-# Homebrew ffmpeg is the local-dev source (unpinned); a self-built, version-pinned ffmpeg
-# matching the OpenSSL/FreeRDP treatment above is Phase 2 W8's job, gated on external
-# distribution -- see deps/freerdp.lock's "ffmpeg" block for the full rationale.
+# Phase 2 W8 replaced the previous Homebrew source with a pinned, self-built, LGPL-only
+# ffmpeg (Scripts/build-ffmpeg.sh) -- Homebrew's formula is --enable-gpl --enable-version3,
+# i.e. GPL-3.0, which is undistributable inside this Apache-2.0 app, and it links by
+# absolute /opt/homebrew path (adr/0006 §3 defect #1). See deps/freerdp.lock's "ffmpeg"
+# block for the full record.
 if [ "$CRDP_WITH_FFMPEG" = "1" ]; then
-	command -v brew >/dev/null 2>&1 || die "Homebrew not found (needed to provide ffmpeg for CRDP_WITH_FFMPEG=1). Install from https://brew.sh, or set CRDP_WITH_FFMPEG=0 to build without H264 decode."
 	require_cmd pkg-config
-	if ! brew list ffmpeg >/dev/null 2>&1; then
-		log "ffmpeg not found via Homebrew; installing (local dev only, per adr/0007)"
-		brew install ffmpeg
-	fi
-	FFMPEG_PREFIX="$(brew --prefix ffmpeg)"
-	export PKG_CONFIG_PATH="$FFMPEG_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-	log "ffmpeg: $FFMPEG_PREFIX (dynamic link only; PKG_CONFIG_PATH set for CMake's find_package(FFmpeg))"
+	[ -d "$CRDP_FFMPEG_PREFIX/lib/pkgconfig" ] \
+		|| die "self-built ffmpeg not found at $CRDP_FFMPEG_PREFIX -- run Scripts/build-ffmpeg.sh first (or set CRDP_WITH_FFMPEG=0 to build without H264 decode)."
+
+	# The stamp, not just the directory: Scripts/build-ffmpeg.sh writes it last, only after
+	# every one of its guards (component set, relocatability, LGPL posture) has passed on the
+	# staged tree. So a prefix with no stamp is a prefix that either failed those guards or
+	# was interrupted mid-promotion, and linking libfreerdp3 against it would quietly undo
+	# the entire point of W8. The version is in the stamp's name, so this also catches a
+	# stale prefix left over from a previous pin after deps/freerdp.lock is bumped.
+	LOCKED_FFMPEG_VERSION="$(jq -er '.ffmpeg.version' "$LOCK_FILE")" \
+		|| die "deps/freerdp.lock has no .ffmpeg.version field"
+	FFMPEG_STAMP="$CRDP_FFMPEG_PREFIX/.ffmpeg-${LOCKED_FFMPEG_VERSION}.stamp"
+	[ -f "$FFMPEG_STAMP" ] \
+		|| die "ffmpeg prefix at $CRDP_FFMPEG_PREFIX has no completed-build stamp for the pinned version $LOCKED_FFMPEG_VERSION (expected $FFMPEG_STAMP).
+It is either a failed/interrupted build or a leftover from a different pin -- refusing to link against it. Run Scripts/build-ffmpeg.sh (add --force to rebuild), or set CRDP_WITH_FFMPEG=0 to build without H264 decode."
+
+	# PKG_CONFIG_LIBDIR, not PKG_CONFIG_PATH: LIBDIR *replaces* pkg-config's default search
+	# path, PATH only prepends to it. That difference is load-bearing here.
+	# ThirdParty/FreeRDP/cmake/FindFFmpeg.cmake probes all eight ffmpeg components and links
+	# every one it finds; with PKG_CONFIG_PATH merely prepended, our prefix would satisfy
+	# avcodec/avutil/swresample while Homebrew's default pkgconfig dir would still satisfy
+	# avformat/avfilter/avdevice/swscale -- silently reintroducing four GPL, absolute-path
+	# Homebrew dylibs into the link line for libraries libfreerdp3 references zero symbols
+	# from. Replacing the search path makes the minimal link line structurally impossible to
+	# widen by accident.
+	#
+	# Safe for the rest of the configure: a CMakeCache audit of the pre-W8 build showed
+	# ffmpeg was the *only* dependency this config resolved through pkg-config at all (every
+	# other pkg_check_modules consumer in the tree is behind a flag this build turns off --
+	# KRB5/PCSC/soxr/opus/uriparser/JSON/WebP/SDL/Wayland/gstreamer). As a bonus this closes
+	# the same auto-detection landmine class that WITH_URIPARSER=OFF / WITH_JSON_DISABLED=ON
+	# had to be added for (see deps/freerdp.lock corrections_applied).
+	export PKG_CONFIG_LIBDIR="$CRDP_FFMPEG_PREFIX/lib/pkgconfig"
+	log "ffmpeg: $CRDP_FFMPEG_PREFIX (self-built, pinned, LGPL; dynamic link only; PKG_CONFIG_LIBDIR pinned to it for CMake's find_package(FFmpeg))"
 fi
 
 FREERDP_SRC="$CRDP_REPO_ROOT/ThirdParty/FreeRDP"
@@ -109,6 +137,13 @@ compute_config_hash() {
 		jq -c '.cmake_config' "$LOCK_FILE"
 		printf -- '--- lock openssl ---\n'
 		jq -c '.openssl' "$LOCK_FILE"
+		# Same role the .openssl block plays: an ffmpeg version/flag bump changes what
+		# libfreerdp3 links against, so it has to invalidate this build cache. (Like
+		# .openssl, this hashes the lock's record rather than Scripts/build-ffmpeg.sh's
+		# contents -- the lock is the reviewable pin, and the script cross-checks its own
+		# version/sha256 against it on every run, so they cannot drift apart unnoticed.)
+		printf -- '--- lock ffmpeg ---\n'
+		jq -c '.ffmpeg' "$LOCK_FILE"
 		printf -- '--- patches ---\n'
 		for patch in "${PATCHES[@]:-}"; do
 			[ -n "$patch" ] || continue
@@ -182,10 +217,35 @@ FREERDP_PREFIX_PLACEHOLDER="/private/var/macdows-freerdp-buildtime-prefix"
 FLAGS_RAW="$(jq -er '.cmake_config.flags[]' "$LOCK_FILE")" || die "failed to read .cmake_config.flags[] from $LOCK_FILE"
 FLAGS=()
 while IFS= read -r flag; do
+	# CRDP_WITH_FFMPEG=0 escape hatch: drop the ffmpeg cache seeds outright rather than
+	# substitute them. With WITH_FFMPEG=OFF nothing ever calls find_package(FFmpeg), so
+	# they would be inert either way -- but this keeps the revert path from depending on
+	# Scripts/build-ffmpeg.sh having been run at all (the prefix they point at legitimately
+	# does not exist in that configuration).
+	if [ "$CRDP_WITH_FFMPEG" != "1" ]; then
+		case "$flag" in
+		-DFFMPEG_* | -DAVCODEC_* | -DAVUTIL_*) continue ;;
+		esac
+	fi
 	case "$flag" in
 	-DCMAKE_INSTALL_PREFIX=*) flag="-DCMAKE_INSTALL_PREFIX=$FREERDP_PREFIX_PLACEHOLDER" ;;
 	-DOPENSSL_ROOT_DIR=*) flag="-DOPENSSL_ROOT_DIR=$CRDP_DEPS_PREFIX" ;;
 	-DCMAKE_OSX_DEPLOYMENT_TARGET=*) flag="-DCMAKE_OSX_DEPLOYMENT_TARGET=$DEPLOYMENT_TARGET" ;;
+	# Pre-seed FindFFmpeg.cmake's result cache rather than let it discover components.
+	# See deps/freerdp.lock's matching corrections_applied entry for the full why; the
+	# short version is that the module links every component it *finds*, its find_library
+	# fallback reaches Homebrew's prefix on a brew-installed CMake, and it skips its entire
+	# discovery block when FFMPEG_LIBRARIES is already set. Seeding exactly the three
+	# components we build is what keeps libavformat/libavfilter/libavdevice/libswscale out
+	# of libfreerdp3's link line no matter what happens to be installed on the machine.
+	-DFFMPEG_INCLUDE_DIRS=*) flag="-DFFMPEG_INCLUDE_DIRS=$CRDP_FFMPEG_PREFIX/include" ;;
+	-DFFMPEG_LIBRARIES=*)
+		flag="-DFFMPEG_LIBRARIES=$CRDP_FFMPEG_PREFIX/lib/libavcodec.dylib;$CRDP_FFMPEG_PREFIX/lib/libavutil.dylib;$CRDP_FFMPEG_PREFIX/lib/libswresample.dylib"
+		;;
+	-DAVCODEC_INCLUDE_DIRS=*) flag="-DAVCODEC_INCLUDE_DIRS=$CRDP_FFMPEG_PREFIX/include" ;;
+	-DAVCODEC_LIBRARIES=*) flag="-DAVCODEC_LIBRARIES=$CRDP_FFMPEG_PREFIX/lib/libavcodec.dylib" ;;
+	-DAVUTIL_INCLUDE_DIRS=*) flag="-DAVUTIL_INCLUDE_DIRS=$CRDP_FFMPEG_PREFIX/include" ;;
+	-DAVUTIL_LIBRARIES=*) flag="-DAVUTIL_LIBRARIES=$CRDP_FFMPEG_PREFIX/lib/libavutil.dylib" ;;
 	# CRDP_WITH_FFMPEG=0 revert path (see the flag's definition above): the lock's
 	# committed flags are the new (post-flip) default of ON, so only force these OFF --
 	# never force them ON, that's what the lock's own committed values already do.

@@ -93,6 +93,64 @@ targets:
           copyFiles:
             destination: frameworks
             codeSignOnCopy: true
+      # W8: the three FFmpeg dylibs libfreerdp3 links for H264/AVC decode (adr/0007).
+      # Same SONAME-symlink rule as the FreeRDP entries above — `libavcodec.63.dylib` is
+      # the literal `@rpath/...` load command baked into libfreerdp3, and it is one hop to
+      # the real `libavcodec.63.1.101.dylib`, which Xcode's Copy Files phase dereferences
+      # into real bytes under the symlink's own name. So these need editing on an FFmpeg
+      # *major* (SONAME) bump only, not on 9.0.1 -> 9.0.2.
+      #
+      # All three are mandatory, not a menu: libavcodec carries its own LC_LOAD_DYLIB on
+      # libswresample (FreeRDP itself calls no swr_* symbol), so shipping two of the three
+      # produces an app that fails to load. Scripts/gen-notices.sh asserts all three are
+      # present rather than trusting this list.
+      #
+      # Embedding rather than static-linking is also the LGPL-2.1 §6 obligation, not just a
+      # packaging preference — see LGPL_RELINK.md, which tells users how to swap exactly
+      # these three files for their own build.
+      - path: ../.build/deps/ffmpeg-prefix/lib/libavcodec.63.dylib
+        optional: true
+        buildPhase:
+          copyFiles:
+            destination: frameworks
+            codeSignOnCopy: true
+      - path: ../.build/deps/ffmpeg-prefix/lib/libavutil.61.dylib
+        optional: true
+        buildPhase:
+          copyFiles:
+            destination: frameworks
+            codeSignOnCopy: true
+      - path: ../.build/deps/ffmpeg-prefix/lib/libswresample.7.dylib
+        optional: true
+        buildPhase:
+          copyFiles:
+            destination: frameworks
+            codeSignOnCopy: true
+      # W8 compliance last mile: the licence obligations have to travel with the *artifact*,
+      # not just with this repository. Someone who receives only Macdows.app must still get
+      # the notices, the verbatim licence texts, and — because FFmpeg is LGPL-2.1 and
+      # dynamically redistributed — the §6 procedure for replacing it with their own build.
+      # Without these, a shipped bundle is out of compliance no matter how correct the
+      # linking is.
+      #
+      # `type: folder` (a folder reference, not a group): Xcode copies the directory
+      # wholesale, so new licence files added to ThirdParty/licenses/ ship automatically and
+      # land at Contents/Resources/licenses/. Scripts/gen-notices.sh independently asserts
+      # each expected file is present AND byte-identical to the tracked copy, so a silently
+      # broken copy phase fails the release gate rather than shipping.
+      - path: ../THIRD_PARTY_NOTICES.md
+        buildPhase:
+          copyFiles:
+            destination: resources
+      - path: ../LGPL_RELINK.md
+        buildPhase:
+          copyFiles:
+            destination: resources
+      - path: ../ThirdParty/licenses
+        type: folder
+        buildPhase:
+          copyFiles:
+            destination: resources
     settings:
       base:
         PRODUCT_NAME: Macdows
@@ -130,6 +188,28 @@ targets:
           # (RemoteWindowRegistry does, once wired in).
           - -framework
           - IOSurface
+      configs:
+        Release:
+          # Keep com.apple.security.get-task-allow out of the distributable build.
+          # Xcode's CODE_SIGN_INJECT_BASE_ENTITLEMENTS defaults to YES and injects that
+          # entitlement whenever it considers the signing to be development-style — which
+          # includes the ad-hoc identity this project uses by default, so it was landing on
+          # *Release* builds too, not just Debug (verified: the only entitlement on a Release
+          # Macdows.app was get-task-allow). It permits any local process to attach a
+          # debugger and read/write the app's memory, i.e. to lift live RDP credentials and
+          # session keys straight out of a running Macdows, and Apple's notary service
+          # rejects it outright.
+          #
+          # Scoped to Release so Debug keeps the injected entitlements and stays debuggable.
+          # Scripts/sign-and-verify.sh independently fails the release gate if a
+          # non-Debug bundle still carries it, so this setting is the fix and that check is
+          # the proof — neither is trusted on its own.
+          #
+          # NOTE: this must live under `settings.configs`, not a target-level `configs:`
+          # key. The latter is silently ignored by XcodeGen for targets (verified with
+          # `xcodebuild -showBuildSettings`) — see the CRBridge target's own configs block,
+          # which does not take effect today.
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
     # Build FreeRDP (and its OpenSSL dependency) before compiling/linking. Both scripts
     # are idempotent — this is a fast no-op once .build/freerdp/current is populated for
     # the current submodule SHA + patch queue + flags, so re-running it on every build
@@ -140,6 +220,7 @@ targets:
         script: |
           set -euo pipefail
           "$SRCROOT/../Scripts/build-openssl.sh"
+          "$SRCROOT/../Scripts/build-ffmpeg.sh"
           "$SRCROOT/../Scripts/build-freerdp.sh"
         basedOnDependencyAnalysis: false
     dependencies:
@@ -173,19 +254,62 @@ targets:
           - $(SRCROOT)/../.build/deps/prefix/include
         CLANG_CXX_LANGUAGE_STANDARD: "c++17"
         CLANG_ENABLE_OBJC_ARC: YES
+        OTHER_CFLAGS:
+          - $(inherited)
+          # Keep the building machine's absolute paths out of the shipped binary.
+          # CRSession.mm's NSAssert expands __FILE__, which clang bakes in as the compiler's
+          # full source path — so a Release build of the app carried
+          # "/Users/<name>/.../App/CRBridge/CRSession.mm" as a string constant in
+          # Contents/MacOS/Macdows. Same defect class as the OpenSSL --openssldir and
+          # FreeRDP CMAKE_INSTALL_PREFIX leaks that Scripts/build-openssl.sh and
+          # Scripts/build-freerdp.sh already work around with placeholder prefixes.
+          #
+          # Found during W8 only because the guard that is supposed to catch it
+          # (Scripts/gen-notices.sh's $HOME check) was itself silently broken by a
+          # pipefail/SIGPIPE interaction and never fired; it does now, and this is what it
+          # caught first. Debug builds hid it for a second reason: Xcode puts CRSession.o
+          # into Contents/MacOS/Macdows.debug.dylib there, which the scan does not cover.
+          #
+          # -fmacro-prefix-map, deliberately NOT -ffile-prefix-map/-fdebug-prefix-map:
+          # it rewrites __FILE__ only and leaves DWARF paths alone, so debugging and dSYM
+          # symbolication are completely unaffected. Result: "App/CRBridge/CRSession.mm".
+          #
+          # The mapped-from value must be a *literal textual* prefix of the path clang is
+          # invoked with — clang does a plain string-prefix replacement, it does not
+          # normalise. `$(SRCROOT)/../=` looks equivalent but expands to ".../App/../",
+          # which never appears in the compiler's ".../App/CRBridge/CRSession.mm" argument,
+          # so it silently matched nothing (confirmed: the leak survived it). `$(SRCROOT)/`
+          # is a real prefix, hence this form.
+          - -fmacro-prefix-map=$(SRCROOT)/=App/
+          # Second entry for the other source tree this target compiles: CRDPQueue's C
+          # sources live at $(SRCROOT)/../Packages/..., which the map above cannot reach
+          # (it only covers paths under App/). `$(SRCROOT:dir)` is Xcode's own
+          # parent-directory operator and expands to the *normalised* repo root with a
+          # trailing slash, which is a literal prefix of those paths — unlike
+          # "$(SRCROOT)/../", which is not. Result: "Packages/MacdowsCore/...".
+          - -fmacro-prefix-map=$(SRCROOT:dir)=
     configs:
       Debug:
-        # W4a review H3: crb_verify_certificate_ex's insecure "accept unconditionally,
-        # this session only" behavior is Debug-only, gated on this macro. Undefined (the
-        # Release default -- no configs.Release entry here at all) means the function
-        # rejects every certificate outright until real pin UX ships (a Phase 1 follow-on
-        # ADR). Never define this for a Release/distributed build.
+        # W4a review H3 intended crb_verify_certificate_ex's insecure "accept
+        # unconditionally, this session only" behavior to be Debug-only, gated on this
+        # macro. KNOWN-INEFFECTIVE (W8 round finding): XcodeGen silently ignores a
+        # target-level `configs:` key, so this macro has NEVER been defined in any
+        # configuration (verified: `xcodebuild -target CRBridge -configuration Debug
+        # -showBuildSettings` shows only DEBUG=1, and the generated pbxproj contains no
+        # CRB_ALLOW_INSECURE_CERT). Actual behavior today: EVERY configuration, Debug
+        # included, rejects every certificate -- the W4a Debug escape hatch has never
+        # existed. Fail-safe, so deliberately left unfixed: the working fix (moving this
+        # under `settings.configs` like the Macdows target's Release entry) would enable
+        # insecure certificate acceptance in Debug builds, a security-relevant change in
+        # W4a's area that needs an explicit owner decision weighing the dev-loop cost of
+        # having no escape hatch. Never define this for a Release/distributed build.
         GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CRB_ALLOW_INSECURE_CERT=1"
     prebuildScripts:
       - name: "Build vendored FreeRDP"
         script: |
           set -euo pipefail
           "$SRCROOT/../Scripts/build-openssl.sh"
+          "$SRCROOT/../Scripts/build-ffmpeg.sh"
           "$SRCROOT/../Scripts/build-freerdp.sh"
         basedOnDependencyAnalysis: false
 

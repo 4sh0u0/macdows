@@ -70,10 +70,15 @@ cd macdows
 
 `bootstrap.sh` is the one-command path from a clean checkout to a buildable Xcode
 project: it installs the required Homebrew formulas (`cmake`, `ninja`, `xcodegen`,
-`jq`), initializes the vendored `ThirdParty/FreeRDP` submodule, verifies it's pinned to
-the commit recorded in `deps/freerdp.lock`, builds a pinned static OpenSSL and the
-vendored FreeRDP from source, and runs `xcodegen generate`. It's idempotent — safe to
-re-run any time.
+`jq`, `pkg-config`), initializes the vendored `ThirdParty/FreeRDP` submodule, verifies
+it's pinned to the commit recorded in `deps/freerdp.lock`, builds a pinned static
+OpenSSL, a pinned LGPL-only FFmpeg and the vendored FreeRDP from source, and runs
+`xcodegen generate`. It's idempotent — safe to re-run any time.
+
+FFmpeg is built from source rather than installed from Homebrew on purpose: the Homebrew
+formula is a GPL-3.0 build, which cannot be redistributed inside this Apache-2.0
+application. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and
+[`LGPL_RELINK.md`](LGPL_RELINK.md).
 
 Then build the app:
 
@@ -106,9 +111,17 @@ documented anywhere in this repository. Launch it via `Scripts/run-window-smoke.
   component actually packaged into the app bundle, and a CycloneDX SBOM is generated
   alongside it at release time by `Scripts/gen-notices.sh`, which fails the build if
   anything linked isn't documented.
-- Phase 2 will add a dynamically-linked ffmpeg dependency (LGPL) for H264 decode —
-  dynamic linking and source-availability obligations under LGPL §6 are a deliberate
-  design constraint, not an afterthought.
+- The compliance payload ships **inside the artifact**, not just the repo: the app
+  bundle carries `THIRD_PARTY_NOTICES.md`, `LGPL_RELINK.md` and the full licence texts
+  (vendored under [`ThirdParty/licenses/`](ThirdParty/licenses/)) in
+  `Contents/Resources/`, and `Scripts/gen-notices.sh` fails the release gate if any of
+  them is missing or has drifted from the tracked copy.
+- Bundles **FFmpeg** (LGPL-2.1-or-later) for H264 decode, self-built from a pinned,
+  checksum-verified upstream tarball with `--disable-gpl --disable-nonfree
+  --disable-version3` and linked **dynamically only**. Dynamic linking and the
+  source-availability obligation under LGPL §6 are a deliberate design constraint, not an
+  afterthought: [`LGPL_RELINK.md`](LGPL_RELINK.md) is the runnable, step-by-step
+  procedure for replacing the bundled libraries with your own modified build.
 
 ## Repository conventions
 

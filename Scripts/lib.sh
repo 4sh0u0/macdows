@@ -12,7 +12,13 @@ export CRDP_REPO_ROOT
 
 CRDP_BUILD_DIR="$CRDP_REPO_ROOT/.build"
 CRDP_DEPS_PREFIX="$CRDP_BUILD_DIR/deps/prefix"
-export CRDP_BUILD_DIR CRDP_DEPS_PREFIX
+# ffmpeg gets its *own* prefix rather than sharing CRDP_DEPS_PREFIX with OpenSSL:
+# Scripts/build-openssl.sh does an `rm -rf "$CRDP_DEPS_PREFIX"` before relocating its
+# staged install, so anything else living there would be silently deleted by an unrelated
+# OpenSSL rebuild. Sibling directories keep the two lifecycles independent while still
+# sharing .build/deps/{download,src}.
+CRDP_FFMPEG_PREFIX="$CRDP_BUILD_DIR/deps/ffmpeg-prefix"
+export CRDP_BUILD_DIR CRDP_DEPS_PREFIX CRDP_FFMPEG_PREFIX
 
 log() { printf '[%s] %s\n' "$(basename "${BASH_SOURCE[1]:-$0}")" "$*" >&2; }
 die() {

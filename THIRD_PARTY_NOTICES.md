@@ -9,6 +9,25 @@ Generated inventory metadata (hashes, purls, patch pedigree) lives in
 `sbom/macdows.cdx.json` (CycloneDX 1.6), regenerated
 at release time by the same script.
 
+> **`Scripts/gen-notices.sh` is a manual release gate, not an automated one.** Nothing in
+> CI runs it today — a Tier 2 CI pipeline is still an open owner decision — so it must be
+> run by hand against the built `.app` before any artifact leaves this machine, and it must
+> exit 0. Treat a release without a green `gen-notices.sh` run as unreleased. Everything
+> below is only as accurate as the last time somebody ran it.
+
+**These obligations ship with the application, not just with this repository.** A built
+`Macdows.app` carries, in `Contents/Resources/`:
+
+- `THIRD_PARTY_NOTICES.md` — this file
+- `LGPL_RELINK.md` — the LGPL-2.1 §6 procedure for replacing the bundled FFmpeg
+- `licenses/` — the verbatim licence text of every packaged component
+  (see [`ThirdParty/licenses/`](ThirdParty/licenses/) for the tracked originals and their
+  provenance)
+
+`Scripts/gen-notices.sh` fails the release if any of them is missing from the bundle or has
+drifted from the tracked copy, so a recipient who receives only the `.app` still gets
+everything the licences require.
+
 ---
 
 ## FreeRDP
@@ -19,7 +38,9 @@ at release time by the same script.
 - **Upstream**: https://github.com/FreeRDP/FreeRDP
 - **SPDX identifier**: Apache-2.0
 - **License text**: `ThirdParty/FreeRDP/LICENSE` (vendored verbatim, upstream copyright
-  headers untouched — see `ThirdParty/patches/README.md`)
+  headers untouched — see `ThirdParty/patches/README.md`). Shipped with the app as
+  `Contents/Resources/licenses/LICENSE-FreeRDP-Apache-2.0.txt`, a byte-identical copy
+  tracked at `ThirdParty/licenses/LICENSE-FreeRDP-Apache-2.0.txt`.
 - **Modified**: No local patches as of Phase 1. If `ThirdParty/patches/*.patch` becomes
   non-empty, the applied patch list is auto-populated into
   `sbom/macdows.cdx.json`'s `pedigree.patches` for the FreeRDP component; the
@@ -41,10 +62,12 @@ at release time by the same script.
 - **Upstream**: https://github.com/openssl/openssl (release
   https://github.com/openssl/openssl/releases/tag/openssl-3.5.7)
 - **SPDX identifier**: Apache-2.0
-- **License text**: https://github.com/openssl/openssl/blob/openssl-3.5.7/LICENSE.txt
-  (not vendored into this repository — self-built from a pinned, checksum-verified
-  tarball by `Scripts/build-openssl.sh`; the license text is fetched alongside the
-  source tarball at build time and not tracked here as a separate file in Phase 1)
+- **License text**: `ThirdParty/licenses/LICENSE-OpenSSL-Apache-2.0.txt` — a byte-identical
+  copy of `LICENSE.txt` from the pinned, checksum-verified `openssl-3.5.7.tar.gz`
+  (upstream: https://github.com/openssl/openssl/blob/openssl-3.5.7/LICENSE.txt). Shipped
+  with the app as `Contents/Resources/licenses/LICENSE-OpenSSL-Apache-2.0.txt`. OpenSSL is
+  statically linked rather than shipped as its own dylib, but it is still redistributed as
+  compiled code, so its licence travels with the artifact.
 - **Modified**: No. Built unmodified with `no-shared darwin64-arm64-cc`.
 - **How it's packaged**: built **statically** and linked into `libfreerdp3` — it does
   not appear as its own dylib in the bundle (`Scripts/gen-notices.sh` detects this via
@@ -56,12 +79,85 @@ at release time by the same script.
   statically-linked build is also required to have a meaningful SBOM entry ("whatever
   brew had installed today" is not a reproducible version).
 
+## FFmpeg
+
+- **Version**: 9.0.1 — synced with `deps/freerdp.lock`'s `.ffmpeg.version`; see the FreeRDP
+  entry above for how that sync is enforced. (`libavcodec` 63, `libavutil` 61,
+  `libswresample` 7.)
+- **Upstream**: https://ffmpeg.org — source tarball
+  https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz
+  (SHA-256 `cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635`, pinned and
+  verified on every build by `Scripts/build-ffmpeg.sh`)
+- **SPDX identifier**: LGPL-2.1-or-later
+- **License text**: `ThirdParty/licenses/LICENSE-FFmpeg-LGPL-2.1.txt` — a byte-identical
+  copy of `COPYING.LGPLv2.1` from the pinned, checksum-verified tarball above. Shipped with
+  the app as `Contents/Resources/licenses/LICENSE-FFmpeg-LGPL-2.1.txt`; delivering the
+  licence with the binary is itself an LGPL-2.1 §1 obligation, not a courtesy.
+- **Modified**: No. Built unmodified from the released tarball; the only project-specific
+  input is the configure flag set below.
+- **Why the licence claim is checkable, not just asserted**: FFmpeg is
+  LGPL-2.1-or-later *only* when built without `--enable-gpl` / `--enable-nonfree` /
+  `--enable-version3`. This build passes the explicit negations, and FFmpeg bakes its
+  entire configure command line into `libavutil` as a string constant, so the posture can
+  be read back out of the shipped binary:
+
+  ```sh
+  strings -a Macdows.app/Contents/Frameworks/libavutil.61.dylib | grep -- --disable-gpl
+  ```
+
+  `Scripts/build-ffmpeg.sh` runs exactly that check itself and refuses to finish if it
+  fails, or if `--enable-gpl`/`--enable-nonfree`/`--enable-version3` appear.
+- **Configure flags** (recorded here as the evidence of the non-GPL, decode-only build;
+  also in `deps/freerdp.lock` `.ffmpeg.configure_flags`, with
+  `Scripts/build-ffmpeg.sh`'s `FFMPEG_CONFIGURE_FLAGS` array as the executable source of
+  truth):
+
+  ```
+  --disable-gpl --disable-nonfree --disable-version3
+  --enable-shared --disable-static --install-name-dir=@rpath
+  --disable-everything --disable-programs --disable-doc
+  --disable-avdevice --disable-avformat --disable-avfilter --disable-swscale
+  --enable-decoder=h264 --enable-parser=h264
+  --enable-videotoolbox --enable-hwaccel=h264_videotoolbox
+  --disable-autodetect --enable-pthreads
+  --disable-network --disable-openssl --disable-iconv
+  --disable-zlib --disable-bzlib --disable-lzma
+  --arch=arm64
+  --extra-cflags=-mmacosx-version-min=14.0 --extra-ldflags=-mmacosx-version-min=14.0
+  ```
+
+- **How it's packaged**: built as **dynamic libraries** and embedded into the app bundle's
+  `Contents/Frameworks`: `libavcodec.63.dylib`, `libavutil.61.dylib`,
+  `libswresample.7.dylib`. Static linking is prohibited here (adr/0007) precisely because
+  LGPL-2.1 §6 requires that a user be able to substitute their own build of the library.
+  `libswresample` is shipped even though Macdows and FreeRDP call no `swr_*` symbol:
+  `libavcodec` carries its own load command on it, so it is a required part of the set.
+  Nothing else from FFmpeg is built or shipped — `libavformat`, `libavfilter`,
+  `libavdevice` and `libswscale` are not produced at all.
+- **How to replace it with your own build**: see **[`LGPL_RELINK.md`](LGPL_RELINK.md)** in
+  this repository — step-by-step, runnable instructions for obtaining the exact
+  corresponding source, rebuilding it (modified or not), swapping the three dylibs inside
+  `Macdows.app`, and re-signing. That document is this project's LGPL-2.1 §6 offer;
+  `Scripts/gen-notices.sh` fails the release gate if it is missing or names a different
+  version than the one actually shipped.
+- **Why self-built instead of Homebrew's `ffmpeg`**: two independent blockers. (1) The
+  Homebrew formula is built `--enable-gpl --enable-version3` (and pulls in libx264 and
+  libx265), which makes those binaries **GPL-3.0** — redistributing them inside this
+  Apache-2.0 application is not permitted, which is what made this a hard prerequisite for
+  any external distribution. (2) It links by absolute `/opt/homebrew/...` path, which is
+  undistributable and breaks on `brew upgrade ffmpeg` — the same adr/0006 §3 defect #1 that
+  the OpenSSL entry above describes. The self-built version additionally narrows what is
+  shipped from seven libraries to three.
+
 ## zlib
 
 - **Version**: system-provided (macOS `/usr/lib/libz.dylib`)
 - **SPDX identifier**: Zlib
-- **License text**: part of the macOS base system; not vendored or redistributed by
-  this project
+- **License text**: `ThirdParty/licenses/LICENSE-zlib.txt`, extracted verbatim from the
+  macOS SDK's own `zlib.h` — the header of the very library the app links. Shipped with the
+  app as `Contents/Resources/licenses/LICENSE-zlib.txt` for completeness; zlib itself is
+  part of the macOS base system and is **not** vendored or redistributed by this project, so
+  no redistribution obligation attaches to it.
 - **Modified**: No.
 - **How it's packaged**: **not packaged.** Dynamically linked from the OS at
   `/usr/lib/libz.dylib` on every target Mac; nothing zlib-related is bundled or
