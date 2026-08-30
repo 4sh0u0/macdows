@@ -77,6 +77,13 @@ final class TrayStatusController {
     /// discipline as `createsSeen`/`updatesSeen`/`deletesSeen` above and for the same reason
     /// (a post-shutdown diagnostics read must still see real per-session totals).
     private(set) var iconSkippedCount = 0
+    /// R1 finding 2: the maximum `realIconKeys.count` ever reached -- latched exactly, at
+    /// the moment a real bitmap is installed in `upsertStatusItem`, NOT timer-sampled (a
+    /// create+delete pair landing inside one drain batch is invisible to any poll, and the
+    /// adr/0013 §4 acceptance gate must not fail a pipeline that worked). Cumulative for
+    /// this controller's lifetime, NOT reset by `removeAll()`, same post-shutdown-read
+    /// reasoning as `createsSeen` above.
+    private(set) var realIconMaxObserved = 0
     /// Latest observed value of `CRSession.iconStoreOverflowCount` — the C side-store's own
     /// counter for icons refused because all `CRDPQ_ICON_SLOTS` (16) slots were held by other
     /// keys (adr/0013 §1). Pushed in by `RemoteWindowRegistry` (which owns the `CRSession`
@@ -124,6 +131,9 @@ final class TrayStatusController {
         let realIconCount: Int
         /// Cumulative; see `iconSkippedCount`'s own doc comment.
         let iconSkippedCount: Int
+        /// Cumulative; see `realIconMaxObserved`'s own doc comment (R1 finding 2: the exact,
+        /// latched form of the real-bitmap evidence `realIconCount` only shows while alive).
+        let realIconMaxObserved: Int
         /// Cumulative; the C side-store's slot-exhaustion counter (adr/0013 §1), as last
         /// pushed in by `RemoteWindowRegistry`.
         let storeOverflowCount: Int
@@ -132,7 +142,8 @@ final class TrayStatusController {
         Diagnostics(
             createsSeen: createsSeen, updatesSeen: updatesSeen, deletesSeen: deletesSeen,
             liveCount: statusItems.count, realIconCount: realIconKeys.count,
-            iconSkippedCount: iconSkippedCount, storeOverflowCount: storeOverflowCount
+            iconSkippedCount: iconSkippedCount, realIconMaxObserved: realIconMaxObserved,
+            storeOverflowCount: storeOverflowCount
         )
     }
 
@@ -171,9 +182,16 @@ final class TrayStatusController {
     /// itself carried no `toolTip` (see `resolvedTooltip`).
     func handleNotifyIconCreate(windowId: UInt32, notifyIconId: UInt32, ownerWindowTitle: String?, icon: IconPayload = .absent) {
         createsSeen += 1
-        let tooltip = Self.resolvedTooltip(wire: icon.toolTip, ownerWindowTitle: ownerWindowTitle)
-        model.create(windowId: windowId, notifyIconId: notifyIconId, info: TrayIconInfo(tooltip: tooltip))
-        upsertStatusItem(windowId: windowId, notifyIconId: notifyIconId, tooltip: tooltip, icon: icon)
+        // R1 finding 1: the model stores the WIRE tooltip truth (nil = the order didn't
+        // carry the NOTIFY_TIP bit), never the display-resolved value -- the owner-title
+        // fallback is applied at NSStatusItem time below, so a later tooltip-less delta
+        // can't launder the fallback into "what the server said".
+        model.create(windowId: windowId, notifyIconId: notifyIconId, info: TrayIconInfo(tooltip: icon.toolTip))
+        upsertStatusItem(
+            windowId: windowId, notifyIconId: notifyIconId,
+            tooltip: Self.resolvedTooltip(wire: storedTooltip(windowId: windowId, notifyIconId: notifyIconId), ownerWindowTitle: ownerWindowTitle),
+            icon: icon
+        )
     }
 
     /// A `NotifyIconUpdate` order -- update-in-place: reuses the existing `NSStatusItem` for
@@ -182,9 +200,25 @@ final class TrayStatusController {
     /// for an update-before-create ordering, see its doc comment).
     func handleNotifyIconUpdate(windowId: UInt32, notifyIconId: UInt32, ownerWindowTitle: String?, icon: IconPayload = .absent) {
         updatesSeen += 1
-        let tooltip = Self.resolvedTooltip(wire: icon.toolTip, ownerWindowTitle: ownerWindowTitle)
-        model.update(windowId: windowId, notifyIconId: notifyIconId, info: TrayIconInfo(tooltip: tooltip))
-        upsertStatusItem(windowId: windowId, notifyIconId: notifyIconId, tooltip: tooltip, icon: icon)
+        // R1 finding 1: `TrayModel.update` delta-merges -- an update without the NOTIFY_TIP
+        // bit keeps the key's previously-seen wire tooltip (the exact mirror of the C
+        // side-store re-referencing this key's pixel slot for an icon-less update), so an
+        // ordinary icon-only state change no longer blanks a real tooltip down to the
+        // owner-title fallback. The button then shows the MERGED wire truth, resolved
+        // against the fallback only when no order ever carried a tooltip at all.
+        model.update(windowId: windowId, notifyIconId: notifyIconId, info: TrayIconInfo(tooltip: icon.toolTip))
+        upsertStatusItem(
+            windowId: windowId, notifyIconId: notifyIconId,
+            tooltip: Self.resolvedTooltip(wire: storedTooltip(windowId: windowId, notifyIconId: notifyIconId), ownerWindowTitle: ownerWindowTitle),
+            icon: icon
+        )
+    }
+
+    /// The delta-merged wire tooltip `TrayModel` currently tracks for this key — the single
+    /// source `resolvedTooltip` reads, so display resolution always sees the merge result,
+    /// never one order's own (possibly bit-absent) field.
+    private func storedTooltip(windowId: UInt32, notifyIconId: UInt32) -> String? {
+        model.icons[NotifyIconState(windowId: windowId, notifyIconId: notifyIconId)]?.tooltip
     }
 
     /// adr/0013 §3's tooltip precedence: the wire's own notify-icon tooltip wins; the owner
@@ -212,9 +246,10 @@ final class TrayStatusController {
         }
     }
 
-    /// Session-scoped teardown -- called from `RemoteWindowRegistry.closeAllWindows()` (both
-    /// its callers: the generation-rollover branch in `handle(_:)` and the explicit
-    /// `prepareForReconnect()` driver), matching how that method already tears down every
+    /// Session-scoped teardown -- called from `RemoteWindowRegistry.closeAllWindows()` (all
+    /// three of its callers: the generation-rollover branch in `handle(_:)`, the
+    /// `.disconnected` case, and the explicit `prepareForReconnect()` driver), matching how
+    /// that method already tears down every
     /// other per-connection resource it owns. Clears the LIVE model/items only -- see
     /// `statusItems`'s own doc comment for why `createsSeen`/`updatesSeen`/`deletesSeen` are
     /// deliberately NOT reset here.
@@ -259,6 +294,7 @@ final class TrayStatusController {
         if let image = Self.menuBarImage(from: icon) {
             button.image = image
             realIconKeys.insert(key)
+            realIconMaxObserved = max(realIconMaxObserved, realIconKeys.count)
         } else {
             button.image = Self.placeholderImage
             realIconKeys.remove(key)

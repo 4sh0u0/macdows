@@ -105,4 +105,50 @@ struct TrayModelTests {
         #expect(model.count == 1)
         #expect(model.icons[NotifyIconState(windowId: 2, notifyIconId: 1)]?.tooltip == "owner B")
     }
+
+    // MARK: - Tooltip delta-merge (adr/0013 §6.9 / review round R1 finding 1)
+
+    @Test("update without the tooltip bit keeps the previously-seen wire tooltip")
+    func updateWithoutTooltipKeepsPrior() {
+        var model = TrayModel()
+        model.create(windowId: 1, notifyIconId: 1, info: TrayIconInfo(tooltip: "Antivirus: 3 threats"))
+        // The ordinary shape: an icon-only state change whose order never carried
+        // WINDOW_ORDER_FIELD_NOTIFY_TIP -- `tooltip: nil` says "unchanged", not "cleared".
+        model.update(windowId: 1, notifyIconId: 1, info: TrayIconInfo(tooltip: nil))
+        #expect(model.icons[NotifyIconState(windowId: 1, notifyIconId: 1)]?.tooltip == "Antivirus: 3 threats")
+    }
+
+    @Test("update carrying a tooltip replaces the stored one")
+    func updateWithTooltipReplaces() {
+        var model = TrayModel()
+        model.create(windowId: 1, notifyIconId: 1, info: TrayIconInfo(tooltip: "old"))
+        model.update(windowId: 1, notifyIconId: 1, info: TrayIconInfo(tooltip: "new"))
+        #expect(model.icons[NotifyIconState(windowId: 1, notifyIconId: 1)]?.tooltip == "new")
+    }
+
+    @Test("update carrying an explicitly EMPTY tooltip clears (bit set + empty != bit absent)")
+    func updateWithEmptyTooltipClears() {
+        var model = TrayModel()
+        model.create(windowId: 1, notifyIconId: 1, info: TrayIconInfo(tooltip: "old"))
+        // The bridge hands "" for a NOTIFY_TIP bit set with a zero-length string (verified
+        // against ConvertWCharNToUtf8 in R1: a zero-length RAIL string yields non-NULL "").
+        model.update(windowId: 1, notifyIconId: 1, info: TrayIconInfo(tooltip: ""))
+        #expect(model.icons[NotifyIconState(windowId: 1, notifyIconId: 1)]?.tooltip == "")
+    }
+
+    @Test("re-create starts a fresh lifetime -- no tooltip inheritance across create")
+    func createReplacesUnconditionally() {
+        var model = TrayModel()
+        model.create(windowId: 1, notifyIconId: 1, info: TrayIconInfo(tooltip: "from the old lifetime"))
+        model.create(windowId: 1, notifyIconId: 1, info: TrayIconInfo(tooltip: nil))
+        #expect(model.icons[NotifyIconState(windowId: 1, notifyIconId: 1)]?.tooltip == nil)
+    }
+
+    @Test("update-before-create with no tooltip creates the entry with none to keep")
+    func updateBeforeCreateWithoutTooltip() {
+        var model = TrayModel()
+        let isNew = model.update(windowId: 1, notifyIconId: 1, info: TrayIconInfo(tooltip: nil))
+        #expect(isNew)
+        #expect(model.icons[NotifyIconState(windowId: 1, notifyIconId: 1)]?.tooltip == nil)
+    }
 }

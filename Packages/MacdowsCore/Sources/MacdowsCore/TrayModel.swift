@@ -14,10 +14,13 @@ import Foundation
 /// `WindowState.title` already uses).
 ///
 /// `TrayStatusController` now fills this with the wire's own `NOTIFY_ICON_STATE_ORDER.toolTip`
-/// when the order carried one, falling back to the notify icon's OWNER WINDOW title (which
-/// has always been captured, via ordinary `WindowCreate`/`WindowUpdate` orders) when it
-/// didn't — so a `nil` here means neither source knew a name for this icon, not that the
-/// transport threw one away.
+/// TRUTH: a `nil` here means "no order in this icon's lifetime has carried the
+/// `WINDOW_ORDER_FIELD_NOTIFY_TIP` bit yet" (thanks to `update`'s delta-merge below, a
+/// tooltip once seen survives later tooltip-less orders), and an empty string means the
+/// server explicitly set an empty tooltip. The owner-window-title DISPLAY fallback lives in
+/// `TrayStatusController.resolvedTooltip`, applied at `NSStatusItem` time — deliberately not
+/// baked into this stored value, so the wire truth and the display policy can't contaminate
+/// each other across deltas (review round R1 finding 1).
 public struct TrayIconInfo: Sendable, Equatable {
     public var tooltip: String?
 
@@ -58,12 +61,12 @@ public struct TrayModel: Sendable, Equatable {
 
     /// A `NotifyIconCreate` order. A duplicate create for an already-tracked key is not
     /// flagged as an anomaly here (unlike `WindowModel.apply`'s `.windowCreate` case, which
-    /// has `Anomaly.duplicateWindowCreate` specifically because `WindowState` carries
-    /// sub-field delta-merge semantics worth protecting) — a notify icon's `TrayIconInfo`
-    /// has no such semantics, so `info` simply, unconditionally replaces whatever was
-    /// previously tracked under this key. Returns whether this key was newly added (`true`)
-    /// or already present (`false`), for a caller that wants to distinguish "created" from
-    /// "re-created" without a separate lookup.
+    /// has `Anomaly.duplicateWindowCreate`) — a create starts a fresh icon lifetime, so
+    /// `info` unconditionally replaces whatever was previously tracked under this key
+    /// (deliberately NOT the delta-merge `update` performs: a re-created icon must not
+    /// inherit a tooltip from the lifetime the server just abandoned). Returns whether this
+    /// key was newly added (`true`) or already present (`false`), for a caller that wants to
+    /// distinguish "created" from "re-created" without a separate lookup.
     @discardableResult
     public mutating func create(windowId: UInt32, notifyIconId: UInt32, info: TrayIconInfo = TrayIconInfo()) -> Bool {
         let key = NotifyIconState(windowId: windowId, notifyIconId: notifyIconId)
@@ -78,11 +81,23 @@ public struct TrayModel: Sendable, Equatable {
     /// this wire (adr/0008 §0's own caveat: not every shape has been sample-verified), so this
     /// creates the entry in place rather than silently dropping the update. Returns whether
     /// this key was newly added by this call.
+    ///
+    /// **Delta-merge (adr/0013 §6.9 / review round R1 finding 1)**: a `NOTIFY_ICON_STATE_ORDER`
+    /// is a delta structure like every other RAIL order — an update whose
+    /// `WINDOW_ORDER_FIELD_NOTIFY_TIP` bit is absent (`info.tooltip == nil`) says nothing
+    /// about the tooltip, so the previously-tracked one is KEPT, not blanked (the exact
+    /// mirror of what the C side-store already does for the pixels: a no-icon-bit order
+    /// re-references the key's existing slot). An update that DID carry the bit replaces —
+    /// including with an explicit empty string, which is the server clearing its tooltip.
     @discardableResult
     public mutating func update(windowId: UInt32, notifyIconId: UInt32, info: TrayIconInfo = TrayIconInfo()) -> Bool {
         let key = NotifyIconState(windowId: windowId, notifyIconId: notifyIconId)
         let isNew = icons[key] == nil
-        icons[key] = info
+        if info.tooltip == nil, let prior = icons[key] {
+            icons[key] = prior
+        } else {
+            icons[key] = info
+        }
         return isNew
     }
 

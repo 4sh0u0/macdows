@@ -1967,16 +1967,17 @@ final class RemoteWindowRegistry {
         warnedUnresolvedOwner.removeAll()
         // Phase 2 W6 (docs/plans/phase2.md §4 W6 acceptance: "delete 清零"): every live
         // NSStatusItem this session created is session-scoped, same as every RemoteWindow
-        // above -- torn down unconditionally on both this method's callers (generation
-        // rollover, explicit prepareForReconnect()). createsSeen/updatesSeen/deletesSeen are
+        // above -- torn down unconditionally on all three of this method's callers (the
+        // generation-rollover branch in `handle(_:)`, the `.disconnected` case, and the
+        // explicit prepareForReconnect() driver). createsSeen/updatesSeen/deletesSeen are
         // NOT reset by this (see TrayStatusController.statusItems' own doc comment).
         trayStatusController.removeAll()
         desktopState = ServerDesktopState()
         // adr/0012 §2 reconnect discipline: reset to `.unmonitored` -- the gate can only
         // reopen on a subsequent *real* MonitoredDesktop order, never by any timeout.
-        // Covers both this method's two callers: the generation-rollover branch in
-        // `handle(_:)` and the explicit `prepareForReconnect()` driver, since both route
-        // through here. Effects intentionally discarded, matching `heldModifierKeys`'
+        // Covers all three of this method's callers: the generation-rollover branch in
+        // `handle(_:)`, the `.disconnected` case, and the explicit `prepareForReconnect()`
+        // driver, since every one routes through here. Effects intentionally discarded, matching `heldModifierKeys`'
         // own reset right below -- the connection this buffered/keyed state described is
         // already gone, so there is nothing left to send any of it to.
         _ = focusAuthority.generationReset()
