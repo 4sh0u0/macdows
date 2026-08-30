@@ -218,9 +218,20 @@ Test-Case 'rejects a method other than GET/POST with 405' {
 }
 
 Test-Case 'rejects a lowercase method (methods are case-sensitive)' {
+    # 400, deliberately, not the 405 the brief's wording suggests (review finding B7). Method
+    # names are case-sensitive tokens per RFC 9110, so 'get' is not a method this agent
+    # declines to support - it is not a well-formed method at all, and the same goes for an
+    # over-long one like 'PATCHPATCHPATCH'. 405 stays reserved for a well-formed method the
+    # agent understands the shape of but does not allow ('PUT', tested above), which is the
+    # distinction that makes 405's "this method is not allowed here" true. Recorded as a
+    # decision in README.md so it is not read as an oversight.
     $r = Read-TestRequest "get /v1/health HTTP/1.1`r`nHost: h`r`n`r`n"
     Assert-True (-not $r.Ok)
     Assert-Equal 400 $r.Status
+
+    $r = Read-TestRequest "PATCHPATCHPATCH /v1/health HTTP/1.1`r`nHost: h`r`n`r`n"
+    Assert-True (-not $r.Ok)
+    Assert-Equal 400 $r.Status 'an over-long method is malformed, not merely unsupported'
 }
 
 Test-Case 'rejects a malformed request line with 400' {
@@ -524,6 +535,104 @@ Test-Case 'inTsAllowList tolerates quoting and separator differences' {
     $resp = Invoke-TestRequest -Context $c -Text "GET /v1/apps HTTP/1.1`r`nAuthorization: Bearer tok-abc`r`n`r`n"
     $body = ConvertTo-TestObject -ResponseBody $resp.Body
     Assert-Equal $true $body.agentAllowlist[0].inTsAllowList
+}
+
+# -------------------------------------------------------------------------------------------
+New-Section 'Published-key enumeration (review finding B6)'
+# -------------------------------------------------------------------------------------------
+
+function New-FakeRegistryKey {
+    <#
+      Stands in for a key from Get-ChildItem over TSAppAllowList\Applications: PSChildName
+      plus GetValue(name). -ThrowOn names a value whose read fails outright.
+
+      The state lives on the object and is read through $this, because a ScriptMethod body
+      does not close over the locals of the function that added it.
+    #>
+    param([string] $ChildName, [hashtable] $Values = @{}, [string] $ThrowOn = '')
+
+    $key = [pscustomobject]@{ ChildName = $ChildName; Values = $Values; ThrowOn = $ThrowOn }
+    Add-Member -InputObject $key -MemberType ScriptProperty -Name 'PSChildName' -Value { $this.ChildName }
+    Add-Member -InputObject $key -MemberType ScriptMethod -Name 'GetValue' -Value {
+        param([string] $Name)
+        if ($this.ThrowOn -eq $Name) { throw "value '$Name' cannot be read" }
+        if ($this.Values.ContainsKey($Name)) { return $this.Values[$Name] }
+        return $null
+    }
+    return $key
+}
+
+Test-Case 'a key with a malformed value does not truncate the listing (review finding B6)' {
+    # The review's own example: an IconIndex that is not a number, so [int] on it throws.
+    # With one try/catch around the whole foreach, that took every later key with it - the
+    # listing simply stopped, with nothing to say anything was missing.
+    $ctx = New-TestContext
+    $keys = @(
+        (New-FakeRegistryKey -ChildName 'first' -Values @{ Name = 'First'; Path = 'C:\a\first.exe' }),
+        (New-FakeRegistryKey -ChildName 'broken' -Values @{
+            Name = 'Broken'; Path = 'C:\a\broken.exe'; IconPath = 'C:\a\broken.exe'; IconIndex = 'not-a-number' }),
+        (New-FakeRegistryKey -ChildName 'third' -Values @{ Name = 'Third'; Path = 'C:\a\third.exe' })
+    )
+    $list = @(ConvertTo-MacdowsPublishedList -Keys $keys -Context $ctx)
+    Assert-Equal 3 $list.Count 'every key must be represented'
+    Assert-Equal 'First' $list[0].name
+    Assert-Equal 'Third' $list[2].name 'the key after the bad one must survive'
+    Assert-Equal 'broken' $list[1].key 'the bad key is reported by name'
+    Assert-Null $list[1].name 'a skipped entry carries no name'
+    Assert-True (-not [string]::IsNullOrWhiteSpace([string]$list[1].readError)) 'a skipped entry says why it was skipped'
+    # ...and it says so without quoting the value it choked on. The cast failure's own message
+    # is Cannot convert value "not-a-number" to type ..., and this field is published in
+    # /v1/apps and written to apps.json on a redirected drive (review finding N5).
+    Assert-True ([string]$list[1].readError -match '^value read failed \(\w+\)$') `
+        "the reason must be a fixed phrase plus an exception type; got [$($list[1].readError)]"
+    Assert-True ([string]$list[1].readError -notmatch 'not-a-number') `
+        "the registry value must not travel in the response; got [$($list[1].readError)]"
+}
+
+Test-Case 'a key whose values cannot be read is reported, not dropped (review finding B6)' {
+    $ctx = New-TestContext
+    $keys = @(
+        (New-FakeRegistryKey -ChildName 'unreadable' -ThrowOn 'Path'),
+        (New-FakeRegistryKey -ChildName 'fine' -Values @{ Name = 'Fine'; Path = 'C:\a\fine.exe' })
+    )
+    $list = @(ConvertTo-MacdowsPublishedList -Keys $keys -Context $ctx)
+    Assert-Equal 2 $list.Count
+    Assert-Equal 'unreadable' $list[0].key
+    # A reason is recorded, and it names the failure type only - the thrown message (here
+    # "value 'Path' cannot be read") never reaches the response (review finding N5).
+    Assert-True ([string]$list[0].readError -match '^value read failed \(\w+\)$') `
+        "the reason is recorded as a type, not a message; got [$($list[0].readError)]"
+    Assert-True ([string]$list[0].readError -notmatch 'cannot be read') `
+        "the exception text must not be echoed; got [$($list[0].readError)]"
+    Assert-Equal 'Fine' $list[1].name 'the readable key still comes through'
+}
+
+Test-Case 'a skipped published entry still serialises and compares as not published' {
+    # A skipped entry reaches /v1/apps like any other, so it must not break the JSON shape
+    # or the inTsAllowList comparison (which reads .path off every published entry).
+    $keys = @(
+        (New-FakeRegistryKey -ChildName 'broken' -Values @{
+            Name = 'Broken'; Path = 'C:\a\broken.exe'; IconPath = 'C:\a\broken.exe'; IconIndex = 'not-a-number' }),
+        (New-FakeRegistryKey -ChildName 'charmap' -Values @{ Name = 'Character Map'; Path = 'C:\Windows\System32\charmap.exe' })
+    )
+    $allowlist = @([pscustomobject]@{ id = 'charmap'; name = 'Character Map'; path = 'C:\Windows\System32\charmap.exe'; args = @() })
+    $c = New-MacdowsContext -Token 'tok-abc' -Bind 'b' -Allowlist $allowlist -SystemRoot 'C:\Windows' -Providers @{
+        TsAllowListDisabled = { $false }
+        IconPng             = { param($Path, $Index) $null }
+    }
+    $c.Providers['PublishedApps'] = {
+        param($Ctx)
+        [pscustomobject]@{
+            tsAllowListDisabled = $false
+            published           = @(ConvertTo-MacdowsPublishedList -Keys $keys -Context $Ctx)
+        }
+    }.GetNewClosure()
+
+    $resp = Invoke-TestRequest -Context $c -Text "GET /v1/apps HTTP/1.1`r`nAuthorization: Bearer tok-abc`r`n`r`n"
+    Assert-Equal 200 $resp.Status
+    $body = ConvertTo-TestObject -ResponseBody $resp.Body
+    Assert-Equal 2 @($body.published).Count 'both keys are listed'
+    Assert-Equal $true $body.agentAllowlist[0].inTsAllowList 'the readable key still answers the comparison'
 }
 
 # -------------------------------------------------------------------------------------------
@@ -1012,6 +1121,98 @@ Test-Case 'the token generator produces 64 hex characters and does not repeat' {
 }
 
 # -------------------------------------------------------------------------------------------
+New-Section 'Token file lifecycle (review findings B10, B11, N3, N4)'
+# -------------------------------------------------------------------------------------------
+
+Test-Case 'a token path containing bracket characters round-trips literally (review finding B11)' {
+    # A regression guard on a property of the current implementation, not a reproduction of a
+    # defect: Save-MacdowsToken creates the parent with [System.IO.Directory]::CreateDirectory
+    # and every later step uses -LiteralPath / the .NET file APIs, so '[' and ']' in a
+    # -TokenPath are ordinary path characters. What this pins is that they stay that way - a
+    # cmdlet that takes wildcards (New-Item has no -LiteralPath, not even on PowerShell 7)
+    # would give the same string a second meaning.
+    $dir = Join-Path $script:TempRoot 'tok[1]'
+    $path = Join-Path $dir 'token'
+    $written = Save-MacdowsToken -Token 'deadbeef' -Path $path
+    Assert-Equal $path $written
+    Assert-True (Test-Path -LiteralPath $path) 'the token file must exist at the literal path'
+    Assert-Equal 'deadbeef' ([System.IO.File]::ReadAllText($path))
+    Assert-True (Remove-MacdowsTokenFile -Path $written -Token 'deadbeef') 'the literal path must be removable too'
+}
+
+Test-Case 'a relative token path is anchored once and the whole chain follows it (review findings B11, N4)' {
+    # Split-Path -Parent returns '' for a bare 'token', and creating '' fails. Worse, the two
+    # halves of the lifecycle used to disagree about what 'token' means: WriteAllText resolves
+    # against [Environment]::CurrentDirectory, Test-Path/Remove-Item -LiteralPath against $PWD.
+    # Save-MacdowsToken now resolves the path up front and hands back the absolute form, so the
+    # permission tightening and the removal act on the file that was written - even here, where
+    # the two roots are deliberately pulled apart.
+    $saved = [System.Environment]::CurrentDirectory
+    $savedLocation = (Get-Location).Path
+    # Set-Location does not update [Environment]::CurrentDirectory, which is the whole point:
+    # after these two lines the PowerShell location and the process working directory differ.
+    Set-Location -LiteralPath ([System.IO.Path]::GetTempPath())
+    [System.Environment]::CurrentDirectory = $script:TempRoot
+    try {
+        # Read the value back rather than reusing $script:TempRoot: the setter canonicalises
+        # the path (on macOS /var/folders/... becomes /private/var/folders/...), and it is the
+        # canonical form that WriteAllText and GetFullPath both work from.
+        $expected = Join-Path ([System.Environment]::CurrentDirectory) 'token'
+        $written = Save-MacdowsToken -Token 'cafe' -Path 'token'
+        Assert-Equal $expected $written 'the returned path must be absolute and point at the file that was written'
+        Assert-Equal 'cafe' ([System.IO.File]::ReadAllText($expected))
+        # The protect and remove halves must now find it as well.
+        Assert-True (Protect-MacdowsTokenFile -Path $written) 'the returned path must be tightenable'
+        Assert-True (Remove-MacdowsTokenFile -Path $written -Token 'cafe') 'the returned path must be removable'
+        Assert-True (-not (Test-Path -LiteralPath $expected)) 'the file that was written must be the file that is gone'
+    } finally {
+        Set-Location -LiteralPath $savedLocation
+        [System.Environment]::CurrentDirectory = $saved
+    }
+}
+
+Test-Case 'the token file is only removed when it still holds this agent''s token (review finding N3)' {
+    # The default token path is shared by every agent this user starts, so removal has to be an
+    # ownership check: an agent shutting down (or failing to start) must not take away a file
+    # that another, running agent has since written its own token into.
+    $path = Join-Path $script:TempRoot 'owned.token'
+    $written = Save-MacdowsToken -Token 'token-A' -Path $path
+    [System.IO.File]::WriteAllText($written, 'token-B')
+
+    Assert-True (-not (Remove-MacdowsTokenFile -Path $written -Token 'token-A')) 'someone else''s token must not be removed'
+    Assert-True (Test-Path -LiteralPath $written) 'the other agent''s token file must survive'
+    Assert-Equal 'token-B' ([System.IO.File]::ReadAllText($written)) 'and must be left untouched'
+
+    Assert-True (Remove-MacdowsTokenFile -Path $written -Token 'token-B') 'the owner still cleans up after itself'
+    Assert-True (-not (Test-Path -LiteralPath $written)) 'a matching token file must be gone'
+}
+
+Test-Case 'removes the token file and tolerates one that is already gone (review finding B10)' {
+    $path = Join-Path $script:TempRoot 'removable.token'
+    [void](Save-MacdowsToken -Token 'abc' -Path $path)
+    Assert-True (Remove-MacdowsTokenFile -Path $path -Token 'abc') 'removing an existing token file reports true'
+    Assert-True (-not (Test-Path -LiteralPath $path)) 'the file must be gone'
+    Assert-True (-not (Remove-MacdowsTokenFile -Path $path)) 'removing it twice is not an error'
+    Assert-True (-not (Remove-MacdowsTokenFile -Path '')) 'an empty path is not an error'
+    Assert-True (-not (Remove-MacdowsTokenFile -Path (Join-Path $script:TempRoot 'never-existed'))) 'a missing path is not an error'
+}
+
+Test-Case 'tightens the permissions on the token file without losing it (review finding B10)' {
+    $path = Join-Path $script:TempRoot 'protected.token'
+    [void](Save-MacdowsToken -Token 'abc' -Path $path)
+    $tightened = Protect-MacdowsTokenFile -Path $path
+    Assert-True ($tightened -is [bool]) 'must always answer with a boolean, never throw'
+    Assert-Equal 'abc' ([System.IO.File]::ReadAllText($path)) 'the token must survive the permission change'
+    Assert-True (-not (Protect-MacdowsTokenFile -Path (Join-Path $script:TempRoot 'never-existed'))) 'a missing file is not an error'
+    if (-not (Test-MacdowsIsWindows)) {
+        Assert-True $tightened 'chmod must succeed on a local temp file'
+        # UnixMode exists on PowerShell 7 on Unix only; 5.1 never reaches this branch.
+        $mode = Get-MacdowsProperty -InputObject (Get-Item -LiteralPath $path) -Name 'UnixMode'
+        if ($null -ne $mode) { Assert-Equal '-rw-------' ([string]$mode) 'the token file must not be group- or world-readable' }
+    }
+}
+
+# -------------------------------------------------------------------------------------------
 New-Section 'probe.ps1 pure helpers'
 # -------------------------------------------------------------------------------------------
 
@@ -1118,6 +1319,47 @@ function Get-PwshPath {
     try { return (Get-Process -Id $PID).Path } catch { return 'pwsh' }
 }
 
+function Start-AgentProcess {
+    <#
+      Starts a real agent process with -Once and returns straight away, without waiting for it
+      to become ready - a start that is expected to fail never prints a banner, so the wait
+      belongs to the caller. -Port and -TokenPath default to a free port and a tag-specific
+      file; handing over another agent's values is what makes a collision reproducible.
+    #>
+    param(
+        [string] $Directory,
+        [string] $AllowlistPath,
+        [string] $Tag = 'agent',
+        [int] $Port = 0,
+        [string] $TokenPath
+    )
+
+    if ($Port -le 0) { $Port = Get-FreeTcpPort }
+    if ([string]::IsNullOrWhiteSpace($TokenPath)) { $TokenPath = Join-Path $Directory "$Tag.token" }
+    $outFile = Join-Path $Directory "$Tag.out"
+    $errFile = Join-Path $Directory "$Tag.err"
+
+    $proc = Start-Process -FilePath (Get-PwshPath) -PassThru `
+        -RedirectStandardOutput $outFile -RedirectStandardError $errFile `
+        -ArgumentList @(
+            '-NoProfile', '-File', $AgentPath,
+            '-BindAddress', '127.0.0.1',
+            '-Port', "$Port",
+            '-AllowlistPath', $AllowlistPath,
+            '-TokenPath', $TokenPath,
+            '-Once'
+        )
+
+    return [pscustomobject]@{
+        Process    = $proc
+        Port       = $Port
+        Token      = $null
+        StdoutPath = $outFile
+        StderrPath = $errFile
+        TokenPath  = $TokenPath
+    }
+}
+
 function Start-TestAgent {
     <#
       Starts a real agent process with -Once and waits for its "listening on" banner.
@@ -1126,53 +1368,30 @@ function Start-TestAgent {
     #>
     param([string] $Directory, [string] $AllowlistPath, [string] $Tag = 'agent')
 
-    $outFile = Join-Path $Directory "$Tag.out"
-    $errFile = Join-Path $Directory "$Tag.err"
-    $tokenFile = Join-Path $Directory "$Tag.token"
-    $port = Get-FreeTcpPort
-
-    $proc = Start-Process -FilePath (Get-PwshPath) -PassThru `
-        -RedirectStandardOutput $outFile -RedirectStandardError $errFile `
-        -ArgumentList @(
-            '-NoProfile', '-File', $AgentPath,
-            '-BindAddress', '127.0.0.1',
-            '-Port', "$port",
-            '-AllowlistPath', $AllowlistPath,
-            '-TokenPath', $tokenFile,
-            '-Once'
-        )
+    $agent = Start-AgentProcess -Directory $Directory -AllowlistPath $AllowlistPath -Tag $Tag
 
     $deadline = (Get-Date).AddSeconds(30)
     $ready = $false
     while ((Get-Date) -lt $deadline) {
         $so = ''
-        if (Test-Path -LiteralPath $outFile) {
-            $so = (Get-Content -LiteralPath $outFile -Raw -ErrorAction SilentlyContinue)
+        if (Test-Path -LiteralPath $agent.StdoutPath) {
+            $so = (Get-Content -LiteralPath $agent.StdoutPath -Raw -ErrorAction SilentlyContinue)
         }
         if ($null -ne $so -and $so -match 'listening on http://') { $ready = $true; break }
-        if ($proc.HasExited) { break }
+        if ($agent.Process.HasExited) { break }
         Start-Sleep -Milliseconds 100
     }
     if (-not $ready) {
-        if (-not $proc.HasExited) { try { $proc.Kill() } catch { } }
-        $err = (Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
-        $so = (Get-Content -LiteralPath $outFile -Raw -ErrorAction SilentlyContinue)
+        if (-not $agent.Process.HasExited) { try { $agent.Process.Kill() } catch { } }
+        $err = (Get-Content -LiteralPath $agent.StderrPath -Raw -ErrorAction SilentlyContinue)
+        $so = (Get-Content -LiteralPath $agent.StdoutPath -Raw -ErrorAction SilentlyContinue)
         throw "agent did not become ready. stdout: $so stderr: $err"
     }
 
-    $token = $null
-    if (Test-Path -LiteralPath $tokenFile) {
-        $token = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
+    if (Test-Path -LiteralPath $agent.TokenPath) {
+        $agent.Token = (Get-Content -LiteralPath $agent.TokenPath -Raw).Trim()
     }
-
-    return [pscustomobject]@{
-        Process   = $proc
-        Port      = $port
-        Token     = $token
-        StdoutPath = $outFile
-        StderrPath = $errFile
-        TokenPath = $tokenFile
-    }
+    return $agent
 }
 
 if ($SkipEndToEnd) {
@@ -1213,8 +1432,56 @@ if ($SkipEndToEnd) {
             $hits = ([regex]::Matches($stdout, [regex]::Escape($agent.Token))).Count
             Assert-Equal 1 $hits 'the token must be printed exactly once'
             Assert-True ($stdout -match 'allowlist: 1 usable') "allowlist should have loaded; got: $stdout"
+
+            # The token is spent once the agent stops, and while nothing is listening another
+            # local process could bind the port and be handed it by a probe (review finding
+            # B10). The agent removes it as the listener shuts down.
+            Assert-True (-not (Test-Path -LiteralPath $agent.TokenPath)) 'the token file must not outlive the agent'
+            Assert-True ($stdout -match 'token file removed') "the removal should be reported; got: $stdout"
         } finally {
             if (-not $agent.Process.HasExited) { try { $agent.Process.Kill() } catch { } }
+        }
+    }
+
+    Test-Case 'an agent that cannot bind the port leaves no token file behind (review finding N2)' {
+        # Two real agents, one port, one token path: the shape a second launch takes when the
+        # first is still running and both use the default -TokenPath. The second agent writes
+        # its token before it finds out the port is taken, so if the failed start left that file
+        # behind, a probe would read a token the live agent has never issued and be answered 401
+        # by a perfectly healthy agent. The listener bind is the only thing that fails here.
+        $agentA = Start-TestAgent -Directory $e2eDir -AllowlistPath $e2eAllowlist -Tag 'bind-a'
+        try {
+            $tokenA = $agentA.Token
+            Assert-True (-not [string]::IsNullOrWhiteSpace($tokenA)) 'the running agent must have written a token file'
+
+            $agentB = Start-AgentProcess -Directory $e2eDir -AllowlistPath $e2eAllowlist -Tag 'bind-b' `
+                -Port $agentA.Port -TokenPath $agentA.TokenPath
+            Assert-True ($agentB.Process.WaitForExit(30000)) 'the second agent must exit, not hang, on a taken port'
+            Assert-True ($agentB.Process.ExitCode -ne 0) "a failed bind must exit non-zero; got $($agentB.Process.ExitCode)"
+
+            $stdoutB = Get-Content -LiteralPath $agentB.StdoutPath -Raw
+            $match = [regex]::Match($stdoutB, '(?m)^token: ([0-9a-f]{64})\s*$')
+            Assert-True $match.Success "the second agent should have written a token before failing; got:`n$stdoutB"
+            $tokenB = $match.Groups[1].Value
+            Assert-True ($tokenB -cne $tokenA) 'the two agents must have generated different tokens'
+            Assert-True ($stdoutB -match 'token file removed') "the failed start must run its cleanup; got:`n$stdoutB"
+
+            $leftover = ''
+            if (Test-Path -LiteralPath $agentA.TokenPath) {
+                $leftover = (Get-Content -LiteralPath $agentA.TokenPath -Raw).Trim()
+            }
+            Assert-True ($leftover -cne $tokenB) 'the failed start must not leave its token at the shared path'
+            Assert-True (-not (Test-Path -LiteralPath $agentA.TokenPath)) `
+                "the file the failed start wrote must be gone; it still holds [$leftover]"
+
+            # And the agent that is actually running is untouched: same port, same token, 200.
+            $raw = & curl --silent --show-error --include --max-time 20 `
+                --header "Authorization: Bearer $tokenA" `
+                "http://127.0.0.1:$($agentA.Port)/v1/health" 2>&1
+            $text = ($raw | Out-String)
+            Assert-True ($text -match 'HTTP/1\.1 200 OK') "the running agent must still serve its own token; got: $text"
+        } finally {
+            if (-not $agentA.Process.HasExited) { try { $agentA.Process.Kill() } catch { } }
         }
     }
 
@@ -1232,10 +1499,13 @@ if ($SkipEndToEnd) {
         }
     }
 
-    Test-Case 'proxy-launches an allowlisted program end to end' {
-        # The allowlist entry points at a file that is not executable, so the launch is
-        # expected to fail at CreateProcess; what this proves is that the request reached
-        # the launch path and that the agent resolved the id itself.
+    Test-Case 'the launch route resolves the id itself: an unknown id gets 404 (not a real launch)' {
+        # Named for what it actually asserts (review finding D1). This is NOT capability-2
+        # evidence: the allowlist entry points at a file that is not executable, so no launch
+        # is attempted at all. What it proves is that the request reached the launch path over
+        # a real socket and that the agent resolved the id against its own config. The
+        # capability-2 PASS comes from the probe.ps1 end-to-end test below and, ultimately,
+        # from the live host run.
         $agent = Start-TestAgent -Directory $e2eDir -AllowlistPath $e2eAllowlist -Tag 'launch'
         try {
             $raw = & curl --silent --show-error --include --max-time 20 `
@@ -1420,6 +1690,70 @@ if ($SkipEndToEnd) {
         }
     }
 
+    Test-Case 'probe.ps1 clears a previous run''s artifacts before starting (review finding B9)' {
+        # apps.json / assoc.json / launch.json / health.json / icon-0.png are written only on
+        # success and nothing used to clear them, so a failing run left the previous run's
+        # files sitting beside a fresh 'failures=3' verdict with no way to tell them apart.
+        $outDir = Join-Path $probeDir 'out-stale'
+        [void][System.IO.Directory]::CreateDirectory($outDir)
+        $artifacts = @('health.json', 'apps.json', 'assoc.json', 'launch.json', 'icon-0.png')
+        foreach ($name in $artifacts) {
+            Set-Content -LiteralPath (Join-Path $outDir $name) -Value 'STALE-FROM-A-PREVIOUS-RUN' -NoNewline
+        }
+        Set-Content -LiteralPath (Join-Path $outDir 'DONE') -Value 'probe finished 1999-01-01T00:00:00Z failures=0' -NoNewline
+
+        $tokenFile = Join-Path $probeDir 'token-stale'
+        Set-Content -LiteralPath $tokenFile -Value $stubToken -NoNewline
+        $deadPort = Get-FreeTcpPort   # nothing is listening, so nothing new gets written
+
+        $code = Invoke-ProbePs1 -OutDir $outDir -Port $deadPort -TokenPath $tokenFile -LogPath (Join-Path $probeDir 'probe-stale.log')
+        Assert-Equal 1 $code 'an unreachable agent must exit non-zero'
+        foreach ($name in $artifacts) {
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $outDir $name))) "the stale $name must be gone"
+        }
+        $done = Get-Content -LiteralPath (Join-Path $outDir 'DONE') -Raw
+        Assert-True ($done -match 'failures=3') "DONE must be rewritten; got: $done"
+        Assert-True ($done -notmatch '1999') "the previous run's DONE must not survive; got: $done"
+    }
+
+    Test-Case 'probe.ps1 treats an -OutDir containing bracket characters literally (review finding B11)' {
+        # As with the token path above: a regression guard on the current implementation's
+        # literal-path property, not a reproduction of a wildcard defect. probe.ps1 creates
+        # -OutDir with [System.IO.Directory]::CreateDirectory and writes every artifact through
+        # -LiteralPath, so '[' and ']' stay path characters; this pins that they do.
+        $outDir = Join-Path $probeDir 'out[1]'
+        $tokenFile = Join-Path $probeDir 'token-glob'
+        Set-Content -LiteralPath $tokenFile -Value $stubToken -NoNewline
+
+        $code = Invoke-ProbePs1 -OutDir $outDir -Port (Get-FreeTcpPort) -TokenPath $tokenFile -LogPath (Join-Path $probeDir 'probe-glob.log')
+        Assert-Equal 1 $code 'an unreachable agent must exit non-zero'
+        Assert-True (Test-Path -LiteralPath (Join-Path $outDir 'DONE')) 'DONE must land in the literal directory'
+        Assert-True (Test-Path -LiteralPath (Join-Path $outDir 'result.txt')) 'result.txt must land in the literal directory'
+    }
+
+    Test-Case 'probe.ps1 reports an uncreatable -OutDir in its own voice (review finding B8)' {
+        # Creating -OutDir used to sit outside the try, so a failure there escaped as a raw
+        # PowerShell error record and skipped the finally that owns the DONE contract. A DONE
+        # marker is impossible when its directory cannot exist, but the failure still has to
+        # be reported by the probe rather than by the runtime.
+        $blocker = Join-Path $probeDir 'not-a-directory'
+        Set-Content -LiteralPath $blocker -Value 'x' -NoNewline
+        $outDir = Join-Path $blocker 'out'
+        $tokenFile = Join-Path $probeDir 'token-outdir'
+        Set-Content -LiteralPath $tokenFile -Value $stubToken -NoNewline
+        $log = Join-Path $probeDir 'probe-outdir.log'
+
+        $code = Invoke-ProbePs1 -OutDir $outDir -Port (Get-FreeTcpPort) -TokenPath $tokenFile -LogPath $log
+        Assert-Equal 1 $code 'an uncreatable -OutDir must still exit non-zero'
+        $text = Get-Content -LiteralPath $log -Raw
+        Assert-True ($text -match 'probe aborted') "the probe must report the failure itself; got:`n$text"
+        Assert-True ($text -match 'could not write result\.txt') "and say the artifacts could not be written; got:`n$text"
+        $stderr = Get-Content -LiteralPath "$log.err" -Raw -ErrorAction SilentlyContinue
+        if ($null -eq $stderr) { $stderr = '' }
+        Assert-True ($stderr -notmatch 'ScriptStackTrace|FullyQualifiedErrorId') "no raw error record should escape; got:`n$stderr"
+        Assert-True (-not (Test-Path -LiteralPath $outDir)) 'nothing should have been created'
+    }
+
     Test-Case 'probe.ps1 writes DONE even when the agent is not running at all' {
         $outDir = Join-Path $probeDir 'out-dead'
         $tokenFile = Join-Path $probeDir 'token-dead'
@@ -1432,6 +1766,69 @@ if ($SkipEndToEnd) {
         $result = Get-Content -LiteralPath (Join-Path $outDir 'result.txt') -Raw
         Assert-True ($result -match 'health: unreachable') "expected an unreachable health line; got:`n$result"
         Assert-Equal 3 @([regex]::Matches($result, '(?m)^FAIL\s')).Count "expected 3 FAIL lines; got:`n$result"
+    }
+}
+
+# -------------------------------------------------------------------------------------------
+New-Section 'probe.sh token validation (review finding B13)'
+# -------------------------------------------------------------------------------------------
+
+$ProbeShPath = Join-Path $PSScriptRoot 'probe.sh'
+
+function Invoke-ProbeSh {
+    <#
+      Runs probe.sh and returns its exit code plus the merged output. A non-zero exit is data
+      here, not a terminating error - PowerShell 7.4+ turns one into an exception while
+      $ErrorActionPreference is 'Stop', so it is lowered for the duration of the call.
+      The call operator (not Start-Process) is deliberate: it passes each argument through as
+      its own argv entry, which is what lets a token containing a newline be tested at all.
+    #>
+    param([string[]] $Arguments)
+
+    $ErrorActionPreference = 'Continue'
+    $text = (& bash $ProbeShPath @Arguments 2>&1 | Out-String)
+    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $text }
+}
+
+# probe.sh checks for curl and python3 itself and exits 2 without them, which would be
+# indistinguishable from a refused token, so require all three before running any of this.
+$probeShTools = @('bash', 'curl', 'python3')
+$missingTool = $null
+foreach ($tool in $probeShTools) {
+    if ($null -eq (Get-Command $tool -ErrorAction SilentlyContinue)) { $missingTool = $tool; break }
+}
+if ($null -ne $missingTool) {
+    Write-Host "  skipped ($missingTool not found)"
+} else {
+    Test-Case 'probe.sh refuses a token carrying curl-config syntax (review finding B13)' {
+        # The token goes into a curl config file as a quoted value, where '"', '\' and a line
+        # break are syntax: such a value would be read as extra curl directives. Escaping a
+        # value that is meant to be 64 hex characters is not worth the risk, so it is refused
+        # with a message that names the problem instead of producing a curl parse error.
+        $cases = @{
+            'zzz"zzz'      = 'contains a double quote'
+            'zzz\zzz'      = 'contains a backslash'
+            "zzz`nzzz"     = 'contains a line break'
+            "zzz`rzzz"     = 'contains a line break'
+        }
+        foreach ($bad in $cases.Keys) {
+            $r = Invoke-ProbeSh -Arguments @('127.0.0.1', '47615', $bad)
+            Assert-Equal 2 $r.ExitCode "a malformed token must be refused; output: $($r.Output)"
+            Assert-True ($r.Output -match [regex]::Escape($cases[$bad])) "expected '$($cases[$bad])'; got: $($r.Output)"
+            Assert-True ($r.Output -notmatch 'zzz') "the token value must never be echoed back; got: $($r.Output)"
+        }
+    }
+
+    Test-Case 'probe.sh accepts a well-formed token and gets as far as the request' {
+        # The guard must not reject the real thing: a 64-hex token reaches curl, which then
+        # fails against a port nothing is listening on - exit 1 (a failed check), not exit 2
+        # (a refused argument).
+        $outDir = Join-Path $script:TempRoot 'probesh-out'
+        $deadPort = Get-FreeTcpPort
+        $r = Invoke-ProbeSh -Arguments @('127.0.0.1', "$deadPort", ('a' * 64), 'charmap', $outDir)
+        Assert-Equal 1 $r.ExitCode "a well-formed token must not be refused; output: $($r.Output)"
+        Assert-True ($r.Output -match 'capability check\(s\) failed') "expected the normal FAIL summary; got: $($r.Output)"
+        Assert-True ($r.Output -notmatch [regex]::Escape('a' * 64)) 'probe.sh must not echo the token'
     }
 }
 

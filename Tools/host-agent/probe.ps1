@@ -59,6 +59,12 @@ $script:MacdowsProbeVersion = '0.1.0'
 $script:MacdowsProbeTimeoutSeconds = 20
 $script:MacdowsProbePngMagic = [byte[]](0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
 
+# Every file this probe writes into -OutDir. Cleared at the start of a run so a failing run
+# cannot leave a previous run's artifacts sitting next to a fresh verdict.
+$script:MacdowsProbeArtifacts = @(
+    'health.json', 'apps.json', 'assoc.json', 'launch.json', 'icon-0.png', 'result.txt', 'DONE'
+)
+
 # ---------------------------------------------------------------------------------------------
 # Pure helpers (no I/O, no network - unit-tested on macOS)
 # ---------------------------------------------------------------------------------------------
@@ -246,6 +252,40 @@ function Invoke-MacdowsProbeRequest {
     }
 }
 
+function Clear-MacdowsProbeArtifacts {
+    <#
+      Deletes this probe's own artifacts from -OutDir before a run.
+
+      apps.json / assoc.json / launch.json / health.json / icon-0.png are written only on
+      success and nothing used to clear them, so a failing run left a previous run's artifacts
+      beside a fresh 'DONE ... failures=3' - and a reader picking files off the redirected
+      drive has no way to tell. probe.sh already removed the stale icon for this reason.
+      DONE is cleared too: while a run is in flight, last run's marker claiming the probe
+      finished is exactly the wrong thing to leave lying around.
+
+      A file that cannot be removed (locked, read-only) is not fatal - the run is still worth
+      doing - so this returns the names it could not remove and lets the caller report them.
+
+      Contract: this emits zero or more names to the pipeline, so callers must wrap the call
+      in @() (same reason as Get-MacdowsProbeEntryList above).
+    #>
+    [CmdletBinding()]
+    param([string] $OutDir)
+
+    $stuck = New-Object System.Collections.ArrayList
+    foreach ($name in $script:MacdowsProbeArtifacts) {
+        $path = Join-Path $OutDir $name
+        try {
+            if (Test-Path -LiteralPath $path) {
+                Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+            }
+        } catch {
+            [void]$stuck.Add($name)
+        }
+    }
+    return $stuck.ToArray()
+}
+
 function Save-MacdowsProbeText {
     [CmdletBinding()]
     param([string] $Path, [string] $Text)
@@ -283,12 +323,29 @@ function Invoke-MacdowsProbe {
     $script:MacdowsProbeFailureCount = 0
     $base = "http://127.0.0.1:$Port"
 
-    if (-not (Test-Path -LiteralPath $OutDir)) {
-        [void](New-Item -ItemType Directory -Path $OutDir -Force)
-    }
-
     try {
+        # Creating -OutDir belongs INSIDE the try. If it throws - an unwritable or unavailable
+        # \\tsclient\... share is exactly the case worth worrying about - the catch below
+        # reports it in the probe's own voice instead of letting a raw PowerShell error record
+        # escape before the finally that owns the DONE contract has run. A DONE marker is
+        # genuinely impossible when its directory does not exist, but the failure still has to
+        # be reported by the probe rather than by the runtime.
+        #
+        # Directory.CreateDirectory rather than New-Item: New-Item has no -LiteralPath (not
+        # even on PowerShell 7), so an -OutDir containing '[', ']' or '*' would be glob-
+        # expanded. The .NET call treats the string literally and is idempotent.
+        if (-not (Test-Path -LiteralPath $OutDir)) {
+            [void][System.IO.Directory]::CreateDirectory($OutDir)
+        }
+
         Add-Line (Format-MacdowsProbeInfo -Text "macdows host-agent probe $($script:MacdowsProbeVersion) -> $base")
+
+        # Before anything is written: a failing run must not leave the previous run's
+        # artifacts next to a fresh verdict.
+        $stale = @(Clear-MacdowsProbeArtifacts -OutDir $OutDir)
+        if ($stale.Count -gt 0) {
+            Add-Line (Format-MacdowsProbeInfo -Text ("could not clear stale artifact(s): {0}" -f ($stale -join ', ')))
+        }
 
         # -- token ------------------------------------------------------------------------
         $token = $null

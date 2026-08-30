@@ -37,6 +37,27 @@ OUT_DIR="${5:-./probe-out}"
 TIMEOUT=20
 BASE="http://${HOST}:${PORT}"
 
+# The token is handed to curl through a config file, where a double quote, a backslash and a
+# line break are all syntax rather than data - a value carrying one of them would be read as
+# additional curl directives. Escaping a value that is supposed to be 64 hex characters is not
+# worth the risk, so a malformed one is refused here with a message that says what is wrong.
+# Without this, a mis-pasted token produces a baffling curl parse error instead.
+case "$TOKEN" in
+    '')              TOKEN_PROBLEM='is empty' ;;
+    *'"'*)           TOKEN_PROBLEM='contains a double quote' ;;
+    *\\*)            TOKEN_PROBLEM='contains a backslash' ;;
+    *$'\n'*|*$'\r'*) TOKEN_PROBLEM='contains a line break' ;;
+    *)               TOKEN_PROBLEM='' ;;
+esac
+if [ -n "$TOKEN_PROBLEM" ]; then
+    # Never echo the value itself.
+    echo "probe.sh: the token $TOKEN_PROBLEM" >&2
+    echo "probe.sh: such a value cannot be passed to curl safely - a quote, a backslash or a" >&2
+    echo "probe.sh: line break would be read as extra curl config directives. The token the" >&2
+    echo "probe.sh: agent prints at startup is 64 hexadecimal characters." >&2
+    exit 2
+fi
+
 for tool in curl python3; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "probe.sh: required tool not found: $tool" >&2
@@ -50,6 +71,7 @@ mkdir -p "$OUT_DIR" || exit 2
 # through a private config file.
 umask 077
 CURL_CFG="$(mktemp "${TMPDIR:-/tmp}/macdows-probe.XXXXXX")"
+# shellcheck disable=SC2329  # invoked indirectly, by the trap below
 cleanup() { rm -f "$CURL_CFG"; }
 trap cleanup EXIT INT TERM
 printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$CURL_CFG"
@@ -75,6 +97,7 @@ http_post_json() {  # <path> <outfile> <json> -> prints HTTP status code
 }
 
 echo "probing ${BASE} ..."
+info "artifacts -> ${OUT_DIR}"
 echo
 
 # ---------------------------------------------------------------------------------------------

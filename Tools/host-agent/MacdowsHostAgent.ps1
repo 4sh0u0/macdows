@@ -149,15 +149,139 @@ function Get-MacdowsDefaultTokenPath {
     return (Join-Path (Join-Path (Join-Path $root 'Macdows') 'host-agent') 'token')
 }
 
+function Protect-MacdowsTokenFile {
+    <#
+      Best-effort restrictive permissions on the token file.
+
+      On Windows the default %LOCALAPPDATA% ACL already excludes other standard accounts, but
+      that protection comes from inheritance rather than from anything this script does - and
+      -TokenPath can point anywhere. So the DACL is replaced outright with a protected one
+      granting only the identity the agent runs as. Everything Windows-only (Get-Acl/Set-Acl,
+      WindowsIdentity, FileSystemAccessRule) sits inside the Windows branch and is resolved at
+      run time, so pwsh on macOS never touches any of it.
+
+      Off-Windows (the ~/.local/share fallback, which exists only so the test suite has
+      somewhere to put the file) the equivalent is chmod 600.
+
+      Returns $true when the permissions were tightened, $false when they were left alone.
+      Never throws: failing to tighten an ACL must not stop the agent from starting.
+    #>
+    [CmdletBinding()]
+    param([string] $Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+
+    if (Test-MacdowsIsWindows) {
+        try {
+            $sid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User
+            # Get-Acl first, rather than a bare new FileSecurity: the descriptor Set-Acl
+            # writes back then keeps its owner and group, and only the DACL is rebuilt.
+            $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+            # (protect, preserveInheritance = $false): drop every inherited ACE instead of
+            # copying it in, so what is left is only what this function puts there.
+            $acl.SetAccessRuleProtection($true, $false)
+            foreach ($existing in @($acl.Access)) {
+                [void]$acl.RemoveAccessRuleAll($existing)
+            }
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid, 'FullControl', 'None', 'None', 'Allow')
+            $acl.SetAccessRule($rule)
+            Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+            return $true
+        } catch {
+            # Not fatal: on a share or a redirected profile this can legitimately fail, and
+            # the inherited %LOCALAPPDATA% ACL is still the default protection.
+            Write-Verbose "could not set an explicit DACL on the token file: $($_.Exception.Message)"
+            return $false
+        }
+    }
+
+    try {
+        # Native call, so no dependency on a .NET API that does not exist on 5.1. This branch
+        # is unreachable on the host.
+        & chmod 600 $Path 2>$null
+        return $true
+    } catch {
+        Write-Verbose "could not chmod the token file: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Save-MacdowsToken {
+    <#
+      Writes the token and returns the path it actually landed on. That return value is what the
+      caller passes on as -TokenPath, so anchoring the path here anchors the whole lifecycle.
+    #>
     [CmdletBinding()]
     param([string] $Token, [string] $Path)
+
+    # A relative -TokenPath is resolved by two different roots below: [IO.File]::WriteAllText
+    # uses [Environment]::CurrentDirectory (the process working directory) while Test-Path and
+    # Remove-Item -LiteralPath use $PWD (the PowerShell location). In a session where those two
+    # differ - which is the normal state after Set-Location - the file would be written in one
+    # place and the chmod/DACL and the removal would look in another and silently do nothing.
+    # Resolving once, against the same root WriteAllText uses, keeps every later step pointed at
+    # the file that was actually written.
+    $Path = [System.IO.Path]::GetFullPath($Path)
+
+    # Split-Path returns '' for a bare filename such as -TokenPath token; creating '' fails.
     $dir = Split-Path -Parent $Path
-    if (-not (Test-Path -LiteralPath $dir)) {
-        [void](New-Item -ItemType Directory -Path $dir -Force)
+    if (-not [string]::IsNullOrEmpty($dir) -and -not (Test-Path -LiteralPath $dir)) {
+        # Directory.CreateDirectory rather than New-Item: New-Item has no -LiteralPath (not
+        # even on PowerShell 7), so a -TokenPath containing '[', ']' or '*' would be glob-
+        # expanded. The .NET call treats the string literally and is idempotent.
+        [void][System.IO.Directory]::CreateDirectory($dir)
     }
     [System.IO.File]::WriteAllText($Path, $Token, (New-Object System.Text.UTF8Encoding($false)))
+    [void](Protect-MacdowsTokenFile -Path $Path)
     return $Path
+}
+
+function Remove-MacdowsTokenFile {
+    <#
+      The token is per-launch, so it is spent the moment the agent stops. Leaving the file
+      behind means a stale token sits in %LOCALAPPDATA% indefinitely, and while the agent is
+      not running another local process can bind the port and be handed that token by a probe.
+
+      -Token makes the removal an ownership check rather than a blind delete (review finding
+      N3): the default token path is shared by every agent this user starts, so an agent that
+      is shutting down must only take away the file that still holds ITS token. If another
+      agent has since written its own token there, the file belongs to that agent and is left
+      alone. A file that cannot be read is also left alone - a delete on a guess is exactly
+      what the check exists to prevent.
+
+      Passing no -Token skips the check and deletes unconditionally, which is the old
+      behaviour; the agent itself always passes one.
+
+      Returns $true when a file was actually removed. Never throws.
+    #>
+    [CmdletBinding()]
+    param([string] $Path, [string] $Token)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+        if (-not [string]::IsNullOrEmpty($Token)) {
+            $current = $null
+            try {
+                $current = [System.IO.File]::ReadAllText($Path)
+            } catch {
+                Write-Verbose "could not read the token file '$Path' to confirm ownership: $($_.Exception.Message)"
+                return $false
+            }
+            if ($null -ne $current) { $current = $current.Trim() }
+            if ($current -cne $Token) {
+                Write-Verbose "token file '$Path' holds another agent's token; leaving it in place"
+                return $false
+            }
+        }
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Verbose "could not remove the token file '$Path': $($_.Exception.Message)"
+        return $false
+    }
 }
 
 function Test-MacdowsTokenMatch {
@@ -848,6 +972,103 @@ public static extern bool DestroyIcon(IntPtr hIcon);
     }
 }
 
+function ConvertTo-MacdowsPublishedEntry {
+    <#
+      Reads one TSAppAllowList\Applications\* key into the shape /v1/apps publishes.
+
+      Split out of the enumeration loop so that a single unreadable or oddly-typed key can be
+      caught per entry (review finding B6) instead of aborting the listing, and so that the
+      behaviour is testable off-Windows against a stand-in key object: anything exposing
+      PSChildName and GetValue(name) will do.
+    #>
+    [CmdletBinding()]
+    param($Key, $Context)
+
+    $name = $Key.GetValue('Name')
+    $path = $Key.GetValue('Path')
+    $cls = $Key.GetValue('CommandLineSetting')
+    $iconPath = $Key.GetValue('IconPath')
+    $iconIndex = $Key.GetValue('IconIndex')
+    if ($null -eq $iconIndex) { $iconIndex = 0 }
+
+    $iconSource = $iconPath
+    if ([string]::IsNullOrWhiteSpace($iconSource)) {
+        $iconSource = $path
+        $iconIndex = 0
+    }
+    $png = Invoke-MacdowsProvider -Context $Context -Name 'IconPng' -Arguments @($iconSource, [int]$iconIndex)
+
+    return [ordered]@{
+        key                = $Key.PSChildName
+        name               = $name
+        path               = $path
+        commandLineSetting = $cls
+        iconPath           = $iconPath
+        iconIndex          = [int]$iconIndex
+        iconPng            = $png
+    }
+}
+
+function New-MacdowsSkippedPublishedEntry {
+    <#
+      Placeholder for a key that could not be read. Same field set as a real entry so a
+      consumer does not have to special-case it, plus a readError saying what went wrong.
+      Reported rather than dropped: a key that exists but cannot be read is information.
+
+      -Reason is a fixed phrase plus an exception type, never exception text: this string is
+      published in /v1/apps and lands in the probe's apps.json, which on the host is written
+      to a redirected drive (review finding N5).
+    #>
+    [CmdletBinding()]
+    param([string] $Key, [string] $Reason)
+
+    return [ordered]@{
+        key                = $Key
+        name               = $null
+        path               = $null
+        commandLineSetting = $null
+        iconPath           = $null
+        iconIndex          = 0
+        iconPng            = $null
+        readError          = $Reason
+    }
+}
+
+function ConvertTo-MacdowsPublishedList {
+    <#
+      Turns registry keys into published entries, one try/catch per key.
+
+      Review finding B6: with a single try/catch around the whole loop, one malformed key
+      (an IconIndex that is not a number, a value that cannot be read) silently truncated the
+      listing at that point - every key after it disappeared with no indication that anything
+      was missing. Icons already degrade per entry; keys now do too.
+    #>
+    [CmdletBinding()]
+    param($Keys, $Context)
+
+    $published = New-Object System.Collections.ArrayList
+    foreach ($key in @($Keys)) {
+        if ($null -eq $key) { continue }
+        $childName = '(unknown)'
+        try { $childName = [string]$key.PSChildName } catch { }
+        try {
+            [void]$published.Add((ConvertTo-MacdowsPublishedEntry -Key $key -Context $Context))
+        } catch {
+            # The exception message routinely quotes the value that failed - a bad IconIndex
+            # reports as Cannot convert value "<the registry data>" to type ... - and this
+            # string is published verbatim in /v1/apps. Only the exception TYPE crosses that
+            # boundary (review finding N5); it still separates a malformed value from an
+            # access-denied read, which is all a caller can act on. The full message goes to
+            # the verbose stream, which stays on the host.
+            $errorType = 'Exception'
+            try { $errorType = $_.Exception.GetType().Name } catch { }
+            Write-Verbose "published key '$childName' could not be read: $($_.Exception.Message)"
+            [void]$published.Add((New-MacdowsSkippedPublishedEntry -Key $childName -Reason "value read failed ($errorType)"))
+        }
+    }
+    return @($published.ToArray())
+}
+
 function Get-MacdowsPublishedApps {
     <#
       Enumerates HKLM\...\Terminal Server\TSAppAllowList\Applications\*, i.e. the RemoteApps
@@ -857,46 +1078,27 @@ function Get-MacdowsPublishedApps {
     param($Context)
 
     $tsDisabled = Invoke-MacdowsProvider -Context $Context -Name 'TsAllowListDisabled'
-    $published = New-Object System.Collections.ArrayList
 
     if (-not (Test-MacdowsIsWindows)) {
         return [pscustomobject]@{ tsAllowListDisabled = $tsDisabled; published = @() }
     }
 
+    $keys = @()
     try {
         $appsKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Terminal Server\TSAppAllowList\Applications'
         if (Test-Path -LiteralPath $appsKey) {
-            foreach ($key in (Get-ChildItem -LiteralPath $appsKey -ErrorAction Stop)) {
-                $name = $key.GetValue('Name')
-                $path = $key.GetValue('Path')
-                $cls = $key.GetValue('CommandLineSetting')
-                $iconPath = $key.GetValue('IconPath')
-                $iconIndex = $key.GetValue('IconIndex')
-                if ($null -eq $iconIndex) { $iconIndex = 0 }
-
-                $iconSource = $iconPath
-                if ([string]::IsNullOrWhiteSpace($iconSource)) {
-                    $iconSource = $path
-                    $iconIndex = 0
-                }
-                $png = Invoke-MacdowsProvider -Context $Context -Name 'IconPng' -Arguments @($iconSource, [int]$iconIndex)
-
-                [void]$published.Add([ordered]@{
-                    key                = $key.PSChildName
-                    name               = $name
-                    path               = $path
-                    commandLineSetting = $cls
-                    iconPath           = $iconPath
-                    iconIndex          = [int]$iconIndex
-                    iconPng            = $png
-                })
-            }
+            $keys = @(Get-ChildItem -LiteralPath $appsKey -ErrorAction Stop)
         }
     } catch {
+        # Only the enumeration itself is fatal to the listing now; a bad individual key is not.
         Write-Verbose "TSAppAllowList enumeration failed: $($_.Exception.Message)"
+        $keys = @()
     }
 
-    return [pscustomobject]@{ tsAllowListDisabled = $tsDisabled; published = @($published.ToArray()) }
+    return [pscustomobject]@{
+        tsAllowListDisabled = $tsDisabled
+        published           = @(ConvertTo-MacdowsPublishedList -Keys $keys -Context $Context)
+    }
 }
 
 # The real native call, kept in one place so it can be replaced wholesale in tests. Returns
@@ -914,6 +1116,14 @@ function Get-MacdowsAssocString {
       with a NULL buffer and pcchOut = 0 to learn the required character count, then allocate
       and call again. S_FALSE (1) is a success here, not a failure - the sizing call returns it
       by design, and some string types return it from the filling call too.
+
+      Accepting S_FALSE from the *filling* call is a deliberate trade (review finding D2). The
+      documented meaning of S_FALSE there is "the buffer was too small", so in principle a
+      truncated string can be returned rather than nothing. Taking it anyway is the right call
+      for this prototype: the buffer is sized by the preceding sizing call and most rungs pass
+      ASSOCF_NOTRUNCATE (which asks the API to fail rather than truncate), while treating
+      S_FALSE as a failure would throw away real answers from the string types that return it
+      routinely. A truncated path is visible in the probe output; a silently dropped one is not.
 
       $Verb is deliberately UNTYPED. PowerShell binds $null to a [string] parameter as an empty
       string, and pszExtra = "" is not the same thing as pszExtra = NULL to AssocQueryString -
@@ -962,7 +1172,11 @@ function Get-MacdowsAssocViaQueryString {
       verb for exactly these - so 'open' is tried before the verb-less form, and ASSOCF_NOTRUNCATE
       / ASSOCF_REMAPRUNDLL / ASSOCF_INIT_IGNOREUNKNOWN are applied before the bare call.
 
-      Returns $null off-Windows or when nothing at all could be resolved.
+      Returns $null only when the lookup could not be attempted at all - off-Windows, or when
+      the P/Invoke would not compile. When the ladder ran but resolved nothing it returns the
+      ordered dictionary with all three fields $null, NOT $null (review finding D3): the caller
+      handles both shapes, and the difference is "we could not ask" versus "we asked and got
+      nothing".
 
       -Invoker replaces the native call outright, which is what lets the ladder (and the verb
       each rung passes) be asserted off-Windows.
@@ -1203,6 +1417,14 @@ function Start-MacdowsAllowlistProcess {
     <#
       Launches an already-validated allowlist entry. The path and arguments come from the
       config file only; nothing here is ever taken from the request. No shell, no cmd /c.
+
+      Caveat for whoever adds an argument to allowlist.json: Windows PowerShell 5.1 joins
+      -ArgumentList with single spaces and does NOT quote the elements, so an element that
+      itself contains a space arrives at the target as two arguments (PowerShell 7 changed
+      this). Nothing in the sample allowlist is affected - every entry ships "args": [] - but
+      a path argument would need the quotes written into the element itself. This is not
+      worked around here because a hand-rolled quoter is easy to get subtly wrong, and the
+      prototype has no argument to pass.
     #>
     [CmdletBinding()]
     param($Entry)
@@ -1474,22 +1696,38 @@ function Start-MacdowsHostAgentServer {
         [string] $BindAddress,
         [int] $Port,
         $Context,
+        # When given, the token file is deleted as the listener shuts down: the token is
+        # spent once the agent stops, and while nothing is listening another local process
+        # could bind the port and be handed the stale token by a probe. Optional so a caller
+        # that owns its own token file (the test stub) can opt out.
+        [string] $TokenPath,
+        # The token that file is expected to hold. Removal is skipped when it holds something
+        # else, so a failed start cannot delete a running agent's file (see Remove-MacdowsTokenFile).
+        [string] $Token,
         [switch] $Once
     )
 
-    $ip = [System.Net.IPAddress]::Parse($BindAddress)
-    $listener = New-Object System.Net.Sockets.TcpListener($ip, $Port)
-    # ExclusiveAddressUse keeps another local process from stealing the port. It is a
-    # Windows socket option; on Unix (test runs only) the setter is not supported.
+    # Parsing the bind address, constructing the listener and binding the port all live INSIDE
+    # the try (review finding N2). They used to sit in front of it, so the two ways a start
+    # realistically fails - a malformed -BindAddress and a port already in use - escaped before
+    # the finally below was armed and left the token file behind. On the shared default path
+    # that orphan is worse than untidy: this process has already overwritten the token of
+    # whichever agent is actually running, so a probe would read a token the live agent does
+    # not accept and get a 401 from a perfectly healthy agent.
+    $listener = $null
     try {
-        $listener.ExclusiveAddressUse = $true
-    } catch {
-        Write-Verbose "ExclusiveAddressUse unavailable on this platform: $($_.Exception.Message)"
-    }
-    $listener.Start()
-    Write-MacdowsLine "listening on http://${BindAddress}:$Port/  (Ctrl+C to stop)"
+        $ip = [System.Net.IPAddress]::Parse($BindAddress)
+        $listener = New-Object System.Net.Sockets.TcpListener($ip, $Port)
+        # ExclusiveAddressUse keeps another local process from stealing the port. It is a
+        # Windows socket option; on Unix (test runs only) the setter is not supported.
+        try {
+            $listener.ExclusiveAddressUse = $true
+        } catch {
+            Write-Verbose "ExclusiveAddressUse unavailable on this platform: $($_.Exception.Message)"
+        }
+        $listener.Start()
+        Write-MacdowsLine "listening on http://${BindAddress}:$Port/  (Ctrl+C to stop)"
 
-    try {
         while ($true) {
             # Poll instead of blocking in AcceptTcpClient so Ctrl+C stays responsive.
             if (-not $listener.Pending()) {
@@ -1501,7 +1739,17 @@ function Start-MacdowsHostAgentServer {
             if ($Once) { break }
         }
     } finally {
-        try { $listener.Stop() } catch { }
+        # $listener is still $null when the constructor itself threw, and StrictMode makes
+        # reading an unassigned variable an error, hence the pre-declaration above.
+        if ($null -ne $listener) { try { $listener.Stop() } catch { } }
+        # PowerShell runs finally on Ctrl+C as well as on a normal exit, so this covers the
+        # ordinary way the agent is stopped. It is still best-effort: a killed process leaves
+        # the file behind, which is why the README says to treat the token as spent regardless.
+        if (-not [string]::IsNullOrWhiteSpace($TokenPath)) {
+            if (Remove-MacdowsTokenFile -Path $TokenPath -Token $Token) {
+                Write-MacdowsLine "token file removed: $TokenPath"
+            }
+        }
     }
 }
 
@@ -1539,7 +1787,11 @@ function Invoke-MacdowsHostAgentMain {
     Write-MacdowsLine "token file: $savedTo"
 
     $context = New-MacdowsContext -Token $token -Allowlist @($loaded.Entries) -Bind "${BindAddress}:$Port"
-    Start-MacdowsHostAgentServer -BindAddress $BindAddress -Port $Port -Context $context -Once:$Once
+    # -Token is what makes the cleanup in there an ownership check: whether the server exits
+    # normally or never manages to bind at all, it only ever removes a file still holding this
+    # token (review findings N2, N3).
+    Start-MacdowsHostAgentServer -BindAddress $BindAddress -Port $Port -Context $context `
+        -TokenPath $savedTo -Token $token -Once:$Once
 }
 
 # ---------------------------------------------------------------------------------------------
