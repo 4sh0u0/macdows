@@ -132,6 +132,8 @@ whole file down:
 
 * `id` matches `^[A-Za-z0-9._-]{1,64}$` and is unique
 * `%SystemRoot%` / `%windir%` are resolved; any other `%TOKEN%` left unresolved is rejected
+* separators in a drive or UNC path are canonicalised to `\`, so `C:/Tools/app.exe` is recorded
+  (and later launched, and published in `/v1/apps`) as `C:\Tools\app.exe`
 * the path must be absolute (drive, UNC, or POSIX), must not contain a `..` segment, and must
   point at a file that exists
 * the target must be a program — only `.exe` and `.com` are accepted. PowerShell 5.1's
@@ -283,7 +285,8 @@ pwsh -NoProfile -File ./MacdowsHostAgent.Tests.ps1
 
 Runs on macOS under PowerShell 7 and on the host under Windows PowerShell 5.1. **Pester is not
 required** — the file carries a ~40-line assertion harness and exits non-zero on any failure.
-116 tests covering:
+119 tests on macOS (117 on the host, where the two `probe.sh` cases skip for want of `bash`)
+covering:
 
 * **The agent** — HTTP head parsing and body framing, size limits, route dispatch and status
   codes, constant-time token comparison, allowlist validation, extension validation, and the
@@ -293,12 +296,24 @@ required** — the file carries a ~40-line assertion harness and exits non-zero 
   one-element-array-collapsed-to-an-object shape that PowerShell 5.1 can emit).
 * **End to end** — four runs that start a real agent on `127.0.0.1` with `-Once` and drive it
   with `curl` (including that the token file does not outlive the agent, and that a second agent
-  which cannot bind the port exits non-zero without leaving a token behind), plus six that run
+  which cannot bind the port exits non-zero without leaving a token behind), plus seven that run
   `probe.ps1` as a separate process and assert the artifacts, the `DONE` marker, the exit code,
-  the stale-artifact clear, a bracketed `-OutDir`, an uncreatable `-OutDir`, and that the token
-  never leaks into any output file. The stub agent is the real server loop and HTTP stack with
-  only the Windows-only providers replaced, which is what lets `probe.ps1`'s PASS path be proven
-  on macOS.
+  the stale-artifact clear, a bracketed `-OutDir`, an uncreatable `-OutDir`, an empty token file,
+  and that the token never leaks into any output file. The stub agent is the real server loop and
+  HTTP stack with only the Windows-only providers replaced, which is what lets `probe.ps1`'s PASS
+  path be proven on macOS.
+
+Two differences between the interpreters are worth knowing before a host run:
+
+* Running the suite with `$PSNativeCommandArgumentPassing = 'Legacy'` on macOS is a useful
+  pre-flight — it reproduces how Windows PowerShell 5.1 composes a native command line, which is
+  what once made an inline JSON `curl` body arrive mangled. **That is all it reproduces.** It does
+  not emulate the 5.1 `curl`→`Invoke-WebRequest` alias, `Start-Process` handle/`ExitCode`
+  behaviour, `Get-Content -Raw` on an empty file, module-scope function lookup, or the ACL APIs.
+  Only a host run covers those.
+* A handful of assertions are Windows-only by nature (the token file's DACL is read back and
+  checked there; `chmod` mode is checked off-Windows). A green macOS run is regression
+  protection, not proof for the host.
 * **`probe.sh`** — its token guard, run through `bash` (skipped when `bash`, `curl` or
   `python3` is unavailable, e.g. on the Windows host).
 

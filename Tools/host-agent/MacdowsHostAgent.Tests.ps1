@@ -610,29 +610,45 @@ Test-Case 'a key whose values cannot be read is reported, not dropped (review fi
 Test-Case 'a skipped published entry still serialises and compares as not published' {
     # A skipped entry reaches /v1/apps like any other, so it must not break the JSON shape
     # or the inTsAllowList comparison (which reads .path off every published entry).
-    $keys = @(
+    # Script scope, not a local: the provider below is invoked from deep inside the agent's
+    # dispatch and reaches the fixture through $script:, which resolves the same way on both
+    # interpreters without needing a closure. See the note on the provider itself. It is torn
+    # down in the finally so it stays a fixture for this one case rather than a file-wide
+    # global that later tests could come to depend on by accident.
+    $script:SkippedEntryKeys = @(
         (New-FakeRegistryKey -ChildName 'broken' -Values @{
             Name = 'Broken'; Path = 'C:\a\broken.exe'; IconPath = 'C:\a\broken.exe'; IconIndex = 'not-a-number' }),
         (New-FakeRegistryKey -ChildName 'charmap' -Values @{ Name = 'Character Map'; Path = 'C:\Windows\System32\charmap.exe' })
     )
-    $allowlist = @([pscustomobject]@{ id = 'charmap'; name = 'Character Map'; path = 'C:\Windows\System32\charmap.exe'; args = @() })
-    $c = New-MacdowsContext -Token 'tok-abc' -Bind 'b' -Allowlist $allowlist -SystemRoot 'C:\Windows' -Providers @{
-        TsAllowListDisabled = { $false }
-        IconPng             = { param($Path, $Index) $null }
-    }
-    $c.Providers['PublishedApps'] = {
-        param($Ctx)
-        [pscustomobject]@{
-            tsAllowListDisabled = $false
-            published           = @(ConvertTo-MacdowsPublishedList -Keys $keys -Context $Ctx)
+    try {
+        $allowlist = @([pscustomobject]@{ id = 'charmap'; name = 'Character Map'; path = 'C:\Windows\System32\charmap.exe'; args = @() })
+        $c = New-MacdowsContext -Token 'tok-abc' -Bind 'b' -Allowlist $allowlist -SystemRoot 'C:\Windows' -Providers @{
+            TsAllowListDisabled = { $false }
+            IconPng             = { param($Path, $Index) $null }
         }
-    }.GetNewClosure()
+        # Deliberately NOT .GetNewClosure(). A closure is rebound to a fresh dynamic module, and
+        # on Windows PowerShell 5.1 function lookup from a module session state falls back to the
+        # GLOBAL scope - while this suite dot-sources the agent into its own SCRIPT scope (the
+        # file is run, not dot-sourced). So a closure here cannot see ConvertTo-MacdowsPublishedList,
+        # and the first live 5.1 run failed this case with "not recognized as the name of a cmdlet".
+        # Variable capture is not the problem (the closures used by the AssocQueryString invokers
+        # call no script functions and are fine); calling a dot-sourced function from a closure is.
+        $c.Providers['PublishedApps'] = {
+            param($Ctx)
+            [pscustomobject]@{
+                tsAllowListDisabled = $false
+                published           = @(ConvertTo-MacdowsPublishedList -Keys $script:SkippedEntryKeys -Context $Ctx)
+            }
+        }
 
-    $resp = Invoke-TestRequest -Context $c -Text "GET /v1/apps HTTP/1.1`r`nAuthorization: Bearer tok-abc`r`n`r`n"
-    Assert-Equal 200 $resp.Status
-    $body = ConvertTo-TestObject -ResponseBody $resp.Body
-    Assert-Equal 2 @($body.published).Count 'both keys are listed'
-    Assert-Equal $true $body.agentAllowlist[0].inTsAllowList 'the readable key still answers the comparison'
+        $resp = Invoke-TestRequest -Context $c -Text "GET /v1/apps HTTP/1.1`r`nAuthorization: Bearer tok-abc`r`n`r`n"
+        Assert-Equal 200 $resp.Status
+        $body = ConvertTo-TestObject -ResponseBody $resp.Body
+        Assert-Equal 2 @($body.published).Count 'both keys are listed'
+        Assert-Equal $true $body.agentAllowlist[0].inTsAllowList 'the readable key still answers the comparison'
+    } finally {
+        Remove-Variable -Name 'SkippedEntryKeys' -Scope Script -ErrorAction SilentlyContinue
+    }
 }
 
 # -------------------------------------------------------------------------------------------
@@ -1162,7 +1178,11 @@ Test-Case 'a relative token path is anchored once and the whole chain follows it
         Assert-Equal $expected $written 'the returned path must be absolute and point at the file that was written'
         Assert-Equal 'cafe' ([System.IO.File]::ReadAllText($expected))
         # The protect and remove halves must now find it as well.
-        Assert-True (Protect-MacdowsTokenFile -Path $written) 'the returned path must be tightenable'
+        # On Windows this also covers the DACL path itself: a $false here means either the
+        # anchoring regressed (the file is not where the returned path says) or the ACL write
+        # was refused - the verbose stream says which.
+        Assert-True (Protect-MacdowsTokenFile -Path $written) `
+            'the returned path must be tightenable (chmod off-Windows, an explicit DACL on Windows)'
         Assert-True (Remove-MacdowsTokenFile -Path $written -Token 'cafe') 'the returned path must be removable'
         Assert-True (-not (Test-Path -LiteralPath $expected)) 'the file that was written must be the file that is gone'
     } finally {
@@ -1209,6 +1229,27 @@ Test-Case 'tightens the permissions on the token file without losing it (review 
         # UnixMode exists on PowerShell 7 on Unix only; 5.1 never reaches this branch.
         $mode = Get-MacdowsProperty -InputObject (Get-Item -LiteralPath $path) -Name 'UnixMode'
         if ($null -ne $mode) { Assert-Equal '-rw-------' ([string]$mode) 'the token file must not be group- or world-readable' }
+    } elseif ($tightened) {
+        # Read the DACL back rather than trusting the return value. Protect-MacdowsTokenFile
+        # builds its descriptor from a default-constructed FileSecurity, which is NOT empty:
+        # CommonSecurityDescriptor synthesises an Everyone-FullControl ACE when handed a null
+        # DACL, and the function purges the rules before adding its own. If that purge ever
+        # stops matching, the function still returns $true, the suite still passes, and the
+        # token file quietly becomes readable by every account on the host - a silent failure
+        # in the one change here that is security-relevant. These assertions are what makes
+        # that loud. Windows-only: the ACL types throw on any other platform.
+        $acl = Get-Acl -LiteralPath $path
+        $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+        Assert-Equal 1 $rules.Count "the DACL must hold exactly one ACE; got $($rules.Count)"
+        $me = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User
+        Assert-Equal $me.Value $rules[0].IdentityReference.Value 'the only ACE must belong to the account the agent runs as'
+        # S-1-1-0 is WorldSid ("Everyone") - spelled as the literal rather than built from
+        # WellKnownSidType so there is no constructor overload to resolve on 5.1. This is the
+        # ACE the synthesised DACL would contribute, so it is the one worth naming.
+        foreach ($r in $rules) {
+            Assert-True ($r.IdentityReference.Value -ne 'S-1-1-0') 'Everyone must not appear in the token file DACL'
+        }
+        Assert-True $acl.AreAccessRulesProtected 'the DACL must be protected, so nothing is inherited back in'
     }
 }
 
@@ -1319,6 +1360,99 @@ function Get-PwshPath {
     try { return (Get-Process -Id $PID).Path } catch { return 'pwsh' }
 }
 
+function Get-CurlPath {
+    <#
+      Resolves the curl PROGRAM, once, to a full path.
+
+      Windows PowerShell 5.1 ships 'curl' as an alias for Invoke-WebRequest, so a bare
+      `curl --silent --show-error ...` never runs a program at all: the cmdlet binds the
+      switches as positional arguments and fails with "A positional parameter cannot be found
+      that accepts argument '--show-error'". That is what the first live 5.1 run reported for
+      all four end-to-end cases. -CommandType Application skips aliases, functions and cmdlets,
+      so what comes back is the executable on both interpreters (curl.exe ships with Windows 10
+      1803 and later); calling it by full path leaves no room for the alias to come back.
+    #>
+    foreach ($name in @('curl.exe', 'curl')) {
+        $found = @(Get-Command -Name $name -CommandType Application -ErrorAction SilentlyContinue)
+        if ($found.Count -gt 0) { return $found[0].Path }
+    }
+    return $null
+}
+
+$script:CurlPath = Get-CurlPath
+
+function Invoke-TestCurlJsonPost {
+    <#
+      POSTs a JSON body to the agent over a real socket and returns curl's output (the
+      response head and body together, via --include).
+
+      The body always travels through a FILE. Windows PowerShell 5.1 composes a native
+      command line by string concatenation and does not escape double quotes inside an
+      argument, so an inline --data '{"id":"x"}' arrives in curl.exe's argv as {id:x} - the
+      quotes are eaten by the C runtime's command-line parser. The agent then correctly
+      answers 400 for a malformed body, which is exactly what the second live 5.1 run
+      reported for the unknown-id case: the agent was right, the harness was wrong.
+      PowerShell 7.3 fixed the underlying behaviour (PSNativeCommandArgumentPassing =
+      Standard), which is why macOS never saw it. Every JSON POST in this suite must go
+      through here rather than through an inline argument.
+
+      Setting $PSNativeCommandArgumentPassing = 'Legacy' before running this suite reproduces
+      that one 5.1 behaviour on macOS and is a useful pre-flight - but only for this one thing.
+      It emulates argument construction, not the curl alias, not Start-Process ExitCode, not
+      Get-Content -Raw on an empty file, not module-scope function lookup, not the ACL APIs.
+
+      The file is written with [IO.File]::WriteAllText and an explicit BOM-less UTF8Encoding:
+      Set-Content and Out-File on 5.1 default to encodings that can prepend a byte-order mark,
+      and in a request body those bytes are payload, not formatting.
+    #>
+    param([string] $Uri, [string] $Token, [string] $Json, [string] $BodyPath)
+
+    [System.IO.File]::WriteAllText($BodyPath, $Json, (New-Object System.Text.UTF8Encoding($false)))
+    try {
+        # "@$BodyPath" is a single token. --data-binary rather than --data so curl sends the
+        # file's bytes verbatim; curl computes Content-Length, which the agent requires on POST.
+        $raw = & $script:CurlPath --silent --show-error --include --max-time 20 `
+            --header "Authorization: Bearer $Token" `
+            --header 'Content-Type: application/json' `
+            --data-binary "@$BodyPath" `
+            $Uri 2>&1
+        return ($raw | Out-String)
+    } finally {
+        try { Remove-Item -LiteralPath $BodyPath -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
+function Set-TestProcessHandle {
+    <#
+      Makes $proc.ExitCode readable after the child exits.
+
+      Start-Process -PassThru does not start the process through the Process object it hands
+      back - it looks the process up by id - so on Windows PowerShell 5.1 that object holds no
+      process handle. Once the child exits the kernel object is released, ExitCode's getter
+      throws, and PowerShell silently turns a throwing property getter into $null: the first
+      live 5.1 run failed six probe cases with "expected [1] but got []". Reading .Handle while
+      the child is still alive forces the object to open and keep a real handle, which is what
+      makes GetExitCodeProcess work afterwards.
+
+      Best-effort and deliberately silent: on .NET on macOS the runtime already tracks its own
+      children (which is why the same tests pass there today), and a child that has raced to
+      exit before this line cannot be handled any more anyway - Get-TestExitCode reports that
+      case in its own words rather than as a confusing empty comparison.
+    #>
+    param($Process)
+    try { [void]$Process.Handle } catch { }
+}
+
+function Get-TestExitCode {
+    <# Reads an exited child's status, turning "not available" into a named failure. #>
+    param($Process, [string] $What = 'child process')
+    $code = $Process.ExitCode
+    if ($null -eq $code) {
+        throw "$What exited but its exit code was not available (the process handle was not held)"
+    }
+    return [int]$code
+}
+
 function Start-AgentProcess {
     <#
       Starts a real agent process with -Once and returns straight away, without waiting for it
@@ -1349,6 +1483,7 @@ function Start-AgentProcess {
             '-TokenPath', $TokenPath,
             '-Once'
         )
+    Set-TestProcessHandle -Process $proc
 
     return [pscustomobject]@{
         Process    = $proc
@@ -1389,14 +1524,18 @@ function Start-TestAgent {
     }
 
     if (Test-Path -LiteralPath $agent.TokenPath) {
-        $agent.Token = (Get-Content -LiteralPath $agent.TokenPath -Raw).Trim()
+        # -Raw emits nothing at all for a zero-byte file (both interpreters), and a [string]
+        # cast of "no output" is still no output - only an explicit null test works.
+        $token = Get-Content -LiteralPath $agent.TokenPath -Raw
+        if ($null -eq $token) { $token = '' }
+        $agent.Token = $token.Trim()
     }
     return $agent
 }
 
 if ($SkipEndToEnd) {
     Write-Host '  skipped (-SkipEndToEnd)'
-} elseif ($null -eq (Get-Command curl -ErrorAction SilentlyContinue)) {
+} elseif ($null -eq $script:CurlPath) {
     Write-Host '  skipped (curl not found)'
 } else {
     $e2eDir = Join-Path $script:TempRoot 'e2e'
@@ -1409,7 +1548,7 @@ if ($SkipEndToEnd) {
         try {
             Assert-True (-not [string]::IsNullOrWhiteSpace($agent.Token)) 'agent must write its token file'
 
-            $raw = & curl --silent --show-error --include --max-time 20 `
+            $raw = & $script:CurlPath --silent --show-error --include --max-time 20 `
                 --header "Authorization: Bearer $($agent.Token)" `
                 "http://127.0.0.1:$($agent.Port)/v1/health" 2>&1
             $text = ($raw | Out-String)
@@ -1457,9 +1596,15 @@ if ($SkipEndToEnd) {
             $agentB = Start-AgentProcess -Directory $e2eDir -AllowlistPath $e2eAllowlist -Tag 'bind-b' `
                 -Port $agentA.Port -TokenPath $agentA.TokenPath
             Assert-True ($agentB.Process.WaitForExit(30000)) 'the second agent must exit, not hang, on a taken port'
-            Assert-True ($agentB.Process.ExitCode -ne 0) "a failed bind must exit non-zero; got $($agentB.Process.ExitCode)"
+            # Through Get-TestExitCode: a null exit code would satisfy a bare -ne 0 and quietly
+            # turn this into a test that asserts nothing.
+            $exitB = Get-TestExitCode -Process $agentB.Process -What 'the second agent'
+            Assert-True ($exitB -ne 0) "a failed bind must exit non-zero; got $exitB"
 
+            # Windows PowerShell 5.1 returns $null (not '') from Get-Content -Raw on an empty
+            # file, and [regex]::Match($null, ...) throws rather than simply not matching.
             $stdoutB = Get-Content -LiteralPath $agentB.StdoutPath -Raw
+            if ($null -eq $stdoutB) { $stdoutB = '' }
             $match = [regex]::Match($stdoutB, '(?m)^token: ([0-9a-f]{64})\s*$')
             Assert-True $match.Success "the second agent should have written a token before failing; got:`n$stdoutB"
             $tokenB = $match.Groups[1].Value
@@ -1468,14 +1613,17 @@ if ($SkipEndToEnd) {
 
             $leftover = ''
             if (Test-Path -LiteralPath $agentA.TokenPath) {
-                $leftover = (Get-Content -LiteralPath $agentA.TokenPath -Raw).Trim()
+                # Same guard as above: a zero-byte leftover file yields no output, not ''.
+                $leftover = Get-Content -LiteralPath $agentA.TokenPath -Raw
+                if ($null -eq $leftover) { $leftover = '' }
+                $leftover = $leftover.Trim()
             }
             Assert-True ($leftover -cne $tokenB) 'the failed start must not leave its token at the shared path'
             Assert-True (-not (Test-Path -LiteralPath $agentA.TokenPath)) `
                 "the file the failed start wrote must be gone; it still holds [$leftover]"
 
             # And the agent that is actually running is untouched: same port, same token, 200.
-            $raw = & curl --silent --show-error --include --max-time 20 `
+            $raw = & $script:CurlPath --silent --show-error --include --max-time 20 `
                 --header "Authorization: Bearer $tokenA" `
                 "http://127.0.0.1:$($agentA.Port)/v1/health" 2>&1
             $text = ($raw | Out-String)
@@ -1488,7 +1636,7 @@ if ($SkipEndToEnd) {
     Test-Case 'rejects a request with no token over a real socket' {
         $agent = Start-TestAgent -Directory $e2eDir -AllowlistPath $e2eAllowlist -Tag 'unauth'
         try {
-            $raw = & curl --silent --show-error --include --max-time 20 "http://127.0.0.1:$($agent.Port)/v1/health" 2>&1
+            $raw = & $script:CurlPath --silent --show-error --include --max-time 20 "http://127.0.0.1:$($agent.Port)/v1/health" 2>&1
             $text = ($raw | Out-String)
             Assert-True ($text -match 'HTTP/1\.1 401 Unauthorized') "expected 401; got: $text"
             Assert-True ($text -match '\{\}') 'the 401 body must be an empty JSON object'
@@ -1508,12 +1656,11 @@ if ($SkipEndToEnd) {
         # from the live host run.
         $agent = Start-TestAgent -Directory $e2eDir -AllowlistPath $e2eAllowlist -Tag 'launch'
         try {
-            $raw = & curl --silent --show-error --include --max-time 20 `
-                --header "Authorization: Bearer $($agent.Token)" `
-                --header 'Content-Type: application/json' `
-                --data '{"id":"no-such-id"}' `
-                "http://127.0.0.1:$($agent.Port)/v1/launch" 2>&1
-            $text = ($raw | Out-String)
+            $text = Invoke-TestCurlJsonPost -Uri "http://127.0.0.1:$($agent.Port)/v1/launch" `
+                -Token $agent.Token -Json '{"id":"no-such-id"}' `
+                -BodyPath (Join-Path $e2eDir 'launch-body.json')
+            # 404 rather than 400 is also what proves the body survived the trip: a JSON body
+            # mangled on the way to curl reaches the agent malformed and is answered 400.
             Assert-True ($text -match 'HTTP/1\.1 404 Not Found') "expected 404 for an unknown id; got: $text"
             Assert-True ($text -match 'unknown_id') "expected an unknown_id body; got: $text"
         } finally {
@@ -1575,6 +1722,7 @@ function Start-StubAgent {
         -RedirectStandardOutput $outFile -RedirectStandardError $errFile `
         -ArgumentList @('-NoProfile', '-File', $scriptPath,
             '-ListenPort', "$port", '-AuthToken', $Token, '-AgentPath', $AgentPath)
+    Set-TestProcessHandle -Process $proc
 
     $deadline = (Get-Date).AddSeconds(30)
     $ready = $false
@@ -1598,11 +1746,12 @@ function Invoke-ProbePs1 {
         -RedirectStandardOutput $LogPath -RedirectStandardError "$LogPath.err" `
         -ArgumentList @('-NoProfile', '-File', $ProbePs1Path,
             '-OutDir', $OutDir, '-Port', "$Port", '-TokenPath', $TokenPath)
+    Set-TestProcessHandle -Process $proc
     if (-not $proc.WaitForExit(90000)) {
         try { $proc.Kill() } catch { }
         throw 'probe.ps1 did not finish within 90s'
     }
-    return $proc.ExitCode
+    return (Get-TestExitCode -Process $proc -What 'probe.ps1')
 }
 
 if ($SkipEndToEnd) {
@@ -1767,6 +1916,29 @@ if ($SkipEndToEnd) {
         Assert-True ($result -match 'health: unreachable') "expected an unreachable health line; got:`n$result"
         Assert-Equal 3 @([regex]::Matches($result, '(?m)^FAIL\s')).Count "expected 3 FAIL lines; got:`n$result"
     }
+
+    Test-Case 'probe.ps1 names an empty token file instead of dying on it (review finding P1)' {
+        # A zero-byte token file is reachable in practice: the agent creates the file and then
+        # writes it, and a probe that runs in that window - or after a truncated write - finds
+        # it empty. probe.ps1 has always had a branch for exactly that ("no token at ..."), but
+        # Get-Content -Raw returns NOTHING for a zero-byte file (an empty pipeline result, not
+        # ''), so calling .Trim() straight off it threw and the branch was unreachable. This
+        # asserts the branch is reached: the probe reports the empty token in its own voice
+        # rather than aborting on an unhandled error.
+        $outDir = Join-Path $probeDir 'out-emptytoken'
+        $tokenFile = Join-Path $probeDir 'token-empty'
+        [System.IO.File]::WriteAllText($tokenFile, '')
+        $deadPort = Get-FreeTcpPort   # nothing is listening; the token file is what is on trial
+
+        $code = Invoke-ProbePs1 -OutDir $outDir -Port $deadPort -TokenPath $tokenFile `
+            -LogPath (Join-Path $probeDir 'probe-emptytoken.log')
+        Assert-Equal 1 $code 'an empty token file must still exit non-zero'
+        Assert-True (Test-Path -LiteralPath (Join-Path $outDir 'DONE')) 'DONE must be written'
+        $result = Get-Content -LiteralPath (Join-Path $outDir 'result.txt') -Raw
+        if ($null -eq $result) { $result = '' }
+        Assert-True ($result -match 'no token at') "the probe must name the empty token file; got:`n$result"
+        Assert-True ($result -notmatch 'probe aborted') "an empty token is a reported condition, not an abort; got:`n$result"
+    }
 }
 
 # -------------------------------------------------------------------------------------------
@@ -1795,10 +1967,37 @@ function Invoke-ProbeSh {
 $probeShTools = @('bash', 'curl', 'python3')
 $missingTool = $null
 foreach ($tool in $probeShTools) {
-    if ($null -eq (Get-Command $tool -ErrorAction SilentlyContinue)) { $missingTool = $tool; break }
+    # -CommandType Application for the same reason as Get-CurlPath: on Windows PowerShell 5.1
+    # a bare Get-Command curl finds the Invoke-WebRequest alias and would report a program that
+    # bash cannot run as present.
+    if (@(Get-Command -Name $tool -CommandType Application -ErrorAction SilentlyContinue).Count -eq 0) {
+        $missingTool = $tool
+        break
+    }
 }
+# Both cases below hand probe.sh a deliberately hostile token (embedded quotes, backslashes,
+# a line break) as a single argv entry. Windows PowerShell 5.1 - and PowerShell 7 put into
+# Legacy argument-passing mode - build a native command line by string concatenation and strip
+# those quotes on the way, so what probe.sh receives is not the token under test and the case
+# would fail for a reason that has nothing to do with probe.sh. Confirmed by running this suite
+# with $PSNativeCommandArgumentPassing = 'Legacy'. This is the same defect that made the live
+# 5.1 run answer 400 to the inline JSON body above; there it could be routed around with a
+# file, here the argument IS the test, so the honest answer is to skip.
+#
+# Scope of that pre-flight, so nobody reads more into a green Legacy run than it says: Legacy
+# mode emulates native-command ARGUMENT CONSTRUCTION and nothing else. It does not emulate the
+# 5.1 curl->Invoke-WebRequest alias, Start-Process handle/ExitCode behaviour, Get-Content -Raw
+# on an empty file, module-scope function lookup, or the ACL APIs. Those differences are only
+# caught by running the suite on the host.
+$argvIsFaithful = $true
+if ($PSVersionTable.PSVersion.Major -lt 6) { $argvIsFaithful = $false }
+$argMode = Get-Variable -Name 'PSNativeCommandArgumentPassing' -ValueOnly -ErrorAction SilentlyContinue
+if ($null -ne $argMode -and "$argMode" -eq 'Legacy') { $argvIsFaithful = $false }
+
 if ($null -ne $missingTool) {
     Write-Host "  skipped ($missingTool not found)"
+} elseif (-not $argvIsFaithful) {
+    Write-Host '  skipped (this interpreter cannot carry a hostile token through argv)'
 } else {
     Test-Case 'probe.sh refuses a token carrying curl-config syntax (review finding B13)' {
         # The token goes into a curl config file as a quoted value, where '"', '\' and a line

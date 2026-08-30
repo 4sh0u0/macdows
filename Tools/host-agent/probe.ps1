@@ -350,7 +350,16 @@ function Invoke-MacdowsProbe {
         # -- token ------------------------------------------------------------------------
         $token = $null
         if (Test-Path -LiteralPath $TokenPath) {
-            $token = (Get-Content -LiteralPath $TokenPath -Raw).Trim()
+            # Get-Content -Raw on a zero-byte file emits NOTHING - an empty pipeline result,
+            # not '' and not $null - on Windows PowerShell 5.1 and on PowerShell 7 alike. A
+            # [string] cast does not rescue it either: casting a literal $null does give '',
+            # but casting "no output" yields no output, so .Trim() still throws and the
+            # "no token at ..." message below becomes unreachable. Only an explicit test for
+            # null works. Get-Content (not [IO.File]::ReadAllText) so that a relative
+            # -TokenPath resolves against the same location as the Test-Path above.
+            $token = Get-Content -LiteralPath $TokenPath -Raw
+            if ($null -eq $token) { $token = '' }
+            $token = $token.Trim()
         }
         if ([string]::IsNullOrWhiteSpace($token)) {
             # Report the path, never the value.

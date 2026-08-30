@@ -175,19 +175,35 @@ function Protect-MacdowsTokenFile {
     if (Test-MacdowsIsWindows) {
         try {
             $sid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User
-            # Get-Acl first, rather than a bare new FileSecurity: the descriptor Set-Acl
-            # writes back then keeps its owner and group, and only the DACL is rebuilt.
-            $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+            # A FileSecurity built here, NOT one read back with Get-Acl. A descriptor read off
+            # an NTFS file carries the SACL control bits (SE_SACL_PRESENT / SE_SACL_AUTO_INHERITED
+            # are set on essentially every file), so writing that same descriptor back asks
+            # Windows to set the audit section too - which requires SeSecurityPrivilege, a
+            # privilege an ordinary interactive/RDP account does not hold. The first live
+            # Windows PowerShell 5.1 run failed exactly there: "The process does not possess the
+            # 'SeSecurityPrivilege' privilege which is required for this operation".
+            #
+            # A fresh FileSecurity starts with nothing modified, and File.SetAccessControl
+            # persists ONLY the sections that were modified on the object. Touching just the
+            # access rules therefore writes just the DACL: no owner, no group, no SACL, no
+            # privilege beyond the WRITE_DAC the file's owner already has.
+            $acl = New-Object System.Security.AccessControl.FileSecurity
             # (protect, preserveInheritance = $false): drop every inherited ACE instead of
             # copying it in, so what is left is only what this function puts there.
             $acl.SetAccessRuleProtection($true, $false)
-            foreach ($existing in @($acl.Access)) {
+            # A default-constructed descriptor is NOT empty: when CommonSecurityDescriptor is
+            # handed a null DACL it synthesises DiscretionaryAcl.CreateAllowEveryoneFullAccess,
+            # and that ACE is explicit, so SetAccessRuleProtection does not remove it. Adding a
+            # rule on top of it would publish a token file readable by every account on the
+            # host - the exact opposite of the point. Clear the rules first, by SID so no
+            # account-name translation is attempted, then add the single ACE we want.
+            foreach ($existing in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
                 [void]$acl.RemoveAccessRuleAll($existing)
             }
             $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
                 $sid, 'FullControl', 'None', 'None', 'Allow')
             $acl.SetAccessRule($rule)
-            Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+            [System.IO.File]::SetAccessControl($Path, $acl)
             return $true
         } catch {
             # Not fatal: on a share or a redirected profile this can legitimately fail, and
@@ -404,6 +420,29 @@ function Test-MacdowsAbsolutePath {
     return [bool]($Path -match '^([A-Za-z]:[\\/]|\\\\|/)')
 }
 
+function ConvertTo-MacdowsWindowsSeparator {
+    <#
+      Canonicalises the separators of a Windows path to '\'.
+
+      Win32 accepts '/' in most places, so an allowlist entry written as C:/Tools/app.exe or a
+      %SystemRoot%/System32/app.exe still opens - but the resolved path is not only compared,
+      it is handed to Start-Process and published in /v1/apps, so what gets recorded should
+      look like a Windows path rather than like whatever the operator happened to type. The
+      first live 5.1 run surfaced this as a resolved path reading
+      C:\...\FakeSystemRoot/System32/app.exe.
+
+      Only drive-rooted and UNC paths are touched. A POSIX path is returned untouched: on Unix
+      '\' is an ordinary filename character, and the test suite runs off-Windows against real
+      files under the system temp directory.
+    #>
+    [CmdletBinding()]
+    param([string] $Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    if ($Path -match '^([A-Za-z]:[\\/]|\\\\)') { return $Path.Replace('/', '\') }
+    return $Path
+}
+
 function Test-MacdowsInterpreterPath {
     [CmdletBinding()]
     param([string] $Path)
@@ -476,7 +515,10 @@ function Import-MacdowsAllowlist {
         if ($names -contains 'path') { $rawPath = [string]$item.path }
         if ([string]::IsNullOrWhiteSpace($rawPath)) { [void]$errors.Add("${label}: missing 'path'"); continue }
 
-        $resolved = Expand-MacdowsPathTokens -Path $rawPath -SystemRoot $SystemRoot
+        # Canonicalise separators before every check below, so the '..' rule, the existence
+        # probe, the recorded path and the path Start-Process is later given are all the same
+        # string in the same shape.
+        $resolved = ConvertTo-MacdowsWindowsSeparator -Path (Expand-MacdowsPathTokens -Path $rawPath -SystemRoot $SystemRoot)
         if ($resolved -match '%[A-Za-z0-9_()]+%') {
             [void]$errors.Add("${label}: unresolved environment token in path"); continue
         }
