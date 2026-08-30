@@ -93,11 +93,16 @@ public struct TrayModel: Sendable, Equatable {
     public mutating func update(windowId: UInt32, notifyIconId: UInt32, info: TrayIconInfo = TrayIconInfo()) -> Bool {
         let key = NotifyIconState(windowId: windowId, notifyIconId: notifyIconId)
         let isNew = icons[key] == nil
-        if info.tooltip == nil, let prior = icons[key] {
-            icons[key] = prior
-        } else {
-            icons[key] = info
+        // Field-local merge, deliberately NOT `icons[key] = prior` wholesale (R1 re-review
+        // observation): with a single field the two forms are equivalent, but the wholesale
+        // form silently drops every OTHER field of `info` the moment a second one lands
+        // (adr/0013 §5's deferred infoTip/state are the obvious candidates) -- merge each
+        // absent field individually so adding a field can never reintroduce that trap.
+        var merged = info
+        if info.tooltip == nil {
+            merged.tooltip = icons[key]?.tooltip
         }
+        icons[key] = merged
         return isNew
     }
 
