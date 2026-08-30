@@ -1266,6 +1266,15 @@ static BOOL crb_pre_connect(freerdp *instance)
     }
     if (!freerdp_settings_set_string(settings, FreeRDP_RemoteApplicationProgram, session.program.UTF8String))
         return FALSE;
+    /* Optional launch arguments (CRSession.h's programArguments contract): the RAIL
+     * channel itself turns this setting into the connect-time Exec order's
+     * RemoteApplicationArguments field (client_rails.c:68-82) -- nothing else to wire. */
+    if (session.programArguments.length > 0)
+    {
+        if (!freerdp_settings_set_string(settings, FreeRDP_RemoteApplicationCmdLine,
+                                         session.programArguments.UTF8String))
+            return FALSE;
+    }
     if (!freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE))
         return FALSE;
     /* adr/0005 §2/task spec: HiDef on by default. */
@@ -1544,7 +1553,21 @@ static void *crb_rdp_thread_main(void *arg)
      * real answer by this point. Never re-read after this -- a mid-session change isn't a
      * real protocol event this class needs to react to, and adr/0011 §2 only calls for a
      * one-time post-connect check. */
-    session.unicodeInputSupported = freerdp_settings_get_bool(instance->context->settings, FreeRDP_UnicodeInput);
+    BOOL unicodeInput =
+        freerdp_settings_get_bool(instance->context->settings, FreeRDP_UnicodeInput) ? YES : NO;
+    if (session.forceUnicodeInputUnsupported)
+    {
+        /* adr/0011 §5 item 7: the harness override (see -forceUnicodeInputUnsupported's own
+         * doc comment in CRSession.h) -- makes the degradation path reachable without a
+         * Windows host reconfigured to drop INPUT_FLAG_UNICODE. WLog_INFO, not WLog_WARN:
+         * this is a caller-requested configuration, not a fault, and it is deliberately
+         * logged even when the server independently agrees (unsupported anyway), so a log
+         * reader can always tell an observed degradation apart from a manufactured one. */
+        WLog_INFO(TAG, "UnicodeInput: forced unsupported by harness override (server negotiated: %s)",
+                  unicodeInput ? "supported" : "unsupported");
+        unicodeInput = NO;
+    }
+    session.unicodeInputSupported = unicodeInput;
 
     while (!freerdp_shall_disconnect_context(instance->context))
     {

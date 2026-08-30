@@ -310,6 +310,14 @@ final class RemoteWindowRegistry {
     /// every physical `macKeyCode` before it's used for anything else (both the ordinary
     /// scancode path and `CommandKeyMapper`'s own passthrough forwarding).
     private let macKeyboardType: MacKeyboardType
+    /// adr/0011 §2's degradation discipline ("降级纪律"): the one per-connection gate standing
+    /// between an IME commit and the keyboard lane. Pure `MacdowsCore` state machine, same
+    /// split as `commandKeyMapper`/`focusAuthority` above -- it decides forward-vs-drop and
+    /// owns the "warn exactly once" budget; this registry performs the log call and the
+    /// enqueue (or, on a drop, neither). Reset alongside every other per-connection input
+    /// state in `closeAllWindows()`; its two counters deliberately survive that reset (see
+    /// `unicodeDegradationDiagnostics()`).
+    private let unicodeInputGate = UnicodeInputDegradationGate()
     /// W4c: last time a `.mouseMoved` event was actually forwarded for each window, for the
     /// move-event throttle in `handleInput` (task spec: "move events may be throttled at 8ms" — AppKit's
     /// native mouseMoved/mouseDragged rate is far higher than the outbound lane needs).
@@ -806,6 +814,55 @@ final class RemoteWindowRegistry {
             arraysReceived: zOrderArraysReceivedCount, appliesPerformed: zOrderAppliesPerformedCount,
             skippedUnknownTotal: zOrderSkippedUnknownTotal
         )
+    }
+
+    /// Diagnostics only (adr/0011 §5 item 7's acceptance: "降级告警恰好一次且无静默丢字") --
+    /// the observable half of adr/0011 §2's degradation discipline, for
+    /// `Tools/window-smoke`'s own summary line and for whatever product-shell banner
+    /// eventually subscribes to it (see the `.unicodeText` capture site's own KNOWN
+    /// DEVIATION note).
+    struct UnicodeDegradationDiagnostics {
+        /// The capability read for the CURRENT connection: `nil` = not yet read this
+        /// connection (no IME commit has arrived since the last connect/reset), which is a
+        /// genuinely different state from `false` -- a run that never typed anything must
+        /// not be mistaken for one that hit the degradation path.
+        let unicodeInputSupported: Bool?
+        /// Cumulative for this registry's lifetime, NOT reset on reconnect -- same rule as
+        /// `zOrderArraysReceivedCount` and friends ("how much has this registry ever done").
+        /// A post-shutdown read (necessarily after `closeAllWindows()` has already reset the
+        /// per-connection half) still sees the real totals, which is the whole point: the
+        /// acceptance assertion is "exactly one warning per degraded connection, and every
+        /// dropped commit accounted for".
+        let warningsEmitted: Int
+        /// Cumulative, same rule. Counts whole commits (adr/0011 §1: one commit is one lane
+        /// slot, atomic), not characters or UTF-16 code units.
+        let droppedCommits: Int
+    }
+    func unicodeDegradationDiagnostics() -> UnicodeDegradationDiagnostics {
+        UnicodeDegradationDiagnostics(
+            unicodeInputSupported: unicodeInputGate.unicodeInputSupported,
+            warningsEmitted: unicodeInputGate.warningsEmitted,
+            droppedCommits: unicodeInputGate.droppedCommits
+        )
+    }
+
+    /// Diagnostics only (adr/0011 §5 item 2: "zero stuck modifiers is a structural
+    /// assertion") -- whether the wire-side modifier ledger (`wireHeldModifiers`, the
+    /// authoritative "what is ACTUALLY held down on the wire right now" state
+    /// `releaseAllHeldModifiers()` reads) is currently empty.
+    ///
+    /// Read-only, and deliberately exposes only the emptiness predicate rather than the set
+    /// itself: the assertion this exists for is "nothing is stuck", not "these specific bits
+    /// are held", and a harness that could read the whole set would be tempted to encode a
+    /// second, drifting notion of what the ledger should contain mid-chord. This is the LIVE
+    /// twin of `MacdowsCore`'s own offline ledger tests (`ModifierKeyTracker`/
+    /// `CommandKeyMapper` unit tests, which cover the same invariant against synthetic
+    /// event sequences with no CRSession or AppKit anywhere): those prove the state machine
+    /// computes the right releases; this proves a real chord sequence, dispatched through a
+    /// real `NSWindow`/`RemoteWindowContentView` against a real host, actually left nothing
+    /// behind (`Tools/window-smoke`'s adr/0011 §5 item 5/6 batteries gate on it).
+    func wireHeldModifiersIsEmpty() -> Bool {
+        wireHeldModifiers.isEmpty
     }
 
     /// Diagnostics only (Tools/window-smoke's `[tray]` summary line, phase2.md §4 W6
@@ -1371,9 +1428,46 @@ final class RemoteWindowRegistry {
             commandKeyMapper.reset()
 
         case .unicodeText(let text):
-            // adr/0011 §1/§2: an IME commit -- same gate as every other keyboard-lane
-            // event (adr/0012 §2 unchanged), atomic (whole string, one buffer slot).
-            execute(focusAuthority.enqueueKeyboardEvent(.unicodeText(text), at: CFAbsoluteTimeGetCurrent()))
+            // adr/0011 §2's degradation gate, evaluated BEFORE the lane: on a server whose
+            // Input Capability Set never set INPUT_FLAG_UNICODE, FreeRDP's own
+            // `freerdp_input_send_unicode_keyboard_event` drops each event with nothing but
+            // a WLog_WARN (adr/0011 §0b, "静默丢字...不可接受"), so the IME path has to be
+            // disabled here, whole, rather than discovered one lost character at a time.
+            //
+            // The capability is read lazily, at the first commit that would need it, and
+            // cached for the connection (`UnicodeInputDegradationGate`'s own contract).
+            // That is sound because `CRSession.unicodeInputSupported` is set on T_rdp
+            // immediately after `freerdp_connect` returns TRUE and strictly before the
+            // event loop that posts any RAIL order starts running -- so by the time any
+            // window exists to have received a keystroke, let alone an IME commit, the
+            // answer is already published.
+            switch unicodeInputGate.evaluateCommit(readCapability: { self.session.unicodeInputSupported }) {
+            case .forward:
+                // adr/0011 §1/§2: an IME commit -- same gate as every other keyboard-lane
+                // event (adr/0012 §2 unchanged), atomic (whole string, one buffer slot).
+                execute(focusAuthority.enqueueKeyboardEvent(.unicodeText(text), at: CFAbsoluteTimeGetCurrent()))
+            case .drop(let warn):
+                // Dropped HERE, before `enqueueKeyboardEvent` -- deliberately not buffered
+                // "in case the server changes its mind": anything that reaches the lane's
+                // FIFO can later be flushed to the wire by a gate-open (adr/0012 §2), and
+                // this text must never reach a server that would silently discard it.
+                if warn {
+                    // Length only, never the text itself: an IME commit is by definition
+                    // whatever the user just typed (passwords included), and this log is
+                    // not a place for it. `.error` rather than `.warning` because adr/0011
+                    // §2 wants this "对用户可见" and this is the loudest channel that exists
+                    // at harness scope today.
+                    //
+                    // KNOWN DEVIATION from adr/0011 §2's "对用户可见": v1 user visibility is
+                    // this log plus `unicodeDegradationDiagnostics()`, not a UI banner --
+                    // there is no product shell to host one yet (the app is a harness with
+                    // no chrome of its own beyond per-window titlebars). The gate, its
+                    // counters and its warn-once budget are exactly what a banner would
+                    // subscribe to once such a shell exists, so this is a missing
+                    // presentation layer, not a missing mechanism.
+                    Self.logger.error("adr/0011 §2 degradation: server did not negotiate INPUT_FLAG_UNICODE -- IME/Unicode input is disabled for this connection; dropped a \(text.count, privacy: .public)-character commit (further drops are counted, not logged)")
+                }
+            }
         }
     }
 
@@ -1872,6 +1966,13 @@ final class RemoteWindowRegistry {
         // ledger and the Cmd remap state machine.
         wireHeldModifiers = []
         commandKeyMapper.reset()
+        // adr/0011 §2: the degradation gate is per-CONNECTION -- the next connection
+        // re-reads `CRSession.unicodeInputSupported` (itself reset to NO at the top of
+        // every `-start`) and, if that one is degraded too, is entitled to its own single
+        // warning. Only the cached capability and the warn-once budget are cleared here;
+        // `warningsEmitted`/`droppedCommits` are cumulative for this registry's lifetime,
+        // exactly like the zOrder counters above (see `unicodeDegradationDiagnostics()`).
+        unicodeInputGate.reset()
         lastMoveSentAt.removeAll()
         pendingTrailingMove.removeAll()
     }

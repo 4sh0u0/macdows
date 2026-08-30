@@ -239,6 +239,15 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 @property (nonatomic) uint32_t desktopWidth;
 @property (nonatomic) uint32_t desktopHeight;
 
+/// Command-line arguments for the initial `program` launch — MS-RDPERP's Exec order
+/// `RemoteApplicationArguments`, carried via FreeRDP's `RemoteApplicationCmdLine` setting
+/// (the vendored RAIL channel reads that setting itself when it sends the connect-time
+/// Exec order — channels/rail/client/client_rails.c:68-82). Same contract as
+/// `desktopWidth`: set before `-start` (read once by the connect path on T_rdp;
+/// unsynchronized afterwards), or leave nil for no arguments. Windows-side quoting is the
+/// caller's responsibility — this string is passed through verbatim.
+@property (nonatomic, copy, nullable) NSString *programArguments;
+
 /// Starts a fresh connection attempt: spawns T_rdp, which connects and (on success) runs
 /// the RAIL/RDPGFX event loop until told to stop. Returns immediately — connection
 /// progress and results surface as drained events (HandshakeFlags/ExecResult/...) or via
@@ -517,6 +526,27 @@ typedef NS_ENUM(NSInteger, CRModifierKey) {
 /// disable the whole IME lane with a single visible warning instead (adr/0011 §2: "不静默
 /// 丢字, §0b的默认行为不可接受").
 @property (nonatomic, readonly) BOOL unicodeInputSupported;
+
+/// Test-harness override for the property above: when `YES`, the connect path forces
+/// `-unicodeInputSupported` to `NO` no matter what the server actually negotiated (and
+/// logs one line saying it did). Same contract as `desktopWidth`: set before `-start`
+/// (read once by the connect path on T_rdp; unsynchronized afterwards), default `NO`.
+///
+/// Exists because adr/0011 §5 item 7's acceptance ("服务端 caps 缺 INPUT_FLAG_UNICODE 时，
+/// 降级告警恰好一次且无静默丢字") otherwise requires a Windows host reconfigured to drop
+/// `INPUT_FLAG_UNICODE` from its Input Capability Set -- a host-side change neither an
+/// offline test nor an ordinary live run can make, which would leave adr/0011 §2's entire
+/// degradation path ("IME通路整体停用、告警一次") permanently unexercised on the very
+/// pipeline it exists to protect. With this, the whole path is constructible against any
+/// host: set it, connect, type through an IME, observe exactly one warning and a nonzero
+/// drop count.
+///
+/// Can only ever *narrow* what reaches the wire -- forcing this on disables the Unicode
+/// lane; it can never enable one the server didn't advertise, so a harness that leaves it
+/// set cannot manufacture a protocol violation. This class still reads no environment
+/// variables of its own (the same red line `-initWithHost:user:password:program:` states
+/// for credentials): a harness that wants this behavior sets the property itself.
+@property (nonatomic) BOOL forceUnicodeInputUnsupported;
 
 /// One `CRModifierKey`'s pressed state changed (from diffing
 /// `NSEvent.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask` against its

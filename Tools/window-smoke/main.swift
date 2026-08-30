@@ -81,6 +81,20 @@ let screenshotPath = ProcessInfo.processInfo.environment["WINDOW_SMOKE_SCREENSHO
 let launchedProgram = ProcessInfo.processInfo.environment["WINDOW_SMOKE_APP"]
     ?? "C:\\Windows\\System32\\winver.exe"
 
+/// adr/0011 §5 items 5/6: command-line arguments for the RemoteApp launch above, assigned
+/// verbatim to `CRSession.programArguments` (MS-RDPERP's `RemoteApplicationArguments`, see
+/// that property's own doc comment) before `-start`. Unset (the default) leaves the
+/// property nil, i.e. exactly today's argument-less launch for every existing scenario.
+///
+/// Exists for the input round-trip batteries below: those need the launched app to open a
+/// SPECIFIC, pre-seeded file (e.g. `WINDOW_SMOKE_APP=C:\Windows\System32\notepad.exe`
+/// with `WINDOW_SMOKE_APP_ARGS=C:\rdp-lab\cmdmap-seed.txt`), so that a Cmd+A/Cmd+C/
+/// Cmd+V/Cmd+S chord sequence has real, known text to act on and Notepad can save back in
+/// place with no Save-As dialog. Windows-side quoting is the caller's responsibility (the
+/// string is passed through untouched, per `programArguments`' own contract).
+let launchedProgramArguments = ProcessInfo.processInfo.environment["WINDOW_SMOKE_APP_ARGS"]
+    .flatMap { $0.isEmpty ? nil : $0 }
+
 /// Which anchored, gating pixel/size assertion applies to *the window this run itself
 /// launched* -- inferred from `launchedProgram`'s path so one harness handles both the
 /// default (winver) and control-group (regedit) cases without a separate binary. `.other`
@@ -114,20 +128,90 @@ let launchedAppKind = LaunchedAppKind(programPath: launchedProgram)
 enum InputTestMode: String {
     case click
     case enter
-    /// adr/0011 §5 item 5's env-gated SCAFFOLD only (this round is offline-scope, adr/0011
-    /// §5's live-host items 5-7 are deferred per adr/0012 §4.7's host-freshness condition):
-    /// synthesizes a real Cmd+C `NSEvent` sequence against the target window, exercising
-    /// `CommandKeyMapper`'s wiring end to end (`RemoteWindowContentView.keyDown`/
-    /// `flagsChanged` -> `RemoteWindowRegistry.handleInput` -> `CommandKeyMapper` -> the
-    /// wire), but asserts nothing about the result -- the real assertion ("真机Word复制粘贴
-    ///往返一致") needs a live host and is explicitly out of scope this round. See
-    /// `runInputTest`'s and `finish()`'s own handling: this mode is deliberately excluded
-    /// from the generic WindowDelete-based pass/fail gate every other `InputTestMode` uses,
-    /// since Cmd+C has no reason to close any window.
+    /// adr/0011 §5 item 5. TWO behaviors, selected by `WINDOW_SMOKE_CMDMAP_LIVE`:
+    ///
+    /// - Unset (the original SCAFFOLD, unchanged): synthesizes a single real Cmd+C `NSEvent`
+    ///   sequence against the target window, exercising `CommandKeyMapper`'s wiring end to
+    ///   end (`RemoteWindowContentView.keyDown`/`flagsChanged` ->
+    ///   `RemoteWindowRegistry.handleInput` -> `CommandKeyMapper` -> the wire), but asserts
+    ///   nothing about the result -- the real assertion ("真机Word复制粘贴往返一致") needs a
+    ///   live host, which this mode originally had no access to (adr/0012 §4.7's
+    ///   host-freshness condition).
+    /// - `WINDOW_SMOKE_CMDMAP_LIVE=1` (the live battery): the full adr/0011 §5 item 5
+    ///   sequence against a remote Notepad holding a seeded single-line file --
+    ///   Cmd+A, Cmd+C, End, Cmd+V, Cmd+V, Cmd+S. See `cmdMapLiveEnabled`'s own doc comment.
+    ///
+    /// In BOTH cases this mode is deliberately excluded from the generic WindowDelete-based
+    /// pass/fail gate `.click`/`.enter` use (see `runInputTest`'s and `finish()`'s own
+    /// handling): no chord in either sequence has any reason to close a window.
     case cmdmap
+    /// adr/0011 §5 item 6: the IME/Unicode round-trip battery. Delivers ONE composed commit
+    /// of a fixed 50-scalar CJK+full-width-punctuation string through the target window's
+    /// content view's `NSTextInputClient.insertText(_:replacementRange:)` -- the exact entry
+    /// point a real macOS input method uses, never a direct `RemoteWindowRegistry.handleInput`
+    /// call -- then saves with Cmd+S so an external readback pass can compare the file on the
+    /// host against the expected UTF-8 bytes this harness prints. Like `.cmdmap`, excluded
+    /// from the WindowDelete gate: nothing here closes a window.
+    case ime
 }
 let inputTestMode = ProcessInfo.processInfo.environment["WINDOW_SMOKE_INPUT_TEST"]
     .flatMap(InputTestMode.init(rawValue:))
+
+/// adr/0011 §5 item 5's live battery, upgrading `InputTestMode.cmdmap` from scaffold to a
+/// real assertion (requires `WINDOW_SMOKE_INPUT_TEST=cmdmap` as well -- on its own this
+/// switch does nothing at all, and with it unset `.cmdmap` behaves exactly as it always
+/// has). Against the locked target window -- which a live run points at a remote Notepad
+/// that opened a seeded single-line text file, via `WINDOW_SMOKE_APP`/`WINDOW_SMOKE_APP_ARGS`
+/// plus `WINDOW_SMOKE_INPUT_TARGET_TITLE` -- it synthesizes six real chords in sequence:
+/// Cmd+A (select all), Cmd+C (copy), plain End (collapse the selection to the line end, so
+/// the pastes APPEND rather than replace the selection), Cmd+V, Cmd+V, Cmd+S. The file
+/// therefore ends up holding the seed text three times over, which is what the external
+/// readback pass compares against `expected-utf8-hex` (see `finish()`'s own note: the
+/// FILE-CONTENT equality is asserted by the controller, not by this process, which has no
+/// access to the host's filesystem).
+let cmdMapLiveEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_CMDMAP_LIVE"] == "1"
+
+/// The exact text the seeded file handed to `WINDOW_SMOKE_CMDMAP_LIVE`'s Notepad contains --
+/// REQUIRED whenever that switch is set (the scenario fails loudly at startup otherwise,
+/// see `applicationDidFinishLaunching`), since without it this harness cannot print the
+/// `expected-utf8-hex` marker the external comparer needs and the whole run would produce
+/// an unverifiable file. Never derived or guessed: the controller seeds the file and passes
+/// the identical string here, so a mismatch between the two is a controller bug this
+/// harness must not paper over.
+let cmdMapSeed = ProcessInfo.processInfo.environment["WINDOW_SMOKE_CMDMAP_SEED"]
+    .flatMap { $0.isEmpty ? nil : $0 }
+
+/// The live battery only exists as an upgrade OF `InputTestMode.cmdmap`, never on its own --
+/// `WINDOW_SMOKE_CMDMAP_LIVE=1` without `WINDOW_SMOKE_INPUT_TEST=cmdmap` selects no scenario
+/// at all (and says so at startup), rather than silently inventing one.
+let cmdMapLiveActive = cmdMapLiveEnabled && inputTestMode == .cmdmap
+
+/// adr/0011 §5 item 7's CONSTRUCTIBLE half (the degradation path). When set, the session is
+/// started with `CRSession.forceUnicodeInputUnsupported = true` -- the negotiated Unicode
+/// capability then reads unsupported no matter what the server actually advertised (see
+/// that property's own doc comment for why this override exists at all) -- and this harness
+/// delivers TWO IME commits through the same real `NSTextInputClient` path
+/// `InputTestMode.ime` uses. `finish()` then asserts adr/0011 §2's degradation discipline
+/// exactly: capability read as unsupported, EXACTLY one warning emitted (the warn-once
+/// budget), both commits counted as dropped, and nothing reaching the wire.
+///
+/// Works against the default winver app -- no seeded file, no save, no host-side state at
+/// all. Its own env switch, its own checks; the normal-path half of item 7 is
+/// `WINDOW_SMOKE_INPUT_TEST=ime`'s own diagnostics gate. The two are mutually exclusive in
+/// practice (both drive the shared scripted-input state machine below, and this one runs
+/// with no `WINDOW_SMOKE_INPUT_TEST` set at all).
+let unicodeDegradeScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_UNICODE_DEGRADE"] == "1"
+
+/// Which window the input-test target lock (`runInputTest`) should pick: the first visible,
+/// content-bearing window whose title case-insensitively contains this substring. Unset (the
+/// default) keeps the original hardcoded winver-About heuristic ("about"/"关于") exactly as
+/// it has always been, so every existing scenario is unaffected.
+///
+/// Needed by adr/0011 §5 items 5/6: those launch a remote Notepad over a seeded file, whose
+/// window title is the file's own name (plus a localized "Notepad"/"记事本" suffix), never
+/// anything containing "about".
+let inputTargetTitleSubstring = ProcessInfo.processInfo.environment["WINDOW_SMOKE_INPUT_TARGET_TITLE"]
+    .flatMap { $0.isEmpty ? nil : $0 }
 
 /// Phase 1 acceptance (multi-window scenario): additional RemoteApp programs to launch
 /// into the same session at t=6s, semicolon-separated full Windows paths. When set, the
@@ -190,6 +274,21 @@ let moveResizeScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOK
 /// Escape closes it within 3s. Requires `WINDOW_SMOKE_EXTRA_APPS` (multiwin prereq), same
 /// convention as `WINDOW_SMOKE_MAXIMIZE`/`WINDOW_SMOKE_MOVE`.
 let popupScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_POPUP"] == "1"
+
+/// How many popup open/close ROUNDS `WINDOW_SMOKE_POPUP`'s scenario runs back to back
+/// (requires that switch and its own multiwin prereq, both unchanged). 1 -- the default --
+/// is the original one-shot: same phases, same log lines, same informational-only latency
+/// report, byte for byte.
+///
+/// >1 turns the scenario into a real sample generator: each round re-arms after the previous
+/// popup closed cleanly (recapture the pre-keystroke windowId set, settle, resend Alt+Space
+/// -- the About window keeps focus, so the activate leg is NOT re-run except as the single
+/// permitted retry when a round's create-poll times out) and contributes one
+/// WindowCreate→first-content latency sample. Only at n>1 does `finish()` gate on the
+/// ≤100ms p95 LAN budget (docs/plans/phase2.md §4 W4) -- which is exactly the "needs real
+/// n>1 data before it can be enforced" condition the one-shot's own informational print has
+/// carried since adr/0010 §5.
+let popupSamplesTotal = max(1, Int(ProcessInfo.processInfo.environment["WINDOW_SMOKE_POPUP_SAMPLES"] ?? "") ?? 1)
 
 /// MS-RDPERP `TS_RAIL_ORDER_SYSCOMMAND` `SC_*` values -- duplicated here from
 /// `App/RemoteWindowRendering/RemoteWindowRegistry.swift`'s own `SysCommand` enum (itself
@@ -372,6 +471,76 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     // synthetic event is sent (see runInputTest), checked in finish().
     private var keyWindowCheckResult: (passed: Bool, detail: String)?
 
+    // MARK: - Scripted input batteries (adr/0011 §5 items 5/6/7)
+
+    /// One step of a scripted input battery. Three scenarios share this one machine --
+    /// `WINDOW_SMOKE_CMDMAP_LIVE` (six chords), `WINDOW_SMOKE_INPUT_TEST=ime` (one IME commit
+    /// then Cmd+S) and `WINDOW_SMOKE_UNICODE_DEGRADE` (two IME commits) -- because all three
+    /// are the same shape: lock one target window, run the input-test focus preamble against
+    /// it, then dispatch a fixed list of real events at real, host-processing-sized gaps.
+    /// They differ only in the list, which is exactly what this type carries.
+    private struct InputScriptStep {
+        /// Human-readable label for this step's own progress line.
+        let label: String
+        /// Seconds to wait after the PREVIOUS step (or after arming, for the first step)
+        /// before dispatching this one. Real gaps, not zero: a real host needs time to
+        /// actually process each chord -- the same finding `sendSyntheticClick`'s own
+        /// two-stage gap documents (firing two synthetic inputs back to back with no gap made
+        /// the remote session miss the second one outright, even with every local
+        /// windowId/canBecomeKey check passing).
+        let gapBefore: TimeInterval
+        let action: Action
+        /// Printed verbatim immediately after this step is dispatched, when non-nil -- this
+        /// is where the machine-readable markers the external comparer parses come from, so
+        /// they are emitted at exactly the step whose completion they describe rather than
+        /// batched at the end.
+        let markerAfter: String?
+
+        enum Action {
+            /// A synthesized real-`NSEvent` chord: optional Cmd-down flagsChanged, keyDown/
+            /// keyUp for `macKeyCode` (carrying `characters` as both `characters` and
+            /// `charactersIgnoringModifiers`), then the matching Cmd-up flagsChanged.
+            case chord(macKeyCode: UInt16, characters: String, command: Bool)
+            /// One composed IME commit, delivered through the target window's content view's
+            /// `NSTextInputClient.insertText(_:replacementRange:)` -- the exact method a real
+            /// macOS input method calls, never `RemoteWindowRegistry.handleInput` directly.
+            case imeCommit(text: String)
+        }
+    }
+
+    /// adr/0011 §5 item 6's fixed probe string: exactly 50 Unicode scalars spanning Han
+    /// characters, CJK punctuation (，：、。), full-width brackets/quotes (（）《》), full-width
+    /// exclamation/question/semicolon (！？；), the em-dash pair (——), the ellipsis (…) and
+    /// full-width digits/latin (０１Ａ) -- deliberately NOT plain ASCII anywhere, since the
+    /// whole point is the lane that only exists for text a scancode cannot express (adr/0011
+    /// §1: "合成型输入源交回 NSTextInputClient"). Fixed, not generated: the external readback
+    /// comparer needs a byte-exact expectation, and `expected-utf8-hex` is derived from this
+    /// same constant so the two can never drift.
+    private static let imeCommitText =
+        "远程视窗如临本机，输入法五十字往返验证：句读、顿号与全角（）《》符号！？；：。破折号——省略…０１Ａ"
+
+    /// The armed script, its target, and its progress. All empty/nil/false on a run where no
+    /// scripted battery is active, which is every run that sets none of the three env
+    /// switches above (`runInputScript` returns immediately in that case).
+    private var inputScriptTag = ""
+    private var inputScriptSteps: [InputScriptStep] = []
+    private var inputScriptWindowId: UInt32?
+    private var inputScriptIndex = 0
+    private var inputScriptNextStepAt: Date?
+    /// Seconds to keep the run alive after the LAST step is dispatched -- a real host needs
+    /// this (the cmdmap/ime batteries end on Cmd+S, whose disk write on the Windows side is
+    /// what the external readback pass is going to read).
+    private var inputScriptSettle: TimeInterval = 0
+    private var inputScriptSettleUntil: Date?
+    private var inputScriptChordsDispatched = 0
+    private var inputScriptCommitsDelivered = 0
+    /// Set when `window.contentView` was not a `RemoteWindowContentView` -- an
+    /// assert-fail-the-scenario condition, not something to route around: an IME commit that
+    /// did not go through the real `NSTextInputClient` conformance proves nothing about the
+    /// path adr/0011 §2 actually ships.
+    private var inputScriptCastFailed = false
+    private var inputScriptComplete = false
+
     // Phase 2 W2 task item 5b/5c (WINDOW_SMOKE_MAXIMIZE): maximize -> restore -> close e2e
     // state machine -- see `runMaximizeScenario`'s own doc comment for the full sequence.
     private enum MaximizePhase: Equatable {
@@ -492,9 +661,39 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         /// appeared but never closed, popup never appeared at all) now funnels through this
         /// one cleanup phase before `.done`.
         case awaitingAboutClose(sentAt: Date)
+        /// `WINDOW_SMOKE_POPUP_SAMPLES` > 1 only: the inter-round re-arm settle. The About
+        /// window keeps focus across a round boundary (the popup that just closed was its own
+        /// child; closing it returns focus to the owner), so a round re-arm deliberately does
+        /// NOT re-run the activate leg -- it recaptures the pre-keystroke windowId set, waits
+        /// out this settle, and sends the next Alt+Space directly. Re-activating between
+        /// rounds would make every sample measure a focus round trip this scenario is not
+        /// trying to measure, on top of the popup latency it is.
+        case awaitingReArmSettle(sentAt: Date)
         case done
     }
     private var popupPhase: PopupPhase = .waitingForTarget
+    private static let popupReArmSettle: TimeInterval = 0.5
+
+    /// One round's outcome (`WINDOW_SMOKE_POPUP_SAMPLES`). `latencyMs` is the round's own
+    /// WindowCreate→first-content measurement, and is `nil` when the popup never presented
+    /// content before Escape closed it -- recorded as a FAILED sample rather than as a
+    /// fabricated number, which is also why `ok` requires it: a round that opened and closed
+    /// a popup that never painted has not demonstrated the ≤100ms first-content budget
+    /// docs/plans/phase2.md §4 W4 gates on, so counting it as a success while quietly leaving
+    /// it out of the latency set would make `ok == N` and the p95 gate measure two different
+    /// populations.
+    private struct PopupRoundResult {
+        let appeared: Bool
+        let attached: Bool
+        let closed: Bool
+        let latencyMs: Double?
+        var ok: Bool { appeared && attached && closed && latencyMs != nil }
+    }
+    private var popupRoundResults: [PopupRoundResult] = []
+    /// One re-activate retry per round, permitted only when the round's create-poll times out
+    /// (multi-round mode only -- at the default N==1 a create-poll timeout still fails
+    /// immediately and funnels straight to cleanup, exactly as it always has).
+    private var popupCreateRetried = false
     private static let popupCreatePollTimeout: TimeInterval = 5.0
     private static let popupEscapeClosePollTimeout: TimeInterval = 3.0
     private static let popupAboutClosePollTimeout: TimeInterval = 5.0
@@ -568,6 +767,32 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         CRSession.logFreeRDPVersion()
         print("[config] launching program=\(launchedProgram) (kind=\(launchedAppKind))")
 
+        // adr/0011 §5 item 5: fail LOUDLY and immediately, not silently or halfway through --
+        // the seed is what every downstream artifact of the live battery is defined against
+        // (the `expected-utf8-hex` marker the external comparer parses, and the file content
+        // the host is supposed to end up holding). A run that dispatched all six chords but
+        // could not say what the result should be would produce an unfalsifiable "PASS" for
+        // the one assertion this whole scenario exists for, so `finish()` gates on this flag
+        // too rather than trusting the operator to have read this line.
+        if cmdMapLiveActive, cmdMapSeed == nil {
+            print("[cmdmap-live] FAILED: WINDOW_SMOKE_CMDMAP_SEED is required when WINDOW_SMOKE_CMDMAP_LIVE=1 "
+                + "(it is the exact text the host-side file was seeded with -- without it this run cannot state "
+                + "what the file should contain afterwards, so no chord is dispatched at all)")
+        }
+        if cmdMapLiveEnabled, inputTestMode != .cmdmap {
+            print("[cmdmap-live] ignored: WINDOW_SMOKE_CMDMAP_LIVE=1 only upgrades WINDOW_SMOKE_INPUT_TEST=cmdmap "
+                + "(current mode: \(inputTestMode.map { $0.rawValue } ?? "unset"))")
+        }
+        // adr/0011 §5 items 6/7 drive the SAME scripted-input state machine (one target lock,
+        // one script, one settle) -- deliberately, since they are the two halves of the same
+        // IME path -- so only one of them can own it per run. Whichever arms first wins; the
+        // other's own `finish()` gates then fail loudly rather than reporting a half-run.
+        if unicodeDegradeScenarioEnabled, inputTestMode != nil {
+            print("[unicode-degrade] WARNING: WINDOW_SMOKE_UNICODE_DEGRADE=1 and WINDOW_SMOKE_INPUT_TEST="
+                + "\(inputTestMode.map { $0.rawValue } ?? "?") both request the scripted-input state "
+                + "machine -- run them as two separate invocations")
+        }
+
         // User-reported "clicks don't work" review round: a window can only actually
         // *become* key while its owning application is the active/frontmost application --
         // canBecomeKey alone (RemoteWindow.swift's RemoteWindowBackingWindow fix) is
@@ -584,6 +809,25 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         let newSession = CRSession(host: host, user: user, password: pass, program: launchedProgram)
+        // adr/0011 §5 items 5/6 (WINDOW_SMOKE_APP_ARGS): RemoteApp launch arguments, so a run
+        // can open a SPECIFIC seeded file (e.g. `notepad.exe C:\rdp-lab\cmdmap-seed.txt`) for
+        // the input round-trip batteries instead of the argument-less winver every other
+        // scenario uses. Set here, before `-start` below -- `programArguments` has the same
+        // "read once by the connect path, unsynchronized afterwards" contract `desktopWidth`
+        // does, so this is the only correct place for it. Printed (the path is a lab file
+        // path, never a credential) so a run's log says what it actually launched.
+        if let launchedProgramArguments {
+            newSession.programArguments = launchedProgramArguments
+            print("[config] programArguments=\(launchedProgramArguments)")
+        }
+        // adr/0011 §5 item 7 (WINDOW_SMOKE_UNICODE_DEGRADE): same before-`-start` contract.
+        // Forces the negotiated Unicode capability to read unsupported, which is what makes
+        // adr/0011 §2's degradation path constructible against an ordinary host at all (see
+        // `forceUnicodeInputUnsupported`'s own doc comment in CRSession.h).
+        if unicodeDegradeScenarioEnabled {
+            newSession.forceUnicodeInputUnsupported = true
+            print("[config] forceUnicodeInputUnsupported=YES (adr/0011 §5 item 7 degradation scenario)")
+        }
         session = newSession
         registry = RemoteWindowRegistry(session: newSession)
         // TEMPORARY debug instrumentation (2026-08-23 Z-order reversal investigation) --
@@ -977,6 +1221,12 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         checkFirstFrameGate(registry.windowSnapshots())
         runActivateExperiment(elapsed: elapsed, session: session, registry: registry)
         runInputTest(elapsed: elapsed, registry: registry)
+        // adr/0011 §5 items 5/6/7: the degradation scenario locks its own target (it is not
+        // an InputTestMode); the script driver then dispatches whichever battery got armed --
+        // by `runInputTest` above (cmdmap-live/ime) or by the degradation scenario -- one
+        // step per tick, gated on each step's own gap.
+        runUnicodeDegradeScenario(elapsed: elapsed, registry: registry)
+        runInputScript(registry: registry)
         runFocusRotation(elapsed: elapsed, session: session, registry: registry)
         runMaximizeScenario(session: session, registry: registry)
         runMoveResizeScenario(session: session, registry: registry)
@@ -1036,14 +1286,37 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // poll) -- worst case ~19.6s, 30s leaves comfortable slack, same "gated by the phase
         // reaching .done, this is only the hard failsafe" shape
         // `maximizeStalled`/`moveResizeStalled` already establish.
-        let popupDeadline: TimeInterval = popupScenarioEnabled ? 30 : baseDeadline
+        //
+        // `WINDOW_SMOKE_POPUP_SAMPLES` > 1 adds N-1 further rounds, each one a re-arm settle
+        // (0.5s) + Alt+Space + up to the 5s create poll + the 0.3s escape settle + up to the
+        // 3s escape-close poll, i.e. under 9s worst case -- 10s per extra round keeps the
+        // same comfortable-slack convention the 30s base already uses. N==1 leaves this at
+        // exactly 30, unchanged.
+        let popupDeadline: TimeInterval = popupScenarioEnabled
+            ? 30 + Double(popupSamplesTotal - 1) * 10
+            : baseDeadline
         let popupStalled = popupScenarioEnabled && popupPhase != .done && elapsed >= popupDeadline + 10
-        let overallDeadline = max(rotationDeadline, maximizeDeadline, moveResizeDeadline, popupDeadline)
+        // adr/0011 §5 items 5/6/7 (WINDOW_SMOKE_CMDMAP_LIVE / WINDOW_SMOKE_INPUT_TEST=ime /
+        // WINDOW_SMOKE_UNICODE_DEGRADE): worst case is the input-test target lock (>=5s, later
+        // if the launched app is slow to paint) + six chords at 0.4s + the 2s post-Cmd+S
+        // settle -- ~10s, so 30s leaves the same comfortable slack every other scenario's
+        // deadline does, and `inputScriptStalled` is the same hard failsafe shape (normally
+        // `inputScriptComplete` is what gates the wait; a battery whose target never appears
+        // fails its own `finish()` assertions rather than hanging).
+        let inputScriptScenarioActive = cmdMapLiveActive || inputTestMode == .ime || unicodeDegradeScenarioEnabled
+        let inputScriptDeadline: TimeInterval = inputScriptScenarioActive ? 30 : baseDeadline
+        let inputScriptStalled = inputScriptScenarioActive && !inputScriptComplete
+            && elapsed >= inputScriptDeadline + 10
+        let overallDeadline = max(
+            max(rotationDeadline, maximizeDeadline),
+            max(moveResizeDeadline, max(popupDeadline, inputScriptDeadline))
+        )
         let rotationReady = focusRotationTotal == 0 || focusRotationDone || rotationStalled
         let maximizeReady = !maximizeScenarioEnabled || maximizePhase == .done || maximizeStalled
         let moveResizeReady = !moveResizeScenarioEnabled || moveResizePhase == .done || moveResizeStalled
         let popupReady = !popupScenarioEnabled || popupPhase == .done || popupStalled
-        if elapsed >= overallDeadline, rotationReady, maximizeReady, moveResizeReady, popupReady {
+        let inputScriptReady = !inputScriptScenarioActive || inputScriptComplete || inputScriptStalled
+        if elapsed >= overallDeadline, rotationReady, maximizeReady, moveResizeReady, popupReady, inputScriptReady {
             finish()
         }
     }
@@ -1752,8 +2025,28 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 print("[popup] popup appeared: windowId=\(located) title=\"\(snap?.title ?? "")\" ownerWindowId=\(registry.attachedOwner(forWindowId: located).map(String.init) ?? "nil")")
                 popupPhase = .awaitingEscapeSettle(popupWindowId: located, sentAt: Date())
             } else if Date().timeIntervalSince(sentAt) >= Self.popupCreatePollTimeout {
+                // Multi-round mode only (`WINDOW_SMOKE_POPUP_SAMPLES` > 1): ONE re-activate
+                // retry before the round is counted failed. A round boundary is the one place
+                // this scenario's "the About window keeps focus" assumption can legitimately
+                // have lapsed (anything at all could have taken focus on the host between
+                // rounds), and a lost Alt+Space is indistinguishable from a lost focus from
+                // here -- so the retry re-runs the real gated activate leg and then the
+                // ordinary 0.3s-settle-then-Alt+Space path, rather than blind-resending the
+                // keystroke into whatever now holds focus. Deliberately NOT applied at the
+                // default N==1: that path stays byte-identical to every prior run.
+                if popupSamplesTotal > 1, !popupCreateRetried, let ownerId = popupOwnerWindowId,
+                   let ownerWindow = registry.window(forWindowId: ownerId)
+                {
+                    popupCreateRetried = true
+                    print("[popup] round \(popupRoundResults.count + 1)/\(popupSamplesTotal): no owner-attached "
+                        + "window within 5s of Alt+Space -- one re-activate retry (new windowIds observed: \(newIds.sorted()))")
+                    activateForClose(ownerWindow)
+                    popupPhase = .awaitingActivateSettle(sentAt: Date())
+                    return
+                }
                 popupAppeared = false
                 print("[popup] FAILED: no new owner-attached window appeared within 5s of Alt+Space (new windowIds observed: \(newIds.sorted()))")
+                recordPopupRound()
                 beginAboutCleanup(session: session, registry: registry)
             }
 
@@ -1769,7 +2062,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 popupFirstContentAt = Date().timeIntervalSince(startTime)
                 if let created = popupCreatedAt, let firstContent = popupFirstContentAt {
                     let latencyMs = (firstContent - created) * 1000
-                    print("[popup] WindowCreate→first-content latency: \(String(format: "%.1f", latencyMs))ms (informational -- plan §4 W4's ≤100ms p95 gate needs n>1 data)")
+                    // The n>1 wording only holds for the one-shot: once
+                    // `WINDOW_SMOKE_POPUP_SAMPLES` > 1 this run IS the n>1 data, and
+                    // `finish()`'s own summary gates on the p95 of these very samples. The
+                    // N==1 branch is byte-identical to every prior run's line.
+                    if popupSamplesTotal > 1 {
+                        print("[popup] round \(popupRoundResults.count + 1)/\(popupSamplesTotal) "
+                            + "WindowCreate→first-content latency: \(String(format: "%.1f", latencyMs))ms")
+                    } else {
+                        print("[popup] WindowCreate→first-content latency: \(String(format: "%.1f", latencyMs))ms (informational -- plan §4 W4's ≤100ms p95 gate needs n>1 data)")
+                    }
                 }
             }
             guard Date().timeIntervalSince(sentAt) >= 0.3 else { return }
@@ -1785,11 +2087,33 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         case .awaitingEscapeClose(_, let sentAt):
             if popupClosedAt != nil {
                 print("[popup] WindowDelete received within 3s of Escape")
-                beginAboutCleanup(session: session, registry: registry)
+                recordPopupRound()
+                // `WINDOW_SMOKE_POPUP_SAMPLES`: the ONLY path that re-arms is this one -- a
+                // round that closed cleanly. Every other terminal path (create-poll exhausted,
+                // Escape never closed the popup) records its failed sample and funnels
+                // straight to the About cleanup, preserving the team-lead review invariant
+                // that every terminal path goes through `beginAboutCleanup` exactly once,
+                // now scoped to "after the FINAL round" rather than "after the only round".
+                if popupRoundResults.count < popupSamplesTotal, popupOwnerWindowId.flatMap({ registry.window(forWindowId: $0) }) != nil {
+                    beginPopupRound(registry: registry)
+                } else {
+                    beginAboutCleanup(session: session, registry: registry)
+                }
             } else if Date().timeIntervalSince(sentAt) >= Self.popupEscapeClosePollTimeout {
                 print("[popup] FAILED to receive WindowDelete within 3s of Escape")
+                recordPopupRound()
                 beginAboutCleanup(session: session, registry: registry)
             }
+
+        case .awaitingReArmSettle(let sentAt):
+            guard Date().timeIntervalSince(sentAt) >= Self.popupReArmSettle else { return }
+            guard let ownerId = popupOwnerWindowId, let window = registry.window(forWindowId: ownerId) else {
+                beginAboutCleanup(session: session, registry: registry)
+                return
+            }
+            sendAltSpace(to: window)
+            print("[popup] round \(popupRoundResults.count + 1)/\(popupSamplesTotal): sent Alt+Space to windowId=\(ownerId)")
+            popupPhase = .awaitingPopupCreate(sentAt: Date())
 
         case .awaitingAboutClose(let sentAt):
             if popupAboutClosedAt != nil {
@@ -1805,6 +2129,54 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         case .done:
             break
         }
+    }
+
+    /// Closes out the round currently in flight (`WINDOW_SMOKE_POPUP_SAMPLES`) -- called from
+    /// every one of `runPopupScenario`'s round-terminal paths, exactly once each, right
+    /// before that path either re-arms or funnels into the About cleanup. Reads the same
+    /// per-round fields `finish()`'s original single-round assertions already read
+    /// (`popupAppeared`/`popupAttachedAsChild`/`popupClosedAt`/`popupCreatedAt`/
+    /// `popupFirstContentAt`), so a round's recorded result can never diverge from what those
+    /// assertions would have said about it.
+    ///
+    /// Silent (no print of its own) and harmless at the default N==1, where the recorded
+    /// result is simply never read: `finish()`'s new sample summary is gated on N>1 precisely
+    /// so a one-shot run's output stays byte-identical to every prior run's.
+    private func recordPopupRound() {
+        let latencyMs: Double?
+        if let created = popupCreatedAt, let firstContent = popupFirstContentAt {
+            latencyMs = (firstContent - created) * 1000
+        } else {
+            latencyMs = nil
+        }
+        popupRoundResults.append(PopupRoundResult(
+            appeared: popupAppeared == true,
+            attached: popupAttachedAsChild == true,
+            closed: popupClosedAt != nil,
+            latencyMs: latencyMs
+        ))
+    }
+
+    /// Arms the NEXT round (`WINDOW_SMOKE_POPUP_SAMPLES` > 1 only): clears every per-round
+    /// field so the next round measures itself and nothing else, recaptures
+    /// `popupWindowIdsBeforeKeystroke` against the CURRENT window population (the round just
+    /// finished deleted its own popup, and the "only count windowIds that appeared AFTER the
+    /// keystroke" discipline the original one-shot established has to be re-established per
+    /// round, not inherited), and enters the re-arm settle -- which sends the next Alt+Space
+    /// without re-running the activate leg (see `PopupPhase.awaitingReArmSettle`).
+    private func beginPopupRound(registry: RemoteWindowRegistry) {
+        popupWindowId = nil
+        popupCreatedAt = nil
+        popupFirstContentAt = nil
+        popupAttachedAsChild = nil
+        popupAppeared = nil
+        popupEscapeSent = false
+        popupClosedAt = nil
+        popupCreateRetried = false
+        popupWindowIdsBeforeKeystroke = Set(registry.windowSnapshots().map(\.windowId))
+        print("[popup] round \(popupRoundResults.count + 1)/\(popupSamplesTotal): re-arming "
+            + "(\(popupRoundResults.filter(\.ok).count)/\(popupRoundResults.count) rounds ok so far)")
+        popupPhase = .awaitingReArmSettle(sentAt: Date())
     }
 
     /// Team-lead review: funnels every terminal path in `runPopupScenario` through one
@@ -1823,6 +2195,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// closed cleanly on its own (a redundant Escape with nothing open to dismiss is a
     /// harmless no-op, matching every other fire-and-forget outbound call this harness
     /// already makes).
+    ///
+    /// `WINDOW_SMOKE_POPUP_SAMPLES` > 1: still exactly one cleanup per RUN, not per round --
+    /// it now runs after the FINAL round (or after whichever round first failed), which is
+    /// how the "every terminal path funnels through here" invariant survives the round loop.
     private func beginAboutCleanup(session: CRSession, registry: RemoteWindowRegistry) {
         guard let ownerId = popupOwnerWindowId else {
             popupPhase = .done
@@ -1989,8 +2365,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
 
         if inputTestWindowId == nil, elapsed >= 5 {
             if let w = registry.windowSnapshots().first(where: { snap in
-                snap.isVisible && snap.hasDisplayedContent
-                    && (snap.title.localizedCaseInsensitiveContains("about") || snap.title.contains("关于"))
+                snap.isVisible && snap.hasDisplayedContent && Self.matchesInputTestTarget(snap.title)
             }) {
                 inputTestWindowId = w.windowId
                 print("[input-test] target locked: windowId=\(w.windowId) title=\"\(w.title)\" mode=\(inputTestMode)")
@@ -2032,8 +2407,32 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         case .enter:
             sendSyntheticEnter(to: window)
         case .cmdmap:
-            sendSyntheticCmdMap(to: window)
+            // adr/0011 §5 item 5: the scaffold's single Cmd+C unless the live battery is
+            // switched on, in which case the six-chord script below takes over (armed here,
+            // dispatched one chord per tick by `runInputScript` -- a single-shot send cannot
+            // express the ~0.4s inter-chord gaps a real host needs).
+            if cmdMapLiveActive {
+                armCmdMapLiveScript(windowId: windowId)
+            } else {
+                sendSyntheticCmdMap(to: window)
+            }
+        case .ime:
+            armImeScript(windowId: windowId)
         }
+    }
+
+    /// The input-test target-lock predicate. `WINDOW_SMOKE_INPUT_TARGET_TITLE`, when set,
+    /// replaces the original hardcoded winver-About heuristic wholesale (not "in addition
+    /// to"): a run that names a target means that target, and silently falling back to an
+    /// About window that happens to be lying around from an earlier run is exactly the
+    /// stale-window contamination class this file has already paid for three times
+    /// (`moveResizeCloseTargetId`'s own doc comment). Unset keeps the original two-language
+    /// title match, unchanged.
+    private static func matchesInputTestTarget(_ title: String) -> Bool {
+        if let inputTargetTitleSubstring {
+            return title.localizedCaseInsensitiveContains(inputTargetTitleSubstring)
+        }
+        return title.localizedCaseInsensitiveContains("about") || title.contains("关于")
     }
 
     /// adr/0011 §5 item 5's SCAFFOLD (offline scope this round -- see `InputTestMode.cmdmap`'s
@@ -2076,6 +2475,303 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         window.sendEvent(cKeyDown)
         window.sendEvent(cKeyUp)
         window.sendEvent(cmdUp)
+    }
+
+    // MARK: - Scripted input batteries (adr/0011 §5 items 5/6/7)
+
+    /// adr/0011 §5 item 5's LIVE battery (`WINDOW_SMOKE_CMDMAP_LIVE=1`, see that switch's own
+    /// doc comment). Arms the six-chord script against the already-locked, already-focused
+    /// input-test target -- a remote Notepad holding a seeded single-line file:
+    ///
+    ///   Cmd+A → Cmd+C → End → Cmd+V → Cmd+V → Cmd+S
+    ///
+    /// `End` is plain (no modifier) and load-bearing: Cmd+A leaves the whole line selected,
+    /// so pasting straight away would REPLACE it and the file would end up holding the seed
+    /// once, not three times. Collapsing the selection to the line end first makes both
+    /// pastes append. Cmd+S saves the already-named file silently in place -- no Save-As
+    /// dialog to steal focus, which is exactly why the scenario needs
+    /// `WINDOW_SMOKE_APP_ARGS` to have opened a real file rather than an untitled buffer.
+    ///
+    /// The chords go out as real `NSEvent`s through `NSWindow.sendEvent(_:)`, the same
+    /// dispatch discipline `sendSyntheticCmdMap` established (flagsChanged Cmd-down, keyDown/
+    /// keyUp carrying `charactersIgnoringModifiers`, flagsChanged Cmd-up) -- never a direct
+    /// `RemoteWindowRegistry.handleInput` call, so `RemoteWindowContentView` ->
+    /// `CommandKeyMapper` -> the wire is all genuinely exercised. Operator note (adr/0011
+    /// §1's mixing rule): the chords only take the scancode path while the Mac's CURRENT
+    /// keyboard input source is ASCII-capable -- a composing CJK source would hand the
+    /// letter keys to `interpretKeyEvents` instead, which is the `.ime` battery's lane, not
+    /// this one's.
+    private func armCmdMapLiveScript(windowId: UInt32) {
+        guard let seed = cmdMapSeed else {
+            // Already reported loudly at startup (`applicationDidFinishLaunching`) and gated
+            // in `finish()` -- nothing is dispatched, deliberately: six chords against a file
+            // whose expected content this run cannot state would mutate the host's seed file
+            // while proving nothing.
+            inputScriptComplete = true
+            return
+        }
+        let expected = String(repeating: seed, count: 3)
+        print("[cmdmap-live] seed=\"\(seed)\"")
+        let gap: TimeInterval = 0.4
+        armInputScript(
+            tag: "[cmdmap-live]",
+            windowId: windowId,
+            settle: 2.0,
+            steps: [
+                // kVK_ANSI_A / _C / _V / _S and kVK_End -- standard, stable AppKit virtual
+                // keycodes (physical position, not layout-dependent), same numbering space
+                // `sendSyntheticCmdMap`/`sendSyntheticEnter` already use.
+                InputScriptStep(label: "Cmd+A (select all)", gapBefore: gap,
+                                action: .chord(macKeyCode: 0, characters: "a", command: true), markerAfter: nil),
+                InputScriptStep(label: "Cmd+C (copy)", gapBefore: gap,
+                                action: .chord(macKeyCode: 8, characters: "c", command: true), markerAfter: nil),
+                InputScriptStep(label: "End (collapse selection to line end)", gapBefore: gap,
+                                action: .chord(macKeyCode: 119, characters: "\u{F72B}", command: false), markerAfter: nil),
+                InputScriptStep(label: "Cmd+V (paste 1/2)", gapBefore: gap,
+                                action: .chord(macKeyCode: 9, characters: "v", command: true), markerAfter: nil),
+                InputScriptStep(label: "Cmd+V (paste 2/2)", gapBefore: gap,
+                                action: .chord(macKeyCode: 9, characters: "v", command: true), markerAfter: nil),
+                InputScriptStep(
+                    label: "Cmd+S (save in place)", gapBefore: gap,
+                    action: .chord(macKeyCode: 1, characters: "s", command: true),
+                    markerAfter: "[cmdmap-live] sequence complete; expected file content = seed x3; "
+                        + "expected-utf8-hex=\(Self.utf8Hex(expected))"
+                ),
+            ]
+        )
+    }
+
+    /// adr/0011 §5 item 6's IME round-trip battery (`WINDOW_SMOKE_INPUT_TEST=ime`). ONE
+    /// composed commit of `Self.imeCommitText` delivered through the target window's content
+    /// view's `NSTextInputClient.insertText(_:replacementRange:)` -- the exact method a real
+    /// macOS input method calls when a composition commits, so the path under test is the
+    /// shipped one (`RemoteWindowContentView.insertText` -> `.unicodeText` ->
+    /// `UnicodeInputDegradationGate` -> `FocusAuthority` -> `CRSession.sendUnicodeText`),
+    /// not a shortcut into `RemoteWindowRegistry.handleInput` that would skip most of it.
+    /// Then Cmd+S, through the same synthesized-chord helper the cmdmap battery uses.
+    ///
+    /// Operator note: no real input method needs to be SELECTED on the Mac for this -- the
+    /// commit is delivered programmatically to the very method an input method would call,
+    /// which is the whole point. Run it with an ordinary ASCII-capable source active, so the
+    /// Cmd+S that follows still takes the scancode path (adr/0011 §1's mixing rule hands
+    /// non-always-scancode keys to `interpretKeyEvents` while a composing source is active,
+    /// and a Cmd+S swallowed there would never save the file the readback pass is going to
+    /// read).
+    private func armImeScript(windowId: UInt32) {
+        let text = Self.imeCommitText
+        // adr/0011 §5 item 6 says fifty characters; this asserts the constant still IS fifty
+        // rather than trusting a comment (an editor auto-correcting one full-width character
+        // into two, or eating the em-dash pair, would otherwise silently weaken the probe).
+        precondition(text.unicodeScalars.count == 50, "adr/0011 §5 item 6's probe string must be exactly 50 scalars")
+        armInputScript(
+            tag: "[ime]",
+            windowId: windowId,
+            settle: 2.0,
+            steps: [
+                InputScriptStep(
+                    label: "IME commit (50 scalars, NSTextInputClient.insertText)", gapBefore: 0.4,
+                    action: .imeCommit(text: text),
+                    markerAfter: "[ime] committed 50 scalars; expected-utf8-hex=\(Self.utf8Hex(text))"
+                ),
+                InputScriptStep(label: "Cmd+S (save in place)", gapBefore: 0.5,
+                                action: .chord(macKeyCode: 1, characters: "s", command: true), markerAfter: nil),
+            ]
+        )
+    }
+
+    /// adr/0011 §5 item 7's degradation half (`WINDOW_SMOKE_UNICODE_DEGRADE=1`). TWO short,
+    /// distinct commits through the SAME real `NSTextInputClient` path the `.ime` battery
+    /// uses -- distinct so a reader of `UnicodeInputDegradationGate`'s counters can tell "two
+    /// commits arrived" from "one commit was double-counted", short because none of this text
+    /// is ever supposed to reach the wire (the session was started with
+    /// `forceUnicodeInputUnsupported`, so the gate drops both). No save leg: there is nothing
+    /// on the host to save.
+    private func armUnicodeDegradeScript(windowId: UInt32) {
+        armInputScript(
+            tag: "[unicode-degrade]",
+            windowId: windowId,
+            settle: 0.5,
+            steps: [
+                InputScriptStep(label: "IME commit 1/2 (expected dropped + warned once)", gapBefore: 0.4,
+                                action: .imeCommit(text: "降级一"), markerAfter: nil),
+                InputScriptStep(label: "IME commit 2/2 (expected dropped, NOT warned again)", gapBefore: 0.3,
+                                action: .imeCommit(text: "降级二"), markerAfter: nil),
+            ]
+        )
+    }
+
+    /// Shared arming for all three batteries above -- records the script and starts the clock
+    /// for its first step. Never overwrites an already-armed script (the three scenarios are
+    /// mutually exclusive per run; see `applicationDidFinishLaunching`'s own warning).
+    private func armInputScript(tag: String, windowId: UInt32, settle: TimeInterval, steps: [InputScriptStep]) {
+        guard inputScriptSteps.isEmpty else { return }
+        inputScriptTag = tag
+        inputScriptWindowId = windowId
+        inputScriptSettle = settle
+        inputScriptSteps = steps
+        inputScriptIndex = 0
+        inputScriptNextStepAt = Date().addingTimeInterval(steps.first?.gapBefore ?? 0)
+        print("\(tag) armed: \(steps.count) step(s) against windowId=\(windowId), "
+            + "\(String(format: "%.1f", settle))s settle after the last one")
+    }
+
+    /// Per-tick driver for whichever battery is armed -- one step per tick at most, gated on
+    /// that step's own `gapBefore`, in the same "enum/array phase + per-tick driver called
+    /// from the run loop" shape `runPopupScenario`/`runMaximizeScenario` already use. Once
+    /// every step has been dispatched it holds the run open for `inputScriptSettle` seconds
+    /// (the host's own disk write, for the batteries that end on Cmd+S) and then flips
+    /// `inputScriptComplete`, which is what lets `tick()`'s deadline logic end the run.
+    private func runInputScript(registry: RemoteWindowRegistry) {
+        guard !inputScriptSteps.isEmpty, !inputScriptComplete else { return }
+
+        if inputScriptIndex >= inputScriptSteps.count {
+            guard let settleUntil = inputScriptSettleUntil, Date() >= settleUntil else { return }
+            inputScriptComplete = true
+            print("\(inputScriptTag) settled \(String(format: "%.1f", inputScriptSettle))s after the final step "
+                + "(chords dispatched=\(inputScriptChordsDispatched), IME commits delivered=\(inputScriptCommitsDelivered))")
+            return
+        }
+
+        let step = inputScriptSteps[inputScriptIndex]
+        guard let due = inputScriptNextStepAt, Date() >= due else { return }
+        guard let windowId = inputScriptWindowId, let window = registry.window(forWindowId: windowId) else {
+            // The target vanished mid-script (a server-side close, a reconnect). Nothing left
+            // to dispatch against; `finish()`'s own per-scenario gates report the shortfall.
+            print("\(inputScriptTag) FAILED: target windowId=\(inputScriptWindowId.map(String.init) ?? "nil") "
+                + "no longer exists -- \(inputScriptSteps.count - inputScriptIndex) step(s) never dispatched")
+            inputScriptComplete = true
+            return
+        }
+
+        print("\(inputScriptTag) step \(inputScriptIndex + 1)/\(inputScriptSteps.count): \(step.label)")
+        switch step.action {
+        case .chord(let macKeyCode, let characters, let command):
+            if sendChord(to: window, macKeyCode: macKeyCode, characters: characters, command: command) {
+                inputScriptChordsDispatched += 1
+            }
+        case .imeCommit(let text):
+            // The cast is the assertion, not a convenience: `insertText(_:replacementRange:)`
+            // only means anything here if it lands on the real `RemoteWindowContentView`
+            // conformance (adr/0011 §2). A window whose content view is something else is a
+            // structural change this scenario must fail on, loudly, rather than route around.
+            guard let contentView = window.contentView as? RemoteWindowContentView else {
+                inputScriptCastFailed = true
+                print("\(inputScriptTag) FAILED: windowId=\(windowId)'s contentView is "
+                    + "\(window.contentView.map { String(describing: type(of: $0)) } ?? "nil"), not RemoteWindowContentView "
+                    + "-- cannot deliver an IME commit through the real NSTextInputClient path")
+                inputScriptComplete = true
+                return
+            }
+            // NSNotFound/0: the conventional "no replacement range" a committing input method
+            // passes for a plain insertion (the same convention `selectedRange()`'s own
+            // "unknown" answer uses on the other side of this protocol).
+            contentView.insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
+            inputScriptCommitsDelivered += 1
+        }
+        if let marker = step.markerAfter {
+            print(marker)
+        }
+
+        inputScriptIndex += 1
+        if inputScriptIndex < inputScriptSteps.count {
+            inputScriptNextStepAt = Date().addingTimeInterval(inputScriptSteps[inputScriptIndex].gapBefore)
+        } else {
+            inputScriptSettleUntil = Date().addingTimeInterval(inputScriptSettle)
+        }
+    }
+
+    /// One synthesized chord, dispatched via `NSWindow.sendEvent(_:)` -- the same real
+    /// capture path (`RemoteWindowContentView.flagsChanged`/`keyDown`/`keyUp` ->
+    /// `RemoteWindowRegistry.handleInput`) `sendSyntheticCmdMap`/`sendAltSpace`/`sendEscape`
+    /// already exercise, generalized over "which key, with or without Cmd". Returns whether
+    /// the events were actually constructed and sent, so the caller's dispatched-count (which
+    /// `finish()` gates on) can never overcount a chord AppKit refused to build.
+    @discardableResult
+    private func sendChord(to window: NSWindow, macKeyCode: UInt16, characters: String, command: Bool) -> Bool {
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        let flags: NSEvent.ModifierFlags = command ? [.command] : []
+        let macCommandKeyCode: UInt16 = 55 // kVK_Command
+        func flagsEvent(_ modifierFlags: NSEvent.ModifierFlags) -> NSEvent? {
+            NSEvent.keyEvent(
+                with: .flagsChanged, location: .zero, modifierFlags: modifierFlags, timestamp: timestamp,
+                windowNumber: window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "",
+                isARepeat: false, keyCode: macCommandKeyCode
+            )
+        }
+        guard
+            let keyDown = NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: flags, timestamp: timestamp,
+                windowNumber: window.windowNumber, context: nil, characters: characters,
+                charactersIgnoringModifiers: characters, isARepeat: false, keyCode: macKeyCode
+            ),
+            let keyUp = NSEvent.keyEvent(
+                with: .keyUp, location: .zero, modifierFlags: flags, timestamp: timestamp,
+                windowNumber: window.windowNumber, context: nil, characters: characters,
+                charactersIgnoringModifiers: characters, isARepeat: false, keyCode: macKeyCode
+            )
+        else {
+            print("\(inputScriptTag) failed to construct synthetic key events for macKeyCode=\(macKeyCode)")
+            return false
+        }
+        if command {
+            guard let commandDown = flagsEvent([.command]), let commandUp = flagsEvent([]) else {
+                print("\(inputScriptTag) failed to construct synthetic Cmd flagsChanged events")
+                return false
+            }
+            window.sendEvent(commandDown)
+            window.sendEvent(keyDown)
+            window.sendEvent(keyUp)
+            // adr/0011 §3: the Cmd-up flagsChanged is what closes the chord on the WIRE
+            // ledger too (`RemoteWindowRegistry.wireHeldModifiers`), which is why
+            // `finish()` can assert "nothing stuck" as a structural invariant rather than a
+            // hope -- a chord helper that skipped this would leave Ctrl held on the server.
+            window.sendEvent(commandUp)
+        } else {
+            window.sendEvent(keyDown)
+            window.sendEvent(keyUp)
+        }
+        return true
+    }
+
+    /// adr/0011 §5 item 7's degradation scenario driver (`WINDOW_SMOKE_UNICODE_DEGRADE=1`).
+    /// Unlike the two batteries above it is NOT an `InputTestMode` -- it needs no particular
+    /// app, no seeded file and no title heuristic, just any visible window with real content
+    /// (the default winver About dialog does fine), so it does its own target lock and its
+    /// own copy of `runInputTest`'s focus preamble rather than borrowing that mode's.
+    /// Deliberately stands down when an `InputTestMode` is also set, so which scenario owns
+    /// the shared script machine is deterministic rather than a race (see
+    /// `applicationDidFinishLaunching`'s own warning line).
+    private func runUnicodeDegradeScenario(elapsed: TimeInterval, registry: RemoteWindowRegistry) {
+        guard unicodeDegradeScenarioEnabled, inputTestMode == nil else { return }
+        guard inputScriptSteps.isEmpty, !inputScriptComplete, elapsed >= 5 else { return }
+        // Same plausible-content band (>=150x80) `finish()`'s own per-window size assertion
+        // and `focusRotationCandidateWindows` use -- never a sliver/ghost window.
+        guard let snapshot = registry.windowSnapshots().first(where: {
+            $0.isVisible && $0.hasDisplayedContent && $0.frame.width >= 150 && $0.frame.height >= 80
+        }), let window = registry.window(forWindowId: snapshot.windowId) else { return }
+
+        // Identical to `runInputTest`'s preamble, and for the identical reason: an IME commit
+        // is focus-addressed input like any other keystroke, so the window has to genuinely
+        // be key before the commit is delivered, not merely visible.
+        let canBecomeKey = window.canBecomeKey
+        window.makeKeyAndOrderFront(nil)
+        let isKeyAfterMakeKey = window.isKeyWindow
+        keyWindowCheckResult = (
+            passed: canBecomeKey && isKeyAfterMakeKey,
+            detail: "windowId=\(snapshot.windowId): canBecomeKey=\(canBecomeKey), isKeyWindow after makeKeyAndOrderFront=\(isKeyAfterMakeKey)"
+        )
+        print("[unicode-degrade] target locked: windowId=\(snapshot.windowId) title=\"\(snapshot.title)\"")
+        print("[unicode-degrade] key-window check: \(keyWindowCheckResult!.detail)")
+        armUnicodeDegradeScript(windowId: snapshot.windowId)
+    }
+
+    /// Lowercase UTF-8 hex of `text`, the form both live batteries' `expected-utf8-hex`
+    /// markers use. Hex, not the text itself: the external comparer reads back a file from
+    /// the Windows host and has to compare BYTES (encoding, BOM and line-ending questions all
+    /// belong to it), and a log line carrying raw CJK through several terminal/pipe layers is
+    /// exactly where a silent transcoding would hide.
+    private static func utf8Hex(_ text: String) -> String {
+        text.utf8.map { String(format: "%02x", Int($0)) }.joined()
     }
 
     /// Mouse half of deliverable 5: a real `NSEvent` mouseDown+mouseUp pair, dispatched via
@@ -2777,13 +3473,14 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // normal run that ends with zero tracked windows for some unrelated reason still
         // gets the unconditional, strict withContent check it always has.
         var inputTestPassed = false
-        if let inputTestMode, inputTestMode != .cmdmap {
-            // adr/0011 §5 item 5: `.cmdmap` is a scaffold-only mode this round (see
-            // `InputTestMode.cmdmap`'s own doc comment) -- Cmd+C has no reason to close any
-            // window, so it's deliberately excluded from this WindowDelete-based gate
-            // (`.click`/`.enter` both close the About-Windows dialog by design). The real
-            // `.cmdmap` assertion (adr/0011 §5 item 5: real-host Word copy/paste round
-            // trip) is out of scope until a live host run.
+        if let inputTestMode, inputTestMode != .cmdmap, inputTestMode != .ime {
+            // adr/0011 §5 items 5/6: `.cmdmap` and `.ime` are both excluded from this
+            // WindowDelete-based gate -- nothing either of them sends has any reason to close
+            // a window (Cmd+C/Cmd+V/Cmd+S against a Notepad, an IME commit into a text field),
+            // whereas `.click`/`.enter` both close the About-Windows dialog by design. Their
+            // own gates are further down: dispatch counts, the wire modifier ledger, the
+            // Unicode degradation diagnostics, and -- for the file contents themselves -- an
+            // external readback pass this process cannot perform.
             if let sentAt = inputTestSentAt, let windowId = inputTestWindowId {
                 if inputTestWindowDeleted, let deletedAt = inputTestWindowDeletedAt {
                     let delta = deletedAt - sentAt
@@ -2807,6 +3504,129 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 inputTestPassed = false
                 check(false, "input test (\(inputTestMode)) found a ready target window to act on before the run ended")
             }
+        }
+
+        // adr/0011 §5 item 5's LIVE battery (WINDOW_SMOKE_CMDMAP_LIVE=1 + INPUT_TEST=cmdmap).
+        // What this process CAN assert: the scenario had a real, focused target; every one of
+        // the six chords actually went out as real NSEvents; and the wire-side modifier ledger
+        // is empty at the end (adr/0011 §5 item 2's structural "zero stuck modifiers" -- the
+        // live twin of MacdowsCore's offline ledger tests). The key-window half of the
+        // preamble is gated by the generic `keyWindowCheckResult` assertion further down,
+        // which fires for every input-test mode -- not duplicated here.
+        //
+        // What it CANNOT assert, by construction: whether the file on the Windows host now
+        // holds the seed text three times over. This process has no access to the host's
+        // filesystem -- the FILE-CONTENT equality is asserted EXTERNALLY, by the controller,
+        // in a readback pass that compares the file's bytes against the `expected-utf8-hex`
+        // marker printed above (adr/0011 §5 item 5).
+        if cmdMapLiveActive {
+            check(
+                cmdMapSeed != nil,
+                "cmdmap-live: WINDOW_SMOKE_CMDMAP_SEED was supplied (without it no chord is dispatched at all -- "
+                    + "this run could not state what the host-side file should contain afterwards)"
+            )
+            check(
+                inputTestWindowId != nil,
+                "cmdmap-live: an input-test target window was locked before the run ended"
+                    + (inputTargetTitleSubstring.map { " (WINDOW_SMOKE_INPUT_TARGET_TITLE=\"\($0)\")" } ?? "")
+            )
+            check(
+                inputScriptChordsDispatched == 6,
+                "cmdmap-live: all 6 chords dispatched (Cmd+A, Cmd+C, End, Cmd+V, Cmd+V, Cmd+S) "
+                    + "(got \(inputScriptChordsDispatched))"
+            )
+            check(
+                registry.wireHeldModifiersIsEmpty(),
+                "cmdmap-live: the wire-side modifier ledger is empty at finish -- zero stuck modifiers after six "
+                    + "Cmd chords (adr/0011 §5 item 2, §3's wireHeldModifiers)"
+            )
+            print("[cmdmap-live] NOTE: file-content equality (seed x3) is asserted EXTERNALLY by the controller's "
+                + "readback pass against the expected-utf8-hex marker above -- this process cannot read the host's "
+                + "filesystem (adr/0011 §5 item 5)")
+        }
+
+        // adr/0011 §5 item 6 (WINDOW_SMOKE_INPUT_TEST=ime) -- the IME round trip, plus the
+        // NORMAL-path half of item 7's degradation acceptance: on a server that DID negotiate
+        // INPUT_FLAG_UNICODE, the gate must report supported, must have dropped nothing, and
+        // must never have warned. (The degraded half is WINDOW_SMOKE_UNICODE_DEGRADE's own
+        // block below.) File-content equality is again external -- same readback-pass split
+        // the cmdmap-live note above spells out.
+        if inputTestMode == .ime {
+            let unicodeDiag = registry.unicodeDegradationDiagnostics()
+            print("[ime] unicodeInputSupported=\(unicodeDiag.unicodeInputSupported.map(String.init) ?? "not read") "
+                + "warningsEmitted=\(unicodeDiag.warningsEmitted) droppedCommits=\(unicodeDiag.droppedCommits)")
+            check(
+                inputTestWindowId != nil,
+                "ime: an input-test target window was locked before the run ended"
+                    + (inputTargetTitleSubstring.map { " (WINDOW_SMOKE_INPUT_TARGET_TITLE=\"\($0)\")" } ?? "")
+            )
+            check(
+                inputScriptCommitsDelivered == 1,
+                "ime: exactly one 50-scalar commit was delivered through the real "
+                    + "NSTextInputClient.insertText(_:replacementRange:) path (got \(inputScriptCommitsDelivered)"
+                    + (inputScriptCastFailed ? ", contentView cast to RemoteWindowContentView FAILED" : "") + ")"
+            )
+            check(
+                inputScriptChordsDispatched == 1,
+                "ime: the Cmd+S save chord was dispatched (got \(inputScriptChordsDispatched))"
+            )
+            check(
+                unicodeDiag.unicodeInputSupported == true,
+                "ime: the server negotiated INPUT_FLAG_UNICODE and the gate read it as supported (adr/0011 §2) "
+                    + "(got \(unicodeDiag.unicodeInputSupported.map(String.init) ?? "not read this connection"))"
+            )
+            check(
+                unicodeDiag.droppedCommits == 0,
+                "ime: no commit was dropped on the normal path (got \(unicodeDiag.droppedCommits))"
+            )
+            check(
+                unicodeDiag.warningsEmitted == 0,
+                "ime: no degradation warning was emitted on the normal path (got \(unicodeDiag.warningsEmitted))"
+            )
+            check(
+                registry.wireHeldModifiersIsEmpty(),
+                "ime: the wire-side modifier ledger is empty at finish -- zero stuck modifiers after the Cmd+S "
+                    + "chord (adr/0011 §5 item 2, §3's wireHeldModifiers)"
+            )
+            print("[ime] NOTE: file-content equality is asserted EXTERNALLY by the controller's readback pass "
+                + "against the expected-utf8-hex marker above -- this process cannot read the host's filesystem "
+                + "(adr/0011 §5 item 6)")
+        }
+
+        // adr/0011 §5 item 7's DEGRADED half (WINDOW_SMOKE_UNICODE_DEGRADE=1): with the
+        // negotiated capability forced to unsupported, adr/0011 §2's discipline is exactly
+        // three numbers -- capability read as unsupported, EXACTLY one warning (the warn-once
+        // budget: "降级告警恰好一次"), and every commit accounted for as dropped ("无静默丢字").
+        // "Exactly", not ">=", on all three: a second warning is as much a defect as a silent
+        // drop, and a third dropped commit would mean something reached this gate that this
+        // scenario never sent.
+        if unicodeDegradeScenarioEnabled {
+            let unicodeDiag = registry.unicodeDegradationDiagnostics()
+            print("[unicode-degrade] unicodeInputSupported="
+                + "\(unicodeDiag.unicodeInputSupported.map(String.init) ?? "not read") "
+                + "warningsEmitted=\(unicodeDiag.warningsEmitted) droppedCommits=\(unicodeDiag.droppedCommits)")
+            check(
+                inputScriptCommitsDelivered == 2,
+                "unicode-degrade: both IME commits were delivered through the real "
+                    + "NSTextInputClient.insertText(_:replacementRange:) path (got \(inputScriptCommitsDelivered)"
+                    + (inputScriptCastFailed ? ", contentView cast to RemoteWindowContentView FAILED" : "") + ")"
+            )
+            check(
+                unicodeDiag.unicodeInputSupported == false,
+                "unicode-degrade: the gate read the negotiated Unicode capability as UNSUPPORTED (got "
+                    + "\(unicodeDiag.unicodeInputSupported.map(String.init) ?? "not read this connection") -- "
+                    + "\"not read\" means no commit ever reached the gate)"
+            )
+            check(
+                unicodeDiag.warningsEmitted == 1,
+                "unicode-degrade: exactly ONE degradation warning was emitted for two dropped commits (adr/0011 §2's "
+                    + "warn-once budget) (got \(unicodeDiag.warningsEmitted))"
+            )
+            check(
+                unicodeDiag.droppedCommits == 2,
+                "unicode-degrade: both commits were counted as dropped, none silently lost and none reaching the "
+                    + "wire (adr/0011 §2: 无静默丢字) (got \(unicodeDiag.droppedCommits))"
+            )
         }
 
         // Focus rotation scenario (task item 2/3): machine-readable summary plus one detail
@@ -2966,18 +3786,59 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                     "popup scenario: the new window carried a real ownerWindowId and was observed attached as a "
                         + "child of the About window (adr/0010 §4)"
                 )
-                if let created = popupCreatedAt, let firstContent = popupFirstContentAt {
-                    print(String(
-                        format: "[popup] WindowCreate→first-content: %.1fms (informational -- plan §4 W4's ≤100ms p95 gate needs n>1 data)",
-                        (firstContent - created) * 1000
-                    ))
-                } else {
-                    print("[popup] WindowCreate→first-content: no content ever observed for the popup (informational -- some popup classes, e.g. a separator-only menu, may legitimately never present a GFX frame)")
+                // These two lines describe the LAST round only, and their "needs n>1 data"
+                // framing is exactly what `WINDOW_SMOKE_POPUP_SAMPLES` > 1 supersedes -- so at
+                // n>1 they are suppressed in favour of the real `[popup] samples=...` summary
+                // (and its actual gate) a few lines below, rather than printing a stale
+                // single-sample claim immediately above it. N==1 is untouched, byte for byte.
+                if popupSamplesTotal == 1 {
+                    if let created = popupCreatedAt, let firstContent = popupFirstContentAt {
+                        print(String(
+                            format: "[popup] WindowCreate→first-content: %.1fms (informational -- plan §4 W4's ≤100ms p95 gate needs n>1 data)",
+                            (firstContent - created) * 1000
+                        ))
+                    } else {
+                        print("[popup] WindowCreate→first-content: no content ever observed for the popup (informational -- some popup classes, e.g. a separator-only menu, may legitimately never present a GFX frame)")
+                    }
                 }
                 check(
                     popupClosedAt != nil,
                     "popup scenario: Escape produced a WindowDelete within 3s"
                         + (popupEscapeSent ? "" : " (Escape was never actually sent -- the popup was never located in time)")
+                )
+            }
+            // adr/0010 §5 + docs/plans/phase2.md §4 W4 (WINDOW_SMOKE_POPUP_SAMPLES > 1): the
+            // multi-round sample summary and the ≤100ms p95 first-content gate the one-shot's
+            // own informational print has been waiting on ("needs real n>1 data before it can
+            // be enforced"). Nearest-rank percentiles, the same convention -- and the same
+            // inline implementation -- the focus-rotation summary below uses.
+            //
+            // Deliberately silent at the default N==1: that run must stay byte-identical to
+            // every prior popup run, right down to which lines it prints, so a single sample
+            // stays informational exactly as adr/0010 §5 left it.
+            if popupSamplesTotal > 1 {
+                let okRounds = popupRoundResults.filter(\.ok).count
+                let latencies = popupRoundResults.compactMap(\.latencyMs).sorted()
+                func popupPercentileMs(_ p: Double) -> Double {
+                    guard !latencies.isEmpty else { return 0 }
+                    let rank = max(0, min(latencies.count - 1, Int((p * Double(latencies.count)).rounded(.up)) - 1))
+                    return latencies[rank]
+                }
+                print(String(
+                    format: "[popup] samples=%d ok=%d latencies p50=%.1fms p95=%.1fms max=%.1fms",
+                    popupSamplesTotal, okRounds, popupPercentileMs(0.5), popupPercentileMs(0.95), latencies.last ?? 0
+                ))
+                check(
+                    okRounds == popupSamplesTotal,
+                    "popup scenario: all \(popupSamplesTotal) rounds opened an owner-attached popup that painted "
+                        + "content and closed on Escape (got \(okRounds); \(popupRoundResults.count) round(s) ran, "
+                        + "\(latencies.count) produced a real first-content latency)"
+                )
+                check(
+                    !latencies.isEmpty && popupPercentileMs(0.95) <= 100.0,
+                    "popup scenario: WindowCreate→first-content p95 <= 100ms over \(latencies.count) sample(s) "
+                        + "(docs/plans/phase2.md §4 W4's LAN gate) (got "
+                        + "\(latencies.isEmpty ? "no samples" : String(format: "%.1fms", popupPercentileMs(0.95))))"
                 )
             }
             // Team-lead review: the About-window cleanup leg (`beginAboutCleanup`) always
