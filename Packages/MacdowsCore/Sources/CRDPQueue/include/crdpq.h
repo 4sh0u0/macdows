@@ -224,11 +224,66 @@ typedef struct {
     uint32_t windowId;
 } crdpq_window_id_t;
 
-/** NotifyIconCreate/Update/Delete. */
+/** adr/0013 §1: the notify-icon pixel side-store's two bounds. `CRDPQ_ICON_MAX_DIM` is the
+ *  largest square a tray icon may be for this client to carry it at all (Windows' shell asks
+ *  its tray for 16/32/48-square icons at the DPI scales this client targets — 48 is the top of
+ *  that range, and anything larger is rejected outright rather than downscaled here, see
+ *  `crdpq_icon_convert`); `CRDPQ_ICON_SLOTS` is how many distinct `(windowId, notifyIconId)`
+ *  icons may be live at once. Together they fix the store's footprint at
+ *  16 * 9216B = ~144KB, allocated once — which is exactly the point (adr/0013 §1): the
+ *  control lane's own slots grow to a 65536-event ceiling (adr/0005 §7), so inlining even a
+ *  32x32 RGBA icon into `crdpq_event_payload_t` would multiply that ceiling's memory
+ *  footprint by ~10x for the lowest-frequency event type in the whole union. Pixels do not
+ *  ride in control slots — the same split the frames lane + `CRSurfaceSlotTable` already
+ *  establish for GFX frames. */
+#define CRDPQ_ICON_MAX_DIM 48
+#define CRDPQ_ICON_SLOTS 16
+/** Bytes one store slot's premultiplied-RGBA8888 buffer occupies (48*48*4 = 9216). */
+#define CRDPQ_ICON_RGBA_BUF_SIZE (CRDPQ_ICON_MAX_DIM * CRDPQ_ICON_MAX_DIM * 4)
+
+/** NotifyIconCreate/Update/Delete.
+ *
+ *  adr/0013 §1: everything past `notifyIconId` was appended (adr/0008 §5's "new fields only
+ *  append" rule) to carry a real tray icon instead of a placeholder. The PIXELS are NOT here —
+ *  `iconSlot` is an index into the session's `crdpq_icon_store_t` (below), written on T_rdp
+ *  BEFORE this event is posted, read on the consumer thread after the drain hands this event
+ *  over. No extra synchronization is needed for that hand-off beyond the control queue's own
+ *  post/drain ordering (adr/0005 §1: the lane is FIFO and its post-side critical section
+ *  publishes everything the producer wrote before it) — see `crdpq_icon_store_t`'s own doc
+ *  comment for the full argument.
+ *
+ *  - `hasIconSlot`: 1 iff `iconSlot` names a live store slot for this key. 0 does NOT imply
+ *    the order carried no icon — an order whose `WINDOW_ORDER_ICON` bit was absent simply
+ *    reuses whatever slot this key already had (NotifyIcon orders are delta-shaped exactly
+ *    like window orders, same discipline as `crdpq_window_order_t.ownerWindowId`'s bit gate),
+ *    so a 0 here means "no pixels are available for this key at all".
+ *  - `iconSkipped`: 1 when an icon WAS present on the wire but this layer refused it —
+ *    oversize/unsupported bpp/self-inconsistent `cb*` fields (`crdpq_icon_convert` returned
+ *    a failure), store slot exhaustion, or the deferred CACHED_ICON variant (adr/0013 §2).
+ *    Fail-open (adr/0008 §4): the consumer falls back to its placeholder and counts this;
+ *    it is evidence, not an error to swallow.
+ *  - `toolTipPresent` / `toolTip`: `NOTIFY_ICON_STATE_ORDER.toolTip`, a `RAIL_UNICODE_STRING`
+ *    transcoded to UTF-8 and truncated through `crdpq_text_set`, exactly like
+ *    `crdpq_window_order_t.title`. `toolTipPresent` is 0 when the order's
+ *    `WINDOW_ORDER_FIELD_NOTIFY_TIP` bit was absent — a distinct state from "present but
+ *    empty", which a delta-merging consumer needs in order to keep a prior tooltip. */
 typedef struct {
     uint32_t windowId;
     uint32_t notifyIconId;
+    uint8_t hasIconSlot;
+    uint8_t iconSlot;
+    uint8_t iconSkipped;
+    uint8_t toolTipPresent;
+    crdpq_text_t toolTip;
 } crdpq_notify_icon_t;
+
+/* adr/0008 §5 / adr/0013 §1: measured (not estimated) with clang/arm64 — same discipline as
+ * crdpq_window_order_t's own assert comment above. 12 bytes of scalars + crdpq_text_t's 260
+ * (256 + uint16_t length + bool truncated, padded to the text struct's own 2-byte alignment)
+ * = 272; up from 8 bytes before this ADR. Deliberately well under crdpq_window_order_t's 572
+ * — adr/0013 §1's whole "pixels go to a side store, the event carries a reference" decision
+ * exists to keep this event type from becoming the union's largest member. */
+_Static_assert(sizeof(crdpq_notify_icon_t) == 272, "crdpq_notify_icon_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0013 §1)");
 
 /** adr/0008 §2a: upper bound on `crdpq_monitored_desktop_t.windowIds`. The protocol's own
  *  hard ceiling is 255 (window.c:1068, a `Stream_Read_UINT8` -- genuinely 1 byte, unlike
@@ -373,9 +428,11 @@ typedef union {
 /* adr/0008 §5: measured (not estimated) with clang/arm64. `crdpq_window_order_t` (572,
  * adr/0010 §1) is still this union's largest member post-ADR (adr/0008 §4's deliberate
  * "take 96, not 255" bound choice for CRDPQ_MAX_WINDOW_IDS exists specifically to keep it
- * that way); the union's own alignment is 8 (from `crdpq_surface_mapped_t`'s `uint64_t
- * windowId`, not from `crdpq_window_order_t`), so 572 pads up to the next multiple of 8 =
- * 576. Up from 568 before this ADR. */
+ * that way, and adr/0013 §1's side-store decision keeps the freshly-grown
+ * `crdpq_notify_icon_t` at 272 — under half of it — for the same reason); the union's own
+ * alignment is 8 (from `crdpq_surface_mapped_t`'s `uint64_t windowId`, not from
+ * `crdpq_window_order_t`), so 572 pads up to the next multiple of 8 = 576. Unchanged by
+ * adr/0013; up from 568 before adr/0010. */
 _Static_assert(sizeof(crdpq_event_payload_t) == 576, "crdpq_event_payload_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0010 §1)");
 
 /** One control-lane event. POD, no pointers, safe to memcpy — this is the whole point
@@ -458,6 +515,187 @@ size_t crdpq_high_water_mark(const crdpq_control_t* q);
  *  that's expected post-shutdown behavior, not an overflow condition worth alerting on.
  *  Monotonically increasing; adr/0005 §7's "dropped-frame count alert" mitigation pattern. */
 size_t crdpq_dropped_count(const crdpq_control_t* q);
+
+/* ==================================================================================== *
+ * Notify-icon pixel side-store + DIB->RGBA conversion (adr/0013) — the fourth primitive,
+ * and the only one that is not itself a lane: it is the bounded side storage the control
+ * lane's `crdpq_notify_icon_t.iconSlot` refers into (adr/0013 §1). Pixels never ride in a
+ * control slot; the event carries a reference, exactly like the frames lane keeps GFX
+ * pixels out of the control lane.
+ * ==================================================================================== */
+
+/** A fixed table of `CRDPQ_ICON_SLOTS` premultiplied-RGBA8888 icon buffers, keyed by
+ *  `(windowId, notifyIconId)` — one allocation, ~144KB, no growth path (adr/0013 §1).
+ *
+ *  DELIBERATELY A PLAIN pthread_mutex, NOT the frames lane's lock-free/seqlock-shaped
+ *  design: NotifyIcon orders arrive at a frequency indistinguishable from zero (a handful
+ *  per session, when a tray icon is created or its bitmap changes), so there is no lock
+ *  contention to design around, and the extra complexity of a lock-free publication
+ *  protocol would be pure liability here. The frames lane earns its complexity from a
+ *  per-frame, per-surface write rate this store will never see.
+ *
+ *  THREADING: written on T_rdp from inside the NotifyIcon callback, BEFORE the
+ *  corresponding control event is enqueued; read on the control lane's consumer thread
+ *  (T_main) AFTER that event has been drained. Nothing extra is needed to make the write
+ *  visible to the reader: the control queue's own post-side critical section and the
+ *  drain-side swap are the happens-before edge (adr/0005 §1 — the lane is FIFO and
+ *  single-consumer by contract), so "written before post" plus "read after drain" is
+ *  already a totally ordered pair. The mutex here exists only to make the store's own
+ *  slot table internally consistent when a put/remove races an unrelated copy-out, not to
+ *  order the write against the read. */
+typedef struct crdpq_icon_store crdpq_icon_store_t;
+
+/** Returns NULL only on allocation failure or if the mutex can't be initialized. */
+crdpq_icon_store_t* crdpq_icon_store_create(void);
+void crdpq_icon_store_destroy(crdpq_icon_store_t* s);
+
+/** Releases every slot, leaving an empty table ready for the next session (the
+ *  session-teardown / generation-rollover path — CRSession's `-shutdownAndWait` calls this
+ *  exactly where it already calls `crsurface_table_clear`). Does NOT reset
+ *  `crdpq_icon_store_overflow_count`: that counter is cumulative for the store's whole
+ *  lifetime, matching the "counters survive reconnects" precedent every other diagnostic
+ *  counter in this header already sets (crdpq_dropped_count et al). */
+void crdpq_icon_store_clear(crdpq_icon_store_t* s);
+
+/** Upsert by key: an existing slot for `(windowId, notifyIconId)` is overwritten in place
+ *  (a tray icon whose bitmap changes must not consume a second slot), otherwise the first
+ *  free slot is claimed. `rgba` must hold `width * height * 4` bytes of premultiplied
+ *  RGBA8888, top-down — i.e. exactly what `crdpq_icon_convert` writes.
+ *
+ *  Returns false (writing nothing, leaving `*out_slot` untouched) when `width`/`height` are
+ *  0 or exceed `CRDPQ_ICON_MAX_DIM`, or when every slot is already taken by another key. The
+ *  slot-exhaustion case additionally increments `crdpq_icon_store_overflow_count` — adr/0013
+ *  §1's fail-open contract (adr/0008 §4): the caller sets `iconSkipped`, the consumer shows
+ *  its placeholder, and the counter is the evidence that the bound was reached. */
+bool crdpq_icon_store_put(crdpq_icon_store_t* s, uint32_t windowId, uint32_t notifyIconId,
+                          const uint8_t* rgba, uint32_t width, uint32_t height, uint8_t* out_slot);
+
+/** Finds the live slot for `(windowId, notifyIconId)` without touching it. The bridge uses
+ *  this for a NotifyIconUpdate whose `WINDOW_ORDER_ICON` bit is absent: MS-RDPERP notify-icon
+ *  orders are delta-shaped, so "no icon field this time" means "keep the icon you have", not
+ *  "this icon has no pixels" (same bit-gating discipline as adr/0008 §3's ownerWindowId). */
+bool crdpq_icon_store_lookup(const crdpq_icon_store_t* s, uint32_t windowId, uint32_t notifyIconId,
+                             uint8_t* out_slot);
+
+/** Frees the slot held by `(windowId, notifyIconId)`, if any (NotifyIconDelete). Returns
+ *  whether a slot was actually released — an unknown-delete is tolerated, matching
+ *  `TrayModel.delete`'s own tolerance on the Swift side. */
+bool crdpq_icon_store_remove(crdpq_icon_store_t* s, uint32_t windowId, uint32_t notifyIconId);
+
+/** Copies slot `slot`'s pixels out into caller-owned memory under the store's lock, so the
+ *  consumer's copy has zero lifetime coupling to the slot (adr/0013 §3: the Swift layer owns
+ *  its `NSData` outright and never observes a later overwrite of the same slot). Returns
+ *  false if `slot` is out of range, not currently in use, or `dst_capacity` is smaller than
+ *  the slot's `width * height * 4`.
+ *
+ *  `windowId`/`notifyIconId` are the key the CALLER's event claims this slot belongs to, and
+ *  the copy is refused if the slot no longer holds it. That check is not redundant: an event
+ *  is a reference, and the store is state, so the reference is resolved at DRAIN time, not at
+ *  post time. Between the two, a NotifyIconDelete could have freed this slot and a different
+ *  icon's create could have claimed it — draining the older event would then hand the
+ *  consumer another icon's pixels. Refusing instead degrades that (very narrow) race to the
+ *  ordinary placeholder path, fail-open (adr/0008 §4).
+ *
+ *  Not covered, and deliberately so: two orders for the SAME key posted before either is
+ *  drained resolve to the newer pixels for both. That is last-writer-wins on a per-key state
+ *  slot — the identical semantics the frames lane already documents for GFX frames ("a
+ *  surface published twice before being consumed once is not two frames, it's one frame") —
+ *  and the consumer's own second drain immediately reasserts the same end state. */
+bool crdpq_icon_store_copy_slot(const crdpq_icon_store_t* s, uint8_t slot, uint32_t windowId,
+                                uint32_t notifyIconId, uint8_t* dst, size_t dst_capacity,
+                                uint32_t* out_width, uint32_t* out_height, size_t* out_bytes);
+
+/** Number of `crdpq_icon_store_put` calls rejected because every slot was already held by a
+ *  different key — the same dropped-count-for-alerting shape as `crdpq_dropped_count` /
+ *  `crdpq_frames_dropped_count` on the lanes (adr/0005 §7). Monotonically increasing, never
+ *  reset by `crdpq_icon_store_clear`. */
+size_t crdpq_icon_store_overflow_count(const crdpq_icon_store_t* s);
+
+/** Slots currently in use. Diagnostics/tests only. */
+size_t crdpq_icon_store_live_count(const crdpq_icon_store_t* s);
+
+/** Why `crdpq_icon_convert` refused an icon. Every non-OK value maps to
+ *  `crdpq_notify_icon_t.iconSkipped = 1` at the caller; the distinction exists for logging
+ *  and for the offline test matrix, not for any behavioral branch downstream. */
+typedef enum {
+    CRDPQ_ICON_OK = 0,
+    /** `width`/`height` is 0, or exceeds `CRDPQ_ICON_MAX_DIM`. */
+    CRDPQ_ICON_ERR_DIMENSIONS,
+    /** `bpp` is not one of {1, 4, 8, 16, 24, 32}. */
+    CRDPQ_ICON_ERR_BPP,
+    /** Indexed bpp (1/4/8) with a missing or self-inconsistent palette: `cbColorTable` zero,
+     *  not a multiple of 4 (DIB palettes are `RGBQUAD` arrays), or describing more than 256
+     *  entries. Same three checks FreeRDP's own `fill_gdi_palette_for_icon` applies. */
+    CRDPQ_ICON_ERR_COLOR_TABLE,
+    /** `bitsColor` is NULL, or `cbBitsColor` is too small to hold `height` scanlines at this
+     *  `bpp`/`width` under EITHER scanline-stride convention (see `crdpq_icon_convert`). */
+    CRDPQ_ICON_ERR_BITS_COLOR,
+    /** `cbBitsMask` is non-zero but `bitsMask` is NULL, or `cbBitsMask` is too small to hold
+     *  `height` 1-bit AND-mask scanlines. */
+    CRDPQ_ICON_ERR_BITS_MASK,
+    /** `dst` is NULL or `dst_capacity` is under `width * height * 4`. A caller bug, not
+     *  server input — kept distinct from the wire-data rejections above for that reason. */
+    CRDPQ_ICON_ERR_DEST,
+} crdpq_icon_convert_result_t;
+
+/** Converts one wire `ICON_INFO` (freerdp/window.h:165-178 — this parameter list is that
+ *  struct's field set verbatim, minus the two cache identifiers) into premultiplied
+ *  RGBA8888, written top-down and tightly packed at `width * 4` bytes per row into `dst`.
+ *  Pure function: no allocation, no globals, no FreeRDP types — which is exactly why it
+ *  lives in this target and can be fed synthetic DIBs straight from the Swift test suite
+ *  (adr/0013 §2).
+ *
+ *  MUST NOT read out of bounds for ANY combination of field values, including deliberately
+ *  malicious ones: FreeRDP's own parser (libfreerdp/core/window.c's `update_read_icon_info`)
+ *  validates only `1 <= bpp <= 32` and that the stream actually held `cbBitsMask` /
+ *  `cbColorTable` / `cbBitsColor` bytes — it never cross-checks any of those three against
+ *  `bpp`/`width`/`height`, so every such check is this function's job. All of them run
+ *  before the first pixel is touched.
+ *
+ *  Layout facts, each verified against the vendored source rather than assumed:
+ *  - Rows are BOTTOM-UP for both the color bitmap and the AND mask
+ *    (libfreerdp/codec/color.c's `freerdp_image_copy_from_icon_data` passes
+ *    `FREERDP_FLIP_VERTICAL` for the color plane and indexes the mask at
+ *    `stride * (height - 1 - y)`).
+ *  - The AND mask's scanline stride is 4-byte aligned (same function:
+ *    `round_up(div_ceil(width, 8), 4)`).
+ *  - The color plane's stride is NOT stated consistently upstream: that same function feeds
+ *    `freerdp_image_copy_no_overlap` a `nSrcStep` of 0, which defaults to an UNPADDED
+ *    `width * bytesPerPixel` (color.c:1040), while the DIB format the data actually is
+ *    pads every scanline to 4 bytes. For the icon sizes that exist in practice
+ *    (16/32/48-square at 8/16/24/32bpp) the two agree exactly, so neither reading has ever
+ *    been exercised against the other. Rather than pick one and mis-decode the other, this
+ *    function infers: it uses the 4-byte-padded stride when `cbBitsColor` is large enough
+ *    for it, and falls back to the unpadded stride when it is not. Both paths are bounded by
+ *    the `cbBitsColor` check, so neither can overread.
+ *  - 16bpp is RGB555, not RGB565 (color.c maps icon bpp 16 to `PIXEL_FORMAT_RGB15`), with
+ *    5->8 channel expansion `(c << 3) | (c >> 2)` — bit-identical to FreeRDP's own
+ *    `(c << 3) + c / 4`.
+ *  - 32bpp source bytes are B,G,R,A and palette entries are `RGBQUAD` B,G,R,X in memory
+ *    (FreeRDP's `PIXEL_FORMAT_BGRA32`/`PIXEL_FORMAT_BGRX32` under its documented
+ *    "format names give byte position in memory" convention).
+ *  - 24bpp source bytes are taken as B,G,R here — the Windows DIB `RGBTRIPLE` order, which
+ *    is also what FreeRDP's own pointer-data path uses for the same 24bpp shape
+ *    (`PIXEL_FORMAT_BGR24`, color.c:717). Its icon path uses `PIXEL_FORMAT_RGB24` instead,
+ *    which contradicts both its sibling and every other channel order in the same switch;
+ *    that is treated here as an upstream inconsistency, not as evidence about the wire.
+ *  - 1bpp and 4bpp are supported here; FreeRDP's own icon converter refuses them outright
+ *    ("1bpp and 4bpp icons are not supported", color.c:438).
+ *
+ *  Alpha (adr/0013 §2):
+ *  - 32bpp uses its own alpha plane, UNLESS that plane is entirely zero — a very common
+ *    shape in real icons, and one that would otherwise render a fully invisible tray item —
+ *    in which case it falls back to the AND mask, or to fully opaque if no mask was sent.
+ *  - <=24bpp derives 1-bit alpha from the AND mask (set bit = transparent, matching
+ *    `freerdp_image_copy_from_icon_data`), or is fully opaque when no mask was sent.
+ *  - An indexed pixel whose palette index is past `cbColorTable / 4` is written fully
+ *    transparent rather than rejecting the whole icon: per-pixel fail-open (adr/0008 §4),
+ *    since a short palette costs a few pixels, not the icon. */
+crdpq_icon_convert_result_t crdpq_icon_convert(uint32_t bpp, uint32_t width, uint32_t height,
+                                               uint32_t cbColorTable, uint32_t cbBitsMask,
+                                               uint32_t cbBitsColor, const uint8_t* bitsColor,
+                                               const uint8_t* colorTable, const uint8_t* bitsMask,
+                                               uint8_t* dst, size_t dst_capacity);
 
 /* ==================================================================================== *
  * Frame lane (crdpq_frames) — GFX frames are state, not events: last-writer-wins per

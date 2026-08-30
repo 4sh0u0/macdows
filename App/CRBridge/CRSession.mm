@@ -58,6 +58,13 @@
 @property (nonatomic) uint32_t generation;
 @property (nonatomic) uint32_t windowId;
 @property (nonatomic) uint32_t notifyIconId;
+/* adr/0013 §3. `iconRGBA` is `copy` for the same reason every NSString property here is:
+ * an NSData handed in could in principle be a mutable subclass. */
+@property (nonatomic, nullable) NSString *toolTip;
+@property (nonatomic, copy, nullable) NSData *iconRGBA;
+@property (nonatomic) uint32_t iconWidth;
+@property (nonatomic) uint32_t iconHeight;
+@property (nonatomic) BOOL iconSkipped;
 @property (nonatomic) uint32_t fieldFlags;
 @property (nonatomic) NSString *title;
 @property (nonatomic) int32_t offsetX;
@@ -128,7 +135,13 @@
 /// Returns nil for a `type` this file doesn't recognize (W4a review M7) — the caller
 /// (`-drainEventsWithHandler:`) skips a nil result and counts it into
 /// `-unknownEventCount` rather than delivering a fabricated event to the drain handler.
-static CRDPEvent *CRDPEventFromCrdpEvent(const CrdpEvent *ev)
+///
+/// `iconStore` (adr/0013 §1/§3) is the one place this function reads state that isn't in
+/// `ev` itself: a notify-icon event carries a slot reference, and the pixels are copied out
+/// of that slot HERE, on the consumer thread, into an `NSData` the caller then owns
+/// outright. May be NULL (a session torn down mid-drain) — treated as "no pixels available",
+/// same fail-open path as an already-recycled slot.
+static CRDPEvent *CRDPEventFromCrdpEvent(const CrdpEvent *ev, crdpq_icon_store_t *iconStore)
 {
     CRDPEvent *out = [CRDPEvent new];
     out.generation = ev->generation;
@@ -189,12 +202,44 @@ static CRDPEvent *CRDPEventFromCrdpEvent(const CrdpEvent *ev)
         case CRDPQ_EVENT_NOTIFY_ICON_CREATE:
         case CRDPQ_EVENT_NOTIFY_ICON_UPDATE:
         case CRDPQ_EVENT_NOTIFY_ICON_DELETE:
+        {
             out.kind = (ev->type == CRDPQ_EVENT_NOTIFY_ICON_CREATE)   ? CRDPEventKindNotifyIconCreate
                        : (ev->type == CRDPQ_EVENT_NOTIFY_ICON_UPDATE) ? CRDPEventKindNotifyIconUpdate
                                                                        : CRDPEventKindNotifyIconDelete;
-            out.windowId = ev->payload.notifyIcon.windowId;
-            out.notifyIconId = ev->payload.notifyIcon.notifyIconId;
+            const crdpq_notify_icon_t *ni = &ev->payload.notifyIcon;
+            out.windowId = ni->windowId;
+            out.notifyIconId = ni->notifyIconId;
+            out.iconSkipped = ni->iconSkipped ? YES : NO;
+            /* adr/0013 §1: toolTipPresent distinguishes "the order didn't mention the
+             * tooltip" from "the order set it to the empty string" -- the property stays
+             * nil in the first case (see CRSession.h), so a delta-merging consumer can keep
+             * whatever it already had. Deliberately unlike `title` above, which is an empty
+             * string rather than nil for the absent case: that property predates this
+             * distinction being expressible and is left alone rather than churned. */
+            if (ni->toolTipPresent)
+                out.toolTip = [NSString stringWithUTF8String:ni->toolTip.bytes] ?: @"";
+            /* adr/0013 §3: copy the pixels out of the slot (under the store's own lock)
+             * into an NSData the Swift layer owns outright -- no lifetime coupling to the
+             * slot at all, so a later overwrite/recycle of the same slot can never be
+             * observed through this event. A refused copy (slot recycled, key reclaimed by
+             * another icon, store already torn down) leaves iconRGBA nil and falls back to
+             * the consumer's placeholder, exactly like iconSkipped does. */
+            if (ni->hasIconSlot && iconStore)
+            {
+                uint8_t rgba[CRDPQ_ICON_RGBA_BUF_SIZE];
+                uint32_t width = 0;
+                uint32_t height = 0;
+                size_t bytes = 0;
+                if (crdpq_icon_store_copy_slot(iconStore, ni->iconSlot, ni->windowId, ni->notifyIconId,
+                                                rgba, sizeof(rgba), &width, &height, &bytes))
+                {
+                    out.iconRGBA = [NSData dataWithBytes:rgba length:bytes];
+                    out.iconWidth = width;
+                    out.iconHeight = height;
+                }
+            }
             break;
+        }
         case CRDPQ_EVENT_MONITORED_DESKTOP:
         {
             out.kind = CRDPEventKindMonitoredDesktop;
@@ -358,6 +403,16 @@ typedef NS_ENUM(NSInteger, CRSessionState) {
      * that method's own comment) even though the table object itself isn't recreated. */
     crdpq_frames_t *_framesQueue;
     CRSurfaceSlotTable *_surfaceSlots;
+    /* adr/0013 §1: the notify-icon pixel side-store. Created once in -init and persisting
+     * across reconnects, exactly like _surfaceSlots above -- and, exactly like it, holding
+     * live per-connection content that must NOT survive one, so -shutdownAndWait calls
+     * crdpq_icon_store_clear on it for the same reason it calls crsurface_table_clear
+     * (see that call site's own comment). Written on T_rdp from crb_notify_icon_common,
+     * always BEFORE the control event referencing the slot is posted; read on T_main in
+     * CRDPEventFromCrdpEvent, always AFTER that event has been drained -- the control
+     * lane's own post/drain ordering is the happens-before edge (adr/0005 §1), the store's
+     * mutex only keeps its slot table internally consistent. */
+    crdpq_icon_store_t *_iconStore;
     /* Manual-reset (W4a review H2) -- WinPR's POSIX event backend on this platform never
      * actually implements auto-reset (winpr/libwinpr/synch/event.c:279-280 logs "auto-reset
      * events not yet implemented" and creates a plain, never-auto-cleared event regardless
@@ -424,6 +479,11 @@ static crdpq_frames_t *crb_frames(CRBridgeContext *p)
 static CRSurfaceSlotTable *crb_surface_slots(CRBridgeContext *p)
 {
     return crb_session(p)->_surfaceSlots;
+}
+
+static crdpq_icon_store_t *crb_icon_store(CRBridgeContext *p)
+{
+    return crb_session(p)->_iconStore;
 }
 
 /* ==================================================================================== *
@@ -564,32 +624,116 @@ static BOOL crb_window_cached_icon(rdpContext *context, const WINDOW_ORDER_INFO 
     return crb_window_icon(context, orderInfo, NULL);
 }
 
-static BOOL crb_notify_icon_create(rdpContext *context, const WINDOW_ORDER_INFO *orderInfo,
-                                    const NOTIFY_ICON_STATE_ORDER *notifyIconState)
+/* adr/0013: NotifyIconCreate and NotifyIconUpdate carry the identical
+ * NOTIFY_ICON_STATE_ORDER shape and get identical treatment here (the create/update
+ * distinction is the consumer's, exactly like crb_window_common's own WINDOW_ORDER_STATE_NEW
+ * split), so both wire callbacks below funnel through this one function. Before adr/0013
+ * both of them did `(void)notifyIconState;` and threw the entire order away -- the icon
+ * bitmap, the tooltip, the infoTip, the state, all of it. */
+static BOOL crb_notify_icon_common(rdpContext *context, const WINDOW_ORDER_INFO *orderInfo,
+                                    const NOTIFY_ICON_STATE_ORDER *notifyIconState, BOOL isCreate)
 {
-    (void)notifyIconState;
     CRBridgeContext *p = (CRBridgeContext *)context;
     CrdpEvent ev;
     memset(&ev, 0, sizeof(ev));
-    ev.type = CRDPQ_EVENT_NOTIFY_ICON_CREATE;
+    ev.type = isCreate ? CRDPQ_EVENT_NOTIFY_ICON_CREATE : CRDPQ_EVENT_NOTIFY_ICON_UPDATE;
     ev.payload.notifyIcon.windowId = orderInfo->windowId;
     ev.payload.notifyIcon.notifyIconId = orderInfo->notifyIconId;
+
+    /* adr/0013 §1: bit-gated exactly like crb_window_common's TITLE handling one function
+     * group up -- WINDOW_ORDER_FIELD_NOTIFY_TIP absent means "this order says nothing about
+     * the tooltip", not "the tooltip is now empty". `toolTipPresent` carries that
+     * distinction across the boundary; `ev.payload` was already memset-to-zero, so the
+     * else case is simply "leave both at 0", this transport layer's standing convention for
+     * every conditional sub-field. */
+    if (orderInfo->fieldFlags & WINDOW_ORDER_FIELD_NOTIFY_TIP)
+    {
+        char *toolTip = rail_string_to_utf8_string(&notifyIconState->toolTip);
+        if (toolTip)
+        {
+            crdpq_text_set(&ev.payload.notifyIcon.toolTip, toolTip, strlen(toolTip));
+            ev.payload.notifyIcon.toolTipPresent = 1;
+            free(toolTip);
+        }
+    }
+
+    crdpq_icon_store_t *icons = crb_icon_store(p);
+    if (orderInfo->fieldFlags & WINDOW_ORDER_ICON)
+    {
+        /* adr/0013 §1/§2: convert on T_rdp, inside this callback, into the side store --
+         * and do it BEFORE crdpq_post below, which is what makes the slot readable by
+         * T_main without any further synchronization (see the _iconStore ivar's own
+         * comment). The stack buffer is one slot's worth (9216B), matching the store's own
+         * per-slot bound; crdpq_icon_convert re-checks that bound itself and refuses
+         * anything that wouldn't fit, so this size is a floor, not a trusted input. */
+        const ICON_INFO *icon = &notifyIconState->icon;
+        uint8_t rgba[CRDPQ_ICON_RGBA_BUF_SIZE];
+        const crdpq_icon_convert_result_t rc =
+            crdpq_icon_convert(icon->bpp, icon->width, icon->height, icon->cbColorTable,
+                               icon->cbBitsMask, icon->cbBitsColor, icon->bitsColor,
+                               icon->colorTable, icon->bitsMask, rgba, sizeof(rgba));
+        uint8_t slot = 0;
+        if (rc == CRDPQ_ICON_OK && icons &&
+            crdpq_icon_store_put(icons, orderInfo->windowId, orderInfo->notifyIconId, rgba,
+                                 icon->width, icon->height, &slot))
+        {
+            ev.payload.notifyIcon.hasIconSlot = 1;
+            ev.payload.notifyIcon.iconSlot = slot;
+        }
+        else
+        {
+            /* Fail-open (adr/0008 §4 / adr/0013 §1): the consumer falls back to its
+             * placeholder. Slot exhaustion is separately counted inside the store
+             * (crdpq_icon_store_overflow_count); a conversion refusal is counted by the
+             * consumer via iconSkipped itself. */
+            ev.payload.notifyIcon.iconSkipped = 1;
+            WLog_WARN(TAG,
+                      "NotifyIcon windowId=%" PRIu32 " notifyIconId=%" PRIu32
+                      ": icon skipped (convert result=%d, bpp=%" PRIu32 " %" PRIu32 "x%" PRIu32
+                      ", cbColorTable=%" PRIu32 " cbBitsMask=%" PRIu32 " cbBitsColor=%" PRIu32
+                      ") -- adr/0013 §1 fail-open, placeholder shown instead",
+                      orderInfo->windowId, orderInfo->notifyIconId, (int)rc, icon->bpp, icon->width,
+                      icon->height, icon->cbColorTable, icon->cbBitsMask, icon->cbBitsColor);
+        }
+    }
+    else if (orderInfo->fieldFlags & WINDOW_ORDER_CACHED_ICON)
+    {
+        /* adr/0013 §2: the CACHED_ICON variant (a cacheId/cacheEntry reference into an icon
+         * cache this client never populates) is deliberately deferred -- implementing the
+         * cache protocol is expensive and no sample has ever shown this path. Counted as a
+         * skip rather than silently ignored, so its first real occurrence produces evidence
+         * instead of a mystery placeholder. */
+        ev.payload.notifyIcon.iconSkipped = 1;
+        WLog_WARN(TAG,
+                  "NotifyIcon windowId=%" PRIu32 " notifyIconId=%" PRIu32
+                  ": CACHED_ICON variant (cacheId=%" PRIu32 " cacheEntry=%" PRIu32
+                  ") -- not implemented, adr/0013 §2 deferred; placeholder shown instead",
+                  orderInfo->windowId, orderInfo->notifyIconId, notifyIconState->cachedIcon.cacheId,
+                  notifyIconState->cachedIcon.cacheEntry);
+    }
+    else if (icons && crdpq_icon_store_lookup(icons, orderInfo->windowId, orderInfo->notifyIconId, &ev.payload.notifyIcon.iconSlot))
+    {
+        /* Neither icon bit set: MS-RDPERP notify-icon orders are delta-shaped just like
+         * window orders, so an order that says nothing about the icon must not be read as
+         * "this icon lost its pixels" (adr/0008 §3's bit-gating discipline, applied to the
+         * icon field). Re-reference whatever slot this key already holds. */
+        ev.payload.notifyIcon.hasIconSlot = 1;
+    }
+
     crdpq_post(crb_control(p), &ev);
     return TRUE;
+}
+
+static BOOL crb_notify_icon_create(rdpContext *context, const WINDOW_ORDER_INFO *orderInfo,
+                                    const NOTIFY_ICON_STATE_ORDER *notifyIconState)
+{
+    return crb_notify_icon_common(context, orderInfo, notifyIconState, YES);
 }
 
 static BOOL crb_notify_icon_update(rdpContext *context, const WINDOW_ORDER_INFO *orderInfo,
                                     const NOTIFY_ICON_STATE_ORDER *notifyIconState)
 {
-    (void)notifyIconState;
-    CRBridgeContext *p = (CRBridgeContext *)context;
-    CrdpEvent ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.type = CRDPQ_EVENT_NOTIFY_ICON_UPDATE;
-    ev.payload.notifyIcon.windowId = orderInfo->windowId;
-    ev.payload.notifyIcon.notifyIconId = orderInfo->notifyIconId;
-    crdpq_post(crb_control(p), &ev);
-    return TRUE;
+    return crb_notify_icon_common(context, orderInfo, notifyIconState, NO);
 }
 
 static BOOL crb_notify_icon_delete(rdpContext *context, const WINDOW_ORDER_INFO *orderInfo)
@@ -600,6 +744,14 @@ static BOOL crb_notify_icon_delete(rdpContext *context, const WINDOW_ORDER_INFO 
     ev.type = CRDPQ_EVENT_NOTIFY_ICON_DELETE;
     ev.payload.notifyIcon.windowId = orderInfo->windowId;
     ev.payload.notifyIcon.notifyIconId = orderInfo->notifyIconId;
+    /* adr/0013 §1: releasing the pixel slot is this order's whole side effect on the store.
+     * Freed here on T_rdp rather than when T_main drains the delete, so a long-lived
+     * create/delete churn can't strand slots. A not-yet-drained create still referencing
+     * this slot resolves to "no icon" instead of to whatever icon claims the slot next --
+     * crdpq_icon_store_copy_slot re-checks the (windowId, notifyIconId) key for exactly
+     * that reason (see its own doc comment). Unknown-delete tolerated -- the return value
+     * is deliberately unused, matching TrayModel.delete's own tolerance. */
+    (void)crdpq_icon_store_remove(crb_icon_store(p), orderInfo->windowId, orderInfo->notifyIconId);
     crdpq_post(crb_control(p), &ev);
     return TRUE;
 }
@@ -1711,6 +1863,9 @@ static void crb_schedule_drain(void *ctx)
          * actually tears those down each disconnect; the table object itself lives on). */
         _framesQueue = crdpq_frames_create(NULL, NULL);
         _surfaceSlots = crsurface_table_create();
+        /* adr/0013 §1: same lifecycle as _surfaceSlots one line up -- created once here,
+         * cleared (not destroyed) by -shutdownAndWait, destroyed in -dealloc. */
+        _iconStore = crdpq_icon_store_create();
     }
     return self;
 }
@@ -1750,6 +1905,15 @@ static void crb_schedule_drain(void *ctx)
          * call sequence, since -shutdownAndWait is guaranteed to have already run above. */
         crsurface_table_destroy(_surfaceSlots);
         _surfaceSlots = NULL;
+    }
+    if (_iconStore)
+    {
+        /* adr/0013 §1: unlike _surfaceSlots above, this store owns nothing that can outlive
+         * it (no leases, no IOSurface refcounts) -- the pixels are plain bytes inside the
+         * one allocation, and every consumer copy was already made under the store's lock
+         * at drain time. Destroying it is unconditionally safe here. */
+        crdpq_icon_store_destroy(_iconStore);
+        _iconStore = NULL;
     }
     if (_framesQueue)
     {
@@ -1973,6 +2137,14 @@ cleanup:
      * call does not block waiting for it. */
     if (_surfaceSlots)
         crsurface_table_clear(_surfaceSlots);
+    /* adr/0013 §1: the icon store's session-scoped teardown, alongside _surfaceSlots' own
+     * for the same reason -- T_rdp (its only writer) has been joined above, and a tray icon
+     * belongs to the connection that announced it. Mirrors TrayStatusController.removeAll()
+     * on the Swift side, which the generation rollover triggers independently. The store's
+     * overflow counter deliberately survives (see crdpq_icon_store_clear's own contract),
+     * matching every other cumulative diagnostic counter on this class. */
+    if (_iconStore)
+        crdpq_icon_store_clear(_iconStore);
     crdpq_generation_bump(_controlQueue);
     _state = CRSessionStateIdle;
     return sawDisconnected;
@@ -1995,8 +2167,12 @@ cleanup:
         NSUInteger *delivered;
         NSUInteger *discarded;
         NSUInteger *unknown;
+        /* adr/0013 §3: the notify-icon pixel side-store, read (never written) from inside
+         * the visitor -- the one piece of session state the C-level translation step needs
+         * beyond the drained event itself. */
+        crdpq_icon_store_t *iconStore;
     } DrainCtx;
-    DrainCtx dctx = {handler, expectedGeneration, &delivered, &discarded, &unknown};
+    DrainCtx dctx = {handler, expectedGeneration, &delivered, &discarded, &unknown, _iconStore};
 
     crdpq_drain(
         _controlQueue,
@@ -2007,7 +2183,7 @@ cleanup:
               (*dctx->discarded)++;
               return;
           }
-          CRDPEvent *event = CRDPEventFromCrdpEvent(ev);
+          CRDPEvent *event = CRDPEventFromCrdpEvent(ev, dctx->iconStore);
           if (!event)
           {
               (*dctx->unknown)++;
@@ -2044,6 +2220,11 @@ cleanup:
 - (uint64_t)droppedEventsCount
 {
     return _controlQueue ? crdpq_dropped_count(_controlQueue) : 0;
+}
+
+- (uint64_t)iconStoreOverflowCount
+{
+    return _iconStore ? (uint64_t)crdpq_icon_store_overflow_count(_iconStore) : 0;
 }
 
 - (nullable IOSurfaceRef)copyPublishedSurface:(uint32_t)surfaceId
