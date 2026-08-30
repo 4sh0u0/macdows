@@ -57,6 +57,37 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 @property (nonatomic, readonly) uint32_t windowId;
 /// NotifyIconCreate/Update/Delete only.
 @property (nonatomic, readonly) uint32_t notifyIconId;
+
+/// NotifyIconCreate/Update only. `NOTIFY_ICON_STATE_ORDER.toolTip` (adr/0013 §1), the tray
+/// icon's own hover text — transcoded UTF-16→UTF-8 and truncated through the same
+/// `crdpq_text_t` path `title` above uses. `nil` (NOT an empty string) when the order didn't
+/// carry `WINDOW_ORDER_FIELD_NOTIFY_TIP`: notify-icon orders are delta-shaped like window
+/// orders, so "the order said nothing" and "the order set it to empty" are different facts
+/// and a consumer must be able to keep a previously-known tooltip across the first. This is
+/// deliberately unlike `title`, which uses `@""` for its absent case — that property predates
+/// the distinction being expressible and is left alone rather than churned.
+@property (nonatomic, readonly, nullable) NSString *toolTip;
+/// NotifyIconCreate/Update only. The tray icon's pixels, premultiplied RGBA8888, top-down,
+/// `iconWidth * 4` bytes per row and `iconWidth * iconHeight * 4` bytes total (adr/0013 §2 —
+/// `crdpq_icon_convert` does the DIB decode on T_rdp; this is already-converted output, not
+/// wire bytes). `nil` when the order carried no icon, when the icon was refused
+/// (see `iconSkipped`), or when the referenced side-store slot was recycled before this
+/// event was drained — all three are the same thing to a consumer: show a placeholder.
+/// Copied out of the store under its own lock at drain time, so this object's lifetime is
+/// wholly independent of the session's (adr/0013 §3).
+@property (nonatomic, readonly, nullable) NSData *iconRGBA;
+/// NotifyIconCreate/Update only. Dimensions of `iconRGBA`, both 0 when it is `nil`. Bounded
+/// by `CRDPQ_ICON_MAX_DIM` (48) — an icon larger than that is refused rather than downscaled
+/// (`iconSkipped`), since scaling policy belongs to the AppKit layer that knows the menu
+/// bar's own metrics, not to this transport.
+@property (nonatomic, readonly) uint32_t iconWidth;
+@property (nonatomic, readonly) uint32_t iconHeight;
+/// NotifyIconCreate/Update only. `YES` iff the order DID carry an icon that this client
+/// refused: oversize/unsupported-bpp/self-inconsistent bitmap fields, side-store slot
+/// exhaustion, or the deferred CACHED_ICON variant (adr/0013 §2). adr/0008 §4's fail-open
+/// contract applies — the consumer shows its placeholder and counts this; it is evidence
+/// that a real icon existed and was dropped, which a plain `iconRGBA == nil` can't express.
+@property (nonatomic, readonly) BOOL iconSkipped;
 /// WindowCreate/Update.fieldFlags; MonitoredDesktop.fieldFlags. Gates which of
 /// offsetX/offsetY (together), width/height (together), and show below are actually
 /// meaningful for a given WindowUpdate — an unset bit means "unchanged from this window's
@@ -314,6 +345,14 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// rejected because the lane was at its capacity ceiling and full, or OOM. Does not
 /// count anything related to sealing/shutdown.
 @property (nonatomic, readonly) uint64_t droppedEventsCount;
+
+/// adr/0013 §1: passthrough of the notify-icon pixel side-store's own overflow counter —
+/// tray icons refused because all `CRDPQ_ICON_SLOTS` (16) slots were already held by other
+/// `(windowId, notifyIconId)` keys. Same dropped-count-for-alerting shape as
+/// `droppedEventsCount` above, and cumulative for this instance's whole lifetime in the same
+/// way (a reconnect clears the slots but never this counter). Consumed by
+/// `TrayStatusController.Diagnostics.storeOverflowCount`.
+@property (nonatomic, readonly) uint64_t iconStoreOverflowCount;
 
 /// Set (non-nil) if the most recent `-start` call's connection attempt failed before any
 /// protocol traffic occurred (DNS/TCP/TLS/NLA/activation failure) — read this after

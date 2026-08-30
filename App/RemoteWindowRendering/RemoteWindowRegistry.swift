@@ -522,14 +522,18 @@ final class RemoteWindowRegistry {
         // below alongside `.windowIcon`/`.execResult`/`.handshakeFlags` (still genuinely
         // ignored; no consumer wants them yet).
         case .notifyIconCreate:
+            trayStatusController.noteStoreOverflowCount(Int(session.iconStoreOverflowCount))
             trayStatusController.handleNotifyIconCreate(
                 windowId: event.windowId, notifyIconId: event.notifyIconId,
-                ownerWindowTitle: ownerWindowTitle(for: event.windowId)
+                ownerWindowTitle: ownerWindowTitle(for: event.windowId),
+                icon: Self.iconPayload(from: event)
             )
         case .notifyIconUpdate:
+            trayStatusController.noteStoreOverflowCount(Int(session.iconStoreOverflowCount))
             trayStatusController.handleNotifyIconUpdate(
                 windowId: event.windowId, notifyIconId: event.notifyIconId,
-                ownerWindowTitle: ownerWindowTitle(for: event.windowId)
+                ownerWindowTitle: ownerWindowTitle(for: event.windowId),
+                icon: Self.iconPayload(from: event)
             )
         case .notifyIconDelete:
             trayStatusController.handleNotifyIconDelete(windowId: event.windowId, notifyIconId: event.notifyIconId)
@@ -871,6 +875,23 @@ final class RemoteWindowRegistry {
     /// establishes for its own counters.
     func trayDiagnostics() -> TrayStatusController.Diagnostics {
         trayStatusController.diagnostics()
+    }
+
+    /// adr/0013 §3: repackages one drained NotifyIconCreate/Update event's icon fields into
+    /// the shape `TrayStatusController` consumes. A pure field transcription -- no policy,
+    /// which is why it is `static` and lives beside the two call sites rather than inside the
+    /// controller (same "Registry adapts, controller renders" split the tray path already
+    /// has). The pixels themselves were already copied out of the C side-store and into an
+    /// owned `NSData` by `CRDPEventFromCrdpEvent`, so nothing here shares lifetime with the
+    /// session (adr/0013 §1's write-on-T_rdp / read-after-drain contract ends at that copy).
+    private static func iconPayload(from event: CRDPEvent) -> TrayStatusController.IconPayload {
+        TrayStatusController.IconPayload(
+            rgba: event.iconRGBA,
+            width: Int(event.iconWidth),
+            height: Int(event.iconHeight),
+            skipped: event.iconSkipped,
+            toolTip: event.toolTip
+        )
     }
 
     private func handleWindowOrder(_ event: CRDPEvent) {

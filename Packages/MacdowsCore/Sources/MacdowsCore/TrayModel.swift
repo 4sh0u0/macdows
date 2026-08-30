@@ -3,18 +3,21 @@ import Foundation
 /// One notification-area (systray) icon's payload data, as tracked by the live
 /// AppKit-side tray rendering path (`TrayStatusController` in the App target).
 ///
-/// `tooltip` is always `nil` on the live `CRSession` path today (Phase 2 W6, docs/plans/
-/// phase2.md §2 W6). Verified against `App/CRBridge/CRSession.mm`'s `crb_notify_icon_create`/
-/// `crb_notify_icon_update`: both discard the entire `NOTIFY_ICON_STATE_ORDER` payload FreeRDP
-/// hands them (`(void)notifyIconState;`) and post only `windowId`/`notifyIconId` through
-/// `crdpq_notify_icon_t` — no title, tooltip, or icon pixel data crosses the CRBridge boundary
-/// at all (not "pixels only," the entire payload). `TrayIconInfo` still carries this field, not
-/// omitted, so a future contract extension (adr/0008-style: teaching `crdpq_notify_icon_t` a
-/// bounded tooltip string, the same `crdpq_text_t` truncation precedent `WindowState.title`
-/// already uses) doesn't need a breaking signature change here — only a new call-site value.
-/// `RemoteWindowRegistry`'s own v1 workaround is to pass the notify icon's OWNER WINDOW's
-/// title (which IS captured, via ordinary `WindowCreate`/`WindowUpdate` orders) as this field
-/// when one is known, not a notify-icon-specific tooltip.
+/// `tooltip` used to be permanently `nil` on the live `CRSession` path (Phase 2 W6,
+/// docs/plans/phase2.md §2 W6): `crb_notify_icon_create`/`crb_notify_icon_update` discarded
+/// the entire `NOTIFY_ICON_STATE_ORDER` payload FreeRDP handed them (`(void)notifyIconState;`)
+/// and posted only `windowId`/`notifyIconId` through `crdpq_notify_icon_t`, so nothing — not
+/// the icon pixels, not the tooltip — crossed the CRBridge boundary at all. The field was
+/// kept anyway, so the contract extension it anticipated wouldn't need a breaking signature
+/// change here; adr/0013 is that extension, and it landed exactly as anticipated (a bounded
+/// `crdpq_text_t` tooltip appended to the POD, the same truncation precedent
+/// `WindowState.title` already uses).
+///
+/// `TrayStatusController` now fills this with the wire's own `NOTIFY_ICON_STATE_ORDER.toolTip`
+/// when the order carried one, falling back to the notify icon's OWNER WINDOW title (which
+/// has always been captured, via ordinary `WindowCreate`/`WindowUpdate` orders) when it
+/// didn't — so a `nil` here means neither source knew a name for this icon, not that the
+/// transport threw one away.
 public struct TrayIconInfo: Sendable, Equatable {
     public var tooltip: String?
 
