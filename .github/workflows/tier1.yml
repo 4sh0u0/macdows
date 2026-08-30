@@ -26,6 +26,14 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           submodules: recursive
+          # gitleaks-action scans the push's commit RANGE (first^..last) and needs those
+          # revisions present locally — its own README requires full history. The default
+          # depth-1 shallow clone happened to survive every previous single-commit push,
+          # then broke on the first multi-commit push (8 commits, 2026-08-31: "fatal:
+          # ambiguous argument '<first>^..<last>': unknown revision", exit 1, zero bytes
+          # scanned — an ERROR, not a finding). Main repo only; submodule cloning is
+          # unchanged.
+          fetch-depth: 0
 
       - name: Install shellcheck
         run: |
