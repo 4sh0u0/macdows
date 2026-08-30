@@ -232,6 +232,15 @@ function Save-MacdowsToken {
     [CmdletBinding()]
     param([string] $Token, [string] $Path)
 
+    # Said plainly, once, here. GetFullPath('') raises ArgumentException and GetFullPath($null)
+    # ArgumentNullException, both naming a parameter the caller of this function never saw; a
+    # caller that forgot -TokenPath deserves to be told that rather than shown a .NET stack.
+    # (For pathological non-empty input the two runtimes disagree - .NET Framework 4.8 rejects
+    # '*' and '?' outright and enforces MAX_PATH, .NET on PowerShell 7 accepts both and lets
+    # the filesystem answer - but either way the call throws for input this function cannot
+    # use, and only the message text differs. Nothing here depends on which one raised it.)
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw 'token path is required' }
+
     # A relative -TokenPath is resolved by two different roots below: [IO.File]::WriteAllText
     # uses [Environment]::CurrentDirectory (the process working directory) while Test-Path and
     # Remove-Item -LiteralPath use $PWD (the PowerShell location). In a session where those two
@@ -277,7 +286,15 @@ function Remove-MacdowsTokenFile {
 
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     try {
-        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+        # [System.IO.File] for all three steps rather than a mix of Test-Path/Remove-Item and
+        # ReadAllText. The cmdlets resolve a relative path against $PWD (the PowerShell
+        # location) while the .NET calls resolve against [Environment]::CurrentDirectory (the
+        # process working directory), and when those two differ the function would check one
+        # file, read a second and delete a third. One root throughout means the file it
+        # confirms is the file it deletes. Every caller inside the agent passes the absolute
+        # path Save-MacdowsToken returned, so this is about not splitting the function against
+        # itself when someone hands it a relative one.
+        if (-not [System.IO.File]::Exists($Path)) { return $false }
         if (-not [string]::IsNullOrEmpty($Token)) {
             $current = $null
             try {
@@ -292,7 +309,14 @@ function Remove-MacdowsTokenFile {
                 return $false
             }
         }
-        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        # Review finding Q1: on Windows, File.Delete throws UnauthorizedAccessException for a
+        # file carrying the read-only attribute, where the old Remove-Item -Force cleared it
+        # first. Best-effort attribute reset in its own try so an odd filesystem cannot turn
+        # the delete into a silent no-op; keeping File.Delete preserves M4's single-root
+        # property (Remove-Item resolves against $PWD, everything here resolves against
+        # Environment.CurrentDirectory).
+        try { [System.IO.File]::SetAttributes($Path, [System.IO.FileAttributes]::Normal) } catch { }
+        [System.IO.File]::Delete($Path)
         return $true
     } catch {
         Write-Verbose "could not remove the token file '$Path': $($_.Exception.Message)"
@@ -1732,66 +1756,61 @@ function Invoke-MacdowsConnection {
     }
 }
 
+function New-MacdowsBoundListener {
+    <#
+      Parses the bind address, creates the listener and takes the port. Split out of the serve
+      loop so a caller can find out whether the port is available BEFORE it writes anything to
+      disk (see Invoke-MacdowsHostAgentMain).
+
+      Throws on every failure - a malformed address, a port outside 0-65535, a port already in
+      use - and owns nothing when it does: no token has been created at this point, so there is
+      nothing to clean up and no finally to arm.
+    #>
+    [CmdletBinding()]
+    param([string] $BindAddress, [int] $Port)
+
+    $ip = [System.Net.IPAddress]::Parse($BindAddress)
+    $listener = New-Object System.Net.Sockets.TcpListener($ip, $Port)
+    # ExclusiveAddressUse keeps another local process from stealing the port. It is a
+    # Windows socket option; on Unix (test runs only) the setter is not supported.
+    try {
+        $listener.ExclusiveAddressUse = $true
+    } catch {
+        Write-Verbose "ExclusiveAddressUse unavailable on this platform: $($_.Exception.Message)"
+    }
+    $listener.Start()
+    return $listener
+}
+
 function Start-MacdowsHostAgentServer {
     [CmdletBinding()]
     param(
-        [string] $BindAddress,
-        [int] $Port,
+        # An already-bound listener from New-MacdowsBoundListener.
+        $Listener,
         $Context,
-        # When given, the token file is deleted as the listener shuts down: the token is
-        # spent once the agent stops, and while nothing is listening another local process
-        # could bind the port and be handed the stale token by a probe. Optional so a caller
-        # that owns its own token file (the test stub) can opt out.
-        [string] $TokenPath,
-        # The token that file is expected to hold. Removal is skipped when it holds something
-        # else, so a failed start cannot delete a running agent's file (see Remove-MacdowsTokenFile).
-        [string] $Token,
+        # Human-readable "address:port", used for the banner only. The listener already knows
+        # what it bound; this is what the operator asked for.
+        [string] $Bind,
         [switch] $Once
     )
 
-    # Parsing the bind address, constructing the listener and binding the port all live INSIDE
-    # the try (review finding N2). They used to sit in front of it, so the two ways a start
-    # realistically fails - a malformed -BindAddress and a port already in use - escaped before
-    # the finally below was armed and left the token file behind. On the shared default path
-    # that orphan is worse than untidy: this process has already overwritten the token of
-    # whichever agent is actually running, so a probe would read a token the live agent does
-    # not accept and get a 401 from a perfectly healthy agent.
-    $listener = $null
+    # No token lifecycle in here. The caller that creates the token owns removing it
+    # (Invoke-MacdowsHostAgentMain), which is what lets the token be written only after the
+    # port is actually held - see the note there.
+    Write-MacdowsLine "listening on http://$Bind/  (Ctrl+C to stop)"
     try {
-        $ip = [System.Net.IPAddress]::Parse($BindAddress)
-        $listener = New-Object System.Net.Sockets.TcpListener($ip, $Port)
-        # ExclusiveAddressUse keeps another local process from stealing the port. It is a
-        # Windows socket option; on Unix (test runs only) the setter is not supported.
-        try {
-            $listener.ExclusiveAddressUse = $true
-        } catch {
-            Write-Verbose "ExclusiveAddressUse unavailable on this platform: $($_.Exception.Message)"
-        }
-        $listener.Start()
-        Write-MacdowsLine "listening on http://${BindAddress}:$Port/  (Ctrl+C to stop)"
-
         while ($true) {
             # Poll instead of blocking in AcceptTcpClient so Ctrl+C stays responsive.
-            if (-not $listener.Pending()) {
+            if (-not $Listener.Pending()) {
                 Start-Sleep -Milliseconds 50
                 continue
             }
-            $client = $listener.AcceptTcpClient()
+            $client = $Listener.AcceptTcpClient()
             Invoke-MacdowsConnection -Client $client -Context $Context
             if ($Once) { break }
         }
     } finally {
-        # $listener is still $null when the constructor itself threw, and StrictMode makes
-        # reading an unassigned variable an error, hence the pre-declaration above.
-        if ($null -ne $listener) { try { $listener.Stop() } catch { } }
-        # PowerShell runs finally on Ctrl+C as well as on a normal exit, so this covers the
-        # ordinary way the agent is stopped. It is still best-effort: a killed process leaves
-        # the file behind, which is why the README says to treat the token as spent regardless.
-        if (-not [string]::IsNullOrWhiteSpace($TokenPath)) {
-            if (Remove-MacdowsTokenFile -Path $TokenPath -Token $Token) {
-                Write-MacdowsLine "token file removed: $TokenPath"
-            }
-        }
+        try { $Listener.Stop() } catch { }
     }
 }
 
@@ -1822,18 +1841,48 @@ function Invoke-MacdowsHostAgentMain {
     foreach ($e in $loaded.Errors) { Write-MacdowsLine "allowlist: $e" }
     Write-MacdowsLine "allowlist: $(@($loaded.Entries).Count) usable entr(y/ies) from $AllowlistPath"
 
-    $token = New-MacdowsToken
-    $savedTo = Save-MacdowsToken -Token $token -Path $TokenPath
-    # The one and only time the token is printed. It is never written to the request log.
-    Write-MacdowsLine "token: $token"
-    Write-MacdowsLine "token file: $savedTo"
+    # Take the port BEFORE writing anything (review finding M1). The token path is shared by
+    # every agent this user starts, so a second agent launched by mistake on a port that is
+    # already taken used to overwrite the running agent's token file and only then discover it
+    # could not bind. It cleaned up its own write, which left the healthy agent running with no
+    # token file at all. Binding first means a start that cannot succeed never touches the
+    # disk: nothing is written, so nothing is clobbered and there is nothing to clean up.
+    #
+    # This is also why there is no try/finally around the bind: at this point the process owns
+    # no resource whose release matters. If it throws, the agent exits non-zero having changed
+    # nothing.
+    $bind = "${BindAddress}:$Port"
+    $listener = New-MacdowsBoundListener -BindAddress $BindAddress -Port $Port
 
-    $context = New-MacdowsContext -Token $token -Allowlist @($loaded.Entries) -Bind "${BindAddress}:$Port"
-    # -Token is what makes the cleanup in there an ownership check: whether the server exits
-    # normally or never manages to bind at all, it only ever removes a file still holding this
-    # token (review findings N2, N3).
-    Start-MacdowsHostAgentServer -BindAddress $BindAddress -Port $Port -Context $context `
-        -TokenPath $savedTo -Token $token -Once:$Once
+    # From here on a token file may exist, so the removal has to be armed. Both variables are
+    # declared before the try because StrictMode makes reading an unassigned variable an error,
+    # and the finally must be able to run even when Save-MacdowsToken is what threw.
+    $token = $null
+    $savedTo = $null
+    try {
+        $token = New-MacdowsToken
+        $savedTo = Save-MacdowsToken -Token $token -Path $TokenPath
+        # The one and only time the token is printed. It is never written to the request log.
+        # Printed after the bind, so a token on stdout means a listening agent.
+        Write-MacdowsLine "token: $token"
+        Write-MacdowsLine "token file: $savedTo"
+
+        $context = New-MacdowsContext -Token $token -Allowlist @($loaded.Entries) -Bind $bind
+        Start-MacdowsHostAgentServer -Listener $listener -Context $context -Bind $bind -Once:$Once
+    } finally {
+        # PowerShell runs finally on Ctrl+C as well as on a normal exit, so this covers the
+        # ordinary way the agent is stopped. It is still best-effort: a killed process leaves
+        # the file behind, which is why the README says to treat the token as spent regardless.
+        # -Token makes it an ownership check: only a file still holding THIS token is removed,
+        # so a later agent's file is never taken away (review finding N3).
+        if (Remove-MacdowsTokenFile -Path $savedTo -Token $token) {
+            Write-MacdowsLine "token file removed: $savedTo"
+        }
+        # Review finding Q2: on the save-throws path Start-MacdowsHostAgentServer (whose own
+        # finally stops the listener) is never reached, so release the bound socket here too.
+        # Stop() is idempotent, so the double call on the normal path is harmless.
+        try { $listener.Stop() } catch { }
+    }
 }
 
 # ---------------------------------------------------------------------------------------------

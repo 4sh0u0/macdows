@@ -29,11 +29,13 @@ administrator to publish a new RemoteApp for every program.
   every such request gets `401` with a `{}` body and no hint.
 * **The token file does not outlive the agent.** It is written with an explicit DACL granting
   only the account the agent runs as (rather than relying on `%LOCALAPPDATA%` inheritance,
-  which `-TokenPath` can point away from), and it is deleted when the listener shuts down —
-  including on `Ctrl+C`, which runs the `finally`, and including when the listener never came
-  up at all (a port already in use). The delete is an ownership check, not a blind one: the
-  path is shared by every agent you start, so a shutting-down agent only removes a file that
-  still holds *its* token and leaves a newer agent's alone. This is best-effort: a killed
+  which `-TokenPath` can point away from), and it is deleted when the agent stops — including
+  on `Ctrl+C`, which runs the `finally`. It is also never written by a start that cannot
+  succeed: the agent takes the port *first* and only then mints and writes the token, so a
+  second agent launched by mistake on a port that is already in use exits without touching the
+  running agent's file. The delete is an ownership check, not a blind one: the path is shared
+  by every agent you start, so a shutting-down agent only removes a file that still holds
+  *its* token and leaves a newer agent's alone. This is best-effort: a killed
   process leaves the file behind, so treat a token as spent once its agent has stopped either
   way. The point is that a spent token should not sit in `%LOCALAPPDATA%` indefinitely — while
   nothing is listening, another local process can bind the port and a probe would hand it that
@@ -285,7 +287,7 @@ pwsh -NoProfile -File ./MacdowsHostAgent.Tests.ps1
 
 Runs on macOS under PowerShell 7 and on the host under Windows PowerShell 5.1. **Pester is not
 required** — the file carries a ~40-line assertion harness and exits non-zero on any failure.
-119 tests on macOS (117 on the host, where the two `probe.sh` cases skip for want of `bash`)
+123 tests on macOS (121 on the host, where the two `probe.sh` cases skip for want of `bash`)
 covering:
 
 * **The agent** — HTTP head parsing and body framing, size limits, route dispatch and status
@@ -294,9 +296,11 @@ covering:
 * **`probe.ps1`'s pure parts** — result-line formatting, the PNG magic check, default
   launch-id selection and icon selection over a parsed `/v1/apps` object (including the
   one-element-array-collapsed-to-an-object shape that PowerShell 5.1 can emit).
-* **End to end** — four runs that start a real agent on `127.0.0.1` with `-Once` and drive it
-  with `curl` (including that the token file does not outlive the agent, and that a second agent
-  which cannot bind the port exits non-zero without leaving a token behind), plus seven that run
+* **End to end** — six runs that start a real agent on `127.0.0.1` with `-Once` and drive it
+  with `curl` (including that the token file does not outlive the agent; that a second agent
+  which cannot bind the port exits non-zero with the running agent's token file still holding
+  the running agent's token; and that a start which cannot bind at all, or cannot write its
+  token file, fails without leaving a file or a second error behind), plus seven that run
   `probe.ps1` as a separate process and assert the artifacts, the `DONE` marker, the exit code,
   the stale-artifact clear, a bracketed `-OutDir`, an uncreatable `-OutDir`, an empty token file,
   and that the token never leaks into any output file. The stub agent is the real server loop and

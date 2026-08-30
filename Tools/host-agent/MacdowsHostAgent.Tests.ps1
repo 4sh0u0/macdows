@@ -1191,6 +1191,22 @@ Test-Case 'a relative token path is anchored once and the whole chain follows it
     }
 }
 
+Test-Case 'Save-MacdowsToken refuses a path it cannot use, in its own words (review finding M3)' {
+    # Without the guard the first thing an empty path meets is [IO.Path]::GetFullPath, which
+    # raises ArgumentException/ArgumentNullException naming a parameter this function's caller
+    # never passed. Saying it plainly is the difference between "you forgot -TokenPath" and a
+    # .NET argument error from two layers down.
+    foreach ($bad in @('', '   ', "`t", $null)) {
+        $message = $null
+        try {
+            [void](Save-MacdowsToken -Token 'abc' -Path $bad)
+        } catch {
+            $message = $_.Exception.Message
+        }
+        Assert-Equal 'token path is required' $message "an empty -Path must be refused by name; got [$message]"
+    }
+}
+
 Test-Case 'the token file is only removed when it still holds this agent''s token (review finding N3)' {
     # The default token path is shared by every agent this user starts, so removal has to be an
     # ownership check: an agent shutting down (or failing to start) must not take away a file
@@ -1205,6 +1221,30 @@ Test-Case 'the token file is only removed when it still holds this agent''s toke
 
     Assert-True (Remove-MacdowsTokenFile -Path $written -Token 'token-B') 'the owner still cleans up after itself'
     Assert-True (-not (Test-Path -LiteralPath $written)) 'a matching token file must be gone'
+}
+
+Test-Case 'the token removal resolves one root for check, read and delete (review finding M4)' {
+    # Same two-roots setup as the N4 case above: the .NET file APIs resolve a relative path
+    # against [Environment]::CurrentDirectory, the cmdlets against $PWD. Remove-MacdowsTokenFile
+    # used to mix them - Test-Path and Remove-Item on one side, ReadAllText on the other - so a
+    # relative path could make it check one file, read a second and delete a third. It now uses
+    # the .NET APIs throughout, which is also the root Save-MacdowsToken anchors to, so the
+    # whole token lifecycle agrees about what a relative path means.
+    $name = 'm4-one-root.token'
+    $saved = [System.Environment]::CurrentDirectory
+    $savedLocation = (Get-Location).Path
+    Set-Location -LiteralPath ([System.IO.Path]::GetTempPath())
+    [System.Environment]::CurrentDirectory = $script:TempRoot
+    try {
+        $absolute = Join-Path ([System.Environment]::CurrentDirectory) $name
+        [System.IO.File]::WriteAllText($absolute, 'tok-m4')
+        Assert-True (Remove-MacdowsTokenFile -Path $name -Token 'tok-m4') `
+            'a relative path must find, verify and delete the same file'
+        Assert-True (-not [System.IO.File]::Exists($absolute)) 'the file it checked must be the file it deleted'
+    } finally {
+        Set-Location -LiteralPath $savedLocation
+        [System.Environment]::CurrentDirectory = $saved
+    }
 }
 
 Test-Case 'removes the token file and tolerates one that is already gone (review finding B10)' {
@@ -1465,7 +1505,9 @@ function Start-AgentProcess {
         [string] $AllowlistPath,
         [string] $Tag = 'agent',
         [int] $Port = 0,
-        [string] $TokenPath
+        [string] $TokenPath,
+        # Overridable so a start that cannot bind at all can be exercised.
+        [string] $BindAddress = '127.0.0.1'
     )
 
     if ($Port -le 0) { $Port = Get-FreeTcpPort }
@@ -1477,7 +1519,7 @@ function Start-AgentProcess {
         -RedirectStandardOutput $outFile -RedirectStandardError $errFile `
         -ArgumentList @(
             '-NoProfile', '-File', $AgentPath,
-            '-BindAddress', '127.0.0.1',
+            '-BindAddress', $BindAddress,
             '-Port', "$Port",
             '-AllowlistPath', $AllowlistPath,
             '-TokenPath', $TokenPath,
@@ -1582,12 +1624,13 @@ if ($SkipEndToEnd) {
         }
     }
 
-    Test-Case 'an agent that cannot bind the port leaves no token file behind (review finding N2)' {
+    Test-Case 'an agent that cannot bind the port never touches the running agent''s token (review findings N2, M1)' {
         # Two real agents, one port, one token path: the shape a second launch takes when the
-        # first is still running and both use the default -TokenPath. The second agent writes
-        # its token before it finds out the port is taken, so if the failed start left that file
-        # behind, a probe would read a token the live agent has never issued and be answered 401
-        # by a perfectly healthy agent. The listener bind is the only thing that fails here.
+        # first is still running and both use the default -TokenPath. The agent takes the port
+        # before it writes anything, so a start that cannot succeed leaves the disk exactly as
+        # it found it. The earlier shape wrote first and bound second: it clobbered the running
+        # agent's token file, then tidied away its own write, and the healthy agent was left
+        # running with no token file at all.
         $agentA = Start-TestAgent -Directory $e2eDir -AllowlistPath $e2eAllowlist -Tag 'bind-a'
         try {
             $tokenA = $agentA.Token
@@ -1605,22 +1648,18 @@ if ($SkipEndToEnd) {
             # file, and [regex]::Match($null, ...) throws rather than simply not matching.
             $stdoutB = Get-Content -LiteralPath $agentB.StdoutPath -Raw
             if ($null -eq $stdoutB) { $stdoutB = '' }
-            $match = [regex]::Match($stdoutB, '(?m)^token: ([0-9a-f]{64})\s*$')
-            Assert-True $match.Success "the second agent should have written a token before failing; got:`n$stdoutB"
-            $tokenB = $match.Groups[1].Value
-            Assert-True ($tokenB -cne $tokenA) 'the two agents must have generated different tokens'
-            Assert-True ($stdoutB -match 'token file removed') "the failed start must run its cleanup; got:`n$stdoutB"
+            # It never got as far as a token: no token printed, and nothing removed, because
+            # there was nothing of its own to remove.
+            Assert-True ($stdoutB -notmatch '(?m)^token: ') "a failed start must not mint a token; got:`n$stdoutB"
+            Assert-True ($stdoutB -notmatch 'token file removed') `
+                "a failed start must not remove a file it never wrote; got:`n$stdoutB"
 
-            $leftover = ''
-            if (Test-Path -LiteralPath $agentA.TokenPath) {
-                # Same guard as above: a zero-byte leftover file yields no output, not ''.
-                $leftover = Get-Content -LiteralPath $agentA.TokenPath -Raw
-                if ($null -eq $leftover) { $leftover = '' }
-                $leftover = $leftover.Trim()
-            }
-            Assert-True ($leftover -cne $tokenB) 'the failed start must not leave its token at the shared path'
-            Assert-True (-not (Test-Path -LiteralPath $agentA.TokenPath)) `
-                "the file the failed start wrote must be gone; it still holds [$leftover]"
+            # The strong form: A's file is not merely present, it still holds A's token.
+            Assert-True (Test-Path -LiteralPath $agentA.TokenPath) 'the running agent''s token file must survive'
+            $leftover = Get-Content -LiteralPath $agentA.TokenPath -Raw
+            if ($null -eq $leftover) { $leftover = '' }
+            $leftover = $leftover.Trim()
+            Assert-Equal $tokenA $leftover 'the running agent''s token file must still hold ITS token, byte for byte'
 
             # And the agent that is actually running is untouched: same port, same token, 200.
             $raw = & $script:CurlPath --silent --show-error --include --max-time 20 `
@@ -1631,6 +1670,59 @@ if ($SkipEndToEnd) {
         } finally {
             if (-not $agentA.Process.HasExited) { try { $agentA.Process.Kill() } catch { } }
         }
+    }
+
+    Test-Case 'a start that cannot bind exits cleanly and writes nothing (review finding M2)' {
+        # The two ways listener setup throws before the agent owns anything: an address that is
+        # not an address (IPAddress.Parse) and a port outside 0-65535 (the TcpListener
+        # constructor). Neither may leave a token file, neither may print a token, and neither
+        # may surface as a raw StrictMode error - what the operator sees should be the real
+        # failure, not a second one raised while unwinding.
+        $cases = @(
+            @{ Tag = 'badport'; Bind = '127.0.0.1'; Port = 99999 },
+            @{ Tag = 'badaddr'; Bind = 'not-an-ip'; Port = 0 }
+        )
+        foreach ($case in $cases) {
+            $tokenPath = Join-Path $e2eDir "$($case.Tag).token"
+            $agent = Start-AgentProcess -Directory $e2eDir -AllowlistPath $e2eAllowlist -Tag $case.Tag `
+                -BindAddress $case.Bind -Port $case.Port -TokenPath $tokenPath
+            Assert-True ($agent.Process.WaitForExit(30000)) "$($case.Tag): must exit rather than hang"
+            $code = Get-TestExitCode -Process $agent.Process -What "the $($case.Tag) agent"
+            Assert-True ($code -ne 0) "$($case.Tag): a failed bind must exit non-zero; got $code"
+            Assert-True (-not (Test-Path -LiteralPath $tokenPath)) "$($case.Tag): no token file may be written"
+
+            $stdout = Get-Content -LiteralPath $agent.StdoutPath -Raw
+            if ($null -eq $stdout) { $stdout = '' }
+            Assert-True ($stdout -notmatch '(?m)^token: ') "$($case.Tag): no token may be minted; got:`n$stdout"
+            $stderr = Get-Content -LiteralPath $agent.StderrPath -Raw
+            if ($null -eq $stderr) { $stderr = '' }
+            Assert-True ($stderr -notmatch 'has not been set') `
+                "$($case.Tag): a StrictMode error must not mask the real failure; got:`n$stderr"
+        }
+    }
+
+    Test-Case 'a token path that cannot be written fails without a second error on the way out (review finding M2)' {
+        # Here the bind SUCCEEDS, so the token cleanup in Invoke-MacdowsHostAgentMain is armed,
+        # and then Save-MacdowsToken throws because the parent of -TokenPath is a file rather
+        # than a directory. The finally still has to run: $token and $savedTo are declared ahead
+        # of the try precisely so that reading them there cannot raise "cannot be retrieved
+        # because it has not been set" and bury the real failure. This is the case that pins
+        # that declaration - after M1 the old $listener guard has no unwind path left to cover.
+        $blocker = Join-Path $e2eDir 'token-blocker'
+        Set-Content -LiteralPath $blocker -Value 'x' -NoNewline
+        $tokenPath = Join-Path $blocker 'token'
+
+        $agent = Start-AgentProcess -Directory $e2eDir -AllowlistPath $e2eAllowlist -Tag 'badtokenpath' `
+            -TokenPath $tokenPath
+        Assert-True ($agent.Process.WaitForExit(30000)) 'must exit rather than hang'
+        $code = Get-TestExitCode -Process $agent.Process -What 'the agent'
+        Assert-True ($code -ne 0) "an unwritable token path must exit non-zero; got $code"
+        Assert-True (-not (Test-Path -LiteralPath $tokenPath)) 'no token file may exist'
+
+        $stderr = Get-Content -LiteralPath $agent.StderrPath -Raw
+        if ($null -eq $stderr) { $stderr = '' }
+        Assert-True ($stderr -notmatch 'has not been set') `
+            "the finally must not raise a StrictMode error of its own; got:`n$stderr"
     }
 
     Test-Case 'rejects a request with no token over a real socket' {
@@ -1707,7 +1799,8 @@ $ctx = New-MacdowsContext -Token $AuthToken -Allowlist $allow -Bind "127.0.0.1:$
     }
     LaunchProcess       = { param($Entry) 31337 }
 }
-Start-MacdowsHostAgentServer -BindAddress '127.0.0.1' -Port $ListenPort -Context $ctx
+$listener = New-MacdowsBoundListener -BindAddress '127.0.0.1' -Port $ListenPort
+Start-MacdowsHostAgentServer -Listener $listener -Context $ctx -Bind "127.0.0.1:$ListenPort"
 '@
 
 function Start-StubAgent {
