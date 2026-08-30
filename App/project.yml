@@ -351,6 +351,14 @@ targets:
         LD_RUNPATH_SEARCH_PATHS:
           - $(inherited)
           - $(SRCROOT)/../.build/freerdp/current/prefix/lib
+          # W8 made libfreerdp3 reference @rpath/libav{codec,util}/libswresample from the
+          # self-built LGPL ffmpeg prefix. The App resolves those inside its own bundle
+          # (Copy Files + @executable_path/../Frameworks); these bare tools link the
+          # FreeRDP dylibs at their build location instead, so they need the ffmpeg
+          # prefix on their rpath too -- without it the tool dies at dyld time
+          # ("Library not loaded: @rpath/libavcodec..."), which is exactly how this
+          # line's absence was discovered on the first post-W8 live run.
+          - $(SRCROOT)/../.build/deps/ffmpeg-prefix/lib
         OTHER_LDFLAGS:
           - -lfreerdp3
           - -lfreerdp-client3
@@ -392,6 +400,14 @@ targets:
         LD_RUNPATH_SEARCH_PATHS:
           - $(inherited)
           - $(SRCROOT)/../.build/freerdp/current/prefix/lib
+          # W8 made libfreerdp3 reference @rpath/libav{codec,util}/libswresample from the
+          # self-built LGPL ffmpeg prefix. The App resolves those inside its own bundle
+          # (Copy Files + @executable_path/../Frameworks); these bare tools link the
+          # FreeRDP dylibs at their build location instead, so they need the ffmpeg
+          # prefix on their rpath too -- without it the tool dies at dyld time
+          # ("Library not loaded: @rpath/libavcodec..."), which is exactly how this
+          # line's absence was discovered on the first post-W8 live run.
+          - $(SRCROOT)/../.build/deps/ffmpeg-prefix/lib
         OTHER_LDFLAGS:
           - -lfreerdp3
           - -lfreerdp-client3

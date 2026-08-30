@@ -328,6 +328,20 @@ let trayClickScenarioEnabled: Bool = {
     return true
 }()
 
+/// Optional target filter for the tray-click scenario (`WINDOW_SMOKE_TRAY_CLICK_TOOLTIP`):
+/// when set, the click targets the first LIVE icon whose wire tooltip equals this string
+/// exactly, and arming WAITS until such an icon exists (bounded by the scenario's own
+/// deadline). Without it the scenario clicks the first live key -- correct for the send-path
+/// gates, but in a real session that key is one of the session's standing tray icons, not the
+/// lab driver's, so a remote loop-back (the driver writing a marker on MouseUp) would measure
+/// the wrong icon. The filter is how the loop-back run says "click MY icon".
+let trayClickTooltipFilter: String? = {
+    guard trayClickScenarioEnabled else { return nil }
+    guard let v = ProcessInfo.processInfo.environment["WINDOW_SMOKE_TRAY_CLICK_TOOLTIP"], !v.isEmpty else { return nil }
+    print("[config] tray-click target filter: tooltip == \"\(v)\"")
+    return v
+}()
+
 /// MS-RDPERP `TS_RAIL_ORDER_SYSCOMMAND` `SC_*` values -- duplicated here from
 /// `App/RemoteWindowRendering/RemoteWindowRegistry.swift`'s own `SysCommand` enum (itself
 /// verified against `ThirdParty/FreeRDP/include/freerdp/rail.h:126-133`), matching this
@@ -790,6 +804,14 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// dependent on `Set` iteration order -- a flaky choice of target would make a failure
     /// report ambiguous about which icon it referred to.
     private var liveNotifyIconKeys: [NotifyIconKey] = []
+    /// Last WIRE tooltip observed per live key (`CRDPEvent.toolTip`, present only when the
+    /// order carried the string bit) -- consulted by the tray-click scenario's optional
+    /// `WINDOW_SMOKE_TRAY_CLICK_TOOLTIP` target filter. Without a filter the scenario clicks
+    /// the FIRST live key, which in a real session is one of the session's own standing tray
+    /// icons (Explorer's battery/network/etc. appear within ~2s, long before a lab driver's
+    /// PowerShell has even finished loading WinForms) -- fine for send-path gates, useless
+    /// for a remote loop-back where the marker-writing driver's OWN icon must be the target.
+    private var notifyIconTooltips: [NotifyIconKey: String] = [:]
     private var trayClickTarget: NotifyIconKey?
     private var trayClickDone = false
     /// Every `(windowId, notifyIconId, message)` triple `RemoteWindowRegistry` reported having
@@ -1227,8 +1249,15 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                     if !self.liveNotifyIconKeys.contains(key) {
                         self.liveNotifyIconKeys.append(key)
                     }
+                    // Wire truth only: absence means "this order didn't carry the bit",
+                    // never "the tooltip was cleared" -- same delta semantics TrayModel
+                    // documents. An explicit empty string IS a clear, and is recorded.
+                    if let tip = event.toolTip {
+                        self.notifyIconTooltips[key] = tip
+                    }
                 case .notifyIconDelete:
                     self.liveNotifyIconKeys.removeAll { $0 == key }
+                    self.notifyIconTooltips.removeValue(forKey: key)
                 default:
                     break
                 }
@@ -1627,6 +1656,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // span every cycle's clicks while the collected message list holds only the last
         // one's, breaking the identity the gate exists to check.
         liveNotifyIconKeys.removeAll()
+        notifyIconTooltips.removeAll()
         if !trayClickDone {
             trayClickTarget = nil
             outboundDroppedNoRailBeforeClick = nil
@@ -2312,7 +2342,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private func runTrayClickScenario(session: CRSession, registry: RemoteWindowRegistry) {
         guard trayClickScenarioEnabled, !trayClickDone else { return }
         let diag = registry.trayDiagnostics()
-        guard diag.realIconMaxObserved >= 1, diag.liveCount >= 1, let target = liveNotifyIconKeys.first else { return }
+        // With a tooltip filter, keep waiting until the NAMED icon is live (the lab driver's
+        // own icon appears seconds after the session's standing ones); without one, first
+        // live key, as before.
+        let candidate: NotifyIconKey?
+        if let filter = trayClickTooltipFilter {
+            candidate = liveNotifyIconKeys.first { notifyIconTooltips[$0] == filter }
+        } else {
+            candidate = liveNotifyIconKeys.first
+        }
+        guard diag.realIconMaxObserved >= 1, diag.liveCount >= 1, let target = candidate else { return }
 
         trayClickTarget = target
         // Read BEFORE the click, so the delta `finish()` asserts on is attributable to this
