@@ -9,11 +9,32 @@ Generated inventory metadata (hashes, purls, patch pedigree) lives in
 `sbom/macdows.cdx.json` (CycloneDX 1.6), regenerated
 at release time by the same script.
 
-> **`Scripts/gen-notices.sh` is a manual release gate, not an automated one.** Nothing in
-> CI runs it today — a Tier 2 CI pipeline is still an open owner decision — so it must be
-> run by hand against the built `.app` before any artifact leaves this machine, and it must
-> exit 0. Treat a release without a green `gen-notices.sh` run as unreleased. Everything
-> below is only as accurate as the last time somebody ran it.
+> **The release gate is manual, not automated.** Nothing in CI runs it today — a Tier 2 CI
+> pipeline is still an open owner decision — so before any artifact leaves this machine,
+> both of these must be run by hand against the built `.app` and both must exit 0:
+>
+> ```sh
+> Scripts/gen-notices.sh      <path-to-.app>   # licences, notices, SBOM
+> Scripts/sign-and-verify.sh --release <path-to-.app>   # signing + release-only checks
+> ```
+>
+> **`--release` is required, and it is not optional book-keeping.** It is what turns the
+> `com.apple.security.get-task-allow` check into a hard failure; without it the script stays
+> lenient so the ordinary Debug loop keeps working. The flag has to be stated explicitly
+> because a macOS bundle carries no trustworthy build-configuration marker — a Debug and a
+> Release `Macdows.app` have byte-identical `Info.plist`s — and guessing from the path would
+> silently downgrade the check for a Release artifact that merely happens to sit under a
+> directory named `Debug`.
+>
+> Notarization, unlike the entitlement check, is still gated on the artifact's *path*: an
+> app under a directory named `Debug` is treated as a local-iteration build and is not
+> submitted automatically. If your staging layout puts a real release artifact on such a
+> path, re-run with `SIGN_AND_VERIFY_FORCE_NOTARIZE=1` (the script warns when `--release`
+> and a `Debug` path are combined). That heuristic is kept deliberately: a wrongly skipped
+> notarization is self-announcing, whereas a wrongly downgraded entitlement check is not.
+>
+> Treat a release without both commands green as unreleased. Everything below is only as
+> accurate as the last time somebody ran them.
 
 **These obligations ship with the application, not just with this repository.** A built
 `Macdows.app` carries, in `Contents/Resources/`:
@@ -112,6 +133,8 @@ everything the licences require.
   `Scripts/build-ffmpeg.sh`'s `FFMPEG_CONFIGURE_FLAGS` array as the executable source of
   truth):
 
+  <!-- BEGIN ffmpeg-configure-flags -->
+
   ```
   --disable-gpl --disable-nonfree --disable-version3
   --enable-shared --disable-static --install-name-dir=@rpath
@@ -125,6 +148,8 @@ everything the licences require.
   --arch=arm64
   --extra-cflags=-mmacosx-version-min=14.0 --extra-ldflags=-mmacosx-version-min=14.0
   ```
+
+  <!-- END ffmpeg-configure-flags -->
 
 - **How it's packaged**: built as **dynamic libraries** and embedded into the app bundle's
   `Contents/Frameworks`: `libavcodec.63.dylib`, `libavutil.61.dylib`,

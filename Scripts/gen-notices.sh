@@ -249,25 +249,146 @@ if printf '%s\n' "${DETECTED[@]}" | grep -cx "FFmpeg" >/dev/null; then
 	# Scripts/build-ffmpeg.sh refuses to build if its own array drifts from it). Both
 	# user-facing documents quote that flag list — THIRD_PARTY_NOTICES.md as the evidence
 	# that the shipped build is not GPL, LGPL_RELINK.md as the recipe a user runs to build a
-	# replacement. A flag that silently disappears from either turns the licence evidence
-	# into a false claim, or produces a replacement library that is not drop-in compatible.
+	# replacement.
+	#
+	# This is a SET-EQUALITY assertion between the locked flag list and the flag block of
+	# each document — both directions, both evaluated against the same extracted token set:
+	#   forward  (locked -> block): a flag silently disappears from a document. The licence
+	#            evidence becomes incomplete, or the user's replacement library is not
+	#            drop-in compatible with what we shipped.
+	#   reverse  (block -> locked): a flag is silently *added* to a document. A notices file
+	#            that reads "--enable-gpl" is an affirmatively false licence claim about a
+	#            binary we redistribute, and a relink recipe with an extra flag produces a
+	#            library that behaves differently from the one it is supposed to replace.
+	#
+	# Both directions run against extract_flag_tokens output, never against the raw file.
+	# That is load-bearing, not tidiness: an earlier version did the forward direction with
+	# `grep -qF -- "$lockflag" "$doc"` over the whole file, and the prose outside the block
+	# silently rescued flags that had been deleted from the block itself. Measured exposure
+	# of that bug: 10 of the 28 locked flags were "documented" somewhere in LGPL_RELINK.md's
+	# prose — including --enable-parser=h264, whose absence from the recipe breaks H.264
+	# decode initialisation outright, i.e. exactly the §6 drop-in-compatibility failure this
+	# check exists to prevent — and 1 of 28 in THIRD_PARTY_NOTICES.md (--disable-gpl, the
+	# single most important one). The gate passed and logged "reproduce all 28 locked flags".
 	FFMPEG_FLAG_DEPLOY="$(jq -er '.deployment_target' "$LOCK_FILE_FOR_NOTICES")" \
 		|| die "deps/freerdp.lock has no .deployment_target field"
+
+	# --- Token extraction ----------------------------------------------------------------
+	# Scoped to an explicitly delimited region of each document rather than the whole file.
+	# The delimiters are HTML comments (invisible when the Markdown is rendered) placed
+	# immediately around the flag block:
+	#     <!-- BEGIN ffmpeg-configure-flags --> ... <!-- END ffmpeg-configure-flags -->
+	# Scoping is not optional. Both documents legitimately name configure flags in prose
+	# outside the block — THIRD_PARTY_NOTICES.md explains that FFmpeg is LGPL "only when
+	# built without --enable-gpl / --enable-nonfree / --enable-version3" and shows a
+	# `grep -- --disable-gpl` command — so a whole-file scan reports the very flags this
+	# check exists to forbid, and (per the note above) also lets deleted flags pass.
+	# Explicit markers were chosen over heuristics like "the first fenced code block after a
+	# heading" because they cannot be broken by ordinary editing of the surrounding prose,
+	# and a missing marker is a hard failure rather than a silently empty scan.
+	FFMPEG_FLAGS_BEGIN_MARK='<!-- BEGIN ffmpeg-configure-flags -->'
+	FFMPEG_FLAGS_END_MARK='<!-- END ffmpeg-configure-flags -->'
+
+	extract_flag_tokens() {
+		# Prints one flag token per line (deduplicated) from the delimited region of $1.
+		# The character class covers every shape the locked flags actually take:
+		# '=' (--arch=arm64), '@' (--install-name-dir=@rpath), '_'
+		# (--enable-hwaccel=h264_videotoolbox), '.' and embedded '-'
+		# (--extra-cflags=-mmacosx-version-min=14.0).
+		# If a future locked flag ever contains '/', ',', ':' or a space (e.g. a path-valued
+		# or list-valued option), the token will be truncated or split here rather than
+		# matched — which fails CLOSED, as a forward-direction "document is missing <flag>"
+		# error. That message blames the document, so: if a newly added flag reports missing
+		# while plainly present in the block, widen this class rather than editing the doc.
+		awk -v b="$FFMPEG_FLAGS_BEGIN_MARK" -v e="$FFMPEG_FLAGS_END_MARK" '
+			index($0, b) { inblk = 1; next }
+			index($0, e) { inblk = 0; next }
+			inblk { print }
+		' "$1" | grep -oE -- '--[A-Za-z0-9][A-Za-z0-9._@=+_-]*' | sort -u
+	}
+
+	# Extract once per document; both directions then reason about exactly the same data.
+	NOTICES_FLAG_TOKENS="$(extract_flag_tokens "$NOTICES_FILE" || true)"
+	RELINK_FLAG_TOKENS="$(extract_flag_tokens "$RELINK_DOC" || true)"
+	[ -n "$NOTICES_FLAG_TOKENS" ] \
+		|| die "THIRD_PARTY_NOTICES.md: found no configure-flag tokens between $FFMPEG_FLAGS_BEGIN_MARK and $FFMPEG_FLAGS_END_MARK — the delimiters are missing, mismatched, or the block is empty, which would make this check silently pass"
+	[ -n "$RELINK_FLAG_TOKENS" ] \
+		|| die "LGPL_RELINK.md: found no configure-flag tokens between $FFMPEG_FLAGS_BEGIN_MARK and $FFMPEG_FLAGS_END_MARK — the delimiters are missing, mismatched, or the block is empty, which would make this check silently pass"
+
+	# grep -c >/dev/null, never -q, in both helpers: -q early-exits and SIGPIPEs the
+	# producer, which under `set -o pipefail` makes the pipeline report 141 instead of the
+	# match result. Same rule as the $HOME guard above.
+	assert_flag_documented() {
+		# $1 = locked flag, $2 = that document's token set, $3 = label, $4 = consequence
+		local flag="$1" tokens="$2" label="$3" consequence="$4"
+		printf '%s\n' "$tokens" | grep -cxF -e "$flag" >/dev/null \
+			|| die "$label's FFmpeg configure-flag block does not contain '$flag' (deps/freerdp.lock .ffmpeg.configure_flags).
+$consequence
+Note this checks the block delimited by $FFMPEG_FLAGS_BEGIN_MARK / $FFMPEG_FLAGS_END_MARK,
+not the whole file — a mention in the surrounding prose does not satisfy it, by design."
+	}
+
+	# --- Forward direction: every locked flag must appear in each document's block --------
+	LOCKED_FLAGS_RESOLVED=""
 	FLAGS_CHECKED=0
 	while IFS= read -r lockflag; do
 		# Same '<computed: ...>' substitution Scripts/build-ffmpeg.sh applies before it
 		# compares; the docs quote the resolved value.
 		lockflag="${lockflag//<computed: .deployment_target>/$FFMPEG_FLAG_DEPLOY}"
-		grep -qF -- "$lockflag" "$NOTICES_FILE" \
-			|| die "THIRD_PARTY_NOTICES.md's recorded FFmpeg configure flags are missing '$lockflag' (deps/freerdp.lock .ffmpeg.configure_flags) — the notices file's licence evidence no longer matches the build"
-		grep -qF -- "$lockflag" "$RELINK_DOC" \
-			|| die "LGPL_RELINK.md's build recipe is missing '$lockflag' (deps/freerdp.lock .ffmpeg.configure_flags) — a user following it would not reproduce the shipped library, which defeats the LGPL-2.1 §6 offer"
+		LOCKED_FLAGS_RESOLVED="$LOCKED_FLAGS_RESOLVED$lockflag
+"
+		assert_flag_documented "$lockflag" "$NOTICES_FLAG_TOKENS" "THIRD_PARTY_NOTICES.md" \
+			"The notices file's recorded licence evidence no longer matches how the shipped library was actually built."
+		assert_flag_documented "$lockflag" "$RELINK_FLAG_TOKENS" "LGPL_RELINK.md" \
+			"A user following that recipe would not reproduce the shipped library, which defeats the LGPL-2.1 §6 offer."
 		FLAGS_CHECKED=$((FLAGS_CHECKED + 1))
 	done < <(jq -er '.ffmpeg.configure_flags[]' "$LOCK_FILE_FOR_NOTICES" \
 		|| die "deps/freerdp.lock has no .ffmpeg.configure_flags[] array")
 	[ "$FLAGS_CHECKED" -ge 20 ] \
 		|| die "only $FLAGS_CHECKED FFmpeg configure flags read from deps/freerdp.lock (expected >= 20) — refusing to treat a suspiciously short list as a passing check"
-	log "THIRD_PARTY_NOTICES.md and LGPL_RELINK.md both reproduce all $FLAGS_CHECKED locked FFmpeg configure flags"
+
+	# --- Reverse direction: each document's block may contain nothing else ----------------
+	assert_no_extra_flags() {
+		# $1 = that document's token set, $2 = label, $3 = newline-delimited allowed extra
+		# flag NAMES (the part before '='), $4 = why those extras are legitimate.
+		local tokens="$1" label="$2" allowed="$3" why="$4"
+		local token name extra_count=0 token_count=0
+		while IFS= read -r token; do
+			[ -n "$token" ] || continue
+			token_count=$((token_count + 1))
+			if printf '%s\n' "$LOCKED_FLAGS_RESOLVED" | grep -cxF -e "$token" >/dev/null; then
+				continue
+			fi
+			name="${token%%=*}"
+			if [ -n "$allowed" ] && printf '%s\n' "$allowed" | grep -cxF -e "$name" >/dev/null; then
+				extra_count=$((extra_count + 1))
+				continue
+			fi
+			die "$label documents FFmpeg configure flag '$token', which is NOT in deps/freerdp.lock .ffmpeg.configure_flags.
+A document may not claim the shipped library was built with a flag it was not built with:
+in THIRD_PARTY_NOTICES.md that is a false licence statement about a binary we redistribute
+(e.g. '--enable-gpl'), and in LGPL_RELINK.md it yields a replacement library that differs
+from the one it is meant to replace. Either add the flag to the lock (and to
+Scripts/build-ffmpeg.sh, which cross-checks it) or remove it from the document."
+		done <<<"$tokens"
+		# `${extra_count:+...}` would fire on the string "0" (it tests for non-empty, not
+		# non-zero), so branch on the value explicitly.
+		if [ "$extra_count" -gt 0 ]; then
+			log "  $label block: $token_count token(s) = $FLAGS_CHECKED locked + $extra_count allowed extra ($why)"
+		else
+			log "  $label block: $token_count token(s) = $FLAGS_CHECKED locked, no extras"
+		fi
+	}
+
+	# Allowed extras, enumerated explicitly rather than pattern-matched. Only LGPL_RELINK.md
+	# has any: its block is a runnable `./configure` invocation, so it must also pass a
+	# --prefix, which deps/freerdp.lock deliberately does not record (Scripts/build-ffmpeg.sh
+	# supplies a throwaway placeholder prefix that is relocated after install, and the user's
+	# own prefix is theirs to choose). The deployment-target flags are NOT extras — they are
+	# locked, just with a '<computed: ...>' placeholder resolved above.
+	assert_no_extra_flags "$NOTICES_FLAG_TOKENS" "THIRD_PARTY_NOTICES.md" "" ""
+	assert_no_extra_flags "$RELINK_FLAG_TOKENS" "LGPL_RELINK.md" "--prefix" "--prefix, chosen by the user running the §6 procedure"
+	log "FFmpeg configure flags: both documents' delimited blocks are set-equal to the $FLAGS_CHECKED flags in deps/freerdp.lock (prose outside the blocks is not consulted in either direction; LGPL_RELINK.md additionally documents the allowed extra --prefix)"
 
 	# --- Licence posture re-verified on the SHIPPED dylib -------------------------------
 	# Scripts/build-ffmpeg.sh already asserts this on what it builds, but that is a

@@ -90,6 +90,8 @@ These are the exact flags Macdows' own build uses (`Scripts/build-ffmpeg.sh`,
 Reproducing them gives you drop-in-compatible libraries. You may of course change them —
 just keep `--enable-shared`, `--install-name-dir=@rpath`, and the same major versions.
 
+<!-- BEGIN ffmpeg-configure-flags -->
+
 ```sh
 ./configure \
   --prefix="$HOME/ffmpeg-relink/out" \
@@ -121,7 +123,11 @@ just keep `--enable-shared`, `--install-name-dir=@rpath`, and the same major ver
   --arch=arm64 \
   --extra-cflags=-mmacosx-version-min=14.0 \
   --extra-ldflags=-mmacosx-version-min=14.0
+```
 
+<!-- END ffmpeg-configure-flags -->
+
+```sh
 make -j"$(sysctl -n hw.ncpu)"
 make install
 ```

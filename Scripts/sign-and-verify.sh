@@ -20,7 +20,7 @@ NOTARY_PROFILE="macdows"
 
 usage() {
 	cat <<EOF
-Usage: $(basename "$0") [--identity "<signing identity>"] [--offline] <path-to-.app>
+Usage: $(basename "$0") [--identity "<signing identity>"] [--offline] [--release] <path-to-.app>
 
 Env:
   CRDP_SIGN_IDENTITY   codesign identity, same effect as --identity (--identity wins if
@@ -30,6 +30,21 @@ Env:
             and skip the notarization step (which requires network access anyway). Use
             for local iteration without network access; the default (online) is what
             ships.
+
+--release   declare that this bundle is a distributable artifact, and enforce the checks
+            that only make sense for one. Currently: the app must NOT carry the
+            com.apple.security.get-task-allow entitlement (arbitrary debugger attachment
+            -> live RDP credentials and session keys readable by any local process); with
+            --release that is a hard failure instead of a note.
+            THIS IS THE MODE THE RELEASE CHECKLIST USES. Run it against every artifact you
+            intend to ship. Without the flag the script stays lenient, so the ordinary
+            local Debug loop is unaffected.
+            Deliberately an explicit declaration rather than something inferred from the
+            bundle: macOS app bundles carry no trustworthy build-configuration marker
+            (a Debug and a Release Macdows.app have byte-identical Info.plists, verified),
+            and inferring it from the path — as an earlier version did, with
+            [[ \$APP_PATH == */Debug/* ]] — silently downgrades the check for a genuine
+            Release artifact that merely happens to sit under a directory named Debug.
 
 Notarization is automatic, not opt-in: this script probes
 'xcrun notarytool history --keychain-profile $NOTARY_PROFILE' after signing. If that
@@ -44,12 +59,17 @@ EOF
 
 IDENTITY_OVERRIDE=""
 OFFLINE=0
+RELEASE=0
 APP_PATH=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 	-h | --help)
 		usage
 		exit 0
+		;;
+	--release)
+		RELEASE=1
+		shift
 		;;
 	--identity)
 		[ $# -ge 2 ] || die "--identity requires a value"
@@ -177,11 +197,21 @@ log "Signature verification: OK"
 # --offline path — so this is the earlier, always-on gate.)
 #
 # Why here and not in Scripts/gen-notices.sh: this is a *release* property, not a licence
-# property, and this script is the release gate — it is already the one place that models
-# the Debug-vs-release distinction (see the notarization skip below, same $APP_PATH test).
-# gen-notices.sh is deliberately run against Debug bundles as routine verification, so a
-# hard failure there would break the normal development loop for a condition that is correct
-# and expected in Debug. Here, Debug gets a warning and release gets a hard failure.
+# property, and this script is the release gate. gen-notices.sh is deliberately run against
+# Debug bundles as routine verification, so a hard failure there would break the normal
+# development loop for a condition that is correct and expected in Debug.
+#
+# The Debug-vs-release distinction is taken from the explicit --release flag, NOT inferred.
+# An earlier version tested [[ "$APP_PATH" == */Debug/* ]], which is unsound in the one
+# direction that matters: a genuine Release artifact staged, copied, or archived under any
+# directory whose name happens to contain "Debug" would silently downgrade the only check
+# standing between a debugger entitlement and a shipped build. There is no trustworthy
+# in-bundle alternative either — a Debug and a Release Macdows.app have byte-identical
+# Info.plists (verified by diffing them), and the Debug-only Contents/MacOS/*.debug.dylib
+# is an artifact of the ENABLE_DEBUG_DYLIB build setting rather than of the configuration,
+# so it can be toggled independently and is not a sound signal. Declaring the intent at the
+# call site is the only honest option: it fails closed for anyone who says --release, and
+# leaves the default lenient so routine local signing is unaffected.
 GTA_ENTITLEMENT="com.apple.security.get-task-allow"
 GTA_PLIST="$(mktemp -t macdows-gta-check).plist"
 HAS_GET_TASK_ALLOW=0
@@ -193,15 +223,16 @@ fi
 rm -f "$GTA_PLIST"
 
 if [ "$HAS_GET_TASK_ALLOW" -eq 1 ]; then
-	if [[ "$APP_PATH" == */Debug/* ]]; then
-		log "NOTE: $GTA_ENTITLEMENT is present — expected for a Debug-configuration build, and harmless locally. A Release build carrying it is a hard failure here."
-	else
-		die "$GTA_ENTITLEMENT is present on $APP_PATH.
+	if [ "$RELEASE" -eq 1 ]; then
+		die "$GTA_ENTITLEMENT is present on $APP_PATH, which was signed with --release.
 This entitlement permits arbitrary debugger attachment (memory read/write) and must never
 ship: for Macdows that means live RDP credentials and session keys are readable by any
-local process. It is added automatically to Debug builds and preserved across re-signing.
-Build with -configuration Release (or strip the entitlement) before signing for distribution."
+local process. Xcode injects it whenever signing looks development-style (including the
+ad-hoc default identity) and this script preserves existing entitlements across re-signing.
+Build with -configuration Release — App/project.yml sets CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO
+there specifically to keep it out — or strip the entitlement before signing."
 	fi
+	log "NOTE: $GTA_ENTITLEMENT is present. Expected for a Debug-configuration build and harmless locally; pass --release to make it a hard failure (the release checklist does)."
 else
 	log "No $GTA_ENTITLEMENT entitlement on the signed bundle"
 fi
@@ -311,6 +342,17 @@ elif [[ "$APP_PATH" == */Debug/* ]] && [ "${SIGN_AND_VERIFY_FORCE_NOTARIZE:-0}" 
 	# Debug builds are local-iteration artifacts; auto-submitting each one to the notary
 	# service is pure waste (recorded debt from the W4a review round). Release paths keep
 	# the automatic flow; SIGN_AND_VERIFY_FORCE_NOTARIZE=1 overrides deliberately.
+	#
+	# This one keeps the path heuristic on purpose, unlike the get-task-allow gate above.
+	# The two fail in opposite directions: a wrongly-skipped notarization is loud and
+	# self-correcting (the artifact simply is not stapled, and Gatekeeper says so on the
+	# first machine that runs it), whereas a wrongly-downgraded entitlement check ships a
+	# debuggable binary and nothing ever tells you. Tying an automatic submission to the
+	# Apple notary service to a flag would also make --release cause network activity as a
+	# side effect, which is a surprise this script should not spring.
+	if [ "$RELEASE" -eq 1 ]; then
+		log "WARNING: --release was given but this path is under a /Debug/ directory, so automatic notarization is still being skipped. If this artifact really is for distribution, re-run with SIGN_AND_VERIFY_FORCE_NOTARIZE=1 (or from a non-Debug path)."
+	fi
 	log "Debug build path detected — skipping automatic notarization (set SIGN_AND_VERIFY_FORCE_NOTARIZE=1 to override)"
 else
 	log "Checking for stored notarization credentials (keychain profile: $NOTARY_PROFILE)"
