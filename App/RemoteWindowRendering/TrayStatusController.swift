@@ -77,6 +77,13 @@ final class TrayStatusController {
     /// discipline as `createsSeen`/`updatesSeen`/`deletesSeen` above and for the same reason
     /// (a post-shutdown diagnostics read must still see real per-session totals).
     private(set) var iconSkippedCount = 0
+    /// The subset of `iconSkippedCount` whose cause was the deferred CACHED_ICON variant
+    /// (adr/0013 §2) — split out (R1 finding 3) because the first live run showed real
+    /// Win11 sessions re-send their own tray icons as cache references routinely, so an
+    /// acceptance gate that lumps this deferred-protocol evidence in with genuine
+    /// converter/store failures fails correct sessions. Cumulative, same discipline as
+    /// `iconSkippedCount` above.
+    private(set) var cachedIconCount = 0
     /// R1 finding 2: the maximum `realIconKeys.count` ever reached -- latched exactly, at
     /// the moment a real bitmap is installed in `upsertStatusItem`, NOT timer-sampled (a
     /// create+delete pair landing inside one drain batch is invisible to any poll, and the
@@ -131,6 +138,11 @@ final class TrayStatusController {
         let realIconCount: Int
         /// Cumulative; see `iconSkippedCount`'s own doc comment.
         let iconSkippedCount: Int
+        /// Cumulative; the CACHED_ICON subset of `iconSkippedCount` (R1 finding 3) — an
+        /// acceptance gate asserts `iconSkippedCount - cachedIconCount == 0` (no NON-cached
+        /// skips) and reports this one as deferred-protocol evidence (adr/0013 §2:
+        /// "出现即有计数证据"), never as a failure.
+        let cachedIconCount: Int
         /// Cumulative; see `realIconMaxObserved`'s own doc comment (R1 finding 2: the exact,
         /// latched form of the real-bitmap evidence `realIconCount` only shows while alive).
         let realIconMaxObserved: Int
@@ -142,7 +154,8 @@ final class TrayStatusController {
         Diagnostics(
             createsSeen: createsSeen, updatesSeen: updatesSeen, deletesSeen: deletesSeen,
             liveCount: statusItems.count, realIconCount: realIconKeys.count,
-            iconSkippedCount: iconSkippedCount, realIconMaxObserved: realIconMaxObserved,
+            iconSkippedCount: iconSkippedCount, cachedIconCount: cachedIconCount,
+            realIconMaxObserved: realIconMaxObserved,
             storeOverflowCount: storeOverflowCount
         )
     }
@@ -169,11 +182,15 @@ final class TrayStatusController {
         /// Distinct from `rgba == nil` alone (which also covers "no icon was sent"), and the
         /// only one of the two worth counting as evidence.
         let skipped: Bool
+        /// `iconSkipped`'s cause was specifically the deferred CACHED_ICON variant (always
+        /// accompanied by `skipped == true`) — see `cachedIconCount`'s doc comment for why
+        /// this cause is counted apart (R1 finding 3).
+        let cached: Bool
         /// `NOTIFY_ICON_STATE_ORDER.toolTip`, or `nil` when the order didn't carry the
         /// `WINDOW_ORDER_FIELD_NOTIFY_TIP` bit.
         let toolTip: String?
 
-        static let absent = IconPayload(rgba: nil, width: 0, height: 0, skipped: false, toolTip: nil)
+        static let absent = IconPayload(rgba: nil, width: 0, height: 0, skipped: false, cached: false, toolTip: nil)
     }
 
     /// A `NotifyIconCreate` order. `ownerWindowTitle` is whatever `RemoteWindowRegistry`
@@ -266,8 +283,9 @@ final class TrayStatusController {
         let key = NotifyIconState(windowId: windowId, notifyIconId: notifyIconId)
         if icon.skipped {
             iconSkippedCount += 1
+            if icon.cached { cachedIconCount += 1 }
             Self.logger.info(
-                "notify icon windowId=\(windowId, privacy: .public) notifyIconId=\(notifyIconId, privacy: .public) carried an icon this client refused (adr/0013 §2 iconSkipped) -- showing the placeholder instead"
+                "notify icon windowId=\(windowId, privacy: .public) notifyIconId=\(notifyIconId, privacy: .public) carried an icon this client refused (adr/0013 §2 iconSkipped, cached=\(icon.cached, privacy: .public)) -- showing the placeholder instead"
             )
         }
         let item: NSStatusItem

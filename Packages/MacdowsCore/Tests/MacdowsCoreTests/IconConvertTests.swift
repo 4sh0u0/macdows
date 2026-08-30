@@ -689,7 +689,9 @@ struct IconStoreTests {
 struct NotifyIconPayloadTests {
     @Test("adr/0013 §1: the grown notify-icon payload stays well under the union's largest member")
     func notifyIconStaysSmallerThanWindowOrder() {
-        #expect(MemoryLayout<crdpq_notify_icon_t>.size == 272)
+        // 276 after the R1-finding-3 iconCached append (was 272; crdpq.h's own assert
+        // comment carries the arithmetic).
+        #expect(MemoryLayout<crdpq_notify_icon_t>.size == 276)
         #expect(MemoryLayout<crdpq_window_order_t>.size == 572)
         #expect(MemoryLayout<crdpq_event_payload_t>.size == 576)
         #expect(MemoryLayout<CrdpEvent>.size == 584)
@@ -709,6 +711,7 @@ struct NotifyIconPayloadTests {
         ev.payload.notifyIcon.hasIconSlot = 1
         ev.payload.notifyIcon.iconSlot = 9
         ev.payload.notifyIcon.iconSkipped = 0
+        ev.payload.notifyIcon.iconCached = 1
         ev.payload.notifyIcon.toolTipPresent = 1
         let tip = "Remote tray icon"
         tip.withCString { c in
@@ -733,6 +736,7 @@ struct NotifyIconPayloadTests {
         #expect(seen.hasIconSlot == 1)
         #expect(seen.iconSlot == 9)
         #expect(seen.iconSkipped == 0)
+        #expect(seen.iconCached == 1)
         #expect(seen.toolTipPresent == 1)
         var copy = seen.toolTip
         let text = withUnsafeBytes(of: &copy.bytes) { raw in

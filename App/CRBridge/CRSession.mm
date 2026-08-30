@@ -65,6 +65,7 @@
 @property (nonatomic) uint32_t iconWidth;
 @property (nonatomic) uint32_t iconHeight;
 @property (nonatomic) BOOL iconSkipped;
+@property (nonatomic) BOOL iconCached;
 @property (nonatomic) uint32_t fieldFlags;
 @property (nonatomic) NSString *title;
 @property (nonatomic) int32_t offsetX;
@@ -210,6 +211,7 @@ static CRDPEvent *CRDPEventFromCrdpEvent(const CrdpEvent *ev, crdpq_icon_store_t
             out.windowId = ni->windowId;
             out.notifyIconId = ni->notifyIconId;
             out.iconSkipped = ni->iconSkipped ? YES : NO;
+            out.iconCached = ni->iconCached ? YES : NO;
             /* adr/0013 §1: toolTipPresent distinguishes "the order didn't mention the
              * tooltip" from "the order set it to the empty string" -- the property stays
              * nil in the first case (see CRSession.h), so a delta-merging consumer can keep
@@ -700,10 +702,13 @@ static BOOL crb_notify_icon_common(rdpContext *context, const WINDOW_ORDER_INFO 
     {
         /* adr/0013 §2: the CACHED_ICON variant (a cacheId/cacheEntry reference into an icon
          * cache this client never populates) is deliberately deferred -- implementing the
-         * cache protocol is expensive and no sample has ever shown this path. Counted as a
-         * skip rather than silently ignored, so its first real occurrence produces evidence
-         * instead of a mystery placeholder. */
+         * cache protocol is expensive. Counted as a skip rather than silently ignored, and
+         * ALSO flagged iconCached (R1 finding 3): the first live run showed real Win11
+         * sessions re-send their own tray icons as cache references routinely, so an
+         * acceptance gate must be able to tell this deferred-protocol evidence apart from
+         * a genuine converter/store failure. */
         ev.payload.notifyIcon.iconSkipped = 1;
+        ev.payload.notifyIcon.iconCached = 1;
         WLog_WARN(TAG,
                   "NotifyIcon windowId=%" PRIu32 " notifyIconId=%" PRIu32
                   ": CACHED_ICON variant (cacheId=%" PRIu32 " cacheEntry=%" PRIu32

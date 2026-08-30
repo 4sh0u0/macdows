@@ -3149,19 +3149,24 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // before shutdown and a poll could miss a same-batch create+delete), a skip
         // (any of iconSkipped's three causes), or a store overflow (slot accounting broke).
         if trayScenarioEnabled {
-            print("[tray] realIconMaxObserved=\(trayDiag.realIconMaxObserved) iconSkipped=\(trayDiag.iconSkippedCount) storeOverflow=\(trayDiag.storeOverflowCount)")
+            print("[tray] realIconMaxObserved=\(trayDiag.realIconMaxObserved) iconSkipped=\(trayDiag.iconSkippedCount) cachedIcon=\(trayDiag.cachedIconCount) storeOverflow=\(trayDiag.storeOverflowCount)")
             check(trayDiag.createsSeen >= 1, "tray scenario saw at least one NotifyIconCreate (got creates=\(trayDiag.createsSeen))")
             check(
                 trayDiag.realIconMaxObserved >= 1,
                 "at least one NSStatusItem displayed the REAL remote icon bitmap while alive (adr/0013 acceptance) (realIconMaxObserved=\(trayDiag.realIconMaxObserved))"
             )
-            // R1 finding 3: iconSkipped conflates three causes -- converter rejection,
-            // side-store slot exhaustion, and the deferred CACHED_ICON variant (adr/0013
-            // §2) -- so a red here says "an icon on the wire never became a bitmap", and
-            // WHICH cause needs the bridge log line / storeOverflow counter to pin down.
+            // R1 finding 3, sharpened by the first live run: real Win11 sessions re-send
+            // their own tray icons as CACHED_ICON references routinely, so the deferred
+            // cache path (adr/0013 §2 -- counted evidence, not a failure) must be excluded
+            // here or this gate fails every correct real-world session. What must be zero
+            // is the NON-cached remainder: genuine converter rejections and store
+            // exhaustion.
+            if trayDiag.cachedIconCount > 0 {
+                print("[info] tray: \(trayDiag.cachedIconCount) CACHED_ICON reference(s) observed -- deferred protocol path, counted as evidence per adr/0013 §2, not gated")
+            }
             check(
-                trayDiag.iconSkippedCount == 0,
-                "no wire icon was skipped (converter rejection, store exhaustion, or a CACHED_ICON reference -- all three count here; got iconSkipped=\(trayDiag.iconSkippedCount))"
+                trayDiag.iconSkippedCount - trayDiag.cachedIconCount == 0,
+                "no wire icon was skipped for a NON-cached cause (converter rejection or store exhaustion; got iconSkipped=\(trayDiag.iconSkippedCount) of which cached=\(trayDiag.cachedIconCount))"
             )
             check(trayDiag.storeOverflowCount == 0, "icon store never overflowed (got storeOverflow=\(trayDiag.storeOverflowCount))")
         }
@@ -3172,7 +3177,14 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // condition, not a failure. The input test's own assertion further down is what
         // actually gates this mode; this generic check was never designed with "the target
         // window's own successful closure empties the whole session" in mind.
-        if inputTestMode == nil {
+        if trayScenarioEnabled && visibleWindows.isEmpty {
+            // First live tray run (2026-08-31): a pure tray driver hosted by Windows
+            // Terminal produced ZERO RAIL windows while its notification icon worked
+            // perfectly -- which is the very point of a tray app. The tray gates above are
+            // this scenario's own acceptance; requiring a visible window here would fail
+            // the run for its subject behaving exactly as designed.
+            print("[info] tray scenario with zero visible windows -- a windowless tray driver is legitimate; skipping the generic visible-RemoteWindow check")
+        } else if inputTestMode == nil {
             check(!visibleWindows.isEmpty, "at least one visible RemoteWindow (got \(visibleWindows.count))")
             // Phase 1 acceptance: with extra apps launched into the same session, N NEW
             // visible content windows (windowIds not present at exec time) must have
@@ -3949,6 +3961,12 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // tracked for any reason) keeps the unconditional, strict check below.
             print("[info] input test passed and left zero tracked windows (its target was the only one) -- "
                 + "skipping the generic \"at least one window has non-nil layer.contents\" check")
+        } else if trayScenarioEnabled && snapshots.isEmpty {
+            // Same reasoning as the visible-RemoteWindow exemption above: a pure tray
+            // driver legitimately produces zero windows (first live run: Windows-Terminal-
+            // hosted PowerShell, working icon, no RAIL window) -- the tray gates are this
+            // scenario's own content assertions.
+            print("[info] tray scenario with zero tracked windows -- skipping the generic layer.contents check")
         } else {
             check(
                 withContent > 0,

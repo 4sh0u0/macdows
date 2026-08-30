@@ -890,6 +890,7 @@ final class RemoteWindowRegistry {
             width: Int(event.iconWidth),
             height: Int(event.iconHeight),
             skipped: event.iconSkipped,
+            cached: event.iconCached,
             toolTip: event.toolTip
         )
     }

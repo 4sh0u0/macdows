@@ -266,7 +266,14 @@ typedef struct {
  *    transcoded to UTF-8 and truncated through `crdpq_text_set`, exactly like
  *    `crdpq_window_order_t.title`. `toolTipPresent` is 0 when the order's
  *    `WINDOW_ORDER_FIELD_NOTIFY_TIP` bit was absent — a distinct state from "present but
- *    empty", which a delta-merging consumer needs in order to keep a prior tooltip. */
+ *    empty", which a delta-merging consumer needs in order to keep a prior tooltip.
+ *  - `iconCached`: 1 iff this order's skip cause was specifically the deferred CACHED_ICON
+ *    variant (a cacheId/cacheEntry reference, adr/0013 §2) — always accompanied by
+ *    `iconSkipped == 1`. Split out (R1 review finding 3, confirmed live 2026-08-31: real
+ *    Win11 sessions re-send their own tray icons as cache references as a matter of
+ *    course) so a consumer can count deferred-protocol evidence separately from genuine
+ *    converter/store failures — the two demand opposite reactions from an acceptance
+ *    gate. Appended per adr/0008 §5's append-only rule. */
 typedef struct {
     uint32_t windowId;
     uint32_t notifyIconId;
@@ -275,15 +282,18 @@ typedef struct {
     uint8_t iconSkipped;
     uint8_t toolTipPresent;
     crdpq_text_t toolTip;
+    uint8_t iconCached;
 } crdpq_notify_icon_t;
 
 /* adr/0008 §5 / adr/0013 §1: measured (not estimated) with clang/arm64 — same discipline as
  * crdpq_window_order_t's own assert comment above. 12 bytes of scalars + crdpq_text_t's 260
  * (256 + uint16_t length + bool truncated, padded to the text struct's own 2-byte alignment)
- * = 272; up from 8 bytes before this ADR. Deliberately well under crdpq_window_order_t's 572
- * — adr/0013 §1's whole "pixels go to a side store, the event carries a reference" decision
- * exists to keep this event type from becoming the union's largest member. */
-_Static_assert(sizeof(crdpq_notify_icon_t) == 272, "crdpq_notify_icon_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0013 §1)");
+ * + iconCached's 1 byte, rounded up to the struct's 4-byte alignment = 276 (was 272 before
+ * the R1-finding-3 iconCached append, 8 before this ADR). Deliberately well under
+ * crdpq_window_order_t's 572 — adr/0013 §1's whole "pixels go to a side store, the event
+ * carries a reference" decision exists to keep this event type from becoming the union's
+ * largest member. */
+_Static_assert(sizeof(crdpq_notify_icon_t) == 276, "crdpq_notify_icon_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0013 §1)");
 
 /** adr/0008 §2a: upper bound on `crdpq_monitored_desktop_t.windowIds`. The protocol's own
  *  hard ceiling is 255 (window.c:1068, a `Stream_Read_UINT8` -- genuinely 1 byte, unlike

@@ -88,6 +88,13 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// contract applies — the consumer shows its placeholder and counts this; it is evidence
 /// that a real icon existed and was dropped, which a plain `iconRGBA == nil` can't express.
 @property (nonatomic, readonly) BOOL iconSkipped;
+/// NotifyIconCreate/Update only. `YES` iff `iconSkipped`'s cause was specifically the
+/// deferred CACHED_ICON variant (a cacheId/cacheEntry reference, adr/0013 §2) — always
+/// accompanied by `iconSkipped == YES`. Split out (R1 review finding 3, confirmed live:
+/// real Win11 sessions re-send their own tray icons as cache references routinely) so a
+/// consumer can count deferred-protocol evidence separately from genuine converter/store
+/// failures.
+@property (nonatomic, readonly) BOOL iconCached;
 /// WindowCreate/Update.fieldFlags; MonitoredDesktop.fieldFlags. Gates which of
 /// offsetX/offsetY (together), width/height (together), and show below are actually
 /// meaningful for a given WindowUpdate — an unset bit means "unchanged from this window's
