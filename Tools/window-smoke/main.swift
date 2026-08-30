@@ -290,6 +290,16 @@ let popupScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_POP
 /// carried since adr/0010 §5.
 let popupSamplesTotal = max(1, Int(ProcessInfo.processInfo.environment["WINDOW_SMOKE_POPUP_SAMPLES"] ?? "") ?? 1)
 
+/// adr/0013 acceptance (W6 long tail, "托盘真图标"): when set, this run is expected to be
+/// pointed (via `WINDOW_SMOKE_APP`/`WINDOW_SMOKE_APP_ARGS`) at a program that creates at
+/// least one notification-area icon -- the lab's PowerShell NotifyIcon driver -- and
+/// `finish()` then gates on the REAL icon bitmap having been displayed: because the driver
+/// disposes its icon before this harness shuts down (so the existing create−delete formula
+/// gate above can see the whole lifecycle), the live `realIconCount` at finish() time is
+/// legitimately 0 again -- the acceptance evidence is therefore the MAXIMUM observed while
+/// the icon was alive, sampled once per tick below, not the final value.
+let trayScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_TRAY"] == "1"
+
 /// MS-RDPERP `TS_RAIL_ORDER_SYSCOMMAND` `SC_*` values -- duplicated here from
 /// `App/RemoteWindowRendering/RemoteWindowRegistry.swift`'s own `SysCommand` enum (itself
 /// verified against `ThirdParty/FreeRDP/include/freerdp/rail.h:126-133`), matching this
@@ -1231,6 +1241,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         runMaximizeScenario(session: session, registry: registry)
         runMoveResizeScenario(session: session, registry: registry)
         runPopupScenario(session: session, registry: registry)
+        sampleTrayDiagnostics(registry: registry)
 
         // Phase 1 acceptance: launch the extra apps once the first app's own window has
         // had time to settle -- several ClientExecutes on one live connection is exactly
@@ -1327,6 +1338,18 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// its per-window pixel anchors are single-connection semantics; what this mode
     /// gates is the reconnect protocol surviving N round trips without a hang, an unclean
     /// shutdown, or runaway memory.
+    /// adr/0013 acceptance sampling (`WINDOW_SMOKE_TRAY=1`): the real-bitmap evidence is
+    /// transient -- the lab driver disposes its icon before shutdown so the create−delete
+    /// formula gate can observe the whole lifecycle -- so the maximum live `realIconCount`
+    /// is captured here, once per tick, while the icon exists. Cheap (one struct read) and
+    /// deliberately unconditional on scenario state: an icon appearing at ANY point of a
+    /// tray run counts, exactly like the wire counters it sits next to.
+    private var trayRealIconMaxObserved = 0
+    private func sampleTrayDiagnostics(registry: RemoteWindowRegistry) {
+        guard trayScenarioEnabled else { return }
+        trayRealIconMaxObserved = max(trayRealIconMaxObserved, registry.trayDiagnostics().realIconCount)
+    }
+
     private func tickCycles(session: CRSession, registry: RemoteWindowRegistry) {
         guard let deadline = cycleDeadline, let startedAt = cycleStartedAt else { return }
         let seconds = Date().timeIntervalSince(startedAt)
@@ -3107,10 +3130,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // The count==create−delete assertion itself is gated ONLY when this session actually
         // saw >=1 notify-icon event at all -- most scenarios this harness runs (winver, Word,
         // Edge, popups) never trigger a systray icon, and asserting 0==0−0 on a session that
-        // never exercised this path would be a vacuous pass, not real evidence. No scenario in
-        // this harness currently launches a tray-icon-bearing app (adr/0012 §4.7: host
-        // degraded, live tray verification deferred), so this line is expected to print all
-        // zeros and stay ungated on every run until such a scenario exists.
+        // never exercised this path would be a vacuous pass, not real evidence. On a run
+        // that IS pointed at a tray-icon-bearing program, `WINDOW_SMOKE_TRAY=1` (below)
+        // additionally turns "nothing ever appeared" into a hard failure -- this formula
+        // gate alone stays conditional so every OTHER scenario keeps printing zeros
+        // ungated, exactly as before.
         let trayDiag = registry.trayDiagnostics()
         print("[tray] creates=\(trayDiag.createsSeen) updates=\(trayDiag.updatesSeen) deletes=\(trayDiag.deletesSeen) liveCount=\(trayDiag.liveCount)")
         if trayDiag.createsSeen > 0 || trayDiag.updatesSeen > 0 || trayDiag.deletesSeen > 0 {
@@ -3118,6 +3142,24 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 trayDiag.liveCount == trayDiag.createsSeen - trayDiag.deletesSeen,
                 "NSStatusItem count == create−delete (phase2.md §4 W6 acceptance) (got liveCount=\(trayDiag.liveCount) creates=\(trayDiag.createsSeen) deletes=\(trayDiag.deletesSeen))"
             )
+        }
+        // adr/0013 acceptance (WINDOW_SMOKE_TRAY=1): the run was pointed at a tray-icon-
+        // bearing program, so "no icon ever appeared" is a FAILURE here, not the vacuous-
+        // pass case the formula gate above deliberately stays silent on. Four separate
+        // checks so a red run says which stage broke: no create at all (driver/launch
+        // problem), created but never showed a REAL bitmap (adr/0013's actual claim --
+        // conversion or payload path broke, `trayRealIconMaxObserved` is tick-sampled
+        // because the driver disposes before shutdown), a skip (converter rejected the
+        // payload), or a store overflow (slot accounting broke).
+        if trayScenarioEnabled {
+            print("[tray] realIconMaxObserved=\(trayRealIconMaxObserved) iconSkipped=\(trayDiag.iconSkippedCount) storeOverflow=\(trayDiag.storeOverflowCount)")
+            check(trayDiag.createsSeen >= 1, "tray scenario saw at least one NotifyIconCreate (got creates=\(trayDiag.createsSeen))")
+            check(
+                trayRealIconMaxObserved >= 1,
+                "at least one NSStatusItem displayed the REAL remote icon bitmap while alive (adr/0013 acceptance) (max observed realIconCount=\(trayRealIconMaxObserved))"
+            )
+            check(trayDiag.iconSkippedCount == 0, "no icon payload was skipped/rejected by the converter (got iconSkipped=\(trayDiag.iconSkippedCount))")
+            check(trayDiag.storeOverflowCount == 0, "icon store never overflowed (got storeOverflow=\(trayDiag.storeOverflowCount))")
         }
 
         // W4c: skip when an input test is active -- a *successful* click/Enter can
