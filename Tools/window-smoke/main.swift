@@ -1683,6 +1683,14 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// Experiment 1 (W4b review round 2): t=6s sample, t=8s ClientActivate, t=20s sample --
     /// see `activateExperimentWindowId`'s own doc comment.
     private func runActivateExperiment(elapsed: TimeInterval, session: CRSession, registry: RemoteWindowRegistry) {
+        // Scripted-input scenarios suppress this legacy W4b experiment outright: its t=20s
+        // ClientActivate moves SERVER focus, and keyboard input is focus-addressed on the
+        // wire (adr/0012 §2) -- the first cmdmap-live host run (2026-08-31) caught exactly
+        // this race, the activate firing between the script's Cmd+V and Cmd+S so the save
+        // chord landed in the experiment's About window and the file round-trip failed
+        // (adr/0011 §5 item 5). An experiment must never steal focus from an acceptance
+        // scenario sharing the run.
+        if cmdMapLiveActive || inputTestMode == .ime || unicodeDegradeScenarioEnabled { return }
         if activateExperimentWindowId == nil {
             if let w = registry.windowSnapshots().first(where: { snap in
                 snap.isVisible
