@@ -1,4 +1,5 @@
 import AppKit
+import MacdowsCore
 
 // M1 (W4b review): explicit @MainActor, matching App/RemoteWindowRendering's own classes --
 // without it, none of this class's methods (connectTapped, a button target-action; drainTick,
@@ -24,6 +25,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	private var registry: RemoteWindowRegistry?
 	private var drainTimer: Timer?
 	private var eventCount: Int = 0
+	/// True between the Connect press and the boundary gate's verdict. `session` is still nil
+	/// across that window, so it cannot serve as the "already busy" flag on its own.
+	private var isCheckingBoundary = false
 
 	func applicationDidFinishLaunching(_ notification: Notification) {
 		// Proves the Swift app actually links through CRBridge into the vendored
@@ -77,20 +81,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	}
 
 	@objc private func connectTapped() {
-		guard session == nil else {
+		// `isCheckingBoundary` as well as `session`: the boundary check below is asynchronous,
+		// and during its window `session` is still nil, so this guard alone would let a second
+		// press start a second check. The button is disabled synchronously before the Task for
+		// the same reason (AppKit delivers actions serially on the main actor, so a disable that
+		// happens before this method returns cannot be raced).
+		guard session == nil, !isCheckingBoundary else {
 			statusLabel.stringValue = "Already connecting/connected."
 			return
 		}
 
-		guard let env = try? String(contentsOfFile: NSHomeDirectory() + "/.config/macdows/host.env", encoding: .utf8) else {
+		// MacdowsCore.EnvFile, not the inline loop this method used to carry. That loop keyed
+		// each line on everything left of the first `=`, so the ordinary line
+		// `export WIN_HOST=x` was filed under the key "export WIN_HOST" and was invisible to
+		// the lookup right below it -- and it stripped no quotes, so `WIN_HOST="x"` dialled a
+		// host whose name included the quote characters. Both defects were duplicated verbatim
+		// in Tools/window-smoke, and both disagreed with the rules
+		// Scripts/run-window-smoke.command applies to the same file; EnvFile's own doc comment
+		// records how that disagreement was measured fail-open. One parser now, in the package
+		// that has a test bundle (this target has none).
+		let values: [String: String]
+		do {
+			values = try EnvFile.parse(path: NSHomeDirectory() + "/.config/macdows/host.env")
+		} catch {
 			statusLabel.stringValue = "Could not read ~/.config/macdows/host.env"
 			return
-		}
-		var values: [String: String] = [:]
-		for line in env.split(separator: "\n") {
-			let trimmed = line.trimmingCharacters(in: .whitespaces)
-			guard !trimmed.isEmpty, !trimmed.hasPrefix("#"), let eq = trimmed.firstIndex(of: "=") else { continue }
-			values[String(trimmed[trimmed.startIndex..<eq])] = String(trimmed[trimmed.index(after: eq)...])
 		}
 		guard let host = values["WIN_HOST"], let user = values["WIN_USER"], let pass = values["WIN_PASS"],
 			!host.isEmpty, !user.isEmpty, !pass.isEmpty
@@ -99,6 +114,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			return
 		}
 
+		// Live-host testing boundary gate (owner rule, 2026-08-31), the in-process mirror of
+		// Scripts/lib.sh's crdp_assert_lab_boundary. Pressing Connect used to build a CRSession
+		// straight from host.env with nothing between the button and the socket -- the shell
+		// gate can only guard steps that go through a shell, and this one never did.
+		//
+		// Unconditional, NOT #if DEBUG. This app is a developer harness today, and gating only
+		// Debug builds would mean the one configuration a stray Release build runs in is the
+		// ungated one. When the product shell replaces this scaffold it will have to revisit
+		// this: a shipped Macdows obviously must connect to hosts that are not the maintainer's
+		// own lab, so the gate belongs to the harness, not to the product, and removing it is a
+		// deliberate act at that point rather than an omission now.
+		//
+		// The refusal line names the host (the operator typed it into host.env and is looking
+		// at the label) and a reason category. It can never contain a boundary segment -- see
+		// LabBoundary's doc comment, and the no-leak test that sweeps the whole refusal
+		// vocabulary.
+		//
+		// Off the main actor, because the gate can block: a WIN_HOST that is a *name* rather
+		// than a numeric literal sends LabBoundary into getaddrinfo, which is synchronous and
+		// can take seconds (much longer for a dead .local). Running that on the main actor
+		// would beachball the UI on the one press that is supposed to feel instant --
+		// CRSession.start explicitly "returns immediately" and connects on its own thread, so
+		// before this gate existed nothing on this path blocked at all, and it must stay that
+		// way. A literal host short-circuits inside LabBoundary without touching the resolver,
+		// so the maintainer's own host.env pays only a Task hop.
+		//
+		// Task.detached rather than a plain `nonisolated async` helper: whether a nonisolated
+		// async function actually leaves the caller's actor is exactly what the
+		// NonisolatedNonsendingByDefault upcoming feature changes, and this has to be off the
+		// main actor under every language mode and feature set. The enclosing `Task {}` inherits
+		// MainActor isolation, so everything after the await is back on the main actor and may
+		// touch AppKit directly.
+		isCheckingBoundary = true
+		connectButton.isEnabled = false
+		statusLabel.stringValue = "Checking the live-host boundary..."
+		Task { [weak self] in
+			let verdict = await Task.detached(priority: .userInitiated) {
+				LabBoundary.check(host: host)
+			}.value
+			guard let self else { return }
+			self.isCheckingBoundary = false
+			switch verdict {
+			case .allowed:
+				self.beginSession(host: host, user: user, password: pass)
+			case .refused(let refusal):
+				self.statusLabel.stringValue = LabBoundary.refusalLine(host: host, refusal: refusal)
+				self.connectButton.isEnabled = true
+			}
+		}
+	}
+
+	/// Everything `connectTapped` used to do inline once the credentials were in hand. Split out
+	/// only so the boundary gate above can be awaited without nesting the whole method inside a
+	/// closure; the body is unchanged, and it is only ever reached on an `.allowed` verdict.
+	private func beginSession(host: String, user: String, password pass: String) {
 		let newSession = CRSession(host: host, user: user, password: pass, program: "C:\\Windows\\System32\\winver.exe")
 		// Size the remote desktop to the primary screen -- same NSScreen the registry's
 		// coordinate mapping anchors on. Without this the server clamps remote windows to

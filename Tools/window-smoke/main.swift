@@ -24,22 +24,17 @@
 // run can never masquerade as this run's own evidence.
 //
 // Never prints WIN_HOST/WIN_USER/WIN_PASS raw values (red line) -- only their lengths.
+//
+// Refuses to dial anything outside the owner's own lab network: MacdowsCore.LabBoundary (the
+// in-process mirror of Scripts/lib.sh's crdp_assert_lab_boundary) runs after the credentials
+// resolve and before any CRSession exists, and exits 78 on a refusal. That gate lives here, and
+// not only in run-window-smoke.command, because this binary is directly runnable out of
+// DerivedData without the launcher.
 
 import AppKit
 import CoreGraphics
 import Foundation
 import MacdowsCore
-
-func parseEnvFile(_ path: String) -> [String: String] {
-    guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else { return [:] }
-    var out: [String: String] = [:]
-    for rawLine in contents.split(separator: "\n", omittingEmptySubsequences: false) {
-        let line = rawLine.trimmingCharacters(in: .whitespaces)
-        guard !line.isEmpty, !line.hasPrefix("#"), let eq = line.firstIndex(of: "=") else { continue }
-        out[String(line[line.startIndex..<eq])] = String(line[line.index(after: eq)...])
-    }
-    return out
-}
 
 func resolveCredential(_ fileEnv: [String: String], envVarName: String, fileKey: String) -> String? {
     if let fromEnv = ProcessInfo.processInfo.environment[envVarName], !fromEnv.isEmpty {
@@ -48,7 +43,20 @@ func resolveCredential(_ fileEnv: [String: String], envVarName: String, fileKey:
     return fileEnv[fileKey]
 }
 
-let fileEnv = parseEnvFile(NSHomeDirectory() + "/.config/macdows/host.env")
+// MacdowsCore.EnvFile, not the hand-rolled parser this file used to carry. That parser keyed
+// each line on everything left of the first `=`, so `export WIN_HOST=x` landed under the key
+// "export WIN_HOST" and was invisible to the lookup below, and it stripped no quotes -- rules
+// that disagreed with the ones run-window-smoke.command applies to the SAME file. The
+// disagreement was measured fail-open (see EnvFile's own doc comment and this launcher's
+// comment on SMOKE_HOST): on a host.env with a bare out-of-boundary line followed by an
+// in-boundary `export` line, the launcher's gate approved one host and this harness would have
+// dialled the other. One parser, in the package `swift test` can reach, is the fix.
+//
+// A missing/unreadable host.env is still not fatal here: the WIN_HOST/WIN_USER/WIN_PASS
+// environment variables take priority over the file anyway (and are how the launcher hands
+// over the exact host its own gate cleared), so an empty dictionary lets that path run and the
+// guard below produce the same "missing credentials" message it always has.
+let fileEnv = (try? EnvFile.parse(path: NSHomeDirectory() + "/.config/macdows/host.env")) ?? [:]
 guard
     let host = resolveCredential(fileEnv, envVarName: "WIN_HOST", fileKey: "WIN_HOST"),
     let user = resolveCredential(fileEnv, envVarName: "WIN_USER", fileKey: "WIN_USER"),
@@ -62,6 +70,37 @@ print(
     "window-smoke: credentials resolved (host=\(host.count) chars, user=\(user.count) chars, "
         + "pass=\(pass.count) chars -- values never printed)"
 )
+
+// Live-host testing boundary gate (owner rule, 2026-08-31), enforced HERE and not only in
+// Scripts/run-window-smoke.command. The launcher already refuses out-of-boundary targets, but
+// it is not the only way this binary starts: `xcodebuild -scheme window-smoke` puts a runnable
+// executable in DerivedData that anyone (or any future script, or Xcode's own Run button) can
+// invoke directly with WIN_HOST set, and that path had no gate at all. The rule is that a
+// real-host step may only ever target the owner's own machine on the owner's own LAN, so the
+// binary that opens the socket is where it has to be checked.
+//
+// exit(78) deliberately reuses the launcher's established refusal code, so `DONE exit=78` keeps
+// exactly one meaning for every caller and every log reader: boundary refusal, host never
+// contacted. Running under the launcher this gate is a cheap second verdict on a string that
+// already cleared the shell gate (the launcher exports the exact host it validated, and
+// resolveCredential prefers the environment) -- agreement is the expected outcome and the two
+// implementations now share one parsing rule, so a disagreement is a bug in one of them rather
+// than the ambiguity it used to be.
+//
+// The host is NOT printed, unlike lib.sh's own refusal line: this file's header commits to
+// never printing WIN_HOST/WIN_USER/WIN_PASS raw values, and its stdout is tee'd into
+// .build/evidence/window-smoke-run.log. The reason category is enough to act on, and carries
+// no segment (see LabBoundary's doc comment).
+switch LabBoundary.check(host: host) {
+case .allowed:
+    print("window-smoke: \(LabBoundary.allowedLine)")
+case .refused(let refusal):
+    print(
+        "window-smoke: live-host boundary gate REFUSED this target -- \(refusal.reasonText). "
+            + "Nothing was connected; the host value is not printed (red line)."
+    )
+    exit(78)
+}
 
 // H2/L4 (W4b review): the evidence path is now a parameter, not a hardcoded absolute path,
 // so this harness (and run-window-smoke.command, which never hardcodes it either) works
