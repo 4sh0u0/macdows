@@ -53,6 +53,18 @@ jobs:
         # was never actually covered by this glob before.
         run: shellcheck -S style Scripts/*.sh Scripts/*.command
 
+      - name: Live-host boundary gate regression suite
+        # crdp_assert_lab_boundary (Scripts/lib.sh) is the mechanical enforcement of the
+        # owner's "only ever debug against your own machine on your own LAN" rule, so its
+        # fail-closed behaviour has to be a CI-enforced contract rather than something a
+        # future edit can quietly invert. Tier 1 can host it because the suite is static in
+        # every way that matters here: it builds its own boundary fixtures (RFC
+        # documentation ranges plus loopback -- it never reads, and does not need, the
+        # maintainer's untracked lab-boundary.env), and it opens no connection. It does make
+        # two resolver calls (localhost, and an RFC 2606 .invalid name); both are answered
+        # locally or refused, and every possible answer to either is still a refusal.
+        run: ./Scripts/test-lab-boundary.sh
+
       - name: gitleaks
         uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
         env:
@@ -80,6 +92,25 @@ jobs:
           # -P (PCRE) doesn't support multi-pattern `-f` files ("the -P option only
           # supports a single pattern" on this grep build) — loop one pattern at a time
           # instead of a single -f-fed invocation.
+          #
+          # Every pattern below is PCRE and every grep call is `-P`. A grep without PCRE
+          # support does not fail the scan -- it exits 2 per pattern, the `2>/dev/null` on
+          # the grep call swallows the usage error, and `if HIT=...` reads exit 2 the same
+          # way it reads "no match", so the step announces a clean tree having matched
+          # nothing at all. That is exactly what a local reproduction on macOS does, whose
+          # /usr/bin/grep is BSD and has no -P; it cost a full round of false-clean scan
+          # evidence during the review this guard came out of. Probe once, up front, and
+          # refuse to report on a scan that cannot run.
+          #
+          # The probe needs a pattern that genuinely matches, on a real input line: an empty
+          # pattern or an empty input would exit 1 (no match) on a working grep too, which
+          # is indistinguishable from the failure being guarded against. No pipeline either
+          # -- `grep -q` in one gets SIGPIPE'd under `pipefail`.
+          if ! grep -P 'p' >/dev/null 2>&1 <<<'p'; then
+            echo "::error::this runner's grep does not support -P (PCRE), so the sensitive-content scan cannot run. Every pattern in $PWD/.github/scan-patterns.txt is PCRE. Install GNU grep (or run this scan on a runner that has it) -- do NOT treat a passing scan from a grep without -P as evidence of a clean tree."
+            exit 1
+          fi
+
           PATTERNS_FILE=".github/scan-patterns.txt"
           mapfile -t FILES < <(git ls-files | grep -vF "$PATTERNS_FILE" | while IFS= read -r f; do [ -f "$f" ] && printf '%s\n' "$f"; done)
 

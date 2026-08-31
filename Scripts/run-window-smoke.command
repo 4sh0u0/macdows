@@ -7,7 +7,17 @@
 # Reads RDP credentials from ~/.config/macdows/host.env (or WIN_HOST/WIN_USER/
 # WIN_PASS env vars, which take priority) itself only via window-smoke's own main.swift --
 # this script never touches them directly (red line: no credential-handling logic in
-# scripts either, not just library code).
+# scripts either, not just library code). The one exception is WIN_HOST, which the
+# boundary gate below has to know: it is read back out of host.env with grep/sed rather
+# than by sourcing the file, so WIN_USER/WIN_PASS never enter this shell at all.
+#
+# LIVE-HOST BOUNDARY GATE. Before anything is built and long before window-smoke opens a
+# socket, crdp_assert_lab_boundary (Scripts/lib.sh) has to confirm the target host is
+# inside the owner's own lab segments; the allowed segments live only in the untracked
+# ~/.config/macdows/lab-boundary.env. The gate is fail-closed -- a missing boundary file,
+# an unresolvable host or an address outside the segments all refuse -- and a refusal
+# writes a non-zero DONE line to the log and leaves this Terminal window open, the same
+# "failure keeps the scrollback" contract the run itself follows.
 #
 # Screenshot capture is explicitly NOT this script's job (H2/H3, W4b review). Confirmed
 # empirically: Screen Recording TCC is evaluated against the *directly calling* process's
@@ -35,6 +45,50 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
+# shellcheck source=Scripts/lib.sh
+source "$SCRIPT_DIR/lib.sh"
+# lib.sh turns on `set -e` for whoever sources it; this launcher deliberately runs without
+# it, so that `"$BIN"`'s own non-zero exit is captured into the DONE line below instead of
+# killing the script before it can be written. Restore the launcher's own mode.
+set +e
+
+# The log is opened before the gate (it used to be opened after the build) so a refusal
+# has somewhere to record its verdict: the DONE line is the contract every caller of this
+# launcher reads, and a gate refusal has to speak it too.
+LOG="${WINDOW_SMOKE_LOG:-$REPO_ROOT/.build/evidence/window-smoke-run.log}"
+mkdir -p "$(dirname "$LOG")"
+: > "$LOG"
+
+# WIN_HOST from the environment wins here, as it does in window-smoke. Otherwise pull just
+# that one key out of host.env textually -- sourcing the file would drag WIN_USER/WIN_PASS
+# into this shell for no reason (the head comment's red line).
+#
+# This extraction is deliberately NOT bug-for-bug identical to window-smoke's own parser,
+# and that difference is exactly why the export below is mandatory rather than tidy.
+# main.swift:33-41 keys each line on the whole text left of the first `=`, so a line
+# `export WIN_HOST=x` is stored under the key "export WIN_HOST" and is invisible to its
+# WIN_HOST lookup; this script instead accepts an optional `export ` prefix and takes the
+# last match. On a host.env carrying both spellings the two disagree, and the disagreement
+# is fail-open in the worst direction: measured on a fixture with a bare out-of-boundary
+# line followed by an in-boundary `export` line, the gate approved the in-boundary value
+# while window-smoke would have connected to the out-of-boundary one.
+SMOKE_HOST="${WIN_HOST:-}"
+HOST_ENV_FILE="$HOME/.config/macdows/host.env"
+if [ -z "$SMOKE_HOST" ] && [ -f "$HOST_ENV_FILE" ]; then
+    SMOKE_HOST="$(grep -E '^(export )?WIN_HOST=' "$HOST_ENV_FILE" | tail -1 |
+        sed -E -e "s/^(export )?WIN_HOST=//" -e "s/^[\"']//" -e "s/[\"']\$//")"
+fi
+if ! crdp_assert_lab_boundary "$SMOKE_HOST"; then
+    echo "[launcher] live-host boundary gate refused this target -- nothing was built, nothing was connected" >&2
+    echo "DONE exit=78" >>"$LOG"
+    exit 78
+fi
+# Hand window-smoke the exact string the gate just cleared, instead of letting it re-derive
+# a host from the same file by different rules. main.swift's resolveCredential prefers the
+# environment variable over the file, so this closes the divergence above by construction:
+# what was validated is what gets dialled, whatever host.env happens to contain.
+export WIN_HOST="$SMOKE_HOST"
+
 APP_DIR="$REPO_ROOT/App"
 # W4c review H2: -derivedDataPath, not the legacy SYMROOT= override this used until this
 # fix. SYMROOT only redirects *this* project's own targets; the MacdowsCore SwiftPM
@@ -52,23 +106,28 @@ APP_DIR="$REPO_ROOT/App"
 # Build/Products/Debug/window-smoke layout under the same redirected root.
 BIN="$APP_DIR/build/Build/Products/Debug/window-smoke"
 
+# Every exit from here on writes a DONE line first: that line is the whole contract callers
+# poll on, and a build failure that exits silently leaves them reading an empty log.
 if [[ ! -x "$BIN" ]]; then
     echo "[launcher] $BIN not found -- generating project and building window-smoke..." >&2
     if ! command -v xcodegen >/dev/null 2>&1; then
         echo "[launcher] xcodegen not found on PATH -- install it (e.g. 'brew install xcodegen') and retry" >&2
+        echo "DONE exit=1" >>"$LOG"
         exit 1
     fi
-    (
+    if ! (
         cd "$APP_DIR" || exit 1
         xcodegen generate
-    ) || exit 1
-    xcodebuild -project "$APP_DIR/Macdows.xcodeproj" -scheme window-smoke -configuration Debug \
-        build -derivedDataPath "$APP_DIR/build" || exit 1
+    ); then
+        echo "DONE exit=1" >>"$LOG"
+        exit 1
+    fi
+    if ! xcodebuild -project "$APP_DIR/Macdows.xcodeproj" -scheme window-smoke -configuration Debug \
+        build -derivedDataPath "$APP_DIR/build"; then
+        echo "DONE exit=1" >>"$LOG"
+        exit 1
+    fi
 fi
-
-LOG="${WINDOW_SMOKE_LOG:-$REPO_ROOT/.build/evidence/window-smoke-run.log}"
-mkdir -p "$(dirname "$LOG")"
-: > "$LOG"
 
 "$BIN" >>"$LOG" 2>&1
 echo "DONE exit=$?" >>"$LOG"
