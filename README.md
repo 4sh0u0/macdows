@@ -126,7 +126,7 @@ documented anywhere in this repository. Launch it via `Scripts/run-window-smoke.
 ## Repository conventions
 
 - Commit style: `<type>: <summary>` (`feat` / `fix` / `docs` / `chore` / `refactor` /
-  `test` / `build`); commit messages and code comments are in English.
+  `test` / `build` / `merge`); commit messages and code comments are in English.
 - No tracked file may ever contain real Windows host IPs/hostnames, RDP credentials,
   private-network addresses, or personal data — those live only in untracked local
   files. Any RAIL protocol capture sample must be sanitized before being committed.
