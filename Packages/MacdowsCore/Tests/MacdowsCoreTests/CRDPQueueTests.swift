@@ -190,6 +190,13 @@ struct CRDPQueueControlSingleThreadedTests {
         // Idempotent.
         crdpq_seal(q)
         #expect(crdpq_is_sealed(q))
+
+        // Exactly one post was rejected above, and sealing twice is not itself a rejection.
+        #expect(crdpq_seal_rejected_count(q) == 1)
+        // ...and it landed in the seal counter rather than the overflow one: crdpq.h states
+        // the two partition every rejected post, which is only true if neither absorbs the
+        // other's cause.
+        #expect(crdpq_dropped_count(q) == 0)
     }
 
     @Test("crdpq_post stamps the queue's current generation into the event, ignoring whatever the caller set")
@@ -419,7 +426,8 @@ struct CRDPQueueOutboundSingleThreadedTests {
         #expect(seen.payload.notifyEvent.message == 0xFFFF_FFFF)
     }
 
-    /// The other half of the seal contract (crdpq.h:934-937; post side at :918-924), which `basicSemantics` above
+    /// The other half of the seal contract (crdpq.h's `crdpq_outbound_seal`/
+    /// `crdpq_outbound_is_sealed`; post side on `crdpq_outbound_post`), which `basicSemantics` above
     /// only pins from the post side (`crdpq_outbound_post` returning false). A rejected post
     /// must also leave NOTHING behind for a later drain to hand to `crb_outbound_visitor` --
     /// otherwise a command issued after `-shutdownAndWait` could still reach a RAIL context
@@ -453,9 +461,60 @@ struct CRDPQueueOutboundSingleThreadedTests {
         #expect(visited == 0)
         #expect(drained.isEmpty)
         // A seal-rejected post is expected post-shutdown behavior, not an overflow --
-        // crdpq.h:941-942 excludes it from this counter deliberately, and CRSession's
+        // crdpq.h excludes it from this counter deliberately, and CRSession's
         // `outboundPostDroppedCount` doc comment depends on that exclusion being real.
         #expect(crdpq_outbound_dropped_count(q) == 0)
+        // The other half of that exclusion: excluded from the overflow counter, but NOT
+        // invisible -- it is counted here instead. Asserting only the `== 0` above would pass
+        // just as happily against the pre-counter behavior, where the rejected post was
+        // counted nowhere at all.
+        #expect(crdpq_outbound_seal_rejected_count(q) == 1)
+    }
+
+    /// The counter that closes the gap the line above used to leave: `crdpq_outbound_post`
+    /// returns a bare `bool` and every CRSession outbound method is `void`, so before
+    /// `crdpq_outbound_seal_rejected_count` existed a command refused by the seal left no
+    /// trace in either outbound counter -- a send issued after `-shutdownAndWait` and a send
+    /// that was never issued at all produced identical diagnostics.
+    ///
+    /// The counts are deliberately unequal (5 accepted, 3 rejected) so a counter wired to the
+    /// wrong event -- total posts, successful posts, drains -- cannot pass by coincidence.
+    @Test("seal-rejected posts are counted, and nothing else is")
+    func sealRejectedCountCountsExactlySealRejections() {
+        let q = crdpq_outbound_create(nil, nil)
+        defer { crdpq_outbound_destroy(q) }
+
+        let accepted = 5
+        for i in 0..<accepted {
+            var cmd = Self.makeExecuteCommand(program: "before-seal-\(i)")
+            #expect(crdpq_outbound_post(q, &cmd))
+        }
+        #expect(crdpq_outbound_seal_rejected_count(q) == 0, "a successful post is not a rejection")
+
+        // A drain is not a rejection either -- and it is the operation most likely to be
+        // mistaken for one by an implementation that reset or recomputed the tally on swap.
+        #expect(crdpq_outbound_drain(q, nil, nil) == accepted)
+        #expect(crdpq_outbound_seal_rejected_count(q) == 0)
+
+        crdpq_outbound_seal(q)
+        let rejected = 3
+        for i in 0..<rejected {
+            var cmd = Self.makeExecuteCommand(program: "after-seal-\(i)")
+            #expect(!crdpq_outbound_post(q, &cmd), "every post after the seal must be refused")
+        }
+        #expect(crdpq_outbound_seal_rejected_count(q) == UInt64(rejected))
+        #expect(crdpq_outbound_dropped_count(q) == 0, "seal rejections must not leak into the overflow counter")
+
+        // Monotonic across a later drain: the rejected posts enqueued nothing, and draining
+        // an empty queue must not disturb the tally.
+        #expect(crdpq_outbound_drain(q, nil, nil) == 0)
+        #expect(crdpq_outbound_seal_rejected_count(q) == UInt64(rejected))
+
+        // Width pin. `sizeof` on the C struct cannot pin a member's width (a narrower field
+        // can hide inside the same padding), so this pins what a caller actually receives:
+        // the getter's own return value, which must stay 64-bit -- a `size_t`/`uint32_t`
+        // slip here would silently change the ABI CRSession's `uint64_t` property reads.
+        #expect(MemoryLayout.size(ofValue: crdpq_outbound_seal_rejected_count(q)) == 8)
     }
 
     @Test("wakeup fires at most once per undrained batch")

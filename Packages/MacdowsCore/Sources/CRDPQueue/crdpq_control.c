@@ -35,6 +35,10 @@ struct crdpq_control {
     size_t high_water_mark;
     size_t max_capacity;   /* M4: ceiling on capacity[b]; growth stops here */
     size_t dropped_count;  /* M4: posts rejected for being at-cap-and-full, or OOM */
+    /* Posts rejected for having already been sealed -- the cause `dropped_count` above
+     * deliberately excludes. Mirrors crdpq_outbound's field of the same name, including
+     * why it is atomic rather than lock-guarded: see that file's declaration comment. */
+    _Atomic uint64_t seal_rejected_count;
     _Atomic crdpq_generation_t generation;
     _Atomic bool sealed;
     crdpq_schedule_drain_fn schedule_drain;
@@ -61,6 +65,7 @@ crdpq_control_t* crdpq_control_create_with_max_capacity(crdpq_schedule_drain_fn 
      * clamp up to the floor rather than accept a config that can never actually bind. */
     q->max_capacity = max_capacity > CRDPQ_CONTROL_INITIAL_CAPACITY ? max_capacity : CRDPQ_CONTROL_INITIAL_CAPACITY;
     atomic_init(&q->generation, 0u);
+    atomic_init(&q->seal_rejected_count, 0u);
     atomic_init(&q->sealed, false);
     q->schedule_drain = schedule_drain;
     q->schedule_drain_ctx = schedule_drain_ctx;
@@ -111,6 +116,8 @@ bool crdpq_post(crdpq_control_t* q, const CrdpEvent* ev) {
      * unconditionally below for the actual append, so this costs nothing extra. */
     if (atomic_load_explicit(&q->sealed, memory_order_relaxed)) {
         ok = false;
+        /* Relaxed: a monotonic diagnostic tally, never a synchronization edge. */
+        atomic_fetch_add_explicit(&q->seal_rejected_count, 1u, memory_order_relaxed);
     } else {
         int b = q->back_idx;
         if (q->count[b] == q->capacity[b]) {
@@ -205,4 +212,10 @@ size_t crdpq_dropped_count(const crdpq_control_t* q) {
     size_t dropped = q->dropped_count;
     os_unfair_lock_unlock(&((crdpq_control_t*)q)->lock);
     return dropped;
+}
+
+uint64_t crdpq_seal_rejected_count(const crdpq_control_t* q) {
+    /* No lock: the field is atomic (see its declaration), same const-cast shape as
+     * crdpq_is_sealed above. */
+    return atomic_load_explicit(&((crdpq_control_t*)q)->seal_rejected_count, memory_order_relaxed);
 }

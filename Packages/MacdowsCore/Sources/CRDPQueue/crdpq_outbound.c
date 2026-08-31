@@ -23,6 +23,15 @@ struct crdpq_outbound {
     size_t high_water_mark;
     size_t max_capacity;   /* M4: ceiling on capacity[b]; growth stops here */
     size_t dropped_count;  /* M4: posts rejected for being at-cap-and-full, or OOM */
+    /* Posts rejected for having already been sealed — the cause `dropped_count` above
+     * deliberately excludes, so before this counter existed a seal-rejected post was
+     * invisible to every counter this lane had. Atomic rather than lock-guarded like its
+     * two neighbours: the increment below already happens inside the post-side critical
+     * section, but the READER is a diagnostic path (CRSession's
+     * `-outboundSealRejectedCount`) that has no reason to contend with T_main's posts for
+     * the lock, and `crdpq_outbound_is_sealed` already sets the lock-free-read precedent
+     * for the seal state this counter is about. */
+    _Atomic uint64_t seal_rejected_count;
     _Atomic bool sealed;
     crdpq_wakeup_fn wakeup;
     void* wakeup_ctx;
@@ -45,6 +54,7 @@ crdpq_outbound_t* crdpq_outbound_create_with_max_capacity(crdpq_wakeup_fn wakeup
     q->back_idx = 0;
     /* Same floor-clamping rationale as crdpq_control_create_with_max_capacity. */
     q->max_capacity = max_capacity > CRDPQ_OUTBOUND_INITIAL_CAPACITY ? max_capacity : CRDPQ_OUTBOUND_INITIAL_CAPACITY;
+    atomic_init(&q->seal_rejected_count, 0u);
     atomic_init(&q->sealed, false);
     q->wakeup = wakeup;
     q->wakeup_ctx = wakeup_ctx;
@@ -74,6 +84,9 @@ bool crdpq_outbound_post(crdpq_outbound_t* q, const CrdpCommand* cmd) {
      * "apply the same isomorphism check to outbound" in the M1 review applies the identical fix here. */
     if (atomic_load_explicit(&q->sealed, memory_order_relaxed)) {
         ok = false;
+        /* Relaxed, like every other counter on this lane: this is a monotonic tally read
+         * for diagnostics, never a synchronization edge for anything. */
+        atomic_fetch_add_explicit(&q->seal_rejected_count, 1u, memory_order_relaxed);
     } else {
         int b = q->back_idx;
         if (q->count[b] == q->capacity[b]) {
@@ -162,4 +175,10 @@ size_t crdpq_outbound_dropped_count(const crdpq_outbound_t* q) {
     size_t dropped = q->dropped_count;
     os_unfair_lock_unlock(&((crdpq_outbound_t*)q)->lock);
     return dropped;
+}
+
+uint64_t crdpq_outbound_seal_rejected_count(const crdpq_outbound_t* q) {
+    /* No lock: the field is atomic (see its declaration), same const-cast shape as
+     * crdpq_outbound_is_sealed above. */
+    return atomic_load_explicit(&((crdpq_outbound_t*)q)->seal_rejected_count, memory_order_relaxed);
 }

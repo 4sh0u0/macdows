@@ -2304,6 +2304,13 @@ cleanup:
     return _outboundQueue ? (uint64_t)crdpq_outbound_dropped_count(_outboundQueue) : 0;
 }
 
+- (uint64_t)outboundSealRejectedCount
+{
+    /* Passthrough, same shape as -outboundPostDroppedCount above -- the counter lives in
+     * the queue itself. Reads 0 once the queue is gone; see the header's caveat. */
+    return _outboundQueue ? crdpq_outbound_seal_rejected_count(_outboundQueue) : 0;
+}
+
 - (nullable IOSurfaceRef)copyPublishedSurface:(uint32_t)surfaceId
 {
     if (!_surfaceSlots)

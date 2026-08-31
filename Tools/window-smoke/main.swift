@@ -3318,6 +3318,12 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // total into a backwards-moving reading. `outboundDroppedNoRailCount` is ivar-backed
         // and survives, but is snapshotted at the same instant so both sides of the click's
         // bracket are measured against the same moment.
+        //
+        // `outboundSealRejectedCount` is deliberately NOT read here: the only
+        // `crdpq_outbound_seal` caller is `-shutdownAndWait` step 1, which this point has not
+        // reached, and the queue is gone once it returns -- so from this harness the counter
+        // is structurally 0 at every readable instant, and printing it would state a constant
+        // as if it were evidence.
         let outboundDroppedNoRailAtEnd = session.outboundDroppedNoRailCount
         let outboundPostDroppedAtEnd = session.outboundPostDroppedCount
         let cleanShutdown = session.shutdownAndWait()

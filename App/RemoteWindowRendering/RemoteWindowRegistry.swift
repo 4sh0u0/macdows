@@ -960,7 +960,7 @@ final class RemoteWindowRegistry {
     /// makes `clicksDroppedIconGone == 0` a meaningful assertion.
     func debugSimulateTrayClick(windowId: UInt32, notifyIconId: UInt32) {
         trayStatusController.handleLeftClick(
-            tag: TrayStatusController.packTag(windowId: windowId, notifyIconId: notifyIconId)
+            tag: TrayButtonTag.pack(windowId: windowId, notifyIconId: notifyIconId)
         )
     }
 

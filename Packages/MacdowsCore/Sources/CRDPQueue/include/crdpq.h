@@ -508,10 +508,11 @@ crdpq_generation_t crdpq_generation_bump(crdpq_control_t* q);
 crdpq_generation_t crdpq_current_generation(const crdpq_control_t* q);
 
 /** Deep-copies `*ev` into the queue's back buffer under lock, stamping `generation`.
- *  Returns false (without copying) if the queue has been sealed (crdpq_seal), if the back
- *  buffer is already at its configured capacity ceiling and full (M4 — see
- *  crdpq_control_create_with_max_capacity, counted in crdpq_dropped_count), or if the
- *  buffer failed to grow under memory pressure (also counted in crdpq_dropped_count) —
+ *  Returns false (without copying) if the queue has been sealed (crdpq_seal, counted in
+ *  crdpq_seal_rejected_count), if the back buffer is already at its configured capacity
+ *  ceiling and full (M4 — see crdpq_control_create_with_max_capacity, counted in
+ *  crdpq_dropped_count), or if the buffer failed to grow under memory pressure (also
+ *  counted in crdpq_dropped_count) —
  *  either way, the event is dropped, never partially enqueued. The seal check happens
  *  inside the same critical section as the enqueue itself, checked as late as possible
  *  (M1 in the W3 review): once crdpq_seal() has returned on any thread, every crdpq_post
@@ -542,6 +543,23 @@ size_t crdpq_high_water_mark(const crdpq_control_t* q);
  *  that's expected post-shutdown behavior, not an overflow condition worth alerting on.
  *  Monotonically increasing; adr/0005 §7's "dropped-frame count alert" mitigation pattern. */
 size_t crdpq_dropped_count(const crdpq_control_t* q);
+
+/** Number of crdpq_post calls rejected because the queue was already sealed (crdpq_seal) —
+ *  exactly the cause crdpq_dropped_count above excludes, and nothing else: a post rejected
+ *  for being at-cap-and-full or for a failed growth is counted THERE, never here. The two
+ *  counters therefore partition the rejections completely — every crdpq_post returning
+ *  false bumps exactly one of them — which is what makes "sealed, so this is expected
+ *  shutdown behavior" distinguishable from "overflowing, so alert" without either counter
+ *  having to be interpreted against the other. Monotonically increasing, cumulative for
+ *  this queue instance's lifetime.
+ *
+ *  The lane's counterpart to crdpq_outbound_seal_rejected_count. Unlike that one it has no
+ *  bridge-layer pass-through and, today, no production writer either: CRSession calls
+ *  crdpq_outbound_seal during teardown but never crdpq_seal — the control lane is simply
+ *  destroyed. This exists for lane symmetry (every other counter on one lane has a twin on
+ *  the other) and so that the seal contract is testable from both directions, not for an
+ *  existing reader; the day the control lane does get sealed, the counter is already here. */
+uint64_t crdpq_seal_rejected_count(const crdpq_control_t* q);
 
 /* ==================================================================================== *
  * Notify-icon pixel side-store + DIB->RGBA conversion (adr/0013) — the fourth primitive,
@@ -918,9 +936,10 @@ void crdpq_outbound_destroy(crdpq_outbound_t* q);
 /** Same POD-deep-copy-under-lock discipline as crdpq_post, including the same M1 fix:
  *  the seal check happens inside the same critical section as the enqueue, checked as
  *  late as possible, immediately before the mutation it gates. Returns false (without
- *  enqueueing) once crdpq_outbound_seal has been called, if the back buffer is already at
- *  its configured capacity ceiling and full (M4, counted in
- *  crdpq_outbound_dropped_count), or on allocation failure (also counted). */
+ *  enqueueing) once crdpq_outbound_seal has been called (counted in
+ *  crdpq_outbound_seal_rejected_count), if the back buffer is already at its configured
+ *  capacity ceiling and full (M4, counted in crdpq_outbound_dropped_count), or on
+ *  allocation failure (also counted). */
 bool crdpq_outbound_post(crdpq_outbound_t* q, const CrdpCommand* cmd);
 
 typedef void (*crdpq_command_visitor_fn)(const CrdpCommand* cmd, void* vctx);
@@ -941,6 +960,34 @@ size_t crdpq_outbound_high_water_mark(const crdpq_outbound_t* q);
 /** Outbound-lane counterpart to crdpq_dropped_count — same semantics, same exclusion of
  *  seal-rejected posts, mirrored for this direction (M4). */
 size_t crdpq_outbound_dropped_count(const crdpq_outbound_t* q);
+
+/** Number of crdpq_outbound_post calls rejected because the queue was already sealed
+ *  (crdpq_outbound_seal, i.e. after CRSession's `-shutdownAndWait` has begun) — the
+ *  outbound-lane counterpart to crdpq_seal_rejected_count, and the exact cause
+ *  crdpq_outbound_dropped_count above excludes. Nothing else lands here: an at-cap-and-full
+ *  rejection and a failed growth are counted THERE. Between them the two counters partition
+ *  every false return from crdpq_outbound_post, so a send that vanished can always be
+ *  attributed to one of "the session was shutting down" or "the lane overflowed" rather than
+ *  to neither, which was the state of affairs before this counter existed.
+ *
+ *  Monotonically increasing, cumulative for this queue instance's lifetime — which, per
+ *  CrdpCommand's own lifecycle note above, is exactly one session: this counter is NOT a
+ *  cross-reconnect total, because the queue it lives in is destroyed and recreated at a
+ *  generation rollover.
+ *
+ *  PASS-THROUGH CAVEAT, and it has bitten this codebase before: a bridge-level reader of
+ *  this counter (CRSession's `-outboundSealRejectedCount`) is a pass-through to the queue
+ *  itself, so once the queue has been destroyed the reader necessarily reports 0 rather
+ *  than the session's real total — reading it after `-shutdownAndWait` yields a
+ *  backwards-moving zero, not a total.
+ *
+ *  Sharper than that, for this counter specifically: CRSession seals inside
+ *  `-shutdownAndWait` (step 1) and destroys the queue before that method returns, so a
+ *  reader OUTSIDE the bridge has no instant at which a nonzero value is observable — it
+ *  reads 0 before the seal and 0 after the destroy. Anything that wants a real total has
+ *  to sample it from inside the shutdown sequence, between those two points. That is why
+ *  Tools/window-smoke does not print it: from there it is a constant, not evidence. */
+uint64_t crdpq_outbound_seal_rejected_count(const crdpq_outbound_t* q);
 
 #ifdef __cplusplus
 } /* extern "C" */

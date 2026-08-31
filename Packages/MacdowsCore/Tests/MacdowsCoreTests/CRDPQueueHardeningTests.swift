@@ -471,6 +471,10 @@ struct CRDPQueueControlCapacityCeilingTests {
         var afterDrain = makeWindowCreateEvent(windowId: 1001)
         #expect(crdpq_post(q, &afterDrain), "a post after a drain frees capacity must succeed again")
         #expect(crdpq_dropped_count(q) == 2, "a successful post must not itself bump dropped_count")
+
+        // The partition crdpq.h promises, checked from the overflow side: this queue was
+        // never sealed, so every rejection above belongs to dropped_count alone.
+        #expect(crdpq_seal_rejected_count(q) == 0, "an overflow rejection must not leak into the seal counter")
     }
 
     @Test("crdpq_control_create's default ceiling (65536) never interferes with ordinary small-scale usage")
@@ -512,6 +516,9 @@ struct CRDPQueueOutboundCapacityCeilingTests {
         var overflow = Self.makeExecuteCommand(program: "overflow")
         #expect(!crdpq_outbound_post(q, &overflow))
         #expect(crdpq_outbound_dropped_count(q) == 1)
+        // Mirrors the control lane's own check: this queue was never sealed, so the rejection
+        // above must be attributed to the overflow counter and to nothing else.
+        #expect(crdpq_outbound_seal_rejected_count(q) == 0)
     }
 }
 

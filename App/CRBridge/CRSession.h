@@ -397,8 +397,10 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 ///
 /// Deliberately does NOT count posts rejected for having already been sealed
 /// (`crdpq_outbound_seal`, i.e. after `-shutdownAndWait`) — crdpq.h treats that as expected
-/// post-shutdown behavior rather than an overflow, so a send issued after shutdown vanishes
-/// from BOTH outbound counters. Only the two live-session causes above are visible here.
+/// post-shutdown behavior rather than an overflow. Such a send is invisible to this counter
+/// and to `outboundDroppedNoRailCount` (it was never enqueued, so the drain side never sees
+/// it); it lands in `outboundSealRejectedCount` below instead. Only the two live-session
+/// causes above are visible here.
 ///
 /// Every outbound method on this interface is `void`: a caller cannot otherwise tell an
 /// enqueued command from a rejected one. Reading this before and after a send and requiring a
@@ -408,6 +410,28 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// queue, and a gate that checks only the drain-side one passes green on zero commands ever
 /// having been enqueued at all.
 @property (nonatomic, readonly) uint64_t outboundPostDroppedCount;
+
+/// Passthrough of the outbound lane's own `crdpq_outbound_seal_rejected_count` — the third
+/// and last post-side rejection cause, and the one `outboundPostDroppedCount` above
+/// deliberately excludes: commands refused because the queue was already sealed, i.e. issued
+/// after `-shutdownAndWait` began. Together the two post-side counters partition every
+/// rejected `crdpq_outbound_post` (crdpq.h states the same partition from the C side), so a
+/// send that never reached the wire is now always attributable to a named cause instead of
+/// vanishing from every counter, which is what it did before this one existed.
+///
+/// Expected to be 0 in a healthy session: a nonzero value means this process kept issuing
+/// outbound commands after teardown started — harmless (they are refused, exactly as
+/// designed) but a real signal that some AppKit-side path is still driving a dead session.
+///
+/// Same pass-through caveat as `outboundPostDroppedCount` — the queue owns the counter, so
+/// once `-shutdownAndWait` has destroyed it (CRSession.mm step 5) this property reads 0
+/// rather than the session's total. For THIS counter that caveat is total rather than
+/// partial, and callers need to know it: the seal happens in step 1 of the same method, so
+/// an external reader sees 0 before the call (nothing sealed yet) and 0 after it (no queue
+/// left). There is no instant outside `-shutdownAndWait` at which a nonzero value is
+/// observable; a real total has to be sampled from inside that sequence, between the seal
+/// and the destroy. Tools/window-smoke deliberately does not print it for this reason.
+@property (nonatomic, readonly) uint64_t outboundSealRejectedCount;
 
 /// Set (non-nil) if the most recent `-start` call's connection attempt failed before any
 /// protocol traffic occurred (DNS/TCP/TLS/NLA/activation failure) — read this after

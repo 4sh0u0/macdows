@@ -417,7 +417,7 @@ final class TrayStatusController {
         // and a plain button action responds only to the primary (left) click by default, so
         // this alone is what satisfies "left-click forwarding only, no right-click menus"
         // (phase2.md §2 W6's own timebox fallback) without any extra event-type filtering.
-        button.tag = Self.packTag(windowId: windowId, notifyIconId: notifyIconId)
+        button.tag = TrayButtonTag.pack(windowId: windowId, notifyIconId: notifyIconId)
     }
 
     /// adr/0013 §3: `Data` (premultiplied RGBA8888, top-down, tight `width * 4` rows -- the
@@ -468,25 +468,11 @@ final class TrayStatusController {
         return image
     }
 
-    /// Packs `(windowId, notifyIconId)` -- each a wire `UInt32` -- into one 64-bit `Int` tag,
-    /// since `NSButton.tag` is a single `Int` and this project already targets a 64-bit-only
-    /// platform (see `RemoteWindowRegistry`'s own `RailEventKind` doc comment on `Int32`/
-    /// `UInt32` field widths for the same "this codebase's one and only target" reasoning).
-    /// `windowId` occupies the high 32 bits, `notifyIconId` the low 32 -- an arbitrary but
-    /// internally consistent choice, `unpackTag` is this function's exact inverse.
-    ///
-    /// Internal (not `private`) since adr/0014: `RemoteWindowRegistry.debugSimulateTrayClick`
-    /// builds its tag with THIS function so the offline harness path and the real
-    /// `NSStatusBarButton.tag` path can never encode the key differently -- a second,
-    /// hand-rolled packing in the harness would test its own arithmetic instead of this one's.
-    static func packTag(windowId: UInt32, notifyIconId: UInt32) -> Int {
-        Int(bitPattern: UInt(UInt64(windowId) << 32 | UInt64(notifyIconId)))
-    }
-
-    private static func unpackTag(_ tag: Int) -> (windowId: UInt32, notifyIconId: UInt32) {
-        let raw = UInt64(UInt(bitPattern: tag))
-        return (UInt32(truncatingIfNeeded: raw >> 32), UInt32(truncatingIfNeeded: raw))
-    }
+    // The `(windowId, notifyIconId)` <-> `NSStatusBarButton.tag` packing that used to live
+    // here (`packTag`/`unpackTag`) is now `MacdowsCore.TrayButtonTag`, bit layout unchanged and
+    // pinned there against literals -- this target has no test bundle, so pure arithmetic kept
+    // here is arithmetic no `swift test` run can check. Both call sites here and
+    // `RemoteWindowRegistry.debugSimulateTrayClick` go through that one implementation.
 
     /// Called by `RemoteWindowRegistry` (which owns the `CRSession`) for each forwarded left
     /// click, with the clicked icon's own `(windowId, notifyIconId)` wire identity. `nil` (the
@@ -519,7 +505,7 @@ final class TrayStatusController {
     /// 5-10s deadline every time the user clicks a tray icon, in exchange for nothing this
     /// PDU needs.
     func handleLeftClick(tag: Int) {
-        let (windowId, notifyIconId) = Self.unpackTag(tag)
+        let (windowId, notifyIconId) = TrayButtonTag.unpack(tag)
         let key = NotifyIconState(windowId: windowId, notifyIconId: notifyIconId)
         guard statusItems[key] != nil else {
             clicksDroppedIconGone += 1
