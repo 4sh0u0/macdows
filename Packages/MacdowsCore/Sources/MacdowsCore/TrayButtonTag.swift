@@ -1,5 +1,3 @@
-import Foundation
-
 /// adr/0014 §1: the packing that lets one tray icon's `(windowId, notifyIconId)` wire identity
 /// ride in an `NSStatusBarButton.tag`, which AppKit gives as a single `Int`.
 ///

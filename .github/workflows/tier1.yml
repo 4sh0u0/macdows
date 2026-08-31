@@ -53,18 +53,6 @@ jobs:
         # was never actually covered by this glob before.
         run: shellcheck -S style Scripts/*.sh Scripts/*.command
 
-      - name: Live-host boundary gate regression suite
-        # crdp_assert_lab_boundary (Scripts/lib.sh) is the mechanical enforcement of the
-        # owner's "only ever debug against your own machine on your own LAN" rule, so its
-        # fail-closed behaviour has to be a CI-enforced contract rather than something a
-        # future edit can quietly invert. Tier 1 can host it because the suite is static in
-        # every way that matters here: it builds its own boundary fixtures (RFC
-        # documentation ranges plus loopback -- it never reads, and does not need, the
-        # maintainer's untracked lab-boundary.env), and it opens no connection. It does make
-        # two resolver calls (localhost, and an RFC 2606 .invalid name); both are answered
-        # locally or refused, and every possible answer to either is still a refusal.
-        run: ./Scripts/test-lab-boundary.sh
-
       - name: gitleaks
         uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
         env:
@@ -131,6 +119,56 @@ jobs:
             exit 1
           fi
           echo "No sensitive-content matches found."
+
+      - name: Live-host boundary gate regression suite
+        # Runs AFTER gitleaks and the sensitive-content scan on purpose: those two are the
+        # security gates, and a failure in this suite must not be what stops them running.
+        #
+        # crdp_assert_lab_boundary (Scripts/lib.sh) is the mechanical enforcement of the
+        # owner's "only ever debug against your own machine on your own LAN" rule, so its
+        # fail-closed behaviour has to be a CI-enforced contract rather than something a
+        # future edit can quietly invert. Tier 1 can host it because the suite is static in
+        # every way that matters here: it builds its own boundary fixtures (RFC
+        # documentation ranges plus loopback -- it never reads, and does not need, the
+        # maintainer's untracked lab-boundary.env), and it opens no connection. Its DNS
+        # footprint is four lookups across three cases: `localhost` three times (the
+        # resolves-outside case, the mixed-answers case, and that case's precondition) and
+        # an RFC 2606 `.invalid` name once. All four are answered from the hosts file or
+        # refused outright, and every possible answer to any of them is still a refusal.
+        run: |
+          set -euo pipefail
+
+          # One case -- "mixed answers, one outside" -- needs localhost to resolve to BOTH
+          # 127.0.0.1 and ::1, because it is the only case that can tell the gate's
+          # all-addresses rule from an any-address one. macOS gives that for free; a stock
+          # Ubuntu hosts file does not, because it names ::1 ip6-localhost/ip6-loopback and
+          # not localhost. On such a host the suite prints a loud SKIP and still exits 0
+          # (a host property is not a defect, and reddening a public repo's CI over one is
+          # worse than useless) -- but CI must not be allowed to take that skip silently, or
+          # the coverage quietly disappears. So: make the runner dual-stack first, then
+          # refuse any run that skipped anyway.
+          #
+          # The presence test is an exact field comparison, not a regex: a hosts line naming
+          # ip6-localhost/ip6-loopback must NOT count as naming localhost, and expressing
+          # that as an ERE needs `^` inside an alternation, whose meaning varies by engine
+          # (GNU grep reads it as an anchor and gets this right; another engine on the same
+          # box read it as matching and would have made the setup a silent no-op on exactly
+          # the runner that needs it). awk compares whole fields and has no such ambiguity.
+          # Also correctly ignores a commented-out line, since "#::1" is not "::1".
+          if ! awk '$1 == "::1" { for (i = 2; i <= NF; i++) if ($i == "localhost") found = 1 } END { exit found ? 0 : 1 }' /etc/hosts; then
+            echo "::1 localhost" | sudo tee -a /etc/hosts >/dev/null \
+              || echo "warning: could not add '::1 localhost' to /etc/hosts; the SKIP assertion below is the backstop"
+          fi
+
+          SUITE_LOG="${RUNNER_TEMP:-/tmp}/lab-boundary.log"
+          ./Scripts/test-lab-boundary.sh | tee "$SUITE_LOG"
+
+          # `grep -c ... >/dev/null` rather than `grep -q`: this repo has been bitten by
+          # `grep -q` being SIGPIPE'd inside a pipefail pipeline.
+          if grep -c '^SKIP' "$SUITE_LOG" >/dev/null; then
+            echo "::error::the boundary suite skipped a case on this runner -- see the SKIP block above. The dual-stack localhost setup at the top of this step did not take effect, so the gate's all-addresses rule went unverified. A skip is tolerated on a developer machine; in CI it is a failure."
+            exit 1
+          fi
 
       - name: Patch queue validation
         run: |

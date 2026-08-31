@@ -41,6 +41,9 @@ printf 'MACDOWS_LAB_ALLOWED_NETS=""\n' >"$BOUNDARY_EMPTY"
 BOUNDARY_MISSING="$TEST_DIR/definitely-not-here.env"
 
 FAILURES=0
+# Skips are not failures, but they must never be silent: the summary repeats the count, and
+# CI refuses a run that produced any.
+SKIPPED=0
 # Everything the gate ever said during this run, so the no-leak assertion at the end can
 # be made against the whole transcript rather than case by case.
 TRANSCRIPT="$TEST_DIR/transcript.txt"
@@ -96,13 +99,20 @@ expect deny "name that does not resolve"  "$BOUNDARY_OK"      "nonexistent.inval
 #
 # 127.0.0.0/8 is loopback, reserved by RFC 1122; it is not a private-network prefix, so
 # using it as a fixture does not weaken the documentation-ranges-only rule for this file.
+# The case only means anything on a host whose localhost is dual-stack, and that is not
+# universal: macOS ships "::1 localhost", but a stock Ubuntu hosts file gives ::1 the names
+# ip6-localhost/ip6-loopback and NOT localhost. There every answer is inside 127.0.0.0/8,
+# the gate correctly allows, and a hard-failing case would redden CI over a host property
+# rather than a defect. So the precondition runs FIRST and gates the case: met -> run it;
+# not met -> one loud SKIP saying the ALL-addresses rule is uncovered on this host, and the
+# suite still exits 0. Silence is the one thing that is not allowed, because a quiet pass
+# here is exactly the blind spot the case exists to close.
+#
+# CI does not get to take the skip: .github/workflows/tier1.yml makes its runner dual-stack
+# first and then fails the step if this suite's output contains a SKIP line at all.
 BOUNDARY_LOOPBACK_V4="$TEST_DIR/boundary-loopback-v4.env"
 printf 'MACDOWS_LAB_ALLOWED_NETS="%s"\n' "$ALLOWED_LOOPBACK" >"$BOUNDARY_LOOPBACK_V4"
-expect deny "mixed answers, one outside"  "$BOUNDARY_LOOPBACK_V4" "localhost"
 
-# ...and a precondition, so that case can never pass vacuously. If this runner's localhost
-# resolved to one family only, the case above would still say deny -- for the wrong reason,
-# silently restoring the blind spot it exists to close.
 echo "== resolver precondition for the ALL-addresses case =="
 if python3 -c '
 import ipaddress
@@ -119,10 +129,13 @@ except (OSError, UnicodeError, ValueError):
 sys.exit(0 if any(a in loopback_v4 for a in addrs) and any(a not in loopback_v4 for a in addrs) else 1)
 '; then
 	printf 'PASS  %-34s localhost gives both an inside and an outside answer\n' "mixed-answer precondition"
+	expect deny "mixed answers, one outside"  "$BOUNDARY_LOOPBACK_V4" "localhost"
 else
-	printf 'FAIL  %-34s localhost does not resolve to both an inside and an outside address here,\n' "mixed-answer precondition"
-	printf '      so the "mixed answers, one outside" case above cannot distinguish all() from any()\n'
-	FAILURES=$((FAILURES + 1))
+	printf 'SKIP  %-34s localhost does not resolve to both an inside and an outside address\n' "mixed answers, one outside"
+	printf '      on this host, so the case cannot tell all() from any() semantics and is not run.\n'
+	printf '      THE ALL-ADDRESSES RULE IS UNCOVERED HERE. Not a failure: give localhost an IPv6\n'
+	printf '      loopback name (CI does this to itself) to restore the coverage.\n'
+	SKIPPED=$((SKIPPED + 1))
 fi
 
 # The no-leak assertion. Checked against the transcript, and reported without echoing the
@@ -143,7 +156,11 @@ fi
 
 echo
 if [ "$FAILURES" -eq 0 ]; then
-	echo "all boundary-gate cases passed"
+	if [ "$SKIPPED" -ne 0 ]; then
+		echo "all boundary-gate cases passed, $SKIPPED skipped -- see the SKIP block above"
+	else
+		echo "all boundary-gate cases passed"
+	fi
 	exit 0
 fi
 echo "$FAILURES boundary-gate case(s) FAILED"

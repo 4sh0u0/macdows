@@ -197,6 +197,14 @@ struct CRDPQueueControlSingleThreadedTests {
         // the two partition every rejected post, which is only true if neither absorbs the
         // other's cause.
         #expect(crdpq_dropped_count(q) == 0)
+
+        // Width pin, symmetric with the outbound lane's own (see
+        // `sealRejectedCountCountsExactlySealRejections` in the outbound suite below).
+        // `sizeof` on the C struct cannot pin a member's width -- a narrower field can hide
+        // inside the same padding -- so this pins what a caller actually receives: the
+        // getter's return value, which must stay 64-bit. A `size_t`/`uint32_t` slip here
+        // would silently change the ABI behind CRSession's `uint64_t` property reads.
+        #expect(MemoryLayout.size(ofValue: crdpq_seal_rejected_count(q)) == 8)
     }
 
     @Test("crdpq_post stamps the queue's current generation into the event, ignoring whatever the caller set")
