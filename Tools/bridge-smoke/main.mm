@@ -10,44 +10,26 @@
  * Never prints WIN_HOST/WIN_USER/WIN_PASS raw values (red line) -- only whether they were
  * found and their lengths, for sanity-checking a misconfigured host.env without leaking
  * it into logs/Console.app.
+ *
+ * Refuses to dial anything outside the owner's own lab network: MacdowsCore.LabBoundary (the
+ * in-process mirror of Scripts/lib.sh's crdp_assert_lab_boundary), reached through
+ * Tools/bridge-smoke/GateShim.swift, runs after the credentials resolve and before any CRSession
+ * exists, and returns 78 on a refusal. That gate lives here because it is the only place it can:
+ * nothing in Scripts/ launches this harness, and the binary is run straight out of DerivedData.
+ * The same shim also does the host.env reading, so the string this harness dials is parsed
+ * by the same code the shell gate's own extraction agrees with -- see GateShim.swift's header for
+ * the fail-open disagreement that motivated deleting this file's own parser.
  */
 #import <Foundation/Foundation.h>
 #import "CRSession.h"
 
+/* The Swift half of this target (GateShim.swift), through the header the Swift compiler emits
+ * for it. The name is the target's own PRODUCT_MODULE_NAME with `-` mapped to `_`, which is
+ * Xcode's c99extidentifier rule, not a choice made here. */
+#import "bridge_smoke-Swift.h"
+
 #include <stdio.h>
 #include <unistd.h>
-
-static NSDictionary<NSString *, NSString *> *ParseEnvFile(NSString *path)
-{
-    NSError *err = nil;
-    NSString *contents = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
-    if (!contents)
-        return @{};
-
-    NSMutableDictionary<NSString *, NSString *> *out = [NSMutableDictionary dictionary];
-    for (NSString *rawLine in [contents componentsSeparatedByString:@"\n"])
-    {
-        NSString *line = [rawLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        if (line.length == 0 || [line hasPrefix:@"#"])
-            continue;
-        NSRange eq = [line rangeOfString:@"="];
-        if (eq.location == NSNotFound)
-            continue;
-        NSString *key = [line substringToIndex:eq.location];
-        NSString *value = [line substringFromIndex:eq.location + 1];
-        out[key] = value;
-    }
-    return out;
-}
-
-static NSString *ResolveCredential(NSDictionary<NSString *, NSString *> *fileEnv, const char *envVarName,
-                                    NSString *fileKey)
-{
-    const char *fromEnv = getenv(envVarName);
-    if (fromEnv && fromEnv[0] != '\0')
-        return [NSString stringWithUTF8String:fromEnv];
-    return fileEnv[fileKey];
-}
 
 static NSString *KindName(CRDPEventKind kind)
 {
@@ -178,13 +160,22 @@ int main(int argc, char *argv[])
     {
         [CRSession logFreeRDPVersion];
 
-        NSString *home = NSHomeDirectory();
-        NSString *envPath = [home stringByAppendingPathComponent:@".config/macdows/host.env"];
-        NSDictionary<NSString *, NSString *> *fileEnv = ParseEnvFile(envPath);
-
-        NSString *host = ResolveCredential(fileEnv, "WIN_HOST", @"WIN_HOST");
-        NSString *user = ResolveCredential(fileEnv, "WIN_USER", @"WIN_USER");
-        NSString *pass = ResolveCredential(fileEnv, "WIN_PASS", @"WIN_PASS");
+        /* MacdowsCore.EnvFile via GateShim.swift, not the hand-rolled ParseEnvFile/
+         * ResolveCredential pair this file used to carry. That parser keyed each line on
+         * everything left of the first `=`, so the ordinary line `export WIN_HOST=x` was filed
+         * under the key "export WIN_HOST" and was invisible to the lookup below it, and it
+         * stripped no quotes -- rules that disagreed with the ones Scripts/run-window-smoke.command
+         * applies to the SAME file, a disagreement a prior review measured fail-open (see
+         * GateShim.swift and MacdowsCore/EnvFile.swift for the measurement). One parser, in the
+         * package `swift test` can reach, is the fix; this was its fourth copy.
+         *
+         * Everything visible on this path is unchanged: the environment variables still take
+         * priority over host.env, a value still comes back nil when neither supplies it, and the
+         * present/MISSING + length reporting below and its exit code are the same as before. */
+        BridgeSmokeCredentials *credentials = [BridgeSmokeGate resolveCredentials];
+        NSString *host = credentials.host;
+        NSString *user = credentials.user;
+        NSString *pass = credentials.password;
 
         printf("credentials: host=%s (len=%lu) user=%s (len=%lu) pass=(len=%lu)\n", host ? "present" : "MISSING",
                (unsigned long)host.length, user ? "present" : "MISSING", (unsigned long)user.length,
@@ -192,11 +183,44 @@ int main(int argc, char *argv[])
 
         if (host.length == 0 || user.length == 0 || pass.length == 0)
         {
+            /* The path comes back from the shim rather than being spelled again here, so the file
+             * this message names is by construction the file that was actually read. */
             fprintf(stderr, "Missing host/user/pass (checked WIN_HOST/WIN_USER/WIN_PASS env vars, then %s). "
                             "Not attempting a connection.\n",
-                    envPath.UTF8String);
+                    [BridgeSmokeGate hostEnvPath].UTF8String);
             return 2;
         }
+
+        /* Live-host testing boundary gate (owner rule, 2026-08-31), enforced HERE because there is
+         * no shell wrapper around this harness to enforce it anywhere else: nothing in this
+         * repository launches bridge-smoke. `xcodebuild -scheme bridge-smoke` leaves a runnable
+         * executable in DerivedData that anyone (or any future script, or Xcode's own Run button)
+         * can invoke directly with WIN_HOST set, and that path had no gate at all -- it went from
+         * getenv straight to -[CRSession initWithHost:...]. The rule is that a real-host step may
+         * only ever target the owner's own machine on the owner's own LAN, so the binary that
+         * opens the socket is where it has to be checked. Before any CRSession exists,
+         * deliberately: a refusal must cost zero packets.
+         *
+         * 78 matches Scripts/run-window-smoke.command's and Tools/window-smoke's established
+         * refusal code, so that exit status keeps exactly one meaning for every caller and every
+         * log reader: boundary refusal, host never contacted. It cannot collide with this
+         * harness's own vocabulary (0 pass, 1 assertion failure or no connection, 2 missing
+         * credentials).
+         *
+         * The host is NOT printed, unlike lib.sh's own refusal line: this file's header commits to
+         * never printing WIN_HOST/WIN_USER/WIN_PASS raw values, and these runs are captured to a
+         * log file. The reason category is enough to act on and can never carry a boundary segment
+         * (see LabBoundary's doc comment). stderr, matching the missing-credentials refusal right
+         * above it -- both are this harness declining to run, not progress. */
+        BridgeSmokeBoundaryVerdict *verdict = [BridgeSmokeGate checkBoundaryForHost:host];
+        if (!verdict.isAllowed)
+        {
+            fprintf(stderr, "bridge-smoke: live-host boundary gate REFUSED this target -- %s. Nothing was "
+                            "connected; the host value is not printed (red line).\n",
+                    verdict.reasonText.UTF8String);
+            return 78;
+        }
+        printf("bridge-smoke: %s\n", [BridgeSmokeGate allowedLine].UTF8String);
 
         NSString *program = @"C:\\Windows\\System32\\winver.exe";
 

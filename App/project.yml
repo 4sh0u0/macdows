@@ -318,7 +318,9 @@ targets:
     # CRBridge's exact build settings/dependency graph rather than a standalone CMake
     # build, so it never drifts from what the real App target links against. Instantiates
     # CRSession directly, connects to a real host (credentials from
-    # ~/.config/macdows/host.env, read by main.mm itself -- never by library code),
+    # ~/.config/macdows/host.env, read by this target's own Tools/bridge-smoke/GateShim.swift
+    # through MacdowsCore.EnvFile -- harness code, not CRBridge library code, which still never
+    # touches host.env; the same shim runs the live-host boundary gate before anything dials),
     # drains and prints every control-lane event, then runs the full shutdown protocol.
     # `.app`'s own TCC identity gates local-network access behind a first-run prompt a
     # headless CI/CLI context can't answer -- this tool, launched from an already-trusted
@@ -370,6 +372,15 @@ targets:
           - IOSurface
     dependencies:
       - target: CRBridge
+      # The live-host boundary gate (MacdowsCore.LabBoundary) and the one host.env parser
+      # (MacdowsCore.EnvFile) this harness now calls through Tools/bridge-smoke/GateShim.swift,
+      # instead of the hand-rolled ObjC++ parser it used to carry and the gate it never had --
+      # see that file's own header. Same `package:`/`product:` pair the Macdows and window-smoke
+      # targets declare; the only thing that makes this target different is that its entry point
+      # stays in ObjC++ (main.mm), so the Swift shim is reached back through the generated
+      # bridge_smoke-Swift.h rather than being the main module itself.
+      - package: MacdowsCore
+        product: MacdowsCore
 
   window-smoke:
     # W4b's real-host pixel-path verification harness (Tools/window-smoke) -- unlike
