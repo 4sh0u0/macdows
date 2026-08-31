@@ -19,7 +19,7 @@ RAIL protocol capture samples must be sanitized before being committed.
 ## Conventions
 
 - Commit style: `<type>: <summary>` (`feat` / `fix` / `docs` / `chore` / `refactor` /
-  `test` / `build`)
+  `test` / `build` / `merge`)
 - Commit messages and code comments: English
 - Code comments cite design decision records as `adr/NNNN §n`. Those records are
   maintained privately by the project owner and their numbering is stable; the

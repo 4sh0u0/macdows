@@ -4215,10 +4215,18 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                         + "content and closed on Escape (got \(okRounds); \(popupRoundResults.count) round(s) ran, "
                         + "\(latencies.count) produced a real first-content latency)"
                 )
+                // Owner ruling 2026-08-31: the original <=100ms budget (docs/plans/phase2.md
+                // §4 W4) was drafted against wired LAN; the formal n=20 run went over WLAN
+                // and read p50=124.1 / p95=132.6 / max=134.3ms with a bimodal split (7x
+                // 70-87ms -- inside the old gate -- vs 13x 119-134ms, a ~50ms void between,
+                // shaped like a missed whole-frame encode window server-side; local present
+                // p95 was 3ms). Gate relaxed to <=150ms as the WLAN acceptance bar; a wired
+                // retest that would settle the bimodality is an OPTIONAL follow-up, and the
+                // 100ms figure remains the wired-LAN aspiration, not this gate.
                 check(
-                    !latencies.isEmpty && popupPercentileMs(0.95) <= 100.0,
-                    "popup scenario: WindowCreate→first-content p95 <= 100ms over \(latencies.count) sample(s) "
-                        + "(docs/plans/phase2.md §4 W4's LAN gate) (got "
+                    !latencies.isEmpty && popupPercentileMs(0.95) <= 150.0,
+                    "popup scenario: WindowCreate→first-content p95 <= 150ms over \(latencies.count) sample(s) "
+                        + "(WLAN gate per owner ruling 2026-08-31; 100ms stays the wired-LAN aspiration) (got "
                         + "\(latencies.isEmpty ? "no samples" : String(format: "%.1fms", popupPercentileMs(0.95))))"
                 )
             }
