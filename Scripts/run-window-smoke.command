@@ -63,17 +63,40 @@ mkdir -p "$(dirname "$LOG")"
 # that one key out of host.env textually -- sourcing the file would drag WIN_USER/WIN_PASS
 # into this shell for no reason (the head comment's red line).
 #
-# This extraction is deliberately NOT bug-for-bug identical to window-smoke's own parser,
-# and that difference is exactly why the export below is mandatory rather than tidy.
-# main.swift:33-41 keys each line on the whole text left of the first `=`, so a line
-# `export WIN_HOST=x` is stored under the key "export WIN_HOST" and is invisible to its
-# WIN_HOST lookup; this script instead accepts an optional `export ` prefix and takes the
-# last match. On a host.env carrying both spellings the two disagree, and the disagreement
-# is fail-open in the worst direction: measured on a fixture with a bare out-of-boundary
-# line followed by an in-boundary `export` line, the gate approved the in-boundary value
-# while window-smoke would have connected to the out-of-boundary one.
+# This extraction and window-smoke's own reader now agree on every line shape that matters.
+# They did not always: the Swift side keyed each line on the whole text left of the first
+# `=`, so `export WIN_HOST=x` was filed under the key "export WIN_HOST" and was invisible to
+# the WIN_HOST lookup, while this script accepted the `export ` prefix and took the last
+# match. On a file carrying both spellings the two disagreed, and fail-open in the worst
+# direction: measured on a fixture with a bare out-of-boundary line followed by an
+# in-boundary `export` line, the gate approved the in-boundary value while window-smoke
+# would have connected to the out-of-boundary one. That divergence is closed at the parser
+# level: MacdowsCore's EnvFile is the one parser now, and window-smoke's main.swift, the app,
+# and Tools/bridge-smoke (through its GateShim) all read host.env through it instead of each
+# carrying their own. Its rule is the
+# Swift statement of the same intent as the grep/sed pair below -- optional `export ` prefix
+# dropped, surrounding quotes stripped, a later occurrence of a key winning over an earlier
+# one, which is this script's `tail -1`.
+#
+# Where the two still differ, the difference either fails CLOSED or is made irrelevant by the
+# export below, never in a way that could point this script and window-smoke at different
+# hosts. EnvFile trims a line before reading it
+# and accepts any whitespace after `export`; the ERE below anchors the key at column 0 and
+# wants exactly one space, so `  WIN_HOST=x`, `export<tab>WIN_HOST=x` and `export  WIN_HOST=x`
+# yield nothing here -- and nothing means an empty SMOKE_HOST, which the gate refuses as an
+# empty target. EnvFile strips only *matching* quotes where the sed pair strips a leading and
+# a trailing one independently, so `WIN_HOST="x'` parses differently in the two; that one is
+# neutralised by the export after the gate. None of them can make this script approve one
+# host and window-smoke dial another.
 SMOKE_HOST="${WIN_HOST:-}"
-HOST_ENV_FILE="$HOME/.config/macdows/host.env"
+# ${HOME:-} rather than $HOME, matching crdp_assert_lab_boundary's own reasoning: this
+# script runs under `set -u`, so with HOME unset the bare expansion would kill it outright,
+# here of all places -- before the gate, and therefore before any DONE line reaches the log
+# that every caller of this launcher polls on. Degrading to an absolute path that cannot
+# exist keeps the failure inside the fail-closed path instead: no host.env is read,
+# SMOKE_HOST stays empty, the gate refuses an empty target, and the run ends the way every
+# other refusal does, with DONE exit=78.
+HOST_ENV_FILE="${HOME:-}/.config/macdows/host.env"
 if [ -z "$SMOKE_HOST" ] && [ -f "$HOST_ENV_FILE" ]; then
     SMOKE_HOST="$(grep -E '^(export )?WIN_HOST=' "$HOST_ENV_FILE" | tail -1 |
         sed -E -e "s/^(export )?WIN_HOST=//" -e "s/^[\"']//" -e "s/[\"']\$//")"
@@ -84,9 +107,12 @@ if ! crdp_assert_lab_boundary "$SMOKE_HOST"; then
     exit 78
 fi
 # Hand window-smoke the exact string the gate just cleared, instead of letting it re-derive
-# a host from the same file by different rules. main.swift's resolveCredential prefers the
-# environment variable over the file, so this closes the divergence above by construction:
-# what was validated is what gets dialled, whatever host.env happens to contain.
+# a host from the same file at all. Keep this even though EnvFile and the extraction above
+# now line up: alignment is a property two separate implementations currently happen to
+# share, and re-deriving would put the gate's verdict at the mercy of it holding forever.
+# main.swift's resolveCredential prefers the environment variable over the file, so this is
+# instead a by-construction guarantee, independent of any parser: what was validated is what
+# gets dialled, whatever host.env happens to contain and however it is read.
 export WIN_HOST="$SMOKE_HOST"
 
 APP_DIR="$REPO_ROOT/App"
