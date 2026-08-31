@@ -187,6 +187,78 @@ struct EnvFileTests {
             try EnvFile.parse(path: path)
         }
     }
+
+    // MARK: Environment-vs-file precedence
+
+    /// The rule the two harnesses each carried a four-line copy of, sitting on top of the
+    /// parser above. Textually identical copies with no measured divergence — which is what the
+    /// *parsing* rule also looked like right up until the divergence was measured fail-open, so
+    /// the copies were hoisted rather than watched.
+    @Test("a present, non-empty environment variable wins over the file")
+    func environmentWinsOverTheFile() {
+        let fileValues = ["WIN_HOST": "192.0.2.10"]
+        #expect(
+            EnvFile.value(forKey: "WIN_HOST", in: fileValues, environment: ["WIN_HOST": "203.0.113.9"])
+                == "203.0.113.9")
+    }
+
+    /// `${VAR:-}` semantics, and the clause with teeth: an exported-but-empty variable is what
+    /// an *unset* one looks like once a shell has expanded it into a child's environment, so it
+    /// must mean "I did not supply one" rather than "supply the empty string". Getting this
+    /// backwards would make `WIN_HOST=` in the launcher's environment shadow a perfectly good
+    /// host.env entry and refuse the run as an empty target.
+    @Test("an empty environment variable is treated as absent and the file value is used")
+    func emptyEnvironmentValueFallsThroughToTheFile() {
+        let fileValues = ["WIN_HOST": "192.0.2.10"]
+        #expect(EnvFile.value(forKey: "WIN_HOST", in: fileValues, environment: ["WIN_HOST": ""]) == "192.0.2.10")
+        #expect(EnvFile.value(forKey: "WIN_HOST", in: fileValues, environment: [:]) == "192.0.2.10")
+    }
+
+    /// The *file* side gets no such repair. `window-smoke` exits 2 on an empty credential and
+    /// `bridge-smoke`'s main.mm prints `present (len=0)` before its own guard does the same, so
+    /// collapsing an empty file value into `nil` here would silently change both messages.
+    @Test("an empty value in the file comes back as the empty string, not as nil")
+    func emptyFileValueIsNotCollapsedToNil() {
+        #expect(EnvFile.value(forKey: "WIN_PASS", in: ["WIN_PASS": ""], environment: [:]) == "")
+        #expect(EnvFile.value(forKey: "WIN_PASS", in: ["WIN_PASS": ""], environment: [:]) != nil)
+    }
+
+    @Test("nil when neither side has the key, and unrelated keys are never consulted")
+    func absentEverywhere() {
+        #expect(EnvFile.value(forKey: "WIN_HOST", in: [:], environment: [:]) == nil)
+        #expect(
+            EnvFile.value(forKey: "WIN_HOST", in: ["WIN_USER": "rdpuser"], environment: ["WIN_PASS": "secret"])
+                == nil)
+    }
+
+    /// One key, not an environment-variable name plus a separate file key: every call site in
+    /// the repository passed the same string for both, and the collapsed signature makes that a
+    /// property of the API instead of a coincidence three call sites happened to share.
+    @Test("the same key names both the environment variable and the file entry")
+    func oneKeyNamesBothSources() {
+        #expect(EnvFile.value(forKey: "WIN_USER", in: ["WIN_USER": "fromfile"], environment: [:]) == "fromfile")
+        #expect(
+            EnvFile.value(forKey: "WIN_USER", in: [:], environment: ["WIN_USER": "fromenvironment"])
+                == "fromenvironment")
+    }
+
+    /// The default argument is what makes the call sites one-liners, so it has to be this
+    /// process's live environment rather than a snapshot. Asserted with a key that cannot be
+    /// set in it, which keeps the case deterministic without mutating anything.
+    @Test("the default environment argument is this process's own environment")
+    func defaultEnvironmentArgumentIsProcessInfo() {
+        let absentKey = "MACDOWS_ENVFILE_TEST_KEY_\(UUID().uuidString.replacingOccurrences(of: "-", with: "_"))"
+        #expect(ProcessInfo.processInfo.environment[absentKey] == nil, "the fixture key must not be set for real")
+        #expect(EnvFile.value(forKey: absentKey, in: [absentKey: "fromfile"]) == "fromfile")
+        // And a key that *is* set: whatever it is, the injected-environment call and the
+        // default-argument call have to agree, which is only true if the default reads
+        // ProcessInfo.
+        let live = ProcessInfo.processInfo.environment
+        for key in ["PATH", "HOME"] where live[key]?.isEmpty == false {
+            #expect(EnvFile.value(forKey: key, in: [key: "fromfile"]) == live[key])
+            #expect(EnvFile.value(forKey: key, in: [key: "fromfile"]) != "fromfile")
+        }
+    }
 }
 
 /// A throwaway directory that removes itself when the test's reference to it goes away.

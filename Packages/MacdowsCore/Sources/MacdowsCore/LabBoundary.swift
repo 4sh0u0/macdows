@@ -536,14 +536,22 @@ public enum LabBoundary {
     /// while this falls back to `NSHomeDirectory()`, the process's actual home. That is the
     /// more correct answer for a bundled app — whose home is its container, not `$HOME` — and
     /// in every configuration where `HOME` is set the two produce the identical path.
+    ///
+    /// **The rule itself now lives in `MacdowsPaths`, and this is a forwarder.** Not a
+    /// cosmetic move: `host.env` — the file the *host* being judged comes out of — used to be
+    /// located by a second, different rule (`NSHomeDirectory()`, at all three call sites), so
+    /// under a redirected `HOME` the gate's two inputs could come from two different homes. A
+    /// review measured that skew and parked the fix; `MacdowsPaths` is it, and the reconciled
+    /// order is the `$HOME`-preferring one *this* function already used, chosen deliberately
+    /// (see that type's doc comment for the four reasons). Consequently **this function's
+    /// behaviour is unchanged in every environment**, including a redirected `HOME`: the gate
+    /// reads the same boundary file it read before, so nothing in the divergence list above
+    /// moves and the pinned cases in `boundaryFilePathResolution` still hold verbatim. What
+    /// changed is that `host.env` joined this rule rather than keeping its own.
     public static func defaultBoundaryFilePath(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> String {
-        if let override = environment["MACDOWS_LAB_BOUNDARY_FILE"], !override.isEmpty {
-            return override
-        }
-        let home = environment["HOME"].flatMap { $0.isEmpty ? nil : $0 } ?? NSHomeDirectory()
-        return home + "/.config/macdows/lab-boundary.env"
+        MacdowsPaths.boundaryFilePath(environment: environment)
     }
 
     // MARK: - Rendering

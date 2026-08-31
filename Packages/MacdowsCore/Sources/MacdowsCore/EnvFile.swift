@@ -53,6 +53,11 @@ import Foundation
 /// file as data, it does not execute it — which is the point, for a file whose whole reason to
 /// be untracked is that its contents are sensitive).
 ///
+/// **The env-var-vs-file precedence rule lives here too**, as
+/// `value(forKey:in:environment:)`, for the same reason the parsing rule does: it used to be a
+/// four-line copy in each harness. `MacdowsPaths` owns the third piece of the same story —
+/// *where* these two files are — so that a caller needs no local spelling of any of the three.
+///
 /// **Never log a parsed value.** Every value these files carry is either a credential or the
 /// owner's own network shape. This type has no logging of its own, and callers must keep it
 /// that way — `window-smoke` prints credential *lengths* for exactly this reason.
@@ -108,6 +113,49 @@ public enum EnvFile {
             throw ReadError.notUTF8(path: path)
         }
         return parse(contents: contents)
+    }
+
+    /// The other half of "read a value out of one of these files": which of the two sources
+    /// wins when both have the key. An environment variable that is present **and non-empty**
+    /// takes precedence over the file; otherwise the file's value is returned, `nil` when it
+    /// has none either.
+    ///
+    /// **Why this lives here and not at the call sites.** `Tools/window-smoke/main.swift` and
+    /// `Tools/bridge-smoke/GateShim.swift` each carried their own four-line copy of exactly
+    /// this rule, sitting directly on top of the parser this type unified — the same
+    /// two-implementations-of-one-rule shape at one-tenth the size, and on the same values
+    /// (`WIN_HOST` above all) whose two readings a boundary gate is supposed to keep identical.
+    /// A review parked it as a follow-up rather than let a third copy appear; this is that
+    /// follow-up. `Scripts/run-window-smoke.command` states the same precedence on the shell
+    /// side (`SMOKE_HOST="${WIN_HOST:-}"`, consulting `host.env` only when that is empty), and
+    /// it is what lets the launcher hand a child the exact host its own gate cleared.
+    ///
+    /// **Empty is treated as absent, on the environment side only.** `${VAR:-}` semantics: an
+    /// exported-but-empty `WIN_HOST` means "I did not supply one", because that is what an
+    /// unset variable looks like after a shell has expanded it into a child's environment. The
+    /// *file* side gets no such repair — an empty value in `host.env` comes back as the empty
+    /// string, not `nil`, so the caller's own "missing credentials" guard keeps deciding what
+    /// emptiness means (`window-smoke` exits 2 on it, `bridge-smoke`'s `main.mm` prints
+    /// `present (len=0)` and then exits 2 on its own guard). Collapsing the two here would
+    /// silently change both of those messages.
+    ///
+    /// **One key, not two.** The rule this replaces took an environment-variable name and a
+    /// file key separately, and every call site in the repository passed the same string for
+    /// both. A single parameter makes that a property of the API instead of a coincidence
+    /// three call sites happened to share.
+    ///
+    /// The environment is a parameter so the rule is testable without mutating the test
+    /// process's own environment (which no test in this package does, and which would not be
+    /// safe to do concurrently in any case).
+    public static func value(
+        forKey key: String,
+        in fileValues: [String: String],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        if let fromEnvironment = environment[key], !fromEnvironment.isEmpty {
+            return fromEnvironment
+        }
+        return fileValues[key]
     }
 
     /// Returns `line` with a leading `export` token removed, or `nil` when there is no such

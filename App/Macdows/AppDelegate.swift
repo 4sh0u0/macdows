@@ -100,9 +100,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// Scripts/run-window-smoke.command applies to the same file; EnvFile's own doc comment
 		// records how that disagreement was measured fail-open. One parser now, in the package
 		// that has a test bundle (this target has none).
+		//
+		// MacdowsPaths.hostEnvPath() rather than a local `NSHomeDirectory()` concatenation, for
+		// the same reason: LabBoundary locates its own boundary file through $HOME, so the two
+		// halves of the gate a few lines below -- the host, and the segments it is judged
+		// against -- used to be able to come out of two different homes when HOME is redirected.
+		// One resolver now decides both (see MacdowsPaths for the reconciled order and why).
+		// In the default environment the path is byte-identical to the one this line built
+		// before, so nothing about a normal launch changes.
+		//
+		// This method deliberately does NOT take the WIN_HOST/WIN_USER/WIN_PASS environment
+		// variables into account, unlike the two command-line harnesses (which get them from
+		// Scripts/run-window-smoke.command, the whole point of the precedence there). This is a
+		// GUI app: it is launched by Finder, by Xcode's Run button or by `open`, none of which
+		// is a place a maintainer sets a variable on purpose, and honouring one would add a way
+		// to change which host a button press dials that is invisible in the window the human
+		// is looking at. host.env is the app's single source, the status label says so, and
+		// EnvFile.value(forKey:in:environment:) is deliberately not called here.
 		let values: [String: String]
 		do {
-			values = try EnvFile.parse(path: NSHomeDirectory() + "/.config/macdows/host.env")
+			values = try EnvFile.parse(path: MacdowsPaths.hostEnvPath())
 		} catch {
 			statusLabel.stringValue = "Could not read ~/.config/macdows/host.env"
 			return

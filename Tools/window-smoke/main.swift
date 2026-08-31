@@ -36,31 +36,38 @@ import CoreGraphics
 import Foundation
 import MacdowsCore
 
-func resolveCredential(_ fileEnv: [String: String], envVarName: String, fileKey: String) -> String? {
-    if let fromEnv = ProcessInfo.processInfo.environment[envVarName], !fromEnv.isEmpty {
-        return fromEnv
-    }
-    return fileEnv[fileKey]
-}
-
-// MacdowsCore.EnvFile, not the hand-rolled parser this file used to carry. That parser keyed
-// each line on everything left of the first `=`, so `export WIN_HOST=x` landed under the key
-// "export WIN_HOST" and was invisible to the lookup below, and it stripped no quotes -- rules
-// that disagreed with the ones run-window-smoke.command applies to the SAME file. The
-// disagreement was measured fail-open (see EnvFile's own doc comment and this launcher's
-// comment on SMOKE_HOST): on a host.env with a bare out-of-boundary line followed by an
-// in-boundary `export` line, the launcher's gate approved one host and this harness would have
-// dialled the other. One parser, in the package `swift test` can reach, is the fix.
+// Three MacdowsCore rules and no local copy of any of them: MacdowsPaths says WHERE host.env
+// is, EnvFile.parse says HOW it is read, EnvFile.value says WHICH of the environment variable
+// and the file value wins. All three used to be spelled out right here.
+//
+// The parser was the worst of them. It keyed each line on everything left of the first `=`, so
+// `export WIN_HOST=x` landed under the key "export WIN_HOST" and was invisible to the lookup
+// below, and it stripped no quotes -- rules that disagreed with the ones
+// run-window-smoke.command applies to the SAME file. The disagreement was measured fail-open
+// (see EnvFile's own doc comment and this launcher's comment on SMOKE_HOST): on a host.env with
+// a bare out-of-boundary line followed by an in-boundary `export` line, the launcher's gate
+// approved one host and this harness would have dialled the other. One parser, in the package
+// `swift test` can reach, was the fix.
+//
+// The path and the precedence followed for the same reason, one review later. The path had been
+// `NSHomeDirectory() + "/.config/macdows/host.env"` while LabBoundary located ITS file through
+// $HOME, so a redirected HOME sent the two halves of one gate decision to two different homes
+// (MacdowsPaths' doc comment has the measurement and the four reasons the reconciled order is
+// the $HOME-preferring one -- which is also what run-window-smoke.command:99 and lib.sh:57 use,
+// so the launcher and this binary now read one file by construction). The precedence had been a
+// four-line local function duplicated verbatim in Tools/bridge-smoke/GateShim.swift. Neither
+// resolved path nor any credential changes in the default environment; what changes is that
+// there is nothing left here for a future edit to change on one side only.
 //
 // A missing/unreadable host.env is still not fatal here: the WIN_HOST/WIN_USER/WIN_PASS
 // environment variables take priority over the file anyway (and are how the launcher hands
 // over the exact host its own gate cleared), so an empty dictionary lets that path run and the
 // guard below produce the same "missing credentials" message it always has.
-let fileEnv = (try? EnvFile.parse(path: NSHomeDirectory() + "/.config/macdows/host.env")) ?? [:]
+let fileEnv = (try? EnvFile.parse(path: MacdowsPaths.hostEnvPath())) ?? [:]
 guard
-    let host = resolveCredential(fileEnv, envVarName: "WIN_HOST", fileKey: "WIN_HOST"),
-    let user = resolveCredential(fileEnv, envVarName: "WIN_USER", fileKey: "WIN_USER"),
-    let pass = resolveCredential(fileEnv, envVarName: "WIN_PASS", fileKey: "WIN_PASS"),
+    let host = EnvFile.value(forKey: "WIN_HOST", in: fileEnv),
+    let user = EnvFile.value(forKey: "WIN_USER", in: fileEnv),
+    let pass = EnvFile.value(forKey: "WIN_PASS", in: fileEnv),
     !host.isEmpty, !user.isEmpty, !pass.isEmpty
 else {
     print("window-smoke: missing WIN_HOST/WIN_USER/WIN_PASS (env vars, or ~/.config/macdows/host.env)")
@@ -83,9 +90,9 @@ print(
 // exactly one meaning for every caller and every log reader: boundary refusal, host never
 // contacted. Running under the launcher this gate is a cheap second verdict on a string that
 // already cleared the shell gate (the launcher exports the exact host it validated, and
-// resolveCredential prefers the environment) -- agreement is the expected outcome and the two
-// implementations now share one parsing rule, so a disagreement is a bug in one of them rather
-// than the ambiguity it used to be.
+// EnvFile.value prefers the environment) -- agreement is the expected outcome and the two
+// implementations now share one parsing rule, one precedence rule and one host.env path, so a
+// disagreement is a bug in one of them rather than the ambiguity it used to be.
 //
 // The host is NOT printed, unlike lib.sh's own refusal line: this file's header commits to
 // never printing WIN_HOST/WIN_USER/WIN_PASS raw values, and its stdout is tee'd into

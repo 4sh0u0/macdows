@@ -86,11 +86,18 @@ public final class BridgeSmokeGate: NSObject {
     /// that the path in that message is by construction the path that was actually read --
     /// two spellings of the same path is how they start drifting.
     ///
-    /// `NSHomeDirectory()`, matching Tools/window-smoke and App/Macdows/AppDelegate.swift
-    /// character for character, and matching what main.mm's own
-    /// `stringByAppendingPathComponent:` produced before this replaced it.
+    /// `MacdowsPaths.hostEnvPath()`, which is also what Tools/window-smoke and
+    /// App/Macdows/AppDelegate.swift call: one resolver for both this file and the boundary
+    /// file LabBoundary reads, so the gate cannot end up judging a host that came out of one
+    /// home against segments that came out of another. This used to be a local
+    /// `NSHomeDirectory()` concatenation, repeated at all three call sites, while the boundary
+    /// half preferred $HOME -- see MacdowsPaths' doc comment for the skew that produced and
+    /// for why the reconciled order is the $HOME-preferring one. In the default environment
+    /// (HOME set to the process's real home) the resolved string is byte-identical to the
+    /// concatenation it replaces, and to what main.mm's own `stringByAppendingPathComponent:`
+    /// produced before the shim existed.
     @objc public static var hostEnvPath: String {
-        NSHomeDirectory() + "/.config/macdows/host.env"
+        MacdowsPaths.hostEnvPath()
     }
 
     /// What `LabBoundary` prints when it lets a target through, so main.mm's allowed-path line
@@ -105,6 +112,12 @@ public final class BridgeSmokeGate: NSObject {
     /// Scripts/probe.sh sources host.env on its behalf, so rail-probe itself never has a file leg
     /// to prefer the environment over.)
     ///
+    /// The precedence itself is `EnvFile.value(forKey:in:)`, not a local four-line copy of it.
+    /// It was such a copy when this file was written -- window-smoke carried the other one --
+    /// and a review parked hoisting it rather than let a third appear; "environment variable
+    /// wins when non-empty" is small, but it decides which string the boundary gate below is
+    /// handed, and this project has already measured what two readings of one host.env cost.
+    ///
     /// A missing or unreadable host.env is not fatal here (the `try?` collapses to an empty
     /// dictionary), for the same reason it is not fatal in window-smoke: the environment
     /// variables alone are a complete configuration, and the caller's own "missing
@@ -112,9 +125,9 @@ public final class BridgeSmokeGate: NSObject {
     @objc public static func resolveCredentials() -> BridgeSmokeCredentials {
         let fileValues = (try? EnvFile.parse(path: hostEnvPath)) ?? [:]
         return BridgeSmokeCredentials(
-            host: resolve(fileValues, key: "WIN_HOST"),
-            user: resolve(fileValues, key: "WIN_USER"),
-            password: resolve(fileValues, key: "WIN_PASS")
+            host: EnvFile.value(forKey: "WIN_HOST", in: fileValues),
+            user: EnvFile.value(forKey: "WIN_USER", in: fileValues),
+            password: EnvFile.value(forKey: "WIN_PASS", in: fileValues)
         )
     }
 
@@ -133,15 +146,5 @@ public final class BridgeSmokeGate: NSObject {
         case .refused(let refusal):
             return BridgeSmokeBoundaryVerdict(isAllowed: false, reasonText: refusal.reasonText)
         }
-    }
-
-    /// window-smoke's `resolveCredential`, with its two parameters collapsed into one: every
-    /// call site there passes the same string for the environment variable and the host.env
-    /// key, and the three keys this harness reads are no exception.
-    private static func resolve(_ fileValues: [String: String], key: String) -> String? {
-        if let fromEnvironment = ProcessInfo.processInfo.environment[key], !fromEnvironment.isEmpty {
-            return fromEnvironment
-        }
-        return fileValues[key]
     }
 }

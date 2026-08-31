@@ -110,7 +110,7 @@ fi
 # a host from the same file at all. Keep this even though EnvFile and the extraction above
 # now line up: alignment is a property two separate implementations currently happen to
 # share, and re-deriving would put the gate's verdict at the mercy of it holding forever.
-# main.swift's resolveCredential prefers the environment variable over the file, so this is
+# main.swift's EnvFile.value prefers the environment variable over the file, so this is
 # instead a by-construction guarantee, independent of any parser: what was validated is what
 # gets dialled, whatever host.env happens to contain and however it is read.
 export WIN_HOST="$SMOKE_HOST"
