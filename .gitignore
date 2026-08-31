@@ -33,6 +33,10 @@ sbom/
 # Secrets & local-only files — never tracked, from day 1
 .env*
 CLAUDE.local.md
+# AGENTS.md untracked per owner instruction (2026-08-31): agent-facing working rules
+# stay maintainer-local; the public-facing summary lives in README.md's conventions
+# section. History before the removal still holds the last tracked revision.
+AGENTS.md
 samples-local/
 .claude/settings.local.json
 .claude/RESUME.md

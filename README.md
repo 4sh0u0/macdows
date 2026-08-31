@@ -130,4 +130,6 @@ documented anywhere in this repository. Launch it via `Scripts/run-window-smoke.
 - No tracked file may ever contain real Windows host IPs/hostnames, RDP credentials,
   private-network addresses, or personal data — those live only in untracked local
   files. Any RAIL protocol capture sample must be sanitized before being committed.
-- See [`AGENTS.md`](AGENTS.md) for the full contributor/agent working rules.
+- The full contributor/agent working rules live in `AGENTS.md`, which is
+  maintainer-local (untracked); this section is the tracked summary of the rules
+  that bind every contribution.
