@@ -9,6 +9,10 @@
  *
  * Modeled on FreeRDP's client/Sample (tf_freerdp.c / tf_channels.c) minimal client, plus
  * the RAIL channel wiring pattern from client/X11/xf_rail.c.
+ *
+ * Run it through Scripts/probe.sh, not directly: main() refuses (exit 78) unless that
+ * launcher's handshake is present, because probe.sh is what clears the live-host boundary
+ * gate first. See the "Launcher handshake" comment block just above main().
  */
 
 #include <freerdp/config.h>
@@ -1238,11 +1242,96 @@ static void print_summary(probeContext* p)
 }
 
 /* ------------------------------------------------------------------------------------ */
+/* Launcher handshake (direct-invocation guardrail)                                      */
+/*                                                                                       */
+/* This binary dials a live machine, and the live-host boundary rule -- only ever the    */
+/* owner's own PC on the owner's own LAN -- is enforced by crdp_assert_lab_boundary in   */
+/* Scripts/lib.sh, which Scripts/probe.sh calls before it builds or runs anything. But a */
+/* built rail-probe sitting in Tools/rail-probe/build/ can be run straight from a shell, */
+/* and that path never passes the gate.                                                  */
+/*                                                                                       */
+/* THREAT MODEL: accidental ungated use, exactly like the rest of the boundary           */
+/* mechanism. This is a guardrail against a mistake -- a stale command recalled from     */
+/* shell history, a copy-pasted invocation, a script that learned the binary's path --    */
+/* NOT a defence against a malicious local user, who owns the process environment and    */
+/* can set anything they like. A defence against that is not achievable here and is not  */
+/* attempted.                                                                            */
+/*                                                                                       */
+/* So the check is a handshake, not a third implementation of the boundary rule. The     */
+/* rule has exactly one implementation (the shell gate); re-deriving "is this address    */
+/* inside the allowed segments" in C would mean two more things that must agree with it  */
+/* forever -- a CIDR comparison and a reader of the untracked boundary file -- and would */
+/* put a copy of that logic in a public source file. Instead this asks a single question: */
+/* "did the launcher that already ran the gate start me?"                                */
+/*                                                                                       */
+/* Contract, and it has to match Scripts/probe.sh (the export there is the other half):  */
+/*   MACDOWS_BOUNDARY_GATED=1                 -- set by Scripts/probe.sh, and only after  */
+/*                                              crdp_assert_lab_boundary has passed.      */
+/*   MACDOWS_BOUNDARY_GATED=skip-gate-i-know  -- deliberate manual override (below).      */
+/*   anything else, including unset or empty  -- refuse, exit 78.                         */
+/*                                                                                       */
+/* The OVERRIDE is spelled as a sentence rather than "1" on purpose -- not because that     */
+/* makes it hard to discover (it does not; this whole file is public, and "1" is a          */
+/* perfectly good token for the launcher, which is a program and cannot mistype it). The    */
+/* point is narrower: an override that a human types has to be one nobody sets reflexively  */
+/* or inherits from an unrelated convention, and "1" is exactly the value that arrives by   */
+/* accident. "skip-gate-i-know" also carries its own condition -- you must already have     */
+/* established, by other means, that the target is inside the owner's lab boundary -- and   */
+/* it is greppable, so an override that escapes into a script or a CI file is findable.     */
+/* None of this makes the handshake a lock; see the threat model above.                     */
+/*                                                                                       */
+/* Exit 78 is the family's refusal code: Scripts/run-window-smoke.command exits 78 on a   */
+/* gate refusal too, so a caller can tell "refused by the boundary contract" apart from   */
+/* an ordinary probe failure without parsing text.                                        */
+/*                                                                                       */
+/* The refusal never prints a host, a credential or a segment -- there is nothing to      */
+/* print, since this runs before any argument or environment value is read.               */
+/* ------------------------------------------------------------------------------------ */
+
+static bool probe_boundary_handshake_ok(void)
+{
+	const char* gated = getenv("MACDOWS_BOUNDARY_GATED");
+
+	if (!gated)
+		return false;
+	if (strcmp(gated, "1") == 0)
+		return true; /* exported by Scripts/probe.sh once the boundary gate has passed */
+	if (strcmp(gated, "skip-gate-i-know") == 0)
+		return true; /* deliberate manual override -- see the comment block above */
+	return false;
+}
+
+/* ------------------------------------------------------------------------------------ */
 /* main                                                                                  */
 /* ------------------------------------------------------------------------------------ */
 
 int main(int argc, char** argv)
 {
+	/* First statement in main(), deliberately: ahead of parse_args (which reads
+	 * WIN_HOST/WIN_USER/WIN_PASS out of the environment) and ahead of every FreeRDP call,
+	 * so an ungated run touches no credential, allocates no client context and opens no
+	 * file, and --help is refused too. Nothing here depends on argc/argv, so there is no
+	 * argument shape that can reach past it. (It is not the first code in the *process* --
+	 * the dynamic linker runs libfreerdp3/winpr3/ffmpeg initialisers before main by
+	 * construction. This translation unit adds no constructor of its own, so nothing of
+	 * ours runs earlier, and Scripts/test-lab-boundary.sh pins that no statement is ever
+	 * inserted between main's brace and this line.) */
+	if (!probe_boundary_handshake_ok())
+	{
+		fprintf(stderr,
+		        /* Hand-wrapped to fit 80 columns: this is the last thing a confused
+		         * operator reads, and a ragged wrap is where they stop reading. */
+		        "rail-probe: refusing to run -- started directly, without the launcher "
+		        "handshake.\n"
+		        "This tool dials a live host. Run it through Scripts/probe.sh, which\n"
+		        "verifies the live-host boundary first and only then hands this process\n"
+		        "MACDOWS_BOUNDARY_GATED.\n"
+		        "If you have already verified the boundary by other means, the deliberate\n"
+		        "override is documented at MACDOWS_BOUNDARY_GATED in\n"
+		        "Tools/rail-probe/rail-probe.c.\n");
+		return 78;
+	}
+
 	probeConfig cfg;
 	if (!parse_args(argc, argv, &cfg))
 		return 2;

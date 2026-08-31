@@ -30,11 +30,29 @@
 #     Scripts/run-window-smoke.command pins that a missing HOME degrades into an ordinary
 #     gate refusal -- exit 78 with the DONE line its callers poll for -- rather than a
 #     `set -u` death that leaves them reading an empty log.
+#   - and the one live entry point that is not a shell script. Tools/rail-probe is a compiled
+#     binary; the gate cannot reach inside it, and re-implementing the boundary rule in C
+#     would give one rule three implementations. So probe.sh hands the binary a handshake
+#     (MACDOWS_BOUNDARY_GATED) only after the gate has passed, and rail-probe refuses to run
+#     without it. The last two sections pin both halves: that probe.sh exports it on the far
+#     side of the gate and not on the near side, and that rail-probe's C guard sits where it
+#     has to sit -- ahead of the argument parser that reads WIN_PASS, and ahead of FreeRDP.
 #
-# That last section makes this suite an executor of other repo scripts, not just of a
-# function, and Tier 1 runs it on every push. It is deliberately contained: fixture files
-# only, a literal address that needs no resolver, a reduced PATH that holds five commands
-# and no build tool, and a $TEST_DIR the EXIT trap removes. See the section's own comment.
+# Those sections make this suite an executor of other repo scripts, not just of a function,
+# and Tier 1 runs it on every push. It is deliberately contained: fixture files only, a
+# literal address that needs no resolver, a reduced PATH that holds five commands and no
+# build tool, and a $TEST_DIR the EXIT trap removes. Still no connection is opened anywhere,
+# including by the rail-probe cases -- see each section's own comment.
+#
+# Three verdict words, and the difference between the last two matters:
+#   PASS/FAIL -- a case ran.
+#   SKIP      -- coverage that exists but could not run HERE, and that CI must not lose:
+#                tier1.yml fails any run whose output contains a SKIP line.
+#   NOTE      -- coverage that CI structurally cannot host at all (it needs a compiled
+#                rail-probe, which needs cmake and a FreeRDP prefix; the Tier 1 runner has
+#                neither). Spelling that SKIP would make Tier 1 permanently red for a
+#                condition nobody intends to fix, so it gets its own word -- still loud,
+#                still counted in the summary, never silent.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -68,6 +86,9 @@ FAILURES=0
 # Skips are not failures, but they must never be silent: the summary repeats the count, and
 # CI refuses a run that produced any.
 SKIPPED=0
+# Cases that need a compiled rail-probe. Same "never silent" rule, different word -- see the
+# three-verdict note in the head comment for why CI must be able to tolerate these.
+NOT_RUN=0
 # Everything the gate ever said during this run, so the no-leak assertion at the end can
 # be made against the whole transcript rather than case by case.
 TRANSCRIPT="$TEST_DIR/transcript.txt"
@@ -274,14 +295,83 @@ if [ "$MINIMAL_BIN_READY" -eq 1 ] &&
 	MINIMAL_BIN_MISSING="$MINIMAL_BIN_MISSING python3(does-not-run-under-the-reduced-PATH)"
 fi
 
-# run_probe <boundary-file>: run probe.sh under the reduced PATH, leaving its combined
-# output in $PROBE_LOG and its status in $PROBE_RC. Never fails itself -- both cases expect
-# a non-zero exit, and `set -e` must not end the suite on one.
+# One of those five entries is then not a symlink: basename. It becomes a wrapper that
+# records one environment variable before exec'ing the real thing.
+#
+# The reason is that probe.sh's other half of the rail-probe handshake is an `export`, and an
+# export is invisible from outside the process -- there is no way to ask a running script what
+# it exported. But probe.sh does spawn a child after the gate has spoken: lib.sh's log() (and
+# therefore die()) interpolates `$(basename ...)`, so every diagnostic probe.sh prints forks a
+# basename carrying probe.sh's environment at that moment. Interposing there measures the
+# export instead of reading the source text and hoping -- the refusal run must show the
+# variable unset, the cleared run must show it set, and the difference between the two runs is
+# still only the boundary file.
+#
+# This is reliable precisely because of the reduced PATH: cmake is hidden, so a cleared run is
+# guaranteed to reach `die "required command not found: cmake"` -- the same die() an existing
+# case already asserts on. If a future probe.sh stopped printing anything after the gate, no
+# witness line would be written, and the assertions below FAIL rather than pass vacuously.
+#
+# The wrapper is /bin/sh with the real basename baked in as an absolute path, so it needs no
+# PATH of its own and cannot recurse into itself; it forwards every argument untouched, so
+# every existing assertion about log()/die() output still holds. It writes only when
+# $CRDP_TEST_ENV_WITNESS is set, so the launcher case (which does not set it) is unaffected.
+PROBE_ENV_WITNESS="$TEST_DIR/probe-env-witness.txt"
+if [ "$MINIMAL_BIN_READY" -eq 1 ]; then
+	REAL_BASENAME="$(command -v basename)"
+	rm -f "$MINIMAL_BIN/basename"
+	printf "#!/bin/sh\nREAL_BASENAME='%s'\n" "$REAL_BASENAME" >"$MINIMAL_BIN/basename"
+	cat >>"$MINIMAL_BIN/basename" <<'CRDP_BASENAME_WITNESS'
+# ${VAR-default}, not ${VAR:-default}: set-but-empty must be distinguishable from unset,
+# because the C guard treats them the same way and the suite asserts on the exact text.
+if [ -n "${CRDP_TEST_ENV_WITNESS:-}" ]; then
+	printf 'MACDOWS_BOUNDARY_GATED=[%s]\n' "${MACDOWS_BOUNDARY_GATED-UNSET}" >>"$CRDP_TEST_ENV_WITNESS"
+fi
+exec "$REAL_BASENAME" "$@"
+CRDP_BASENAME_WITNESS
+	chmod +x "$MINIMAL_BIN/basename"
+	if ! PATH="$MINIMAL_BIN" "$MINIMAL_BIN/basename" /a/b/c >/dev/null 2>&1; then
+		MINIMAL_BIN_READY=0
+		MINIMAL_BIN_MISSING="$MINIMAL_BIN_MISSING basename(witness-wrapper-does-not-run)"
+	fi
+fi
+
+# run_probe <boundary-file> [inherited-handshake-value]: run probe.sh under the reduced PATH,
+# leaving its combined output in $PROBE_LOG and its status in $PROBE_RC. Never fails itself --
+# every case expects a non-zero exit, and `set -e` must not end the suite on one.
+#
+# MACDOWS_BOUNDARY_GATED is always removed first and then set only if the caller asked for it,
+# so the handshake this measures is an input of the case and never an accident of the shell
+# the suite was started from -- the same rule run_launcher states for HOME and WIN_HOST, and
+# for a sharper reason here: a maintainer who has the documented override exported (which is
+# what that override is *for*) would otherwise be feeding it to every case below.
 run_probe() {
 	PROBE_RC=0
-	PATH="$MINIMAL_BIN" CRDP_HOST_ENV="$PROBE_HOST_ENV" MACDOWS_LAB_BOUNDARY_FILE="$1" \
-		"$SCRIPT_DIR/probe.sh" >"$PROBE_LOG" 2>&1 || PROBE_RC=$?
+	# Truncated per run: each case asserts against the environment of ITS run, and a stale
+	# line from the previous one would let a case pass on the wrong evidence.
+	: >"$PROBE_ENV_WITNESS"
+	(
+		unset MACDOWS_BOUNDARY_GATED
+		if [ -n "${2:-}" ]; then
+			# SC2030: shellcheck notes the change is local to this subshell. That is the
+			# entire design -- the value must reach probe.sh and nothing else, least of all
+			# the suite's own shell or a later case.
+			# shellcheck disable=SC2030
+			export MACDOWS_BOUNDARY_GATED="$2"
+		fi
+		PATH="$MINIMAL_BIN" CRDP_HOST_ENV="$PROBE_HOST_ENV" MACDOWS_LAB_BOUNDARY_FILE="$1" \
+			CRDP_TEST_ENV_WITNESS="$PROBE_ENV_WITNESS" \
+			"$SCRIPT_DIR/probe.sh"
+	) >"$PROBE_LOG" 2>&1 || PROBE_RC=$?
 	cat "$PROBE_LOG" >>"$TRANSCRIPT"
+}
+
+# handshake_witness_says <expected-line>: 0 if the witness recorded exactly that state.
+# An empty or absent witness is a failure -- it means probe.sh printed no diagnostic after
+# the point being measured, so nothing was measured and the case must not pass.
+handshake_witness_says() {
+	[ -s "$PROBE_ENV_WITNESS" ] || return 1
+	grep -Fq -- "$1" "$PROBE_ENV_WITNESS"
 }
 
 # run_launcher: run run-window-smoke.command under the reduced PATH with HOME and WIN_HOST
@@ -358,6 +448,28 @@ else
 	fi
 	check "$PROBE_OK" "refusal predates any toolchain" "no mention of cmake in the whole run" "$PROBE_LOG"
 
+	# The rail-probe handshake, refusal side, measured from the refused run's own
+	# environment (see the basename-wrapper comment above). probe.sh's export must sit on
+	# the far side of the gate for the same reason the credential export does: a run the
+	# boundary just rejected must not leave behind the one thing that would let the binary
+	# it did not build run ungated later.
+	PROBE_OK=0
+	handshake_witness_says 'MACDOWS_BOUNDARY_GATED=[UNSET]' || PROBE_OK=1
+	check "$PROBE_OK" "refused run exports no handshake" "MACDOWS_BOUNDARY_GATED unset after a refusal" "$PROBE_ENV_WITNESS"
+
+	# Same refusal, but started from a shell that ALREADY exports the handshake -- and not a
+	# contrived value: `export MACDOWS_BOUNDARY_GATED=skip-gate-i-know` is precisely what the
+	# documented override tells a maintainer to do, so the realistic operator is the one who
+	# has it set. "Placed after the gate" says nothing about a value probe.sh did not set, so
+	# probe.sh clears the variable before the gate runs and this is what holds it there. Get
+	# this wrong and a refused run hands the handshake to its whole process tree.
+	run_probe "$BOUNDARY_OTHER" "skip-gate-i-know"
+
+	PROBE_OK=0
+	[ "$PROBE_RC" -ne 0 ] || PROBE_OK=1
+	handshake_witness_says 'MACDOWS_BOUNDARY_GATED=[UNSET]' || PROBE_OK=1
+	check "$PROBE_OK" "inherited handshake is cleared" "a pre-set value does not survive into a refusal" "$PROBE_ENV_WITNESS"
+
 	# Allow case: same fixture host, same script, a boundary that contains it. Proves the
 	# refusal above was the gate's verdict and not an early death with a convenient shape.
 	run_probe "$BOUNDARY_OK"
@@ -369,6 +481,13 @@ else
 	PROBE_OK=0
 	grep -Fq -- 'required command not found: cmake' "$PROBE_LOG" || PROBE_OK=1
 	check "$PROBE_OK" "cleared run stops at cmake next" "the toolchain check is the next thing" "$PROBE_LOG"
+
+	# The handshake, cleared side. Same measurement, opposite verdict, and the only input
+	# that changed between the two runs is the boundary file -- so the gate is provably what
+	# decides whether rail-probe would have been allowed to start.
+	PROBE_OK=0
+	handshake_witness_says 'MACDOWS_BOUNDARY_GATED=[1]' || PROBE_OK=1
+	check "$PROBE_OK" "cleared run exports the handshake" "MACDOWS_BOUNDARY_GATED=1 after the gate passes" "$PROBE_ENV_WITNESS"
 
 	# The launcher, with HOME unset. Two things are pinned at once, and they are the two
 	# halves of what that script owes its callers.
@@ -419,6 +538,246 @@ else
 	check "$LAUNCHER_ASSERT" "refusal predates any build" "no xcodegen/xcodebuild in the run" "$LAUNCHER_OUT"
 fi
 
+# The other half of the handshake: Tools/rail-probe itself, the one live entry point that is
+# not a shell script and so cannot call the gate.
+#
+# It does not re-decide the boundary -- one rule, one implementation -- it only asks whether
+# the launcher that already ran the gate started it. That makes the C side's correctness
+# almost entirely a question of WHERE the check sits, and placement is exactly what a
+# behavioural test of an ungated run cannot see: a guard moved below parse_args still refuses,
+# still exits 78, still prints the right words, and has by then read WIN_PASS out of the
+# environment. So the source pins below run always and hold the placement; the binary cases
+# after them run when a built rail-probe happens to exist and hold the behaviour.
+#
+# Nothing here opens a socket, and that is by construction rather than by care: no case ever
+# passes --app, without which parse_args refuses, so even a case that deliberately clears the
+# guard cannot reach freerdp_connect. The fixture credentials the cases do export are the same
+# documentation-range host and placeholder strings used above.
+echo "== rail-probe refuses a direct, ungated invocation =="
+
+RAILPROBE_SRC="$CRDP_REPO_ROOT/Tools/rail-probe/rail-probe.c"
+
+# src_line <file> <fixed-string>: line number of the first occurrence, empty if absent.
+# `|| return 0` keeps a no-match (grep's exit 1) from ending the suite under `set -e`; the
+# caller decides what an empty answer means.
+src_line() {
+	local match
+	match="$(grep -nF -m1 -- "$2" "$1" 2>/dev/null)" || return 0
+	printf '%s' "${match%%:*}"
+}
+
+RAILPROBE_MAIN_LINE="$(src_line "$RAILPROBE_SRC" 'int main(int argc, char** argv)')"
+RAILPROBE_GUARD_LINE="$(src_line "$RAILPROBE_SRC" 'if (!probe_boundary_handshake_ok())')"
+RAILPROBE_PARSE_LINE="$(src_line "$RAILPROBE_SRC" 'if (!parse_args(argc, argv, &cfg))')"
+RAILPROBE_FRDP_LINE="$(src_line "$RAILPROBE_SRC" '= freerdp_client_context_new(&entryPoints)')"
+
+RAILPROBE_OK=0
+RAILPROBE_PREAMBLE="n/a"
+if [ -n "$RAILPROBE_MAIN_LINE" ] && [ -n "$RAILPROBE_GUARD_LINE" ] &&
+	[ -n "$RAILPROBE_PARSE_LINE" ] && [ -n "$RAILPROBE_FRDP_LINE" ]; then
+	[ "$RAILPROBE_GUARD_LINE" -gt "$RAILPROBE_MAIN_LINE" ] || RAILPROBE_OK=1
+	[ "$RAILPROBE_GUARD_LINE" -lt "$RAILPROBE_PARSE_LINE" ] || RAILPROBE_OK=1
+	[ "$RAILPROBE_GUARD_LINE" -lt "$RAILPROBE_FRDP_LINE" ] || RAILPROBE_OK=1
+
+	# Relative order is NOT the claim. Three anchors in the right sequence say nothing about
+	# what sits between main()'s brace and the guard, and a statement inserted there -- say a
+	# getenv("WIN_PASS") -- leaves every line number above exactly where it was while
+	# destroying the property the guard exists for. Measured: without this assertion that
+	# insertion passes the whole suite, because an ungated run still refuses, still exits 78
+	# and still creates nothing, so no behavioural case can see it either.
+	#
+	# So: the lines strictly between the two anchors must be nothing but blanks, an opening
+	# brace, and comment text. awk selects the range and grep counts the lines that are none
+	# of those; the count must be zero. `|| true` because grep -c exits 1 when it counts none,
+	# which is the passing case. Portable to bash 3.2 and to ubuntu-latest -- awk and grep
+	# only, no GNU-specific flags.
+	RAILPROBE_PREAMBLE="$(awk -v a="$RAILPROBE_MAIN_LINE" -v b="$RAILPROBE_GUARD_LINE" \
+		'NR > a && NR < b' "$RAILPROBE_SRC" |
+		grep -cvE '^[[:space:]]*($|\{|/\*|\*|//)' || true)"
+	[ "${RAILPROBE_PREAMBLE:-1}" -eq 0 ] || RAILPROBE_OK=1
+else
+	RAILPROBE_OK=1
+fi
+
+# Line numbers rather than an excerpt: a failure here is a claim about position, and the four
+# numbers plus the preamble count say which way it went -- "guard at 1317, 1 effectful line
+# above it" is a diagnosis, an excerpt is a puzzle. An empty field means the anchor string
+# itself is gone, which is also a failure, since a renamed guard is an unpinned guard.
+RAILPROBE_SRC_EVIDENCE="$TEST_DIR/railprobe-src-lines.txt"
+{
+	printf 'main() ......................... line %s\n' "${RAILPROBE_MAIN_LINE:-<anchor not found>}"
+	printf 'handshake guard ................ line %s\n' "${RAILPROBE_GUARD_LINE:-<anchor not found>}"
+	printf 'parse_args() call .............. line %s\n' "${RAILPROBE_PARSE_LINE:-<anchor not found>}"
+	printf 'freerdp_client_context_new() ... line %s\n' "${RAILPROBE_FRDP_LINE:-<anchor not found>}"
+	printf 'effectful lines between main() and the guard (must be 0): %s\n' "$RAILPROBE_PREAMBLE"
+} >"$RAILPROBE_SRC_EVIDENCE"
+
+check "$RAILPROBE_OK" "guard is main()'s first act" "nothing at all between main's brace and the guard" "$RAILPROBE_SRC_EVIDENCE"
+
+# The handshake value is a bare literal on each side -- a C program and a shell script share
+# no header -- so "the two halves agree" is not enforceable anywhere except in a reader of
+# both files, which is this one. Also pins the refusal code (78, the family's) and the
+# override's exact spelling, since an override renamed on only one side of a comment would
+# leave the documented escape hatch not working.
+RAILPROBE_OK=0
+grep -Fq -- 'export MACDOWS_BOUNDARY_GATED=1' "$SCRIPT_DIR/probe.sh" || RAILPROBE_OK=1
+grep -Fq -- 'getenv("MACDOWS_BOUNDARY_GATED")' "$RAILPROBE_SRC" || RAILPROBE_OK=1
+grep -Fq -- 'strcmp(gated, "1") == 0' "$RAILPROBE_SRC" || RAILPROBE_OK=1
+grep -Fq -- 'strcmp(gated, "skip-gate-i-know") == 0' "$RAILPROBE_SRC" || RAILPROBE_OK=1
+grep -Fq -- 'return 78;' "$RAILPROBE_SRC" || RAILPROBE_OK=1
+check "$RAILPROBE_OK" "both halves speak one vocabulary" "probe.sh exports what rail-probe accepts, refusal is 78"
+
+RAILPROBE_BIN="$CRDP_REPO_ROOT/Tools/rail-probe/build/rail-probe"
+RAILPROBE_OUT="$TEST_DIR/railprobe-run.out"
+# A path rail-probe opens only once parse_args has fully succeeded. It must not exist after
+# any refusal -- an ungated run may not so much as create a file.
+RAILPROBE_JSONL="$TEST_DIR/railprobe-should-not-exist.jsonl"
+
+# run_railprobe <handshake-value|unset> [args...]: run the built binary with fixture
+# credentials in the environment and the handshake set to the given value (or removed).
+# Never fails itself -- most cases expect a non-zero exit.
+run_railprobe() {
+	local gated="$1"
+	shift
+	RAILPROBE_RC=0
+	rm -f "$RAILPROBE_JSONL"
+	# The outer `2>/dev/null` is on the enclosing block, not on the run: it suppresses bash's
+	# own job notice ("Abort trap: 6") for a child killed by a signal, which is what a
+	# dynamic-loader failure produces -- see the runnability probe below. That notice goes to
+	# the suite's stderr, where it is noise the NOTE block already says better; the child's
+	# own output is captured in $RAILPROBE_OUT either way, and its exit status, which every
+	# case asserts on, is unaffected. A `{ }` block, not a subshell, so RAILPROBE_RC survives.
+	{
+		(
+			# The maintainer's own shell may have any of these exported; a test whose input
+			# depends on the operator's environment is not a test.
+			unset MACDOWS_BOUNDARY_GATED
+			# Deliberately present, not absent: the guard has to refuse BEFORE parse_args
+			# reads them, and the refusal must not echo them back. Absent credentials would
+			# let a guard that ran too late still look like it had run early.
+			export WIN_HOST="$PROBE_FIXTURE_HOST"
+			export WIN_USER="fixture-user"
+			export WIN_PASS="fixture-value-not-a-credential"
+			if [ "$gated" != "unset" ]; then
+				# SC2031: same intent as run_probe's -- the assignment is meant to live and
+				# die inside this subshell, so "the change might be lost" is the contract.
+				# shellcheck disable=SC2031
+				export MACDOWS_BOUNDARY_GATED="$gated"
+			fi
+			"$RAILPROBE_BIN" "$@"
+		) >"$RAILPROBE_OUT" 2>&1 || RAILPROBE_RC=$?
+	} 2>/dev/null
+	cat "$RAILPROBE_OUT" >>"$TRANSCRIPT"
+}
+
+if [ ! -x "$RAILPROBE_BIN" ]; then
+	printf 'NOTE  %-34s no built binary at Tools/rail-probe/build/rail-probe\n' "binary handshake cases"
+	printf '      Building it needs cmake and a FreeRDP prefix, which Tier 1 does not have and is not\n'
+	printf '      meant to; run Scripts/probe.sh once on a maintainer machine and these cases appear.\n'
+	printf '      The source pins above are what hold the C guard in the meantime.\n'
+	NOT_RUN=$((NOT_RUN + 1))
+elif [ "$RAILPROBE_SRC" -nt "$RAILPROBE_BIN" ]; then
+	# Freshness. Every verdict below is taken as a statement about rail-probe.c, and it is only
+	# that if the artefact was built from it. A stale binary keeps passing after the source has
+	# regressed -- and this is not hypothetical bookkeeping: during review the artefact in this
+	# very worktree was nine minutes older than the source it was credited with validating.
+	# `-nt` is supported by bash 3.2 and dash alike and needs no external tool.
+	printf 'NOTE  %-34s the built binary predates rail-probe.c\n' "binary handshake cases"
+	printf '      Its verdicts would describe an older source than the pins above just checked, so it is\n'
+	printf '      not run. Rebuild via Scripts/probe.sh (or cmake --build Tools/rail-probe/build).\n'
+	NOT_RUN=$((NOT_RUN + 1))
+else
+	# Runnability probe, and a real case in its own right: the documented override, with no
+	# --app, must get PAST the guard and die in parse_args with exit 2. That is the
+	# past-the-guard proof this suite is willing to make -- it reaches the argument parser
+	# and stops there, having opened nothing.
+	#
+	# It is also how "this machine cannot run the binary" is told apart from "the guard
+	# regressed" -- and the two are distinguishable, which is why 78 is split out first.
+	# Exit 2 means the loader worked and main() ran. Exit 78 can only have come from this
+	# project's own guard: main() WAS entered and it refused the value this file documents as
+	# the override, which is a regression and must be red. Anything else (a dyld failure
+	# aborts at 134 before main is entered, as happens when the FreeRDP prefix's ffmpeg
+	# dependency is not on the search path) means the cases below would be measuring the host
+	# rather than the code, so they are not run and say so.
+	run_railprobe skip-gate-i-know --out "$RAILPROBE_JSONL"
+	if [ "$RAILPROBE_RC" -eq 78 ]; then
+		# Deliberately a FAIL and not a NOTE: reporting this as "not run" would withdraw the
+		# eight cases below along with it and call a broken override an absent toolchain. It
+		# fails closed (more refusals, not fewer), but "coverage disappears quietly" is the
+		# one outcome this suite does not permit.
+		check 1 "override reaches the arg parser" "exit 78: the guard refused the documented override" "$RAILPROBE_OUT"
+	elif [ "$RAILPROBE_RC" -ne 2 ]; then
+		printf 'NOTE  %-34s the built binary did not run here (exit %s, expected 2)\n' "binary handshake cases" "$RAILPROBE_RC"
+		printf '      A missing runtime dependency of the FreeRDP prefix will do this before main() is\n'
+		printf '      ever entered, which would make every verdict below a statement about this machine.\n'
+		printf '      Rebuild via Scripts/probe.sh; the source pins above still hold the C guard.\n'
+		NOT_RUN=$((NOT_RUN + 1))
+	else
+		check 0 "override reaches the arg parser" "exit 2 from parse_args, nothing opened"
+
+		RAILPROBE_OK=0
+		[ ! -f "$RAILPROBE_JSONL" ] || RAILPROBE_OK=1
+		check "$RAILPROBE_OK" "no log file even past the guard" "--out is opened only after parse_args"
+
+		# The refusal itself. Credentials are in the environment and --out names a writable
+		# path, so an ungated run that got even as far as parse_args would behave visibly
+		# differently.
+		run_railprobe unset --out "$RAILPROBE_JSONL"
+
+		RAILPROBE_OK=0
+		[ "$RAILPROBE_RC" -eq 78 ] || RAILPROBE_OK=1
+		check "$RAILPROBE_OK" "ungated direct run is refused" "exit 78, the family's refusal code" "$RAILPROBE_OUT"
+
+		RAILPROBE_OK=0
+		grep -Fq -- 'refusing to run' "$RAILPROBE_OUT" || RAILPROBE_OK=1
+		grep -Fq -- 'Scripts/probe.sh' "$RAILPROBE_OUT" || RAILPROBE_OK=1
+		check "$RAILPROBE_OK" "refusal says what to run instead" "names Scripts/probe.sh" "$RAILPROBE_OUT"
+
+		RAILPROBE_OK=0
+		[ ! -f "$RAILPROBE_JSONL" ] || RAILPROBE_OK=1
+		check "$RAILPROBE_OK" "refusal creates no artefacts" "--out file never opened" "$RAILPROBE_OUT"
+
+		# The refusal runs before anything is read, so it has nothing to leak -- but "has
+		# nothing to leak" is a property of the placement, and the placement is what this
+		# whole section is about. Asserted, not assumed. Reported without quoting, same
+		# discipline as the segment check below.
+		RAILPROBE_OK=0
+		if grep -Fq -- "$PROBE_FIXTURE_HOST" "$RAILPROBE_OUT"; then
+			RAILPROBE_OK=1
+		fi
+		if grep -Fq -- 'fixture-value-not-a-credential' "$RAILPROBE_OUT"; then
+			RAILPROBE_OK=1
+		fi
+		check "$RAILPROBE_OK" "refusal echoes no host or secret" "neither env value appears in the output"
+
+		# --help is the sharp form: it is the one argument shape whose ungated exit code
+		# would be 0 rather than 78, so this fails loudly if the guard ever drifts below
+		# parse_args, where --help is handled.
+		run_railprobe unset --help
+		RAILPROBE_OK=0
+		[ "$RAILPROBE_RC" -eq 78 ] || RAILPROBE_OK=1
+		check "$RAILPROBE_OK" "even --help is refused ungated" "exit 78, not the usage text's 0" "$RAILPROBE_OUT"
+
+		# The value probe.sh actually exports, exercised against the actual binary. The
+		# vocabulary pin above compares two source files; this compares behaviour, and would
+		# catch a C side that accepted only the override.
+		run_railprobe 1 --out "$RAILPROBE_JSONL"
+		RAILPROBE_OK=0
+		[ "$RAILPROBE_RC" -eq 2 ] || RAILPROBE_OK=1
+		check "$RAILPROBE_OK" "probe.sh's value is accepted" "exit 2, i.e. past the guard" "$RAILPROBE_OUT"
+
+		# And a plausible-but-wrong value. "Any non-empty string opens the door" is the easy
+		# way to write this guard and the reason the override is a sentence would then be
+		# fiction: a stray MACDOWS_BOUNDARY_GATED=true anywhere would silently ungate the
+		# tool.
+		run_railprobe true --out "$RAILPROBE_JSONL"
+		RAILPROBE_OK=0
+		[ "$RAILPROBE_RC" -eq 78 ] || RAILPROBE_OK=1
+		check "$RAILPROBE_OK" "an off-vocabulary value refuses" "only the two documented values pass" "$RAILPROBE_OUT"
+	fi
+fi
+
 # The no-leak assertion. Checked against the transcript, and reported without echoing the
 # offending line -- a failing leak test must not itself print the thing that leaked.
 echo "== verdict text carries no segment list =="
@@ -441,11 +800,14 @@ fi
 
 echo
 if [ "$FAILURES" -eq 0 ]; then
+	SUMMARY="all boundary-gate cases passed"
 	if [ "$SKIPPED" -ne 0 ]; then
-		echo "all boundary-gate cases passed, $SKIPPED skipped -- see the SKIP block above"
-	else
-		echo "all boundary-gate cases passed"
+		SUMMARY="$SUMMARY, $SKIPPED skipped -- see the SKIP block above"
 	fi
+	if [ "$NOT_RUN" -ne 0 ]; then
+		SUMMARY="$SUMMARY, $NOT_RUN group(s) not run for want of a usable rail-probe build -- see the NOTE block above"
+	fi
+	echo "$SUMMARY"
 	exit 0
 fi
 echo "$FAILURES boundary-gate case(s) FAILED"

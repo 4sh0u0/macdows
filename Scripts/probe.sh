@@ -13,13 +13,25 @@
 # ~/.config/macdows/lab-boundary.env. The gate is fail-closed -- a missing boundary file, an
 # unresolvable host or an address outside the segments all refuse -- and neither it nor the
 # refusal below ever names a segment, so a scrollback or a CI transcript cannot become the
-# place the owner's network shape leaks.
+# place the owner's network shape leaks. Once the gate has passed, this script exports
+# MACDOWS_BOUNDARY_GATED=1; rail-probe refuses to run without it, so the binary this script
+# builds cannot be usefully run behind this script's back (see the handshake comment below).
 #
 # Usage: Scripts/probe.sh [rail-probe args, e.g. --app 'C:\Windows\System32\winver.exe' --duration 25 --out runs/s1.jsonl]
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=Scripts/lib.sh
 source "$SCRIPT_DIR/lib.sh"
+
+# Nothing this script inherited may stand in for its own verdict. The handshake below is a
+# statement about THIS run -- "the gate passed here" -- so any value the caller already had is
+# cleared first, before the gate is even consulted. Without this the invariant the handshake
+# comment states would be false in the one case that matters most: a maintainer using the
+# documented `export MACDOWS_BOUNDARY_GATED=skip-gate-i-know` override in their shell would
+# hand the handshake to the entire process tree of a run the boundary is about to REFUSE.
+# Clearing it here also makes the refusal path's promise exact -- a refused run leaves no
+# handshake behind, whatever the environment it started in.
+unset MACDOWS_BOUNDARY_GATED
 
 # ${HOME:-} rather than $HOME in both places below, matching crdp_assert_lab_boundary and
 # Scripts/run-window-smoke.command: this script runs under `set -u`, where a bare $HOME with
@@ -57,6 +69,28 @@ source "$HOST_ENV"
 crdp_assert_lab_boundary "$WIN_HOST" || die "refusing to probe: target host is outside the owner lab boundary (or the boundary file is missing/unreadable); see AGENTS.md live-host testing boundary"
 
 export WIN_HOST WIN_USER WIN_PASS
+
+# Launcher handshake for Tools/rail-probe. The gate above is a shell function, so it only
+# protects the shell entry points; the binary this script builds lands at
+# Tools/rail-probe/build/rail-probe and can be run straight from a shell, where nothing
+# checks anything. rail-probe's main() therefore refuses (exit 78) unless it is told that a
+# launcher already cleared the boundary, and this is where it gets told.
+#
+# It is a handshake, not a second opinion: the boundary rule keeps exactly one
+# implementation (crdp_assert_lab_boundary), and rail-probe only ever answers "was I
+# started by something that ran it?". The threat model is an accidental ungated run -- a
+# recalled shell-history line, a script that learned the binary's path -- not a local user
+# who means to bypass it and owns this environment anyway. The C side documents the value
+# vocabulary ("1" here, a deliberate "skip-gate-i-know" override for a developer who has
+# gated by other means); the two files have to agree, and the boundary suite pins that.
+#
+# Placed AFTER the gate, for the same reason as the credential export above: a refused run
+# must leave nothing behind that could let a later, ungated invocation slip through. If
+# this sat before the refusal, the handshake would be exported into the environment of a
+# run the boundary had just rejected. This line plus the `unset` near the top of the script
+# are what make that an invariant rather than a habit: inside this process the handshake
+# exists on the far side of the gate and nowhere else, no matter what the caller exported.
+export MACDOWS_BOUNDARY_GATED=1
 
 require_cmd cmake
 
