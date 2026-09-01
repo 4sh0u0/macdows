@@ -46,5 +46,15 @@ policy).
 
 ## Current state
 
-Empty. No local patches against FreeRDP 3.30.0 as of Phase 1. This file (and the rules
-above) exist ahead of any patch so the bar is set before the first one is ever added.
+One patch against FreeRDP 3.30.0. Patches are applied in `sort` order of their filenames,
+hence the numeric prefix.
+
+- `0001-core-capabilities-apply-input-caps-from-src.patch` —
+  `rdp_apply_input_capability_set()` reads two received-capability values out of the
+  destination `settings` instead of the parsed server answer `src`, discarding the
+  server's Input Capability Set answer. One token per hunk. Defect detail, provenance,
+  upstream status and the per-hunk retirement conditions live in the patch header; it
+  travels with the patch, so that is the one place they are written.
+
+The rules above predate the first patch on purpose — the bar was set before anything was
+ever added to this directory.

@@ -62,10 +62,24 @@ everything the licences require.
   headers untouched — see `ThirdParty/patches/README.md`). Shipped with the app as
   `Contents/Resources/licenses/LICENSE-FreeRDP-Apache-2.0.txt`, a byte-identical copy
   tracked at `ThirdParty/licenses/LICENSE-FreeRDP-Apache-2.0.txt`.
-- **Modified**: No local patches as of Phase 1. If `ThirdParty/patches/*.patch` becomes
-  non-empty, the applied patch list is auto-populated into
-  `sbom/macdows.cdx.json`'s `pedigree.patches` for the FreeRDP component; the
-  human-readable summary belongs here once patches actually land.
+- **Modified**: Yes — one patch, applied at build time from the external patch queue at
+  `ThirdParty/patches/` (the vendored checkout itself stays a verbatim copy of the pinned
+  tag; `Scripts/build-freerdp.sh` applies the queue before configuring and reverts it
+  afterwards). The entry is
+  `0001-core-capabilities-apply-input-caps-from-src.patch`: two one-token fixes in
+  `libfreerdp/core/capabilities.c`'s `rdp_apply_input_capability_set()`, one a backport of
+  upstream PR #13287 (`FreeRDP_UnicodeInput`), the other the same-shape fix for
+  `FreeRDP_HasQoeEvent`, which upstream has not yet fixed. The queue is also auto-populated
+  into `sbom/macdows.cdx.json`'s `pedigree.patches` for this component, as CycloneDX `patch`
+  objects carrying the upstream reference from each patch's header.
+  The Apache-2.0 obligations are met, not waived, by that arrangement. §4(b) ("modified files
+  carry prominent notices") is discharged by the patch file itself: the modified source is
+  never distributed — only the patch is — and its header records what changed, why, its
+  upstream status and the condition under which it is dropped. The licence text and every
+  upstream copyright header ship unaltered. §4(d) adds nothing here: FreeRDP 3.30.0 has no
+  top-level `NOTICE` file, only `LICENSE`. (The one `NOTICE` anywhere in its tree,
+  `winpr/libwinpr/sysinfo/cpufeatures/NOTICE`, belongs to a vendored third-party component
+  that this configuration does not compile and that this patch does not touch.)
 - **Includes**: WinPR (WinPR is part of the FreeRDP repository/release and shares the
   same license and copyright).
 - **How it's packaged**: built as dynamic libraries and embedded into the app bundle's

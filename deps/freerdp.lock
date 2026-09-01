@@ -5,7 +5,17 @@
   "tag": "3.30.0",
   "commit": "6b107f0aadbabc47941c5a5b893b88c01792af6d",
   "upstream_url": "https://github.com/FreeRDP/FreeRDP.git",
-  "patches": [],
+  "patches": [
+    {
+      "file": "0001-core-capabilities-apply-input-caps-from-src.patch",
+      "target": "libfreerdp/core/capabilities.c",
+      "summary": "rdp_apply_input_capability_set() reads FreeRDP_UnicodeInput (:1414) and FreeRDP_HasQoeEvent (:1423) back out of the destination `settings` instead of the parsed server answer `src`, making both assignments self-assignments that discard the server's Input Capability Set answer. One token per hunk; provenance in adr/0011 §7.",
+      "upstream": "https://github.com/FreeRDP/FreeRDP/pull/13287",
+      "upstream_status": "Hunk 1 (UnicodeInput) is fixed in upstream master, in no release yet; hunk 2 (HasQoeEvent) is not fixed upstream and not yet reported. Dates, SHAs and compare figures live in the patch header — deliberately not duplicated here, so they cannot rot behind it.",
+      "retire_when": "Per hunk; the conditions and the mechanism that announces them (a pin bump replays the queue and `git apply` fails hard once upstream absorbs a hunk) are stated in the patch header."
+    }
+  ],
+  "_patches_note": "Inventory and rationale only — ThirdParty/patches/*.patch is the authoritative queue. Scripts/build-freerdp.sh discovers patches by globbing that directory (never from this field) and folds their file *contents* into the config hash, and Scripts/gen-notices.sh derives the SBOM's pedigree.patches from the same directory, so nothing mechanical reads this block and it cannot drift the build. It exists because this lock is the reviewable pin record: a reader must be able to see from here alone that the pinned checkout is not built verbatim. Per-hunk detail (defect, provenance, upstream status, retirement condition) lives in each patch file's own header; the queue's rules live in ThirdParty/patches/README.md.",
   "deployment_target": "14.0",
   "_deployment_target_note": "Single source for the minimum macOS version this repo targets. Scripts/build-openssl.sh reads this for -mmacosx-version-min; Scripts/build-freerdp.sh substitutes it into the -DCMAKE_OSX_DEPLOYMENT_TARGET flag below (the literal '14.0' in cmake_config.flags is a fallback/documentation value only — the running script always overrides it from this field, so the two can never drift silently).",
   "cmake_config": {

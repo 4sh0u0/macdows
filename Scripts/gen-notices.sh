@@ -442,9 +442,56 @@ FFMPEG_SRC_SHA256="$(jq -er '.ffmpeg.sha256' "$LOCK_FILE_FOR_NOTICES")" || die "
 OPENSSL_SRC_SHA256="$(jq -er '.openssl.sha256' "$LOCK_FILE_FOR_NOTICES")" || die "deps/freerdp.lock has no .openssl.sha256 field"
 
 PATCH_DIR="$CRDP_REPO_ROOT/ThirdParty/patches"
+# Where a reader can fetch a patch by name. The queue is tracked in the public repository, so
+# the blob URL is stable while the patch exists; once it retires, the SBOM that referenced it
+# stays pinned to the release it was generated for, which is the point of recording it at all.
+PATCH_BLOB_BASE="https://github.com/4sh0u0/macdows/blob/main/ThirdParty/patches"
+
+# CycloneDX 1.6 `pedigree.patches[]` takes patch OBJECTS, not filenames: required `type` from
+# the enum unofficial|monkey|backport|cherry-pick, optional `diff` ({text}|{url}) and
+# `resolves[]` issue objects (themselves requiring `type` from defect|enhancement|security),
+# every one of them additionalProperties:false. This block used to emit bare basename strings,
+# which validated only for as long as the queue was empty ([] satisfies any items schema) and
+# would have produced a BOM rejected by `cyclonedx validate` / Dependency-Track the first time
+# a patch landed. Schema: https://cyclonedx.org/docs/1.6/json/#components_items_pedigree_patches
+#
+# `type: "unofficial"` ("a patch not developed by the creators or maintainers of the software
+# being patched") is the honest classification for this queue as a whole: a single file here may
+# carry both an upstream backport and a fix upstream has not taken yet, and "unofficial" is true
+# of the file either way, where "backport" would only be true of part of it.
+#
+# `resolves[].references` is not a second source of truth: the URLs are grepped out of the patch
+# header, i.e. the same "# Upstream: …" link that ThirdParty/patches/README.md rule 1 mandates and
+# that both Scripts/build-freerdp.sh and tier1.yml's patch-queue validation already enforce.
+PATCH_FILES=()
+while IFS= read -r -d '' patch_path; do PATCH_FILES+=("$patch_path"); done \
+	< <(find "$PATCH_DIR" -maxdepth 1 -name '*.patch' -print0 2>/dev/null | sort -z)
+
 PATCHES_JSON="[]"
-if [ -d "$PATCH_DIR" ] && find "$PATCH_DIR" -maxdepth 1 -name '*.patch' -print -quit | grep -c . >/dev/null; then
-	PATCHES_JSON="$(find "$PATCH_DIR" -maxdepth 1 -name '*.patch' -print0 | xargs -0 -n1 basename | sort | jq -R . | jq -s .)"
+if [ "${#PATCH_FILES[@]}" -gt 0 ]; then
+	PATCH_OBJECTS=()
+	for patch_path in "${PATCH_FILES[@]}"; do
+		patch_name="$(basename "$patch_path")"
+		# Same PCRE-free pattern the other two enforcement points use. Fails closed: an SBOM that
+		# declares a modification with no upstream record is exactly the privately-maintained-fork
+		# shape README rule 1 exists to prevent, so refuse to emit one rather than drop `resolves`.
+		patch_refs="$(grep -oE 'https://github\.com/FreeRDP/FreeRDP/(issues|pull)/[0-9]+' "$patch_path" | sort -u | jq -R . | jq -s .)" \
+			|| patch_refs="[]"
+		[ "$patch_refs" != "[]" ] \
+			|| die "patch $patch_name has no upstream issue/PR link in its header (ThirdParty/patches/README.md rule 1) — refusing to emit an SBOM that records a modification with no upstream record"
+		PATCH_OBJECTS+=("$(jq -n --arg url "$PATCH_BLOB_BASE/$patch_name" --argjson refs "$patch_refs" '
+			{
+				type: "unofficial",
+				diff: {url: $url},
+				resolves: [$refs[] | {
+					type: "defect",
+					id: (split("/") | last),
+					source: {name: "FreeRDP", url: "https://github.com/FreeRDP/FreeRDP"},
+					references: [.]
+				}]
+			}')")
+	done
+	PATCHES_JSON="$(printf '%s\n' "${PATCH_OBJECTS[@]}" | jq -s .)"
 fi
 
 mkdir -p "$CRDP_REPO_ROOT/sbom"
