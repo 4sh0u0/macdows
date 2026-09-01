@@ -445,6 +445,43 @@ struct GateDriverPlumbingTests {
         )
         #expect(report.differences.isEmpty, "unexpected: \(report.differences)")
     }
+
+    // MARK: - Pre-authored known-difference table files (tables/)
+
+    /// The repo ships pre-authored per-drill table files under `Tools/replay-diff/tables/`
+    /// (first: the host_freshness-conditioned `WindowCachedIcon` exemption — the
+    /// conditionality lives in table *selection*, not schema; see tables/README.md).
+    /// This pin keeps loader schema evolution from silently invalidating a shipped file,
+    /// and pins the entry's load-bearing shape: a **pure one-sided** exemption
+    /// (`WindowIcon` is never one-sided in the corpus, so `supersedes` pairing is
+    /// structurally inapplicable), whose cause states the injection precondition in-band.
+    /// Review cachedicon-r1: the file holds exactly one entry (I1 — an appended rider
+    /// would otherwise load green), and the cause keeps its two ruled guard sentences
+    /// (the census-only boundary, and the B2 counter-evidence statement that stops the
+    /// WindowIcon count shift from being re-narrated as cache evidence).
+    @Test("the shipped window-cached-icon table file loads and keeps its ruled shape")
+    func shippedCachedIconTableLoads() throws {
+        let file = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // -> ReplayDiffKitTests/
+            .deletingLastPathComponent() // -> Tests/
+            .deletingLastPathComponent() // -> replay-diff/
+            .appendingPathComponent("tables/window-cached-icon-candidate-cold.json")
+        let table = try KnownDifferenceTable.load(fromJSONAt: file)
+        #expect(table.entries.count == 1) // nothing rides along in this file
+        let entry = try #require(table.entries["WindowCachedIcon"])
+        #expect(entry.expectedSide == .baseline) // C-3's verified direction
+        #expect(entry.supersedes == nil) // pure addition -- never pair cached vs full icons
+        #expect(entry.newFields.isEmpty)
+        // The precondition must travel inside the artifact-visible cause text, so a drill
+        // report that quotes the entry also quotes when it may be used at all — and the
+        // precondition presses the CANDIDATE half only (review cachedicon-r1 B1: the
+        // baseline half has no independent record and must not be demanded).
+        #expect(entry.cause.contains("host_freshness"))
+        #expect(entry.cause.contains("CANDIDATE"))
+        #expect(entry.cause.contains("Type-census exemption only"))
+        #expect(entry.cause.contains("NOT evidence for the cache story"))
+        #expect(!entry.reference.isEmpty)
+    }
 }
 
 /// A self-cleaning temporary directory for the directory-mode tests.

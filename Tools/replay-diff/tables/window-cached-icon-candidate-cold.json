@@ -1,0 +1,8 @@
+[
+  {
+    "eventName": "WindowCachedIcon",
+    "expectedSide": "baseline",
+    "cause": "HOST ICON-CACHE STATE, NOT BEHAVIOUR. Inject ONLY when this drill's CANDIDATE capture was made on a freshly rebooted host and that fact is recorded in the drill's host_freshness (adr/0012; see Tools/replay-diff/tables/README.md). The precondition deliberately presses only the candidate half: the baseline half ('the 2026-08-19 host was warm') has NO independent record -- that recording day predates the freshness discipline, and warmth is inferred from the cached-icon events themselves, a non-independent inference this entry does not rely on. What it relies on: the frozen baselines carry WindowCachedIcon events (s4-badpath: 1, s5b: 2; an icon delivered by cache reference instead of full payload), and a cold icon cache on the candidate's freshly rebooted host suffices to explain their absence on that side (drill C-3, 2026-09-01: reboot ~55 minutes prior, zero cached icons -- consistent; cache location and eviction mechanics were NOT measured and are not asserted). Type-census exemption only. The WindowIcon COUNT shift in the same corpus is NOT evidence for the cache story -- the +2 also appears in s3/s5a, which carry no cached-icon events on either side -- and stays a reported difference.",
+    "reference": "upgrade-gate drill C-3 (2026-09-01 re-record): eventTypeOnlyOnOneSide=2 ruled host-freshness-consistent, not regression; adr/0012's host-freshness recording requirement; Tools/replay-diff/tables/README.md carries the injection precondition"
+  }
+]
