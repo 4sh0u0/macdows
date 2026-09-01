@@ -205,10 +205,30 @@ exactly 1 finding** (the extra window itself — pinned by `TitleAnchoredIdentit
 Three populations still cascade:
 
 - **Untitled `window` handles** keep plain first-appearance ordinals. The same experiment
-  with an UNTITLED extra window measures **53 `eventCountChanged` findings** (pinned,
+  with an UNTITLED extra window measures **49 `eventCountChanged` findings** (pinned,
   interlocked with the runtime note's own text; only that count is
-  construction-independent). A live re-record that opens one transient untitled window the
-  baseline did not (a splash screen, a tooltip, a tray flyout) lands here.
+  construction-independent; it was 53 before untitled anchoring step 1, next paragraph). A
+  live re-record that opens one transient untitled window the baseline did not (a splash
+  screen, a tooltip, a tray flyout) lands here.
+
+  Two identifier values are **constants, not handles**, and never take an ordinal: `0`
+  (`<namespace>#none`, the null handle) and — `window` namespace only — `0xFFFFFFFF`
+  (`window#0xFFFFFFFF`, MonitoredDesktop's no-active-window sentinel; untitled anchoring
+  step 1, `IdentifierConstantTests`). Until step 1 the latter was ordinalised, and because
+  every frozen capture reports it early and 21–23 times it sat at `window#0` and shifted
+  every later untitled ordinal by one on whichever side carried it — a structural +1 cascade
+  against any re-record that does not report it. Neither constant counts toward the runtime
+  note's un-anchored handle totals. Measured on the step's target corpus — the six
+  frozen×re-record pairs the untitled-payload-stability record quotes at 946
+  (`samples-local/rerecord-2026-09-drill-01`, an **untracked** maintainer-local directory;
+  contributors cannot reproduce this number from the repo alone): total findings
+  **946 → 879** (per scenario 199/116/164/164/162/141 → 192/104/163/165/136/119 — s4 rose by
+  one), `window#`-ordinal identities 295 → 271. The synthetic experiment above carries the
+  constant on both sides and is not that scenario — its `eventCountChanged` fell 53 → 49
+  while its total rose 87 → 118: the constant's MonitoredDesktop occurrences now pair and
+  report their drift (`eventOrderChanged` 0 → 18 for that event) instead of counting as two
+  unmatched identities, and the injected synthetic window now mis-pairs with a real untitled
+  one and compares payloads (WindowCreate `fieldValueChanged` 12 → 18, all from that pair).
 - **Same-title groups.** The `#k` disambiguator is a *per-side* first-appearance index —
   the ordinal mechanism again, reduced to the group — so a membership or creation-order
   drift inside a same-title group mis-pairs its members and reports loudly. Measured on

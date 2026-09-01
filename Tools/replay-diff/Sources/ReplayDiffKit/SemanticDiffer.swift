@@ -217,10 +217,31 @@ public enum EventLane: String, Sendable, Equatable, CaseIterable {
 /// Three populations still cascade, and the cascade note counts all of them:
 ///
 /// - **Untitled `window` handles** keep plain first-appearance ordinals. The same
-///   experiment with an UNTITLED extra window measures **53 `eventCountChanged`**
-///   findings (pinned, interlocked with the note's own text). A re-record that opens one
-///   transient untitled window the baseline did not (a splash screen, a tooltip, a tray
-///   flyout) lands here.
+///   experiment with an UNTITLED extra window measures **49 `eventCountChanged`**
+///   findings (pinned, interlocked with the note's own text; 53 before untitled anchoring
+///   step 1, below). A re-record that opens one transient untitled window the baseline did
+///   not (a splash screen, a tooltip, a tray flyout) lands here.
+///
+///   Two values in the identifier fields are **constants, not handles**, and never take an
+///   ordinal: `0` (`<namespace>#none`, the null handle) and — `window` namespace only —
+///   `0xFFFFFFFF` (`window#0xFFFFFFFF`, MonitoredDesktop's no-active-window sentinel;
+///   untitled anchoring step 1, `IdentifierConstantTests`). Until step 1 the latter was
+///   ordinalised, and since every frozen capture reports it early and 21–23 times it sat at
+///   `window#0` and shifted every later untitled ordinal by one on whichever side carried
+///   it — a structural +1 cascade against any re-record that does not report it. Neither
+///   constant counts toward the cascade note's un-anchored handle totals. Measured on the
+///   step's own target corpus — the six frozen×re-record pairs the untitled-payload-stability
+///   record §6 quotes at 946 (`samples-local/rerecord-2026-09-drill-01`, untracked) — total
+///   findings fell **946 → 879** (per scenario 199/116/164/164/162/141 → 192/104/163/165/136/119;
+///   s4 rose by one) and findings whose identity carries a bare `window#` ordinal fell
+///   295 → 271. The synthetic head-insertion experiment above carries the constant on BOTH
+///   sides and is not that scenario: its `eventCountChanged` fell 53 → 49 (MonitoredDesktop
+///   2 → 0, WindowCreate 9 → 7) while its total rose 87 → 118 — `eventOrderChanged` 22 → 51
+///   (MonitoredDesktop 0 → 18: the constant's occurrences now pair and report their drift
+///   instead of being two unmatched identities; WindowCreate 10 → 18; three other events +1)
+///   and WindowCreate `fieldValueChanged` 12 → 18 — all six from ONE new pairing, the injected
+///   synthetic head window against a real untitled window (a mis-pair the shifted ordinals
+///   produce, not a correct match), whose payloads now compare instead of being leftovers.
 /// - **Same-title groups**: duplicates disambiguate by `#k`, a *per-side*
 ///   first-appearance index — the ordinal mechanism again, reduced to the group. A
 ///   membership or creation-order drift inside the group mis-pairs its members. Measured
@@ -544,6 +565,43 @@ public struct SemanticDiffer: Sendable {
             .replacingOccurrences(of: "#", with: "%23")
     }
 
+    /// `0xFFFFFFFF` as ``JSONValue/integerCanonicalForm`` renders it — the probe prints
+    /// `activeWindowId` with `%u` (`rail-probe.c`), so the capture carries the decimal form.
+    private static let noActiveWindowRaw = "4294967295"
+
+    /// Server-side constants that travel in identifier fields without being handles. Each
+    /// canonicalizes to a fixed token — never an ordinal — and is not counted as an
+    /// un-anchored handle, or "this desktop has no active window" would read as "the
+    /// ordinals shifted". Both callers (`canonicalized`, `distinctUnanchoredHandleCounts`)
+    /// go through here so the two views of "what is a handle" cannot drift apart.
+    ///
+    /// - `0`, any namespace: RAIL's/RDPGFX's null handle ("no owner", "no active window").
+    /// - `0xFFFFFFFF`, `window` namespace only: MonitoredDesktop's sentinel — "no active
+    ///   window, or focus is not on the monitored desktop" (adr/0008 §0's capture census:
+    ///   134/150 MonitoredDesktop records carried it and it must never be read as a window
+    ///   id). Every frozen capture reports it early (from its second MonitoredDesktop on; the
+    ///   first reports 0) and 21–23 times; ordinalised, it sat at `window#0` and pushed every
+    ///   later untitled ordinal up by one on whichever side carried it — a structural +1
+    ///   cascade against any re-record that does not report it (docs
+    ///   `upgrade-gate/2026-09-untitled-payload-stability.md` §4.1, step 1 of §7). The
+    ///   exemption covers all four `window`-namespace fields (only `activeWindowId` has been
+    ///   observed carrying it) and is scoped to `window` because that is the only namespace it
+    ///   has been measured in: `surfaceId` is a 16-bit space where the value cannot occur and
+    ///   `notifyIconId` may legitimately be 0xFFFFFFFF, so both keep treating it as a value
+    ///   (`IdentifierConstantTests` pins the scope).
+    ///
+    /// The two constants are different server statements and stay distinct tokens. Neither
+    /// shape is forgeable: ordinals are `<namespace>#<decimal>`, title tokens start
+    /// `<namespace>@` (`tokenEscapedTitle` escapes `@`/`#`), so `#none` / `#0xFFFFFFFF`
+    /// collide with nothing a capture can produce.
+    private func constantToken(raw: String, namespace: String, windowNamespace: String?) -> String? {
+        if raw == "0" { return "\(namespace)#none" }
+        if raw == Self.noActiveWindowRaw, namespace == windowNamespace {
+            return "\(namespace)#0xFFFFFFFF"
+        }
+        return nil
+    }
+
     private func canonicalized(_ records: [ReplayRecord]) -> [ReplayRecord] {
         guard options.canonicalizeIdentifiers else { return records }
         let identifierFields = options.fieldPolicy.sortedIdentifierFieldNames
@@ -572,11 +630,8 @@ public struct SemanticDiffer: Sendable {
                 guard let raw = fields[fieldName]?.integerCanonicalForm,
                       let namespace = options.fieldPolicy.namespace(of: fieldName)
                 else { continue }
-                // 0 is RAIL's/RDPGFX's null handle ("no owner", "no active window"). It
-                // must stay a distinguishable constant rather than becoming ordinal #0,
-                // or "this window gained an owner" would read as "the ordinals shifted".
-                if raw == "0" {
-                    fields[fieldName] = .string("\(namespace)#none")
+                if let constant = constantToken(raw: raw, namespace: namespace, windowNamespace: windowNamespace) {
+                    fields[fieldName] = .string(constant)
                     continue
                 }
                 if let existing = tokens[namespace]?[raw] {
@@ -727,7 +782,7 @@ public struct SemanticDiffer: Sendable {
                     + "to the group) are position-keyed, so an extra or missing one EARLY in the stream shifts "
                     + "every later `\(namespace)` position and can turn one real difference into dozens "
                     + "(measured residual: one extra UNTITLED WindowCreate at the head of a 145-line capture → "
-                    + "53 eventCountChanged findings; only UNIQUELY-titled windows are immune, since W2 batch "
+                    + "49 eventCountChanged findings; only UNIQUELY-titled windows are immune, since W2 batch "
                     + "2's title-anchored identity). Read the FIRST eventCountChanged below and check "
                     + "whether the candidate simply opened one extra transient window; if so, the rest of this "
                     + "report is one finding wearing a costume. --no-canonical-ids is NOT the remedy (it makes "
@@ -753,8 +808,8 @@ public struct SemanticDiffer: Sendable {
         for record in records {
             for fieldName in options.fieldPolicy.sortedIdentifierFieldNames {
                 guard let raw = record.fields[fieldName]?.integerCanonicalForm,
-                      raw != "0",
-                      let namespace = options.fieldPolicy.namespace(of: fieldName)
+                      let namespace = options.fieldPolicy.namespace(of: fieldName),
+                      constantToken(raw: raw, namespace: namespace, windowNamespace: windowNamespace) == nil
                 else { continue }
                 if namespace == windowNamespace, let title = titles[raw],
                    handlesPerTitle[title] == 1 { continue }
