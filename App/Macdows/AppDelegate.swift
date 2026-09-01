@@ -149,7 +149,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// in Tools/window-smoke, and both disagreed with the rules
 		// Scripts/run-window-smoke.command applies to the same file; EnvFile's own doc comment
 		// records how that disagreement was measured fail-open. One parser now, in the package
-		// that has a test bundle (this target has none).
+		// whose tests run in every replay-gate pass (the app-side bundle, MacdowsAppTests,
+		// arrived later -- D7, 2026-09-02 -- and does not change where a parser belongs).
 		//
 		// MacdowsPaths.hostEnvPath() rather than a local `NSHomeDirectory()` concatenation, for
 		// the same reason: LabBoundary locates its own boundary file through $HOME, so the two

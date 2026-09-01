@@ -438,8 +438,68 @@ targets:
       - package: MacdowsCore
         product: MacdowsCore
 
+  MacdowsAppTests:
+    # W2/D7 (docs/plans/phase3.md:248, pre-hung on W2 by the 2026-09-01 D7 ruling): the App
+    # target's first test bundle. Standalone (`bundle.unit-test`, no `TEST_HOST`): the sources
+    # under test are compiled INTO this bundle by the same direct source-file sharing the
+    # window-smoke target already uses for the identical file set (see that target's own W4b
+    # comment) -- so `internal` members are same-module visible with no `@testable`, no
+    # framework target, and zero changes to the Sources themselves (the D7 boundary:
+    # phase3.md:82/:171/:257, "不为测试重构 registry"). Hosted-in-Macdows was rejected because
+    # the scaffold app's launch path activates NSApp and builds real windows, and the app
+    # bundle's own TCC identity pops a local-network prompt on first connect
+    # (`bridge-smoke`'s comment above) -- none of which a headless `xcodebuild test` can answer.
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: MacdowsAppTests
+      - path: RemoteWindowRendering
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.haru.macdows.dev.apptests
+        # No hand-authored plist for a test bundle -- unlike the app target's (which carries
+        # real usage-description keys), there is nothing to declare, so Xcode's generated one
+        # is the correct source rather than a second tracked file.
+        GENERATE_INFOPLIST_FILE: YES
+        # The shared sources reference CRSession/CRDPEvent types directly
+        # (`RemoteWindowRegistry.swift`'s `session` ivar, `RemoteWindow.present(surface:via:)`),
+        # so this bundle needs the same bridging header + header/library/linker settings the
+        # window-smoke target documents -- see that target's comments for each line's rationale;
+        # nothing here is new.
+        SWIFT_OBJC_BRIDGING_HEADER: Macdows/Macdows-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/CRBridge
+          - $(SRCROOT)/../.build/freerdp/current/prefix/include/freerdp3
+          - $(SRCROOT)/../.build/freerdp/current/prefix/include/winpr3
+        # Same Team-ID-mismatch issue bridge-smoke's own comment documents; a test bundle,
+        # never a distributed artifact.
+        ENABLE_HARDENED_RUNTIME: NO
+        LIBRARY_SEARCH_PATHS:
+          - $(SRCROOT)/../.build/freerdp/current/prefix/lib
+        LD_RUNPATH_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/../.build/freerdp/current/prefix/lib
+          - $(SRCROOT)/../.build/deps/ffmpeg-prefix/lib
+        OTHER_LDFLAGS:
+          - -lfreerdp3
+          - -lfreerdp-client3
+          - -lwinpr3
+          - -framework
+          - IOSurface
+          # Swift-linked bundle + CRBridge's C++ exception-unwinding scaffolding -- same
+          # reason as the App and window-smoke targets' identical addition.
+          - -lc++
+    dependencies:
+      # Carries the "Build vendored FreeRDP" prebuild script, so building this bundle alone
+      # still produces the headers/dylibs the settings above point at (same reason
+      # window-smoke needs no prebuild script of its own).
+      - target: CRBridge
+      - package: MacdowsCore
+        product: MacdowsCore
+
 # W4c review H2: explicit, so `xcodegen generate` always deterministically (re)produces
-# exactly these four schemes on any machine/checkout, rather than relying on XcodeGen's
+# exactly these five schemes on any machine/checkout, rather than relying on XcodeGen's
 # implicit per-target scheme auto-generation. That implicit behavior turned out to be the
 # root cause behind a real build-flakiness episode this round: building this project's own
 # raw SwiftPM-package scheme directly (e.g. `-scheme MacdowsCore`, which XcodeGen doesn't
@@ -474,3 +534,13 @@ schemes:
     build:
       targets:
         window-smoke: all
+  # W2/D7: the one supported test entry point for the App-side sources --
+  # `xcodebuild test -project Macdows.xcodeproj -scheme MacdowsAppTests -destination
+  # 'platform=macOS'`. Same never-a-bare-package-scheme rule as the build schemes above.
+  MacdowsAppTests:
+    build:
+      targets:
+        MacdowsAppTests: all
+    test:
+      targets:
+        - MacdowsAppTests

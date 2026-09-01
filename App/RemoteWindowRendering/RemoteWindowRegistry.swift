@@ -464,9 +464,12 @@ final class RemoteWindowRegistry {
     /// read-only-counter shape this project already uses for facts that are otherwise invisible
     /// (`CRSession.staleEventsDiscardedCount`, `clicksDroppedIconGone`).
     ///
-    /// It exists because the App target has no test bundle (`m1-execution-plan.md:38`; D7's item,
-    /// explicitly not M1 work), so the ADR §5 re-take **cannot be pinned by an offline test** —
-    /// and r1 review found the previous shape was dead code precisely because nothing pinned it.
+    /// It exists because when it landed the App target had no test bundle
+    /// (`m1-execution-plan.md:38`), so the ADR §5 re-take **could not be pinned by an offline
+    /// test** — and r1 review found the previous shape was dead code precisely because nothing
+    /// pinned it. D7's bundle (MacdowsAppTests, 2026-09-02) has since landed, but this counter
+    /// keeps its job: the re-take needs a live `CRSession` mid-reconnect, which no unit test
+    /// stages — the counter, not a test, is still the assertion surface.
     /// This is the assertion surface instead, and the assertion is exact: after an
     /// N-cycle `WINDOW_SMOKE_CYCLES` soak (one `prepareForReconnect()` per finished cycle,
     /// `Tools/window-smoke/main.swift:1667`), **`sessionTopologyFreezeCount == N + 1`**. A value

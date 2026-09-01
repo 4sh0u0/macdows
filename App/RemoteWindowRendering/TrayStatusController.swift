@@ -470,9 +470,11 @@ final class TrayStatusController {
 
     // The `(windowId, notifyIconId)` <-> `NSStatusBarButton.tag` packing that used to live
     // here (`packTag`/`unpackTag`) is now `MacdowsCore.TrayButtonTag`, bit layout unchanged and
-    // pinned there against literals -- this target has no test bundle, so pure arithmetic kept
-    // here is arithmetic no `swift test` run can check. Both call sites here and
-    // `RemoteWindowRegistry.debugSimulateTrayClick` go through that one implementation.
+    // pinned there against literals. The move predates this target's test bundle
+    // (MacdowsAppTests, D7, 2026-09-02) and stays on its merits: the package pin runs in
+    // every `swift test`/replay-gate pass, a coverage class the app-side bundle does not
+    // claim. Both call sites here and `RemoteWindowRegistry.debugSimulateTrayClick` go
+    // through that one implementation.
 
     /// Called by `RemoteWindowRegistry` (which owns the `CRSession`) for each forwarded left
     /// click, with the clicked icon's own `(windowId, notifyIconId)` wire identity. `nil` (the

@@ -18,11 +18,12 @@ import os
 // package's tests, which run under `swift test` with no display attached
 // (`Packages/MacdowsCore/Package.swift:21-24`). This file is deliberately a *thin adapter*: it
 // reads screens, maps four fields per screen, and hands the result to a failable initializer.
-// That split is not tidiness -- the App target has no test bundle at all
-// (`App/project.yml`'s `Macdows` target declares none; closing that gap is `docs/plans/phase3.md`
-// decision D7's item, pre-hung on W2, and explicitly not M1 work),
-// so anything with a decision in it that lives here is untestable by construction. Hence the
-// rule this file is written to: **no branching in the AppKit half**. Every `if` below is a
+// That split is not tidiness. When this file was written the App target had no test bundle
+// at all, so anything with a decision in it that lived here was untestable by construction.
+// D7's bundle (MacdowsAppTests, 2026-09-02) has since landed and does exercise this
+// adapter's mapping — but the rule stays, because the package's replay-gate coverage is
+// still the stronger harness and a thin adapter needs no second opinion. Hence the rule
+// this file is written to: **no branching in the AppKit half**. Every `if` below is a
 // diagnostic that mutates nothing and changes no return value, and each one says so.
 //
 // WHAT THIS FILE MUST NOT DO (ADR §5.A.3, from `docs/plans/phase3.md:110`'s deliverable 2 --
@@ -250,8 +251,10 @@ final class DisplayTopologyProvider: DisplayTopologyProviding {
         let current = Self.readTopologyFromScreens(reason: "screen-parameters change")
         currentTopology = current
 
-        // THE ONE NON-DIAGNOSTIC DECISION IN THIS FILE, and therefore the one thing here that no
-        // test can reach (this target has no test bundle). It stays rather than moving into
+        // THE ONE NON-DIAGNOSTIC DECISION IN THIS FILE. MacdowsAppTests (D7) can reach this
+        // file now, but not this branch: its true arm needs a REAL display-parameter change
+        // mid-observation, which a headless unit test cannot stage (the bundle's own
+        // coverage-boundary note names it). It stays rather than moving into
         // `MacdowsCore` for a roster reason, not a design one: `DisplayTopology.swift` is L2's
         // file and wave 2 does not own it. The natural home is a ~3-line pure member such as
         // `DisplayTopology.desktopSizeMatches(_:)`, which `swift test` would cover; that is
