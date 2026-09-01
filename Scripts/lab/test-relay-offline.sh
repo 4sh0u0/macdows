@@ -441,6 +441,36 @@ if assert_has "$LOG" 'JOB-ENV-INVALID' && assert_has "$LOG" 'TIMEOUT is not a po
 	pass "$CASE: JOB-ENV-INVALID (TIMEOUT) logged, DONE exit=65, xfreerdp never invoked"
 fi
 
+# 10e. A hand-edited CRLF job.env must not ship a bare CR into the argv nor into the TIMEOUT check:
+#      every value's trailing CR is stripped, so `/app:program:<PROGRAM>` is exact, `timeout=5s` is
+#      accepted (a `5\r` used to fail the positive-integer check, review r6 I1) and DONE exit=0.
+begin '10e CRLF job.env'
+printf 'PROGRAM=%q\r\nCMDARGS=%q\r\nTIMEOUT=5\r\n' 'C:\Windows\System32\notepad.exe' '-NoProfile' > "$SBRUNTIME/job.env"
+run_relay "$SBLAB/relay.command" "" exit0
+argv="$(xfreerdp_argv)"
+# One verdict: collect reasons first.
+reasons=''
+[ "$(xfreerdp_calls)" = "1" ] || reasons="$reasons xfreerdp-calls=$(xfreerdp_calls);"
+[ "$(last_line)" = "DONE exit=0" ] || reasons="$reasons last-line=[$(last_line)];"
+[[ "$argv" == *'[/app:program:C:\Windows\System32\notepad.exe,cmd:-NoProfile]'* ]] || reasons="$reasons app-arg-not-exact;"
+grep -qF 'timeout=5s' "$LOG" || reasons="$reasons timeout-not-5s;"
+grep -q "$(printf '\r')" "$LABTEST_TRACE" && reasons="$reasons bare-CR-in-argv;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: trailing CRs are stripped from PROGRAM/CMDARGS/TIMEOUT; no CR reaches the argv; timeout=5s accepted"
+else
+	fail "$CASE:$reasons"; note "argv: $argv"
+fi
+
+# 10f. A value that spans lines (a CMDARGS with an embedded newline) is refused as JOB-ENV-INVALID
+#      instead of being silently truncated and mis-diagnosed as a TIMEOUT problem.
+begin '10f multi-line job.env value'
+printf 'PROGRAM=%q\nCMDARGS=$'"'"'a\\nb'"'"'\nTIMEOUT=5\n' 'C:\Windows\System32\notepad.exe' > "$SBRUNTIME/job.env"
+run_relay "$SBLAB/relay.command" "" exit0
+if assert_has "$LOG" 'spans more than one line' && assert_eq "$(last_line)" 'DONE exit=65' 'last log line' \
+	&& assert_eq "$(xfreerdp_calls)" '0' 'xfreerdp invocations'; then
+	pass "$CASE: a multi-line CMDARGS is refused as JOB-ENV-INVALID (65), xfreerdp never invoked"
+fi
+
 # 10c. job.env cannot redirect the connection either: overriding WIN_HOST/WIN_USER/WIN_PASS/SHARE
 #      (and the gate function) in job.env must change nothing about the argv -- the relay reads
 #      job.env in a subshell and takes only PROGRAM/CMDARGS/TIMEOUT out (review r3 B1: with a plain
@@ -529,7 +559,7 @@ MUTANT_SOURCE="$SBLAB/labtest-mutant-source.command"
 # sourced variables -- exactly the pre-isolation behaviour).
 if awk '
 	/JOB_KEYS="\$\( \. "\$RUNTIME\/job\.env"/ {
-		if (!done) { print "        source \"$RUNTIME/job.env\"; JOB_KEYS=\"${PROGRAM:-}"; print "${CMDARGS:-}"; print "${TIMEOUT:-}\""; done = 1 }
+		if (!done) { print "        source \"$RUNTIME/job.env\"; JOB_KEYS=\"${PROGRAM:-}"; print "${CMDARGS:-}"; print "${TIMEOUT:-}"; print "END-OF-JOB-KEYS\""; done = 1 }
 		next
 	}
 	{ print }
@@ -572,7 +602,7 @@ fi
 
 # Every case must have reported (review r2 B1): a case that neither passed nor failed would
 # otherwise vanish from the tally with exit 0.
-EXPECTED_CASES=19
+EXPECTED_CASES=21
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi

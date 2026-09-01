@@ -66,16 +66,26 @@ RELAY_RC=0
         echo "[relay] JOB-ENV-MISSING -- $RUNTIME/job.env is not readable; no connection attempted"
         RELAY_RC=66
     else
-        # One subshell, three lines out (the keys are single-line by contract; `read -r` keeps
-        # CMDARGS' backslashes). job.env therefore runs exactly once.
+        # One subshell, three lines out plus a sentinel (the keys are single-line by contract;
+        # `read -r` keeps CMDARGS' backslashes). job.env therefore runs exactly once. A value
+        # carrying a newline would shift the following lines, so the fourth read must land on
+        # the sentinel or the job is refused as multi-line. job.env is normally copied from
+        # jobs/*.env by run-scenario.sh (LF), but a hand-edited CRLF file leaves a trailing CR on
+        # each value; it is stripped, not shipped to xfreerdp's argv or fed to the TIMEOUT check
+        # (review relay-offline r5 minors, r6 I1).
         # shellcheck source=/dev/null
-        JOB_KEYS="$( . "$RUNTIME/job.env" >/dev/null 2>&1; printf '%s\n%s\n%s\n' "${PROGRAM:-}" "${CMDARGS:-}" "${TIMEOUT:-}" )"
-        PROGRAM=""; CMDARGS=""; TIMEOUT=""
-        { IFS= read -r PROGRAM; IFS= read -r CMDARGS; IFS= read -r TIMEOUT; } <<EOF_JOB_KEYS
+        JOB_KEYS="$( . "$RUNTIME/job.env" >/dev/null 2>&1; printf '%s\n%s\n%s\n%s\n' "${PROGRAM:-}" "${CMDARGS:-}" "${TIMEOUT:-}" 'END-OF-JOB-KEYS' )"
+        PROGRAM=""; CMDARGS=""; TIMEOUT=""; JOB_KEYS_END=""
+        { IFS= read -r PROGRAM; IFS= read -r CMDARGS; IFS= read -r TIMEOUT; IFS= read -r JOB_KEYS_END; } <<EOF_JOB_KEYS
 $JOB_KEYS
 EOF_JOB_KEYS
+        CR=$(printf '\r')
+        PROGRAM="${PROGRAM%"$CR"}"; CMDARGS="${CMDARGS%"$CR"}"; TIMEOUT="${TIMEOUT%"$CR"}"; JOB_KEYS_END="${JOB_KEYS_END%"$CR"}"
         TIMEOUT="${TIMEOUT:-25}"
-        if [ -z "$PROGRAM" ]; then
+        if [ "$JOB_KEYS_END" != "END-OF-JOB-KEYS" ]; then
+            echo "[relay] JOB-ENV-INVALID -- a job.env value spans more than one line; no connection attempted"
+            RELAY_RC=65
+        elif [ -z "$PROGRAM" ]; then
             echo "[relay] JOB-ENV-INVALID -- job.env sets no PROGRAM; no connection attempted"
             RELAY_RC=65
         elif ! printf '%s' "$TIMEOUT" | grep -qE '^[1-9][0-9]*$'; then
