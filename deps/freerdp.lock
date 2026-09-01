@@ -11,7 +11,7 @@
       "target": "libfreerdp/core/capabilities.c",
       "summary": "rdp_apply_input_capability_set() reads FreeRDP_UnicodeInput (:1414) and FreeRDP_HasQoeEvent (:1423) back out of the destination `settings` instead of the parsed server answer `src`, making both assignments self-assignments that discard the server's Input Capability Set answer. One token per hunk; provenance in adr/0011 §7.",
       "upstream": "https://github.com/FreeRDP/FreeRDP/pull/13287",
-      "upstream_status": "Hunk 1 (UnicodeInput) is fixed in upstream master, in no release yet; hunk 2 (HasQoeEvent) is not fixed upstream and not yet reported. Dates, SHAs and compare figures live in the patch header — deliberately not duplicated here, so they cannot rot behind it.",
+      "upstream_status": "Hunk 1 (UnicodeInput) is fixed in upstream master, in no release yet; hunk 2 (HasQoeEvent) is filed upstream as PR #13313, not yet merged. Dates, SHAs and compare figures live in the patch header — deliberately not duplicated here, so they cannot rot behind it.",
       "retire_when": "Per hunk; the conditions and the mechanism that announces them (a pin bump replays the queue and `git apply` fails hard once upstream absorbs a hunk) are stated in the patch header."
     }
   ],
