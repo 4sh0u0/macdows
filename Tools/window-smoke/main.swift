@@ -529,6 +529,20 @@ enum SizeBand {
         aboutWindowsRange.contains(size.width) && aboutWindowsRange.contains(size.height)
     }
 
+    /// The maximize scenario's two width thresholds, remote px. Observed against the lab host's
+    /// 2560-remote-px-wide desktop at rasterScale 1: a maximized About window spans the desktop
+    /// (>= 2000), a restored one is back near its ~536 natural width (< 1000). Until this landed
+    /// both were compared against `NSWindow.frame.width` in pt (review sizeband-r1 I2): a 2x
+    /// session's maximized 2560-remote-px window is a 1280 pt frame and read as "did not grow",
+    /// while a 600 pt frame (1200 remote px, NOT restored) read as restored. Same conversion as
+    /// the content bands; the constants keep their 1x meaning. A desktop-relative threshold
+    /// (fraction of the frozen `sessionDesktopSizeInRemotePixels`) would be the principled next
+    /// form and is deliberately NOT introduced here -- this change only fixes the unit.
+    static let maximizedWidthFloor: Double = 2000
+    static let restoredWidthCeiling: Double = 1000
+    static func isMaximizedWidth(_ size: RemotePixelSize) -> Bool { size.width >= maximizedWidthFloor }
+    static func isRestoredWidth(_ size: RemotePixelSize) -> Bool { size.width < restoredWidthCeiling }
+
     /// The converted size plus the one-line rendering every band assertion prints, so a failure
     /// names both units and the factor that linked them.
     static func describe(frameSize: CGSize, in topology: DisplayTopology) -> (RemotePixelSize, String) {
@@ -567,7 +581,11 @@ enum SizeBand {
 ///    pre-C-2 shape) => `sizeBandJudgesAboutInRemotePixelsAt2x` / `sizeBandFloorIsInclusiveInRemotePixels`;
 ///    the band loosened to hide the 2x red instead => `sizeBandAboutRejectsHalfSizeAt1x`; one axis
 ///    of either band dropped => `sizeBandFloorRejectsEachAxisAlone` / `sizeBandAboutNeedsBothAxes` /
-///    `sizeBandCeilingRejectsEachAxisAlone`.
+///    `sizeBandCeilingRejectsEachAxisAlone`; the maximize thresholds' comparison loosened, or
+///    `remotePixelSize` no longer applying `rasterScale` => `sizeBandMaximizeThresholdsAreRemotePixels`.
+///    **Not covered here**: the two `runMaximizeScenario` call sites reverting to `snap.frame.width`
+///    in pt while still printing the converted value (review sizeband-maximize-r1 D2 survives) --
+///    the live wiring has no offline seam; `grep 'frame.width >= 2000'` zero-hit is the only guard.
 ///
 /// **Known blind spot, stated rather than papered over** (rev-L9 I-2, R6): replacing the two
 /// `WindowGeometry.windowsPoint` calls with a copy of the rect conversion's own origin is an
@@ -584,8 +602,10 @@ enum WindowSmokeGateSelfTest {
             if !condition { ok = false }
         }
 
-        // A 1920x1080-point primary at 1x -- today's only real hardware shape
-        // (`docs/plans/phase3.md:219`) -- and its 2x twin, the mode-switch session M1 plans for.
+        // A 1920x1080-point primary at 1x and its 2x twin -- synthetic shapes for arithmetic
+        // pins. The lab host's real display is 2560x1440 at 1x native (`docs/plans/phase3.md:219`;
+        // 1920x1080 appears there only as a downsampled-2x comparison mode), which is what the
+        // `SizeBand` thresholds were observed against.
         guard
             let topology1x = DisplayTopology.single(widthInPoints: 1920, heightInPoints: 1080),
             let topology2x = DisplayTopology.single(
@@ -878,6 +898,22 @@ enum WindowSmokeGateSelfTest {
             !SizeBand.isAboutWindowsDialog(SizeBand.RemotePixelSize(width: 536, height: 300))
                 && !SizeBand.isAboutWindowsDialog(SizeBand.RemotePixelSize(width: 300, height: 521)),
             "sizeBandAboutNeedsBothAxes: 536x300 and 300x521 remote px are each outside the About band"
+        )
+        // The maximize scenario's width thresholds are remote px too (sizeband-r1 I2): at 2x a
+        // 1280 pt frame is a maximized 2560-remote-px window, and a 600 pt frame (1200 remote px) is
+        // NOT restored although 600 < 1000 in pt. Exact boundaries pinned: 1000 pt at 2x is exactly
+        // 2000 remote px (inclusive floor); 1000 pt at 1x is exactly 1000 remote px (exclusive ceiling).
+        expect(
+            SizeBand.isMaximizedWidth(SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 1280, height: 800), in: topology2x))
+                && !SizeBand.isMaximizedWidth(SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 1280, height: 800), in: topology1x))
+                && SizeBand.isMaximizedWidth(SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 1000, height: 800), in: topology2x))
+                && !SizeBand.isMaximizedWidth(SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 999.5, height: 800), in: topology2x))
+                && SizeBand.isRestoredWidth(SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 536, height: 521), in: topology1x))
+                && SizeBand.isRestoredWidth(SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 268, height: 260.5), in: topology2x))
+                && !SizeBand.isRestoredWidth(SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 600, height: 400), in: topology2x))
+                && !SizeBand.isRestoredWidth(SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 1000, height: 400), in: topology1x))
+                && SizeBand.isRestoredWidth(SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 999.5, height: 400), in: topology1x)),
+            "sizeBandMaximizeThresholdsAreRemotePixels: 1280 pt maximized only at 2x; 600 pt at 2x is not restored; boundaries 2000 inclusive / 1000 exclusive"
         )
         // The ceiling stays a remote-px number as well: 5000x5000 pt at 2x is 10000x10000 remote px
         // and hits the exclusive ceiling, while the same frame at 1x is a legitimate large window.
@@ -1563,12 +1599,14 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     }
     private var maximizePhase: MaximizePhase = .waitingForTarget
     private static let maximizePollTimeout: TimeInterval = 5.0
-    /// `grew`: did a WindowUpdate report width >=2000pt within 5s of SC_MAXIMIZE.
+    /// `grew`: did a WindowUpdate report width >= 2000 remote px (`SizeBand.maximizedWidthFloor`,
+    /// judged through the frozen topology) within 5s of SC_MAXIMIZE.
     /// `mappedWithContent`: was the window still mapped (visible, real content) at that
     /// point -- closes W0's deferred M1 acceptance debt ("a maximized window must build",
     /// phase2.md W0/M1) even on the failure path (checked at the 5s timeout too).
     private var maximizeResult: (grew: Bool, mappedWithContent: Bool)?
-    /// Did a later WindowUpdate report width <1000pt within 5s of SC_RESTORE.
+    /// Did a later WindowUpdate report width < 1000 remote px (`SizeBand.restoredWidthCeiling`,
+    /// judged through the frozen topology) within 5s of SC_RESTORE.
     private var restoreResult: Bool?
     /// Did WindowDelete arrive within 5s of SC_CLOSE (task item 5c's traffic-light loop
     /// assert) -- resolved via `maximizeCloseTargetId`/`maximizeCloseWindowDeletedAt` below,
@@ -3095,22 +3133,24 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
 
         case .awaitingMaximize(let windowId, let sentAt):
             let snap = registry.windowSnapshots().first { $0.windowId == windowId }
-            // KNOWN pt/remote-px confusion, deliberately left as is (review sizeband-r1 I2 -> the
-            // follow-up pool in docs STATUS): this 2000 is a mac-pt frame threshold that only means "maximized" at rasterScale
-            // 1 -- a 2x session's maximized 2560-remote-px window is a 1280 pt frame and would read as
-            // "did not grow". Not exercised by C-2's four runs (scenario was off). Re-express through
-            // `SizeBand`'s conversion when this scenario is next run on a 2x session.
-            if let snap, snap.frame.width >= 2000, snap.isVisible, snap.hasDisplayedContent {
+            // Judged in remote px through the session's frozen topology (`SizeBand`, review
+            // sizeband-r1 I2): the 2000 is a remote-px fact from the 2560-wide lab desktop, and a 2x
+            // session's maximized window is a 1280 pt frame. No frozen topology means the width
+            // cannot be judged at all -- the leg then times out and says so, never falls back to pt.
+            let grown: (SizeBand.RemotePixelSize, String)? = snap.flatMap { s in
+                displayTopology.sessionSnapshot.map { SizeBand.describe(frameSize: s.frame.size, in: $0) }
+            }
+            if let snap, let grown, SizeBand.isMaximizedWidth(grown.0), snap.isVisible, snap.hasDisplayedContent {
                 maximizeResult = (grew: true, mappedWithContent: true)
-                print("[maximize] windowId=\(windowId) grew to \(Int(snap.frame.width))x\(Int(snap.frame.height)), still mapped with content")
+                print("[maximize] windowId=\(windowId) grew to \(grown.1), still mapped with content")
                 session.sendSysCommand(windowId, command: SC.restore)
                 print("[maximize] sent SC_RESTORE to windowId=\(windowId)")
                 maximizePhase = .awaitingRestore(windowId: windowId, sentAt: Date())
             } else if Date().timeIntervalSince(sentAt) >= Self.maximizePollTimeout {
                 let mappedWithContent = snap?.isVisible == true && snap?.hasDisplayedContent == true
                 maximizeResult = (grew: false, mappedWithContent: mappedWithContent)
-                print("[maximize] windowId=\(windowId) FAILED to reach >=2000pt width within 5s "
-                    + "(got \(snap.map { "\(Int($0.frame.width))x\(Int($0.frame.height))" } ?? "no snapshot"))")
+                print("[maximize] windowId=\(windowId) FAILED to reach >= \(Int(SizeBand.maximizedWidthFloor)) remote px width within 5s "
+                    + "(got \(grown?.1 ?? (snap == nil ? "no snapshot" : "no frozen session topology to convert pt into remote px")))")
                 // Still exercise the close leg (task item 5c) even after a maximize
                 // failure, skipping straight past the now-moot restore leg, rather than
                 // abandoning the rest of the scenario and reporting even less data.
@@ -3122,18 +3162,21 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
 
         case .awaitingRestore(let windowId, let sentAt):
             let snap = registry.windowSnapshots().first { $0.windowId == windowId }
-            // Same pt/remote-px caveat as the maximize check above (review sizeband-r1 I2).
-            if let snap, snap.frame.width < 1000 {
+            // Same remote-px judgement as the maximize check above.
+            let restored: (SizeBand.RemotePixelSize, String)? = snap.flatMap { s in
+                displayTopology.sessionSnapshot.map { SizeBand.describe(frameSize: s.frame.size, in: $0) }
+            }
+            if let restored, SizeBand.isRestoredWidth(restored.0) {
                 restoreResult = true
-                print("[maximize] windowId=\(windowId) restored to \(Int(snap.frame.width))x\(Int(snap.frame.height))")
+                print("[maximize] windowId=\(windowId) restored to \(restored.1)")
                 session.sendSysCommand(windowId, command: SC.close)
                 print("[maximize] sent SC_CLOSE to windowId=\(windowId)")
                 maximizeCloseTargetId = windowId
                 maximizePhase = .awaitingClose(windowId: windowId, sentAt: Date())
             } else if Date().timeIntervalSince(sentAt) >= Self.maximizePollTimeout {
                 restoreResult = false
-                print("[maximize] windowId=\(windowId) FAILED to restore below 1000pt width within 5s "
-                    + "(got \(snap.map { "\(Int($0.frame.width))x\(Int($0.frame.height))" } ?? "no snapshot"))")
+                print("[maximize] windowId=\(windowId) FAILED to restore below \(Int(SizeBand.restoredWidthCeiling)) remote px width within 5s "
+                    + "(got \(restored?.1 ?? (snap == nil ? "no snapshot" : "no frozen session topology to convert pt into remote px")))")
                 session.sendSysCommand(windowId, command: SC.close)
                 print("[maximize] sent SC_CLOSE to windowId=\(windowId)")
                 maximizeCloseTargetId = windowId
@@ -5403,7 +5446,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             if let maximizeResult {
                 check(
                     maximizeResult.grew,
-                    "maximize scenario: SC_MAXIMIZE grew the About window to >=2000pt width within 5s"
+                    "maximize scenario: SC_MAXIMIZE grew the About window to >= 2000 remote px width within 5s"
                 )
                 check(
                     maximizeResult.mappedWithContent,
@@ -5414,7 +5457,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 check(false, "maximize scenario: a target window was locked and SC_MAXIMIZE was sent before the run ended")
             }
             if let restoreResult {
-                check(restoreResult, "maximize scenario: SC_RESTORE shrank the window back below 1000pt width within 5s")
+                check(restoreResult, "maximize scenario: SC_RESTORE shrank the window back below 1000 remote px width within 5s")
             } else {
                 check(false, "maximize scenario: the restore leg ran (may be skipped if the maximize leg itself already failed -- see the maximize assertions above)")
             }
