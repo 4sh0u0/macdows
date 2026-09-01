@@ -319,7 +319,147 @@ struct GfxTargetHintTally {
     }
 }
 
-/// `WINDOW_SMOKE_SELFTEST=1`: runs the two pure gates above against fixtures and exits.
+/// M1's live acceptance item 1 (`docs/plans/phase3.md:130`) — **F1, "red today, green on
+/// delivery"**: an `NSWindow`'s content **backing-pixel** size must equal the GFX `mappedSize`
+/// that window was given.
+///
+/// WHY THIS MEASUREMENT IS THE MILESTONE'S REASON TO EXIST. `mappedSize` is **remote px** (the GFX
+/// map order's own unit, `crdpq.h`); an `NSWindow`'s content backing size is **backing px** =
+/// mac pt x that window's `backingScaleFactor`. adr/0015 §1's identity `remote px == backing px`
+/// is exactly the claim these two numbers test, and today nothing enforces it: the layer's
+/// `contentsGravity = .resize` (`RemoteWindow.swift:420`) stretches a remote-px raster into
+/// whatever backing store AppKit gave the view, so on a 2x display the two differ by exactly the
+/// `backingScaleFactor` and the picture is silently upsampled rather than sharp.
+///
+/// **EXPECTED VERDICTS, stated up front so a RED is not mistaken for a regression:**
+///  * **1x display (today's only hardware, `docs/plans/phase3.md:219`): GREEN.** `backingScaleFactor`
+///    is 1, so backing px and mac pt are the same number and the identity holds trivially.
+///  * **2x display: RED, and that RED is the deliverable** — it is 验收-真机-1 itself
+///    (`docs/plans/phase3.md:130`: "今天必红、转绿即交付"). `RemoteWindow.present`'s own W3-TRIGGER
+///    note (`RemoteWindow.swift:1120-1129`) names the mechanism and the factor: moving the window
+///    onto a Retina display makes `backingPixelsPerPoint != 1` while `remotePixelsPerPoint` stays
+///    1 (`DisplayScale.retinaBackingOnly`), "and it is the `backingScaleFactor` factor phase3.md §1
+///    F1 names; the 'red today, green on delivery' assertion … is the measurement for THIS
+///    trigger". A GREEN on a 2x display before W3 lands would mean the measurement is broken, not
+///    that the bug is fixed.
+///
+/// **MEASUREMENT ONLY in M1 — this verdict must never move `ok` or the exit code.** M1 is a
+/// measurement batch; touching `contentsScale`/backing alignment is W3's (adr/0015 §8), and this
+/// harness's own gate would otherwise go permanently red on the very display the checkpoint needs
+/// to run on. W3 is what promotes this line into the gate.
+///
+/// **The comparison is exact.** It measures a factor-of-two discrepancy, not jitter, so there is
+/// no tolerance here and none may be added: unlike `MoveResizeGate`, whose 0 is an owner-priced
+/// gate value (U6), this one is 0 because any nonzero difference already means the two spaces
+/// disagree. Deliberately NOT rounded either -- rounding to the nearest backing pixel would be a
+/// tolerance wearing a different hat, and AppKit's `convertToBacking` returns integral sizes for
+/// the integral content rects this path produces anyway, so rounding would buy nothing and hide
+/// a genuine sub-pixel disagreement.
+enum F1BackingVsMapped {
+    enum Verdict: String {
+        case green = "GREEN"
+        case red = "RED"
+    }
+
+    /// One window's pairing at present time. All four size fields are stored as `Double` because
+    /// that is what AppKit and the GFX payload hand over; the verdict compares them exactly.
+    struct Observation: Equatable {
+        let windowId: UInt32
+        /// `contentView.convertToBacking(bounds).size` -- **backing px**.
+        let backingWidthInBackingPixels: Double
+        let backingHeightInBackingPixels: Double
+        /// The same content rect in **mac pt**, kept only so the line can state the implied scale.
+        let contentWidthInPoints: Double
+        let contentHeightInPoints: Double
+        /// `RemoteWindowRegistry.debugMappedSize` -- the GFX map order's `mappedWidth/Height`,
+        /// **remote px**.
+        let mappedWidthInRemotePixels: Double
+        let mappedHeightInRemotePixels: Double
+
+        /// EXACT equality, both axes. See the type's own note on why there is no tolerance and no
+        /// rounding.
+        var verdict: Verdict {
+            backingWidthInBackingPixels == mappedWidthInRemotePixels
+                && backingHeightInBackingPixels == mappedHeightInRemotePixels ? .green : .red
+        }
+
+        /// Derived from this window's own conversion rather than read from `NSScreen`/`NSWindow`:
+        /// adr/0015 §5.A.5 confines screen reads to the topology provider, and this number is a
+        /// diagnostic label, never a geometry input. `nil` for a zero-width content rect.
+        var impliedBackingScale: Double? {
+            contentWidthInPoints > 0 ? backingWidthInBackingPixels / contentWidthInPoints : nil
+        }
+
+        var line: String {
+            let scale = impliedBackingScale.map { String(format: "%.2f", $0) } ?? "unknown"
+            return "[f1] windowId=\(windowId)"
+                + " backing=\(Self.fmt(backingWidthInBackingPixels))x\(Self.fmt(backingHeightInBackingPixels)) backing px"
+                + " mapped=\(Self.fmt(mappedWidthInRemotePixels))x\(Self.fmt(mappedHeightInRemotePixels)) remote px"
+                + " content=\(Self.fmt(contentWidthInPoints))x\(Self.fmt(contentHeightInPoints)) mac pt"
+                + " impliedBackingScale=\(scale)"
+                + " delta=(\(Self.fmt(backingWidthInBackingPixels - mappedWidthInRemotePixels)),"
+                + "\(Self.fmt(backingHeightInBackingPixels - mappedHeightInRemotePixels)))"
+                + " verdict=\(verdict.rawValue)"
+        }
+
+        /// Integral values print without a decimal tail; anything fractional keeps three places, so
+        /// a sub-pixel disagreement is visible rather than rounded away in the log too.
+        static func fmt(_ value: Double) -> String {
+            value == value.rounded() ? String(Int(value)) : String(format: "%.3f", value)
+        }
+    }
+}
+
+/// Run-scoped record of the F1 measurement: dedupes the per-window line (a 60fps stream would
+/// otherwise print one line per frame) and produces the one summary every run must emit.
+struct F1BackingVsMappedTally {
+    /// The most recent observation per window -- the dedupe key AND the summary's input, so the
+    /// summary always describes the LAST state of each window rather than a first impression.
+    private(set) var lastByWindow: [UInt32: F1BackingVsMapped.Observation] = [:]
+    /// Every sample taken, including repeats (the denominator for "did this actually run").
+    private(set) var samplesTaken = 0
+    /// Windows that were RED at any point, even if a later observation went GREEN -- a verdict
+    /// that flips mid-run is itself a finding, and a summary that only reported the final state
+    /// would hide it.
+    private(set) var everRedWindows: Set<UInt32> = []
+
+    /// Records `observation` and returns it **only when it is worth printing** -- i.e. the first
+    /// sample for that window, or one whose numbers changed since the last printed line. Returns
+    /// `nil` for an unchanged repeat.
+    mutating func record(_ observation: F1BackingVsMapped.Observation) -> F1BackingVsMapped.Observation? {
+        samplesTaken += 1
+        if observation.verdict == .red { everRedWindows.insert(observation.windowId) }
+        let previous = lastByWindow[observation.windowId]
+        lastByWindow[observation.windowId] = observation
+        return previous == observation ? nil : observation
+    }
+
+    /// The one `[f1] summary:` line, printed on EVERY run from every terminal path -- same
+    /// discipline as `GfxTargetHintTally.summaryLine`, and for the same reason: "absent because no
+    /// window was ever measurable" and "absent because the measurement fell off" must not look
+    /// alike, least of all on the checkpoint run this measurement exists for.
+    var summaryLine: String {
+        let tail = " (MEASUREMENT ONLY in M1: this verdict does not affect the exit code. "
+            + "docs/plans/phase3.md:130 -- GREEN expected at 1x, RED expected on a 2x display "
+            + "today and that RED is the deliverable; W3 promotes it into the gate)"
+        guard !lastByWindow.isEmpty else {
+            return "[f1] summary: none (no window with both a presented frame and a GFX mapped size "
+                + "was observed this run; samples=\(samplesTaken))" + tail
+        }
+        let green = lastByWindow.values.filter { $0.verdict == .green }.count
+        let red = lastByWindow.values.count - green
+        let redDetail = lastByWindow.values
+            .filter { $0.verdict == .red }
+            .sorted { $0.windowId < $1.windowId }
+            .map { "\($0.windowId): backing=\(F1BackingVsMapped.Observation.fmt($0.backingWidthInBackingPixels))x\(F1BackingVsMapped.Observation.fmt($0.backingHeightInBackingPixels)) vs mapped=\(F1BackingVsMapped.Observation.fmt($0.mappedWidthInRemotePixels))x\(F1BackingVsMapped.Observation.fmt($0.mappedHeightInRemotePixels))" }
+            .joined(separator: "; ")
+        return "[f1] summary: windows=\(lastByWindow.count) GREEN=\(green) RED=\(red)"
+            + " samples=\(samplesTaken) everRed=\(everRedWindows.count)"
+            + (redDetail.isEmpty ? "" : " red[\(redDetail)]") + tail
+    }
+}
+
+/// `WINDOW_SMOKE_SELFTEST=1`: runs the pure gates above against fixtures and exits.
 ///
 /// WHY THIS EXISTS. `window-smoke` has no test bundle and cannot get one without touching another
 /// lane's file (`App/project.yml`), yet L9's own instruction is that no assertion may be
@@ -341,6 +481,10 @@ struct GfxTargetHintTally {
 ///  * `MacdowsCore.windowsPoint` mis-scaling that is invisible at 1x (`(H − y) * s` -> `H − y * s`)
 ///    => `pointPathPinsItsOwnNumbers at rasterScale 2` (found KILLED by review's own R1 mutation --
 ///    the 2x pin is what makes a package-side regression visible offline).
+///  * **F1's verdict inverted, or its exactness weakened** (`==` -> `abs(...) <= 1`, or a rounding
+///    step) => `f1RedAtTwoX` / `f1AdmitsOnlyExactEquality` (L9b). F1 is measurement-only and never
+///    touches the exit code, which is exactly why its own logic has to be pinned here: nothing in a
+///    live run can fail because of it, so nothing in a live run can reveal it broken either.
 ///
 /// **Known blind spot, stated rather than papered over** (rev-L9 I-2, R6): replacing the two
 /// `WindowGeometry.windowsPoint` calls with a copy of the rect conversion's own origin is an
@@ -529,6 +673,78 @@ enum WindowSmokeGateSelfTest {
             tally.summaryLine.hasPrefix("[gfx] target= 1664x960 remote px (n=2), 1280x720 remote px (n=1)")
                 && tally.summaryLine.contains("hintAbsent=1") && tally.summaryLine.contains("degenerateHint=1"),
             "the observed form lists distinct sizes with counts, most frequent first, plus the denominators"
+        )
+
+        // --- F1: backing px vs GFX mappedSize (docs/plans/phase3.md:130, M1 L9b) --------------
+        // The fixture numbers are a real window's shape: 508x507 remote px is the About window's
+        // own GFX-mapped size from the 2026-08-23 real-host run (`WindowGeometry.swift`'s
+        // correction note records it), so the 1x and 2x rows below are what this measurement will
+        // actually print at the checkpoint, not invented values.
+        func f1(backing: (Double, Double), content: (Double, Double), mapped: (Double, Double))
+            -> F1BackingVsMapped.Observation
+        {
+            F1BackingVsMapped.Observation(
+                windowId: 4242,
+                backingWidthInBackingPixels: backing.0, backingHeightInBackingPixels: backing.1,
+                contentWidthInPoints: content.0, contentHeightInPoints: content.1,
+                mappedWidthInRemotePixels: mapped.0, mappedHeightInRemotePixels: mapped.1
+            )
+        }
+
+        let f1At1x = f1(backing: (508, 507), content: (508, 507), mapped: (508, 507))
+        expect(
+            f1At1x.verdict == .green && f1At1x.impliedBackingScale == 1,
+            "f1GreenAtOneX: backing px == mappedSize when backingScaleFactor is 1 (today's hardware)"
+        )
+
+        let f1At2x = f1(backing: (1016, 1014), content: (508, 507), mapped: (508, 507))
+        expect(
+            f1At2x.verdict == .red && f1At2x.impliedBackingScale == 2
+                && f1At2x.line.contains("verdict=RED") && f1At2x.line.contains("delta=(508,507)"),
+            "f1RedAtTwoX: a factor-of-2 backing store is RED, and the line states the factor and the "
+                + "delta -- this RED is 验收-真机-1 itself (docs/plans/phase3.md:130), not a regression"
+        )
+
+        // The EFFECTIVE comparison, not just the factor-of-2 headline: one backing pixel of
+        // difference must be RED. A `<= 1` or a rounding step introduced here would absorb it and
+        // turn this measurement into one that cannot fail for small errors.
+        //
+        // The 0.25 row is the one that discriminates ROUNDING specifically, and it was added after
+        // a mutation survived: `Int(x.rounded()) == Int(y.rounded())` still reports RED for 508.5 vs
+        // 508 (508.5 rounds AWAY to 509), so a half-pixel fixture proves nothing about rounding.
+        // Sub-half-pixel is the only fixture that does. It pins the type's own stated claim -- exact,
+        // unrounded -- rather than a field-reachable scenario: `convertToBacking` of the integral
+        // content rects this path produces is itself integral, so a fractional backing size is not
+        // expected in a live run. An assertion about a claim is still an assertion.
+        expect(
+            f1(backing: (509, 507), content: (509, 507), mapped: (508, 507)).verdict == .red
+                && f1(backing: (508, 508), content: (508, 508), mapped: (508, 507)).verdict == .red
+                && f1(backing: (508.5, 507), content: (508.5, 507), mapped: (508, 507)).verdict == .red
+                && f1(backing: (508.25, 507), content: (508.25, 507), mapped: (508, 507)).verdict == .red,
+            "f1AdmitsOnlyExactEquality: 1 backing px on either axis -- and a half, and a quarter -- is RED"
+        )
+        // Direction-independent: the mapped side being the larger one is equally a disagreement.
+        expect(
+            f1(backing: (508, 507), content: (508, 507), mapped: (1016, 1014)).verdict == .red,
+            "f1IsSymmetric: mapped larger than backing is RED too, not silently tolerated"
+        )
+
+        var f1Tally = F1BackingVsMappedTally()
+        expect(
+            f1Tally.summaryLine.hasPrefix("[f1] summary: none (no window with both a presented frame")
+                && f1Tally.summaryLine.contains("MEASUREMENT ONLY"),
+            "the F1 summary is well-formed and explicit when no window was ever measurable"
+        )
+        expect(
+            f1Tally.record(f1At2x) != nil && f1Tally.record(f1At2x) == nil,
+            "f1TallyDedupesUnchangedSamples: the first sample prints, an identical repeat does not"
+        )
+        let recovered = f1Tally.record(f1At1x)
+        expect(
+            recovered != nil && f1Tally.samplesTaken == 3 && f1Tally.everRedWindows.count == 1
+                && f1Tally.summaryLine.contains("windows=1 GREEN=1 RED=0")
+                && f1Tally.summaryLine.contains("everRed=1"),
+            "f1TallyKeepsTheLastStateAndRemembersAnEarlierRed: a verdict that flips is still visible"
         )
 
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
@@ -955,6 +1171,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// F2's measurement (`docs/plans/phase3.md:132`): every SURFACE_MAPPED event's target hint,
     /// aggregated for the one `[gfx] target=` line every run prints at summary time.
     private var gfxTargetHints = GfxTargetHintTally()
+
+    /// F1's measurement (`docs/plans/phase3.md:130`, M1 L9b): the backing-px vs GFX-mappedSize
+    /// pairing, sampled at present time. **Measurement only** -- see `F1BackingVsMapped`'s own
+    /// note; nothing here may reach `ok` or the exit code.
+    private var f1Measurements = F1BackingVsMappedTally()
 
     // Phase 1 acceptance state (see the extraApps/cyclesTotal globals' doc comments).
     private var extraAppsLaunched = false
@@ -1700,12 +1921,60 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         return desktop
     }
 
-    /// The one `[gfx] target=` line (F2's visible half, `docs/plans/phase3.md:132`), printed once
-    /// per RUN from every terminal path -- `finish()` and `finishCycles()` both call it. Never
-    /// conditional: see `GfxTargetHintTally.summaryLine` for why an absent line is worse than a
-    /// "none" line.
-    private func printGfxTargetSummary() {
+    /// The M1 measurement summaries — F2's `[gfx] target=` (`docs/plans/phase3.md:132`) and F1's
+    /// `[f1] summary:` (`:130`) — printed once per RUN from every terminal path (`finish()` and
+    /// `finishCycles()` both call THIS, not the individual lines). Never conditional: see
+    /// `GfxTargetHintTally.summaryLine` for why an absent line is worse than a "none" line.
+    ///
+    /// One method rather than two calls per path on purpose (rev-L9 M-5 observed that these lines
+    /// are call-site-printed rather than structurally enforced): a future third exit path has one
+    /// thing to remember instead of N, and adding an M3 measurement later adds no new call sites.
+    private func printMeasurementSummaries() {
         print(gfxTargetHints.summaryLine)
+        print(f1Measurements.summaryLine)
+    }
+
+    /// F1 (`docs/plans/phase3.md:130`, M1 L9b) sampled at **present time**: called from
+    /// `drainNow()` for any drain batch that carried a FRAME_READY, i.e. immediately after
+    /// `registry.handle(event)` has synchronously run `handleFrameReady` -> `RemoteWindow.present`
+    /// for that frame. That is the moment the window is showing the surface whose `mappedSize`
+    /// this compares against, which is why the sample is taken here rather than on a timer.
+    ///
+    /// The pairing is done from the harness side because `RemoteWindow.present` is not this lane's
+    /// file: `windowSnapshots()` supplies the tracked windows, `window(forWindowId:)` the live
+    /// `NSWindow`, and `debugMappedSize(forWindowId:)` the GFX mapped size the registry itself
+    /// uses for the crop. A window without both a presented frame and a mapped size is **skipped,
+    /// not defaulted** -- an invented backing or mapped size would produce exactly the kind of
+    /// unfalsifiable GREEN this measurement exists to prevent.
+    ///
+    /// `convertToBacking` is asked of the CONTENT view, not the window frame: RAIL geometry
+    /// round-trips through the content rect once a window has native chrome
+    /// (`RemoteWindow.updateFrame`'s own finding), so comparing the frame would be off by this
+    /// window's titlebar insets and would report RED at 1x for a reason that has nothing to do
+    /// with F1.
+    private func sampleF1BackingVsMapped(registry: RemoteWindowRegistry) {
+        for snapshot in registry.windowSnapshots() where snapshot.hasDisplayedContent {
+            guard let window = registry.window(forWindowId: snapshot.windowId),
+                  let contentView = window.contentView,
+                  let mapped = registry.debugMappedSize(forWindowId: snapshot.windowId)
+            else { continue }
+            let contentSizeInPoints = contentView.bounds.size
+            let backingSize = contentView.convertToBacking(contentSizeInPoints)
+            let observation = F1BackingVsMapped.Observation(
+                windowId: snapshot.windowId,
+                backingWidthInBackingPixels: Double(backingSize.width),
+                backingHeightInBackingPixels: Double(backingSize.height),
+                contentWidthInPoints: Double(contentSizeInPoints.width),
+                contentHeightInPoints: Double(contentSizeInPoints.height),
+                mappedWidthInRemotePixels: Double(mapped.width),
+                mappedHeightInRemotePixels: Double(mapped.height)
+            )
+            // Printed only when the numbers changed (or on the first sample for this window) --
+            // a 60fps stream would otherwise bury every other line in the run's log.
+            if let changed = f1Measurements.record(observation) {
+                print(changed.line)
+            }
+        }
     }
 
     /// The ADR §5 reconnect re-take, pinned. `RemoteWindowRegistry.sessionTopologyFreezeCount`
@@ -2021,6 +2290,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
 
         if sawFrameReady {
             frameLatencySamplesMs.append(Date().timeIntervalSince(pushObservedAt) * 1000)
+            // F1 (`docs/plans/phase3.md:130`, M1 L9b): this batch presented at least one frame, so
+            // every tracked window that has content is now showing a surface whose `mappedSize`
+            // the registry knows -- present time, and the only moment the pairing is meaningful.
+            // Sampled AFTER the latency sample so it can never distort that measurement.
+            sampleF1BackingVsMapped(registry: registry)
         }
 
         // Focus rotation convergence poll (task item 2/3): checked once per drain batch
@@ -2472,9 +2746,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             if !cond { ok = false }
         }
 
-        // M1 F2: the same one-per-run line `finish()` prints -- cycle mode exits through HERE, so
-        // omitting it would make the measurement silently mode-dependent.
-        printGfxTargetSummary()
+        // M1 F2 + F1: the same one-per-run measurement lines `finish()` prints -- cycle mode exits
+        // through HERE, so omitting them would make the measurements silently mode-dependent.
+        printMeasurementSummaries()
         print("[topology] session desktop size after \(cycleResults.count) cycle(s): "
             + (sessionDesktopSizeInRemotePixels.map { "\($0.width)x\($0.height) remote px" }
                 ?? "<not set -- no usable display at the last freeze, adr/0015 §5.A.6>"))
@@ -4213,10 +4487,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             if !cond { ok = false }
         }
 
-        // M1 F2 (`docs/plans/phase3.md:132`): once per RUN, unconditionally, in both terminal
-        // paths (`finishCycles()` prints the same line). Placed at the top of the summary so it
-        // cannot be lost behind an early `exit` in some future edit.
-        printGfxTargetSummary()
+        // M1 F2 (`docs/plans/phase3.md:132`) and F1 (`:130`): once per RUN, unconditionally, in
+        // both terminal paths (`finishCycles()` prints the same lines). Placed at the top of the
+        // summary so they cannot be lost behind an early `exit` in some future edit.
+        printMeasurementSummaries()
         // The connect-time desktop size actually negotiated, and the ADR §5 re-take pin. A
         // single-run `finish()` performed exactly one freeze (no `prepareForReconnect()` -- see
         // this method's own note on why it never resets the registry).
