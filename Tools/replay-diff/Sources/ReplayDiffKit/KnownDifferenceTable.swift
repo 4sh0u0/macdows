@@ -17,8 +17,8 @@ public enum SupersessionRole: Sendable, Equatable {
     case superseded
 }
 
-/// One entry in the "this event type is missing from one side because *we* changed
-/// something locally, not because the remote end regressed" table.
+/// One entry in the "this event type is one-sided because of a known difference between the
+/// two recordings, not because the remote end regressed" table.
 ///
 /// This type exists because of M1 finding **F-1**. The upgrade gate's whole purpose is to
 /// answer "did the thing we are about to upgrade change server behaviour?", and its only
@@ -30,11 +30,20 @@ public enum SupersessionRole: Sendable, Equatable {
 public struct KnownDifferenceEntry: Sendable, Equatable, Codable {
     /// The `ev` name this entry explains (e.g. `GfxMapSurfaceToScaledWindow`).
     public let eventName: String
-    /// The side the event is *expected* to appear on. The asymmetry is load-bearing: the
-    /// AVC flip means the scaled-map event should appear on the **candidate** side and be
-    /// absent from the pre-flip baseline. If it ever shows up only on the *baseline* side
-    /// the explanation does not apply — that is the flip having been lost, a real
-    /// regression — so the differ falls back to the unexplained class.
+    /// The side the event is *expected* to appear on, as an **empirical** statement about
+    /// the two recordings — never a claim about what caused the asymmetry.
+    ///
+    /// The asymmetry is load-bearing. For the pre-seeded entry it records that the
+    /// scaled-map event is absent from the frozen 2026-08-19 captures and present on
+    /// post-that-era ones, so it is expected on the **candidate** side. If it ever shows up
+    /// only on the *baseline* side the recorded expectation does not hold, the entry does
+    /// not apply, and the differ falls back to the unexplained class.
+    ///
+    /// An earlier revision of this comment derived the asymmetry from the FFmpeg/AVC
+    /// capability flip. That attribution was falsified (see ``cause`` and
+    /// `deps/freerdp.lock`'s CORRECTION note) and the mechanism is open pending the W2
+    /// instrumented re-record. An entry states which side, and on what evidence; it never
+    /// states why the server behaved that way.
     public let expectedSide: DiffSide
     /// The event type this one stands in for: the two names describe **the same class of
     /// server behaviour in two variants**, and the differ should compare them against each
