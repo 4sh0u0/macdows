@@ -206,13 +206,17 @@ struct GateDriverPlumbingTests {
 
     // MARK: - Round-1 finding I-3: the ordinal-shift cascade note
 
-    /// One extra window early in the stream shifts every later `window` ordinal and turns
-    /// one real difference into a three-figure report. The tool cannot avoid that in M1
-    /// (payload-anchored identity is W2 batch 2) but it must not let the operator read 196
-    /// findings without being told that finding 1 caused the other 195.
-    @Test("an extra window handle raises a cascade note naming the namespace and the remedy")
+    /// One extra *un-anchored* window early in the stream still shifts every later
+    /// ordinal handle and turns one real difference into a multi-finding report. Since
+    /// W2 batch 2's title-anchored identity the population this can happen to is the
+    /// un-anchored one (untitled windows; same-title-group members; surface/notifyIcon
+    /// always) — only a UNIQUELY-titled extra window raises no note
+    /// (`TitleAnchoredIdentityTests.titledExperimentCollapses` pins that side, and its
+    /// `sameTitleGroupChangeRaisesNote` pins the group side). The note must still name
+    /// the namespace and the remedy for the residual.
+    @Test("an extra un-anchored window handle raises a cascade note naming the namespace and the remedy")
     func cascadeNoteAppearsWhenHandleCountsDiffer() throws {
-        let extraWindow = #"{"t_ms":5,"tid":"0x1f6be3540","ev":"WindowCreate","windowId":90001,"fieldFlags":13567,"windowOffsetX":0,"windowOffsetY":0,"windowWidth":320,"windowHeight":240,"numVisibilityRects":1,"style":382664704,"styleEx":256,"show":5,"title":"Extra Head Window"}"#
+        let extraWindow = #"{"t_ms":5,"tid":"0x1f6be3540","ev":"WindowCreate","windowId":90001,"fieldFlags":13567,"windowOffsetX":0,"windowOffsetY":0,"windowWidth":320,"windowHeight":240,"numVisibilityRects":1,"style":382664704,"styleEx":256,"show":5,"title":""}"#
         let mutated = CaptureFixture.inserting(CaptureFixture.baseline, [extraWindow], atIndex: 0)
 
         let report = SemanticDiffer().diff(
@@ -221,8 +225,8 @@ struct GateDriverPlumbingTests {
         )
         let cascade = try #require(report.notes.first { $0.hasPrefix("CASCADE RISK") })
         #expect(cascade.contains("`window`"))
-        #expect(cascade.contains("2 distinct"))
-        #expect(cascade.contains("baseline's 1"))
+        #expect(cascade.contains("1 distinct"))
+        #expect(cascade.contains("baseline's 0"))
         // The operator's actual first-line remedy has to be in the note, not only in the
         // README they do not have open.
         #expect(cascade.contains("FIRST eventCountChanged"))
@@ -230,32 +234,11 @@ struct GateDriverPlumbingTests {
         #expect(report.hasRegressions)
     }
 
-    /// Round-2 finding **N-4**: the docs quoted an exact total (196) that the reviewer could
-    /// not reproduce (they measured 193) because the number depends on the payload of the
-    /// injected `WindowCreate`, which nothing specified and no test pinned. The docs now
-    /// quote only the part that is construction-independent — the `eventCountChanged` count
-    /// — and this pins it against the real capture the docs name.
-    @Test("the documented cascade experiment yields 98 eventCountChanged findings")
-    func documentedCascadeExperimentIsReproducible() throws {
-        let url = try #require(PhaseSamples.url(named: "s3-multiapp"))
-        let contents = try String(contentsOf: url, encoding: .utf8)
-        var lines = contents.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        while lines.last?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true { lines.removeLast() }
-        #expect(lines.count == 145, "the documented experiment names a 145-line capture, got \(lines.count)")
-
-        // "one extra WindowCreate prepended". Its payload does not affect the pinned number.
-        let extra = #"{"t_ms":1,"tid":"0x1f6be3540","ev":"WindowCreate","windowId":11111,"fieldFlags":13567,"windowOffsetX":0,"windowOffsetY":0,"windowWidth":320,"windowHeight":240,"numVisibilityRects":1,"style":382664704,"styleEx":256,"show":5,"title":"Extra Head Window"}"#
-        let mutated = [lines[0], extra] + lines.dropFirst()
-
-        let report = SemanticDiffer().diff(
-            baseline: ReplayStream.parse(contents: contents, label: "s3"),
-            candidate: ReplayStream.parse(contents: mutated.joined(separator: "\n") + "\n", label: "s3-plus-one")
-        )
-        let counts = report.differences.filter { $0.diffClass == .eventCountChanged }.count
-        #expect(counts == 98, "documented cascade count drifted: \(counts)")
-        #expect(report.notes.contains { $0.hasPrefix("CASCADE RISK") })
-        #expect(report.differences.count > 150, "the point of the doc note is that the total is large")
-    }
+    // Round-2 finding N-4's exact-pin duty (the documented cascade-experiment number must
+    // be reproduced by a test against the real capture the prose names) moved with the
+    // experiment itself: since W2 batch 2's title-anchored identity the TITLED variant
+    // collapses to one finding and the documented number is the UNTITLED residual (53) —
+    // both halves are pinned in `TitleAnchoredIdentityTests`.
 
     /// Negative control: the note is evidence-driven, not decoration. Equal handle counts
     /// produce no note at all, so its presence in an artifact means something.

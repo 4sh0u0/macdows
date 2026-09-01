@@ -158,9 +158,11 @@ struct CommandLineOptions {
         WHAT "SEMANTIC" MEANS
           Timestamps (t_ms), thread ids (tid) and run duration (sinceConnectMs) are
           ignored. Session-scoped handles (windowId/ownerWindowId/activeWindowId/
-          windowIdMarker, surfaceId, notifyIconId) are compared as per-side
-          first-appearance ordinals, so a re-record's fresh HWNDs do not read as changes
-          while "these events are about the same window" still does. Events are matched
+          windowIdMarker, surfaceId, notifyIconId) are compared as per-side canonical
+          tokens — a window handle with a UNIQUE title anchors on it, the rest (untitled,
+          same-title groups, surfaces, notify icons) get first-appearance positions — so
+          a re-record's fresh HWNDs do not read as changes while "these events are about
+          the same window" still does. Events are matched
           per event type and identity tuple, so cross-type reordering is tolerated
           exactly. Residual movement is checked twice: within the event's own producer
           lane (main / gfx / server, derived from the ev name and verified against the

@@ -5,11 +5,15 @@ public struct DifferOptions: Sendable, Equatable {
     public var fieldPolicy: FieldPolicy
     public var knownDifferenceTable: KnownDifferenceTable
 
-    /// Replace session-scoped handle values with per-side first-appearance ordinals before
-    /// comparing (`windowId: 65832` → `window#0`). On by default; without it, *no* pair of
-    /// separately recorded captures can ever match, because a re-record gets fresh HWNDs
-    /// and surface ids for the same user actions. Turn off with `--no-canonical-ids` when
-    /// diffing two captures from the same session, where the raw ids are meaningful.
+    /// Replace session-scoped handle values with per-side canonical tokens before
+    /// comparing: a `window` handle that ever carries a non-empty `title` anchors on it
+    /// (`windowId: 65832` → `window@About Windows`; same-title duplicates disambiguate by
+    /// first appearance), everything else — untitled windows, `surface`, `notifyIcon` —
+    /// gets a per-side first-appearance ordinal (`surfaceId: 7` → `surface#0`). On by
+    /// default; without it, *no* pair of separately recorded captures can ever match,
+    /// because a re-record gets fresh HWNDs and surface ids for the same user actions.
+    /// Turn off with `--no-canonical-ids` when diffing two captures from the same
+    /// session, where the raw ids are meaningful.
     public var canonicalizeIdentifiers: Bool
 
     /// How far a matched event may move **across producer lanes**, measured in positions
@@ -168,7 +172,8 @@ public enum EventLane: String, Sendable, Equatable, CaseIterable {
 ///
 /// 1. **Parse failures** on either side become ``DiffClass/unparsableLine`` findings.
 /// 2. **Identifier canonicalization** (optional, default on) rewrites handle-valued fields
-///    to per-side, per-namespace, first-appearance ordinals.
+///    to per-side canonical tokens: title-anchored for `window` handles that ever carry
+///    a non-empty `title`, per-namespace first-appearance ordinals for the rest.
 /// 3. **Type census.** An `ev` name present on exactly one side is a whole-type finding:
 ///    ``DiffClass/knownLocalDifference`` when the ``KnownDifferenceTable`` claims it
 ///    on that side — as an appearance *or* as the superseded half of a substitution, see
@@ -199,28 +204,48 @@ public enum EventLane: String, Sendable, Equatable, CaseIterable {
 ///
 /// ## Known limitations
 ///
-/// **Ordinal-shift cascade (W2 batch 2).** Canonical ordinals are assigned in
-/// first-appearance order, so an event that changes *which* handle appears first shifts
-/// every later ordinal in that namespace. Measured on a real capture: **one** extra
-/// `WindowCreate` prepended to `s3-multiapp.jsonl` (145 lines) yields **98
-/// `eventCountChanged` findings on its own**, and roughly 190 findings in total. Only the
-/// 98 is construction-independent — it falls straight out of the ordinal shift and is
-/// pinned by `CascadeBlastRadiusTests`; the `fieldValueChanged` and `eventOrderChanged`
-/// counts depend on the payload of the injected window (round-1 measured 180 total, round 2
-/// 193–196 with the lane rule, from two differently-shaped injected lines), so no exact
-/// total is quoted here. The propagation is what matters: the `window` namespace shift
-/// reaches every identity bucket that references a window, which is most of the stream. A
-/// live re-record that opens one transient window the baseline did not (a splash screen, a
-/// tooltip, a tray flyout) lands here.
+/// **Ordinal-shift cascade — collapsed for UNIQUELY-titled windows (W2 batch 2),
+/// residual for everything else.** A `window`-namespace handle whose stream carries a
+/// non-empty `title` no other handle shares is anchored on it, so an event that changes
+/// *which* handle appears first no longer shifts its identity: the experiment that used
+/// to yield **98 `eventCountChanged` findings and roughly 190 total** (pre-W2b2 numbers,
+/// measured against the then-current implementation and no longer reproducible in-tree;
+/// only the 98 was construction-independent, the total depended on the injected payload)
+/// from **one** extra uniquely-titled `WindowCreate` prepended to `s3-multiapp.jsonl`
+/// (145 lines) now yields exactly **1** finding (pinned by `TitleAnchoredIdentityTests`).
 ///
-/// The tool fails *loudly*, never silently, so the verdict is not misleading — but a
-/// three-figure report for one extra window is exactly the false-alarm shape
-/// ``KnownDifferenceTable``'s own doc warns trains an operator to ignore the gate. First-line
-/// remedy for the operator: read the report's **cascade note** and the *first*
-/// `eventCountChanged`, and check whether the candidate simply has an extra window early in
-/// the stream. ``DifferOptions/canonicalizeIdentifiers`` = false is the documented escape
-/// hatch but is the wrong tool here — it makes every handle differ. The real fix is
-/// payload-anchored identity (title-keyed where a title is present), deferred to W2 batch 2.
+/// Three populations still cascade, and the cascade note counts all of them:
+///
+/// - **Untitled `window` handles** keep plain first-appearance ordinals. The same
+///   experiment with an UNTITLED extra window measures **53 `eventCountChanged`**
+///   findings (pinned, interlocked with the note's own text). A re-record that opens one
+///   transient untitled window the baseline did not (a splash screen, a tooltip, a tray
+///   flyout) lands here.
+/// - **Same-title groups**: duplicates disambiguate by `#k`, a *per-side*
+///   first-appearance index — the ordinal mechanism again, reduced to the group. A
+///   membership or creation-order drift inside the group mis-pairs its members. Measured
+///   on the frozen samples' five-window IME-overlay group (review W2b-r1 F2 / r2-2
+///   attribution): a pure two-line creation-order swap, **8 findings** (pinned — the
+///   only clean single-cause number; equal counts, so no note); dropping the FIRST
+///   member, 98 findings *jointly* — the dropped window carries a Gfx map, so the
+///   surface pool shifts too, and the no-`k`-shift control (dropping the LAST member)
+///   measures 26, putting the group's own share at ≈72. In the frozen captures 5 of the
+///   9 titled handles share that one title, so this is the majority titled case, not a
+///   corner.
+/// - **`surface`/`notifyIcon`**: no anchorable payload exists on their events; ordinals
+///   as before.
+///
+/// The tool fails *loudly*, never silently, so the verdict is not misleading — and the
+/// report's **cascade note** fires on un-anchored handle-count changes (untitled and
+/// same-title-group `window` handles included), telling the operator to read the *first*
+/// `eventCountChanged` before the other fifty. A pure in-group reorder with equal counts
+/// raises no note — count inequality is the only trigger the note has ever had.
+/// ``DifferOptions/canonicalizeIdentifiers`` = false is the documented escape hatch but
+/// is the wrong tool here — it makes every handle differ. Anchoring's own trade-off, by
+/// design: a window whose title *differs between the two recordings* (a
+/// timestamp-bearing document title, a localized shell title) anchors differently per
+/// side and reports as two count findings instead of one matched pair with a title
+/// `fieldValueChanged` — one honest finding becomes two, never zero.
 ///
 /// **Residual silent reorder class.** With ``DifferOptions/laneOrderTolerance`` at its
 /// default `0`, within-lane causal inversions are caught. What remains tolerated is
@@ -411,7 +436,8 @@ public struct SemanticDiffer: Sendable {
             let namespaces = Set(options.fieldPolicy.identifierNamespaces.values).sorted()
             notes.append(
                 "identifier canonicalization ON for namespaces [\(namespaces.joined(separator: ", "))]"
-                    + " — handle values are compared as per-side first-appearance ordinals"
+                    + " — titled window handles are compared by title-anchored identity, all other"
+                    + " handle values as per-side first-appearance ordinals"
             )
         } else {
             notes.append("identifier canonicalization OFF — raw handle values are compared literally")
@@ -458,9 +484,85 @@ public struct SemanticDiffer: Sendable {
 
     // MARK: - Step 2
 
+    /// First non-empty `title` carried for each raw `window`-namespace handle, scanning
+    /// the WHOLE stream before canonicalization: a window whose title only arrives on a
+    /// later `WindowUpdate` still anchors, and an early reference to the handle from a
+    /// title-less event (`MonitoredDesktop.activeWindowId`, a Gfx map) inherits the
+    /// anchored token instead of freezing an ordinal first. Structural, not event-name
+    /// keyed: any record carrying both a `windowId` and a non-empty `title` contributes
+    /// (today that is exactly the two window-order events). First non-empty title wins —
+    /// a mid-session rename does not re-anchor, so the mapping is deterministic per side;
+    /// a window whose title DIFFERS between the two recordings anchors differently on
+    /// each side and shows up as two count findings rather than one matched pair, which
+    /// is the documented trade-off of anchoring on payload (see the README's
+    /// Known-limitations section). Same first-wins consequence for HWND reuse (review
+    /// W2b-r1 F7): a handle destroyed and re-created for a DIFFERENT window within one
+    /// capture keeps the first window's title in its token — the events still pair the
+    /// same way ordinals paired them, but the token's name is then actively misleading
+    /// for the second lifetime, where `window#7` was merely opaque.
+    private func windowTitlesByRawHandle(_ records: [ReplayRecord]) -> [String: String] {
+        // Forward-looking redaction guard (review W2b-r1 F6): anchoring copies title text
+        // into the four window-namespace identifier fields and into every `identity …`
+        // line, none of which redaction covers. Today `title` is not redacted, so this is
+        // dead; the day someone hardens `title` into `redactedFields`, anchoring must not
+        // become the leak that defeats it — fall back to ordinals wholesale.
+        guard !options.fieldPolicy.isRedacted("title") else { return [:] }
+        var titles: [String: String] = [:]
+        for record in records {
+            // Keyed on the literal `windowId` deliberately (review W2b-r1 F10): the title
+            // belongs to the window itself, never to the referrer — anchoring on every
+            // window-namespace field would make an owner inherit its child's title. If a
+            // caller reconfigures `identifierNamespaces` away from `windowId`, the
+            // `namespace == windowNamespace` check in `canonicalized` goes nil-false and
+            // everything degrades consistently to ordinals.
+            guard let titleValue = record.fields["title"],
+                  case .string(let title) = titleValue,
+                  !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let raw = record.fields["windowId"]?.integerCanonicalForm,
+                  raw != "0",
+                  titles[raw] == nil
+            else { continue }
+            // Emptiness is judged trimmed, but the stored anchor keeps the title verbatim
+            // (review W2b-r2 R2-6): normalizing it would silently merge two titles that
+            // differ only in whitespace — a collision, not a cleanup.
+            titles[raw] = title
+        }
+        return titles
+    }
+
+    /// Escapes a title for embedding in a canonical token. `#` separates the same-title
+    /// disambiguator and `@` introduces the title, so a title that literally contains
+    /// either could forge another window's token — a window titled `Chrome#1` must never
+    /// collide with the second window titled `Chrome` (review W2b-r1 F1: that collision
+    /// merged two real windows into one identity bucket and turned a genuine difference
+    /// into PASS/exit 0, the one failure mode this module declares out of bounds).
+    /// Percent-escape, `%` first so the escape itself is unambiguous.
+    private static func tokenEscapedTitle(_ title: String) -> String {
+        title
+            .replacingOccurrences(of: "%", with: "%25")
+            .replacingOccurrences(of: "@", with: "%40")
+            .replacingOccurrences(of: "#", with: "%23")
+    }
+
     private func canonicalized(_ records: [ReplayRecord]) -> [ReplayRecord] {
         guard options.canonicalizeIdentifiers else { return records }
         let identifierFields = options.fieldPolicy.sortedIdentifierFieldNames
+        // W2 batch 2 (title-anchored identity): `window`-namespace handles that ever
+        // carry a title are keyed by that title, not by a first-appearance ordinal — so
+        // an extra or missing window early in the stream no longer shifts every later
+        // window's identity (the ordinal-shift cascade, measured at 98 eventCountChanged
+        // findings from ONE prepended WindowCreate before this landed). The immunity is
+        // scoped to UNIQUELY-titled handles: same-title duplicates disambiguate by a
+        // per-side first-appearance index `k` — the ordinal mechanism again, reduced to
+        // the group — so a same-title group whose membership or creation order drifts
+        // between the two recordings still mis-pairs within the group (review W2b-r1 F2;
+        // in the frozen samples 5 of the 9 titled handles share one title, so this is the
+        // majority case, not a corner). Untitled window handles and the other namespaces
+        // (surface/notifyIcon carry no anchorable payload) keep plain ordinals. Both
+        // residual populations are what `cascadeNotes` counts.
+        let windowNamespace = options.fieldPolicy.namespace(of: "windowId")
+        let windowTitles = windowTitlesByRawHandle(records)
+        var titleDisambiguator: [String: Int] = [:]
         var nextOrdinal: [String: Int] = [:]
         var tokens: [String: [String: String]] = [:]
 
@@ -481,9 +583,17 @@ public struct SemanticDiffer: Sendable {
                     fields[fieldName] = .string(existing)
                     continue
                 }
-                let ordinal = nextOrdinal[namespace, default: 0]
-                nextOrdinal[namespace] = ordinal + 1
-                let token = "\(namespace)#\(ordinal)"
+                let token: String
+                if namespace == windowNamespace, let title = windowTitles[raw] {
+                    let k = titleDisambiguator[title, default: 0]
+                    titleDisambiguator[title] = k + 1
+                    let escaped = Self.tokenEscapedTitle(title)
+                    token = k == 0 ? "\(namespace)@\(escaped)" : "\(namespace)@\(escaped)#\(k)"
+                } else {
+                    let ordinal = nextOrdinal[namespace, default: 0]
+                    nextOrdinal[namespace] = ordinal + 1
+                    token = "\(namespace)#\(ordinal)"
+                }
                 tokens[namespace, default: [:]][raw] = token
                 fields[fieldName] = .string(token)
             }
@@ -602,29 +712,43 @@ public struct SemanticDiffer: Sendable {
     /// finding 137 to work out that finding 1 caused it.
     private func cascadeNotes(baseline: [ReplayRecord], candidate: [ReplayRecord]) -> [String] {
         guard options.canonicalizeIdentifiers else { return [] }
-        let baselineCounts = distinctHandleCounts(baseline)
-        let candidateCounts = distinctHandleCounts(candidate)
+        let baselineCounts = distinctUnanchoredHandleCounts(baseline)
+        let candidateCounts = distinctUnanchoredHandleCounts(candidate)
         var notes: [String] = []
         for namespace in Set(baselineCounts.keys).union(candidateCounts.keys).sorted() {
             let before = baselineCounts[namespace] ?? 0
             let after = candidateCounts[namespace] ?? 0
             guard before != after else { continue }
             notes.append(
-                "CASCADE RISK: the candidate has \(after) distinct `\(namespace)` handle(s) against the "
-                    + "baseline's \(before). Ordinals are assigned in first-appearance order, so an extra or "
-                    + "missing handle EARLY in the stream shifts every later `\(namespace)` ordinal and can turn "
-                    + "one real difference into hundreds (measured: one extra WindowCreate at the head of a "
-                    + "145-line capture → 98 eventCountChanged findings alone, ~190 in total). Read the FIRST "
-                    + "eventCountChanged below and check "
+                "CASCADE RISK: the candidate has \(after) distinct un-anchored `\(namespace)` handle(s) "
+                    + "against the baseline's \(before). Un-anchored handles (`surface`/`notifyIcon` always; "
+                    + "`window` handles that never carry a title, plus every member of a same-title group — "
+                    + "those disambiguate by a per-side first-appearance index, the ordinal mechanism reduced "
+                    + "to the group) are position-keyed, so an extra or missing one EARLY in the stream shifts "
+                    + "every later `\(namespace)` position and can turn one real difference into dozens "
+                    + "(measured residual: one extra UNTITLED WindowCreate at the head of a 145-line capture → "
+                    + "53 eventCountChanged findings; only UNIQUELY-titled windows are immune, since W2 batch "
+                    + "2's title-anchored identity). Read the FIRST eventCountChanged below and check "
                     + "whether the candidate simply opened one extra transient window; if so, the rest of this "
                     + "report is one finding wearing a costume. --no-canonical-ids is NOT the remedy (it makes "
-                    + "every handle differ); payload-anchored identity is W2 batch 2."
+                    + "every handle differ)."
             )
         }
         return notes
     }
 
-    private func distinctHandleCounts(_ records: [ReplayRecord]) -> [String: Int] {
+    /// Handles that still rely on position-keyed identity — the population the cascade
+    /// note is about. Only UNIQUELY-titled `window` handles are excluded: their identity
+    /// survives an early extra/missing handle, so a count change among them is exactly
+    /// one honest finding, not a cascade. A member of a same-title group stays counted
+    /// (review W2b-r1 F2): its `#k` disambiguator is a per-side first-appearance index,
+    /// so a membership change in the group shifts the other members' identities — the
+    /// same blast-radius shape the note exists to explain.
+    private func distinctUnanchoredHandleCounts(_ records: [ReplayRecord]) -> [String: Int] {
+        let windowNamespace = options.fieldPolicy.namespace(of: "windowId")
+        let titles = windowTitlesByRawHandle(records)
+        var handlesPerTitle: [String: Int] = [:]
+        for title in titles.values { handlesPerTitle[title, default: 0] += 1 }
         var seen: [String: Set<String>] = [:]
         for record in records {
             for fieldName in options.fieldPolicy.sortedIdentifierFieldNames {
@@ -632,6 +756,8 @@ public struct SemanticDiffer: Sendable {
                       raw != "0",
                       let namespace = options.fieldPolicy.namespace(of: fieldName)
                 else { continue }
+                if namespace == windowNamespace, let title = titles[raw],
+                   handlesPerTitle[title] == 1 { continue }
                 seen[namespace, default: []].insert(raw)
             }
         }
@@ -685,7 +811,14 @@ public struct SemanticDiffer: Sendable {
                     candidateValue: "\(rhs.count) occurrence(s)",
                     baselineLine: lhs.count > paired ? lhs[paired].lineNumber : lhs.first?.lineNumber,
                     candidateLine: rhs.count > paired ? rhs[paired].lineNumber : rhs.first?.lineNumber,
-                    detail: "identity \(key)"
+                    // Display-capped only, at the report's own maxValueLength (one
+                    // truncation vocabulary per artifact, review W2b-r2 R2-4): `key`
+                    // itself stays uncapped as the bucket key — truncating the KEY could
+                    // merge two long same-prefix identities, the F1 collision class in a
+                    // different coat. Since title anchoring, an identity string can carry
+                    // an arbitrarily long window title (review W2b-r1 F6); the artifact
+                    // line gets the same cap-with-length shape FieldPolicy.render uses.
+                    detail: "identity \(options.maxValueLength > 0 && key.count > options.maxValueLength ? String(key.prefix(options.maxValueLength)) + "…(\(key.count) chars)" : key)"
                 )
             )
         }

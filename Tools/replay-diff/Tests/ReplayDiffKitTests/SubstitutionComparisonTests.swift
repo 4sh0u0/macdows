@@ -113,8 +113,10 @@ struct SubstitutionComparisonTests {
         let counts = report.differences.filter { $0.diffClass == .eventCountChanged }
         #expect(counts.count == 2, "unexpected: \(report.differences)")
         #expect(counts.allSatisfy { $0.eventName == "GfxMapSurfaceToWindow→GfxMapSurfaceToScaledWindow" })
-        #expect(counts.contains { $0.detail.contains("windowId=\"window#0\"") })
-        #expect(counts.contains { $0.detail.contains("windowId=\"window#1\"") })
+        // Title anchoring (W2 batch 2): Alpha and Beta are titled, so the two orphaned
+        // sides name the windows themselves — better evidence than the old ordinals.
+        #expect(counts.contains { $0.detail.contains("windowId=\"window@Alpha\"") })
+        #expect(counts.contains { $0.detail.contains("windowId=\"window@Beta\"") })
     }
 
     // MARK: - Counts must correspond

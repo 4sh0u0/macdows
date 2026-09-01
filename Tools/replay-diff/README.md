@@ -26,8 +26,11 @@ A byte diff of two captures of the same server behaviour is 100% noise: every `t
 every `tid`, and every kernel handle differs by construction. This tool ignores the timing
 and thread fields outright, and compares session-scoped handles
 (`windowId`/`ownerWindowId`/`activeWindowId`/`windowIdMarker`, `surfaceId`, `notifyIconId`)
-as per-side first-appearance ordinals — so "the window ids changed" is silence while "this
-surface now maps to a different window" is a finding. Events are matched per event type and
+as per-side canonical tokens: a `window` handle that ever carries a non-empty `title`
+anchors on it (same-title duplicates disambiguate by a per-side first-appearance index —
+see the known-limitations section for what that index does NOT buy), everything else
+gets a per-side first-appearance ordinal — so "the window ids changed" is silence while
+"this surface now maps to a different window" is a finding. Events are matched per event type and
 identity tuple, which tolerates cross-channel reordering exactly rather than approximately.
 
 ## Order: two tolerances, because there are three producer threads
@@ -183,29 +186,48 @@ one-off table is never indistinguishable from a run without one.
   (M1 wave-1 ruling U7): `samples/phase05-rail-events-2026-08-19` is what the gate diffs
   against and must stay byte-identical.
 
-## Known limitation: the ordinal-shift cascade
+## Known limitation: the ordinal-shift cascade (collapsed for uniquely-titled windows, W2 batch 2)
 
-Canonical ordinals are assigned in first-appearance order, so anything that changes *which*
-handle appears first shifts every later ordinal in that namespace — and the blast radius is
-much larger than "the two windows trade ordinals". **Measured on a real capture: one extra
-`WindowCreate` prepended to `s3-multiapp.jsonl` (145 lines) yields 98 `eventCountChanged`
-findings on its own**, and roughly 190 findings in total. Only the 98 is
-construction-independent — it falls out of the ordinal shift and is pinned by
-`GateDriverPlumbingTests`; the `fieldValueChanged` and `eventOrderChanged` counts depend on
-the payload of the injected window, so no exact total is quoted (two differently-shaped
-injected lines gave 176–196 across review rounds). The propagation is the point: the `window`
-namespace shift reaches every identity bucket that references a window, which is most of the
-stream. A live re-record that opens one transient window the baseline did not (a splash
-screen, a tooltip, a tray flyout) lands here.
+Since W2 batch 2, a `window` handle that carries a `title` no other handle shares is
+anchored on it — the cascade this section used to describe no longer reaches those.
+**Measured on the same real capture the old limitation quoted: one extra uniquely-titled
+`WindowCreate` prepended to `s3-multiapp.jsonl` (145 lines) used to yield 98
+`eventCountChanged` findings and roughly 190 in total (pre-W2b2 numbers, measured against
+the then-current implementation and no longer reproducible in-tree; only the 98 was
+construction-independent, the total depended on the injected payload); it now yields
+exactly 1 finding** (the extra window itself — pinned by `TitleAnchoredIdentityTests`).
 
-The tool fails **loudly, never silently**, so the verdict is not misleading. But a
-three-figure report for one extra window is exactly the false-alarm shape that trains an
-operator to ignore a gate, so the report says so itself: whenever the two sides have
-different numbers of distinct handles in a namespace, a `CASCADE RISK` note appears at the
-top of that capture's section.
+Three populations still cascade:
+
+- **Untitled `window` handles** keep plain first-appearance ordinals. The same experiment
+  with an UNTITLED extra window measures **53 `eventCountChanged` findings** (pinned,
+  interlocked with the runtime note's own text; only that count is
+  construction-independent). A live re-record that opens one transient untitled window the
+  baseline did not (a splash screen, a tooltip, a tray flyout) lands here.
+- **Same-title groups.** The `#k` disambiguator is a *per-side* first-appearance index —
+  the ordinal mechanism again, reduced to the group — so a membership or creation-order
+  drift inside a same-title group mis-pairs its members and reports loudly. Measured on
+  the frozen samples' five-window IME-overlay group: a pure two-line creation-order swap,
+  **8 findings** (pinned — the only clean single-cause number); dropping the group's first
+  window, 98 *jointly* with the surface-pool jitter its Gfx map causes (the no-`k`-shift
+  control — dropping the last window — measures 26, putting the group's own share at
+  ≈72). In every frozen capture 5 of the 9 titled handles share that one title, so this
+  is the majority titled case.
+- **`surface`/`notifyIcon`**: their events carry nothing stable to anchor on; ordinals as
+  before.
+
+The tool fails **loudly, never silently**, so the verdict is not misleading. The report says
+so itself: whenever the two sides have different numbers of distinct **un-anchored** handles
+in a namespace — untitled windows and same-title-group members included — a `CASCADE RISK`
+note appears at the top of that capture's section (an extra *uniquely-titled* window is one
+honest finding and raises no note; a pure in-group reorder with equal counts also raises no
+note, count inequality being the only trigger the note has ever had).
 
 **First-line remedy for the operator**: read the `CASCADE RISK` note and the **first**
 `eventCountChanged`, and check whether the candidate simply opened one extra window early in
 the stream. If so, the rest of the report is one finding wearing a costume.
-`--no-canonical-ids` is **not** the remedy here — it makes every handle differ. The real fix
-is payload-anchored identity (title-keyed where a title is present), deferred to W2 batch 2.
+`--no-canonical-ids` is **not** the remedy here — it makes every handle differ. Anchoring's
+own trade-off, by design: a window whose title *differs between the two recordings* (a
+timestamp-bearing document title, a localized shell title) anchors differently per side and
+reports as two count findings instead of one matched pair with a title `fieldValueChanged` —
+one honest finding becomes two, never zero.

@@ -202,13 +202,12 @@ public struct KnownDifferenceTable: Sendable, Equatable {
                 that (AVC_DISABLED is advertised identically before and after; the variant \
                 was seen two days BEFORE the flip, on a WITH_FFMPEG=OFF build). Leading open \
                 hypothesis is the client's advertised RDPGFX caps (SCALEDMAP_DISABLE, 10.7+), \
-                unmeasured in every existing recording because nothing logged the \
-                CapsAdvertise PDU or the negotiated capset when they were made; the \
-                client-side log has since landed (P1: GfxCapsAdvertise/GfxCapsConfirm), the \
-                instrumented re-record is still pending. At least four things differ between \
-                the two recordings (client tool, \
-                session desktop size, session/date, FreeRDP build settings) and the samples cannot \
-                separate them. RESOLVER: the W2 drill's instrumented re-record. Until then \
+                unmeasured in every existing recording because nothing logged the CapsAdvertise \
+                PDU or the negotiated capset when they were made; the client-side log has since \
+                landed (P1: GfxCapsAdvertise/GfxCapsConfirm), the instrumented re-record is \
+                still pending. At least four things differ between the two recordings (client \
+                tool, session desktop size, session/date, FreeRDP build settings) and the \
+                samples cannot separate them. RESOLVER: the W2 drill's instrumented re-record. Until then \
                 L11 must record freerdp_avc, freerdp_scaledmap_caps, client_tool and \
                 session_desktop for BOTH sides and assert no mechanism in either direction.
                 """,

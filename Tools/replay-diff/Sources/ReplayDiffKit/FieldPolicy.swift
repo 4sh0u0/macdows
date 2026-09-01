@@ -86,6 +86,9 @@ public struct FieldPolicy: Sendable, Equatable {
     /// so an unsorted walk over an event carrying two same-namespace identifiers
     /// (`WindowUpdate` has both `windowId` and `ownerWindowId`) could hand out different
     /// ordinals on two runs of the same input. Sorting makes the differ deterministic.
+    /// Since W2 batch 2 the same-title disambiguator `#k` is assigned on the same walk,
+    /// so title-anchored tokens depend on this order for their determinism exactly as
+    /// ordinals do — the sort is load-bearing for both branches, not just the `else`.
     public var sortedIdentifierFieldNames: [String] {
         identifierNamespaces.keys.sorted()
     }

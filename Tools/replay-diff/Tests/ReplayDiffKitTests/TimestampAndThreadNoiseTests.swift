@@ -73,7 +73,11 @@ struct TimestampAndThreadNoiseTests {
         let counts = report.differences.filter { $0.diffClass == .eventCountChanged }
         #expect(counts.count == 2, "unexpected: \(report.differences)")
         #expect(counts.allSatisfy { $0.eventName == "GfxMapSurfaceToWindow" })
-        #expect(counts.contains { $0.detail.contains("windowId=\"window#1\"") })
+        // Title anchoring (W2 batch 2): the fixture window is titled, so its identity is
+        // the anchored token; the re-attribution target 99999 never carries a title, so it
+        // is the first (and only) ordinal handle.
+        #expect(counts.contains { $0.detail.contains("windowId=\"window@Fixture Window\"") })
+        #expect(counts.contains { $0.detail.contains("windowId=\"window#0\"") })
     }
 
     /// `--no-canonical-ids` must remain a real switch: with it, raw handle values are the
