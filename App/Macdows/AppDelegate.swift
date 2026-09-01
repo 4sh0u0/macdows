@@ -29,6 +29,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// across that window, so it cannot serve as the "already busy" flag on its own.
 	private var isCheckingBoundary = false
 
+	/// M1/W1: the project's only `NSScreen` reader and the owner of the screen-parameter
+	/// observer (adr/0015 §5.A.5). A `let` initialised with this delegate rather than something
+	/// created in `applicationDidFinishLaunching`, because adr/0015 §5.A.1's answer to U8 is that
+	/// the observer is **app-resident** -- registered once, never per connection, never torn down
+	/// -- and a stored `let` is the shortest expression of that lifetime. Its callback is attached
+	/// at launch, once the status label it writes into exists.
+	private let displayTopology = DisplayTopologyProvider()
+
+	/// The most recent screen-parameter change, kept only so `drainTick`'s status text does not
+	/// overwrite it a second later. Text, nothing else: adr/0015 §5.A.3 forbids the observer's
+	/// event from causing a reconnect, a resize or a desktop-size re-send, and this app honours
+	/// that by having the event reach exactly one place -- a label.
+	private var lastDisplayChangeNote: String?
+
 	func applicationDidFinishLaunching(_ notification: Notification) {
 		// Proves the Swift app actually links through CRBridge into the vendored
 		// FreeRDP dylibs — check Console.app / stderr for the logged version string.
@@ -78,6 +92,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		window = newWindow
 		window.makeKeyAndOrderFront(nil)
 		NSApp.activate(ignoringOtherApps: true)
+
+		// M1/W1 deliverable 2: the screen-parameter observer's *observable* half. The provider
+		// already logs every change (Console.app, category "DisplayTopology"); this puts the same
+		// verdict where a human running the scaffold can see it, which matters because the state
+		// worth seeing -- "this session's desktop size no longer matches the displays" -- only
+		// exists while a session is up and the label is otherwise busy showing event counts.
+		//
+		// Attached here rather than in the provider's own initializer because it writes into
+		// `statusLabel`, which is created a few lines above; the provider itself is constructed
+		// with this delegate and is already observing by now, so a change that arrives before
+		// this line is still logged and still updates `currentTopology` -- it just has no label
+		// to write to yet.
+		//
+		// This closure is the complete list of what a display change does in this app: it sets a
+		// string. No reconnect, no resize, no desktop-size re-send (adr/0015 §5.A.3).
+		displayTopology.onScreenParametersChange = { [weak self] change in
+			guard let self else { return }
+			let note: String
+			if change.currentTopologyIsEmpty {
+				// adr/0015 §5.A.6: an empty screen list is a real, transient state (lock, sleep,
+				// a display switching mode) and is reported, never folded into a 0x0 desktop.
+				note = "Display change: no usable display right now."
+			} else if change.sessionDesktopSize == nil {
+				// No connect since launch (or since the last session ended), so there is no
+				// negotiated size to be stale. Distinguishable precisely because the payload
+				// carries the session's size (adr/0015 §5.A.2), so say so instead of reporting
+				// "unaffected", which would imply a session exists.
+				note = "Display change: no session yet -- the desktop size is taken at connect."
+			} else if change.connectedDesktopSizeIsStale {
+				note = "Display change: this session's desktop size is now out of date -- reconnect to re-negotiate."
+			} else {
+				note = "Display change: this session's desktop size is unaffected."
+			}
+			self.lastDisplayChangeNote = note
+			self.statusLabel.stringValue = note
+		}
 	}
 
 	@objc private func connectTapped() {
@@ -187,16 +237,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// closure; the body is unchanged, and it is only ever reached on an `.allowed` verdict.
 	private func beginSession(host: String, user: String, password pass: String) {
 		let newSession = CRSession(host: host, user: user, password: pass, program: "C:\\Windows\\System32\\winver.exe")
-		// Size the remote desktop to the primary screen -- same NSScreen the registry's
-		// coordinate mapping anchors on. Without this the server clamps remote windows to
-		// FreeRDP's 1024x768 default desktop (an invisible drag wall mid-screen, and
-		// position desync that breaks clicks after a drag; see CRSession.desktopWidth).
-		if let screen = NSScreen.screens.first {
-			newSession.desktopWidth = UInt32(max(0, screen.frame.width))
-			newSession.desktopHeight = UInt32(max(0, screen.frame.height))
+		// Size the remote desktop to the UNION of the local screens, in remote pixels -- adr/0015
+		// §3 rule 3's `desktopSizePx`, the only value allowed to reach desktopWidth/Height.
+		// Without a desktop size at all the server clamps remote windows to FreeRDP's 1024x768
+		// default (an invisible drag wall mid-screen, and position desync that breaks clicks
+		// after a drag; see CRSession.desktopWidth). What changed in M1 is which number this is:
+		// it used to be the primary screen's frame in *points* read straight off NSScreen, which
+		// (a) ignored every screen but the first, leaving the charter's union constraint
+		// (ARCHITECTURE.md:38, in force since Phase 1) unimplemented, and (b) carried no unit --
+		// on the 1x hardware this project owns, points and remote pixels are the same number, so
+		// the two were indistinguishable until the type made them different.
+		//
+		// freezeSessionSnapshot() is also the moment this session's topology is frozen (adr/0015
+		// §5.A): the size returned here and the Y-flip anchor the registry uses come from one
+		// NSScreen read, which is §5.A.4's invariant. A later display change is reported by the
+		// observer and deliberately does NOT re-send anything (§5.A.3).
+		//
+		// nil means "no usable display" (headless, every display asleep, a mode switch in
+		// flight). In that state we set NOTHING and let the connection proceed: adr/0015 §5.A.6
+		// is explicit that 0x0 must never be sent, because CRSession.h:285-286 records that 0/0
+		// is exactly what makes FreeRDP fall back to the 1024x768 desktop this line exists to
+		// prevent. UInt32(clamping:) cannot actually clamp -- DisplayTopology guarantees
+		// 0 < value <= maxExtentInRemotePixels (65535) -- and is written that way so that if that
+		// guarantee is ever relaxed, the connect path degrades instead of trapping.
+		if let desktop = displayTopology.freezeSessionSnapshot() {
+			newSession.desktopWidth = UInt32(clamping: desktop.width)
+			newSession.desktopHeight = UInt32(clamping: desktop.height)
 		}
+		// A staleness verdict belongs to the session it was computed against, and the line above
+		// just started a new one against a fresh snapshot.
+		lastDisplayChangeNote = nil
 		session = newSession
-		registry = RemoteWindowRegistry(session: newSession)
+		// The registry is handed the session's FROZEN snapshot, not the live provider -- adr/0015
+		// §5.A.4: within one session the Y-flip anchor and the desktop size must come from the
+		// same topology read. freezeSessionSnapshot() above performed that read and derived the
+		// size assigned to the CRSession from it; StaticDisplayTopologyProvider wraps the very
+		// same value, so the registry structurally cannot observe a different layout than the one
+		// the server was sized for. Handing over `displayTopology` itself would leave the
+		// invariant resting on these two statements running in the same main-actor turn, and
+		// would additionally let the registry's own re-take on a generation rollover pick up a
+		// layout the (never re-sent, CRSession.h:284-286) desktop size no longer matches -- which
+		// is exactly the divergence §5.A.4 forbids. Without any provider the registry cannot learn
+		// about screens at all (its NSScreen read was removed in M1) and would decline to position
+		// any window, warning once -- loud, but still broken.
+		registry = RemoteWindowRegistry(
+			session: newSession,
+			topologyProvider: StaticDisplayTopologyProvider(displayTopology.sessionSnapshot)
+		)
 		eventCount = 0
 		statusLabel.stringValue = "Connecting..."
 		connectButton.isEnabled = false
@@ -240,6 +327,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			drainTimer?.invalidate()
 			drainTimer = nil
 			connectButton.isEnabled = true
+			// The session frozen at connect never came up, so drop it: otherwise every later
+			// display change would report its desktop size as "stale" and advise a reconnect for
+			// a session that does not exist.
+			displayTopology.endSession()
 			return
 		}
 		// Mirrors Tools/window-smoke/main.swift's own tick() exactly: every drained event
@@ -252,9 +343,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		}
 		if delivered > 0 || eventCount > 0 {
 			let windowCount = registry?.windowSnapshots().count ?? 0
+			// M1/W1: carry the screen-parameter note through this tick's overwrite. Without it,
+			// the one event this milestone adds would be legible for well under a second whenever
+			// a session is live -- which is precisely the state in which it means anything.
+			let displayNote = lastDisplayChangeNote.map { "\n\($0)" } ?? ""
 			statusLabel.stringValue = """
 				Connected — \(eventCount) event(s) so far (generation \(session.currentGeneration))
-				\(windowCount) remote window(s) live
+				\(windowCount) remote window(s) live\(displayNote)
 				"""
 		}
 	}
@@ -266,5 +361,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	func applicationWillTerminate(_ notification: Notification) {
 		drainTimer?.invalidate()
 		session?.shutdownAndWait()
+		// The app's other session end. Paired with the shutdown above so the two ends of a
+		// session's lifetime read as one thing; the process is going away regardless.
+		displayTopology.endSession()
 	}
 }
