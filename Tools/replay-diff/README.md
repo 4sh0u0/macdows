@@ -90,9 +90,12 @@ that control** — it is not a speed-up, it gives up the differ's backstop.
 | `knownLocalDifference` | **expected** | an entire event type is present on one side only, attributable to a known *local difference* between the two recordings (mechanism **not** asserted) |
 | `unparsableLine` | regression | a line could not be parsed as a `RailEvent` |
 
-`knownLocalDifference` exists because of M1 finding **F-1** and is pre-seeded with one
-entry: `GfxMapSurfaceToScaledWindow`, expected on the *candidate* side, `supersedes`
-`GfxMapSurfaceToWindow`, `newFields` `["targetWidth","targetHeight"]`.
+`knownLocalDifference` exists because of M1 finding **F-1** and is pre-seeded with three
+entries: F-1's `GfxMapSurfaceToScaledWindow`, expected on the *candidate* side, `supersedes`
+`GfxMapSurfaceToWindow`, `newFields` `["targetWidth","targetHeight"]`; and P1's
+`GfxCapsAdvertise` / `GfxCapsConfirm` (the caps instrumentation the resolver below
+prescribed), both pure candidate-side additions — no `supersedes`, because the
+instrumentation adds events without removing any.
 
 ### What is claimed, and what is not
 
@@ -108,8 +111,11 @@ flip. The M1 L4 audit — recorded in `deps/freerdp.lock`'s own `CORRECTION` not
 before and after the flip, and the variant was observed **two days before** the flip landed,
 on a `WITH_FFMPEG=OFF` build. Assertions are forbidden in **both** directions — not "this is
 the AVC flip", and not "this is upstream". The leading open hypothesis is the client's
-advertised RDPGFX caps (`SCALEDMAP_DISABLE`, 10.7+), unmeasured because nothing logs the
-`CapsAdvertise` PDU. **Resolver: the W2 drill's instrumented re-record.** Until then L11
+advertised RDPGFX caps (`SCALEDMAP_DISABLE`, 10.7+), unmeasured in every frozen baseline
+because nothing logged the `CapsAdvertise` PDU when they were recorded. The client-side log
+has since landed with P1 (`rail-probe.c`'s `probe_gfx_caps_advertise`/`probe_gfx_caps_confirm`
+and CRBridge's WLog twins) — the instrumented **re-record itself is still pending**, so the
+mechanism stays open. **Resolver: the W2 drill's instrumented re-record.** Until it runs, L11
 must record `freerdp_avc`, `freerdp_scaledmap_caps`, `client_tool` and `session_desktop` for
 both sides.
 

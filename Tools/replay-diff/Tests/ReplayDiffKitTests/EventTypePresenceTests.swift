@@ -199,9 +199,12 @@ struct EventTypePresenceTests {
         #expect(entry.expectedSide == .candidate)
         #expect(entry.reference.contains("F-1"))
         // The substitution half (round-1 finding I-1) is expressed as a field on this one
-        // entry, not as a second row — so the minimality guard below still holds at 1.
+        // entry, not as a second row — so the minimality guard below counts it once.
         #expect(entry.supersedes == "GfxMapSurfaceToWindow")
-        #expect(KnownDifferenceTable.preSeeded.entries.count == 1, "the table must stay minimal — every entry disarms the gate for one event type")
+        // 3 = F-1's scaled-map entry + the two P1 caps-instrumentation entries
+        // (CapsInstrumentationTests) — every entry disarms the gate for one event type,
+        // so any growth here must name the event and the ruling that admits it.
+        #expect(KnownDifferenceTable.preSeeded.entries.count == 3, "the table must stay minimal — every entry disarms the gate for one event type")
     }
 
     // MARK: - F-1, substitution half (round-1 finding I-1)

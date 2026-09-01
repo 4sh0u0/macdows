@@ -159,6 +159,18 @@ public enum RailEventKind: Sendable, Equatable {
         targetWidth: UInt32, targetHeight: UInt32
     )
     case gfxResetGraphics(width: Int32, height: Int32, monitorCount: UInt32)
+    /// P1 (upgrade-gate drill 2026-09-drill-01 §7.2): the client's advertised RDPGFX capset
+    /// list, one summary event per session. `capsSets` is the whole list in wire order as a
+    /// single deterministic string of `"0xVVVVVVVV:0xFFFFFFFF"` (version:flags) pairs,
+    /// comma-joined — one event rather than one per capset, so a capset-list change between
+    /// captures surfaces in the upgrade gate as a single value difference, not a per-capset
+    /// pairing cascade. `capsSetCount` is `UInt16`, faithful to
+    /// `RDPGFX_CAPS_ADVERTISE_PDU.capsSetCount`'s wire type.
+    case gfxCapsAdvertise(capsSetCount: UInt16, capsSets: String)
+    /// P1's other half: the one capset the server negotiated
+    /// (`RDPGFX_CAPS_CONFIRM_PDU.capsSet`), hex strings in the same `0x%08X` shape as the
+    /// advertise list so the two grep and diff against each other directly.
+    case gfxCapsConfirm(version: String, flags: String)
     /// Only emitted when the probe was run with `--decode`; absent from every sample in
     /// `samples/phase05-rail-events-2026-08-19` (none were captured with that flag).
     case codecStats(counts: [String: UInt64])
@@ -254,6 +266,12 @@ public enum RailEventKind: Sendable, Equatable {
         case "GfxResetGraphics":
             let p = try ResetGraphicsPayload(from: decoder)
             self = .gfxResetGraphics(width: p.width, height: p.height, monitorCount: p.monitorCount)
+        case "GfxCapsAdvertise":
+            let p = try CapsAdvertisePayload(from: decoder)
+            self = .gfxCapsAdvertise(capsSetCount: p.capsSetCount, capsSets: p.capsSets)
+        case "GfxCapsConfirm":
+            let p = try CapsConfirmPayload(from: decoder)
+            self = .gfxCapsConfirm(version: p.version, flags: p.flags)
         case "CodecStats": self = .codecStats(counts: try CodecStatsPayload(from: decoder).counts)
 
         case "ChannelConnected": self = .channelConnected(name: try NamePayload(from: decoder).name)
@@ -418,6 +436,8 @@ struct MapSurfaceToScaledWindowPayload: Decodable {
     let targetHeight: UInt32
 }
 struct ResetGraphicsPayload: Decodable { let width: Int32; let height: Int32; let monitorCount: UInt32 }
+struct CapsAdvertisePayload: Decodable { let capsSetCount: UInt16; let capsSets: String }
+struct CapsConfirmPayload: Decodable { let version: String; let flags: String }
 struct CodecStatsPayload: Decodable { let counts: [String: UInt64] }
 struct NamePayload: Decodable { let name: String }
 struct VerifyCertificateExPayload: Decodable {

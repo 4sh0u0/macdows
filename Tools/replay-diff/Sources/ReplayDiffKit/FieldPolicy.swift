@@ -51,18 +51,32 @@ public struct FieldPolicy: Sendable, Equatable {
         "notifyIconId": "notifyIcon",
     ]
 
+    /// Compared normally, but exempt from ``render(_:field:maxLength:)``'s length cap.
+    ///
+    /// - `capsSets`: `GfxCapsAdvertise`'s whole advertised capset list in one string (the
+    ///   P1 instrumentation's single-summary-event design). A full FreeRDP advertise is
+    ///   ~15 capsets ≈ 329 chars, and the capsets that carry `SCALEDMAP_DISABLE` — the
+    ///   reason the field exists — sit at the *end* in wire order, so the default 120-char
+    ///   cap would cut exactly the part a drill artifact needs visible. The value's
+    ///   character set is closed (`[0-9A-Fx:,]`, built by the probe from `%08X` pairs), so
+    ///   the redaction rationale above never applies to it.
+    public static let defaultUnTruncatedFields: Set<String> = ["capsSets"]
+
     public var ignoredFields: Set<String>
     public var redactedFields: Set<String>
     public var identifierNamespaces: [String: String]
+    public var unTruncatedFields: Set<String>
 
     public init(
         ignoredFields: Set<String> = FieldPolicy.defaultIgnoredFields,
         redactedFields: Set<String> = FieldPolicy.defaultRedactedFields,
-        identifierNamespaces: [String: String] = FieldPolicy.defaultIdentifierNamespaces
+        identifierNamespaces: [String: String] = FieldPolicy.defaultIdentifierNamespaces,
+        unTruncatedFields: Set<String> = FieldPolicy.defaultUnTruncatedFields
     ) {
         self.ignoredFields = ignoredFields
         self.redactedFields = redactedFields
         self.identifierNamespaces = identifierNamespaces
+        self.unTruncatedFields = unTruncatedFields
     }
 
     public static let `default` = FieldPolicy()
@@ -89,7 +103,9 @@ public struct FieldPolicy: Sendable, Equatable {
             return "<redacted:\(value.displayString.count) chars>"
         }
         let text = value.displayString
-        guard maxLength > 0, text.count > maxLength else { return text }
+        guard maxLength > 0, !unTruncatedFields.contains(field), text.count > maxLength else {
+            return text
+        }
         return String(text.prefix(maxLength)) + "…(\(text.count) chars)"
     }
 }

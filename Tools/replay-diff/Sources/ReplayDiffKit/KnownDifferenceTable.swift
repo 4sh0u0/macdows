@@ -172,8 +172,9 @@ public struct KnownDifferenceTable: Sendable, Equatable {
     ///
     /// So: an **expected delta against a pre-flip-era baseline**, cause unresolved, resolver
     /// = the W2 drill's instrumented re-record (L4 §7(g): rail-probe/CRBridge need a
-    /// client-`CapsAdvertise` log first, since `SCALEDMAP_DISABLE` only exists at 10.7+ and
-    /// nothing records which capset was negotiated). Assertions are forbidden in **both**
+    /// client-`CapsAdvertise` log first, since `SCALEDMAP_DISABLE` only exists at 10.7+ —
+    /// that log has since landed with P1, see the two caps entries below; the re-record
+    /// itself is still pending, so the cause stays unresolved). Assertions are forbidden in **both**
     /// directions: not "this is the AVC flip" (falsified), and not "this is an upstream
     /// FreeRDP regression" (ruling F-1).
     ///
@@ -201,8 +202,11 @@ public struct KnownDifferenceTable: Sendable, Equatable {
                 that (AVC_DISABLED is advertised identically before and after; the variant \
                 was seen two days BEFORE the flip, on a WITH_FFMPEG=OFF build). Leading open \
                 hypothesis is the client's advertised RDPGFX caps (SCALEDMAP_DISABLE, 10.7+), \
-                unmeasured because nothing logs the CapsAdvertise PDU or the negotiated \
-                capset. At least four things differ between the two recordings (client tool, \
+                unmeasured in every existing recording because nothing logged the \
+                CapsAdvertise PDU or the negotiated capset when they were made; the \
+                client-side log has since landed (P1: GfxCapsAdvertise/GfxCapsConfirm), the \
+                instrumented re-record is still pending. At least four things differ between \
+                the two recordings (client tool, \
                 session desktop size, session/date, FreeRDP build settings) and the samples cannot \
                 separate them. RESOLVER: the W2 drill's instrumented re-record. Until then \
                 L11 must record freerdp_avc, freerdp_scaledmap_caps, client_tool and \
@@ -218,6 +222,49 @@ public struct KnownDifferenceTable: Sendable, Equatable {
                 phase3 M1 finding F-1 / wave-1 ruling F-1; deps/freerdp.lock, \
                 cmake_config.corrections_applied — "Phase 2 W0(2) AVC caps flip" entry, \
                 CORRECTION 2026-09-01 (falsification, and the four fields L11 must record)
+                """
+        ),
+        // P1 (the F-1 entry's own named RESOLVER): the caps instrumentation itself. An
+        // instrumented probe logs both events on every session; the six frozen 2026-08-19
+        // baselines predate the instrumentation and structurally cannot contain either.
+        // Pure additions — no `supersedes`, nothing disappears from the baseline in
+        // exchange. Both entries become inert (never consulted) the day the baselines are
+        // re-recorded with an instrumented probe, at which point the events exist on both
+        // sides and the type census no longer fires; until then they keep the gate from
+        // reporting the instrumentation as its own regression.
+        KnownDifferenceEntry(
+            eventName: "GfxCapsAdvertise",
+            expectedSide: .candidate,
+            cause: """
+                INSTRUMENTATION, NOT BEHAVIOUR. One summary event per session: the client's \
+                advertised RDPGFX capset list (wire order, version:flags pairs in one \
+                string) — added so the scaled-map re-record can pin which capsets were on \
+                the table (SCALEDMAP_DISABLE exists only at 10.7+). The frozen 2026-08-19 \
+                baselines were recorded by a pre-P1 probe, so this event appearing on the \
+                candidate side only is the instrumentation's arrival, not a server or \
+                upstream change. The capset list VALUES are still compared normally once \
+                both sides carry the event.
+                """,
+            reference: """
+                upgrade-gate drill P1 (CapsAdvertise instrumentation, the resolver the F-1 \
+                entry and Tools/replay-diff/README.md name); rail-probe.c's \
+                probe_gfx_caps_advertise is the emitter
+                """
+        ),
+        KnownDifferenceEntry(
+            eventName: "GfxCapsConfirm",
+            expectedSide: .candidate,
+            cause: """
+                INSTRUMENTATION, NOT BEHAVIOUR. The other half of P1: the one capset the \
+                server negotiated (RDPGFX_CAPS_CONFIRM_PDU), previously observable nowhere. \
+                Same shape as GfxCapsAdvertise's entry: candidate-only because the frozen \
+                baselines predate the instrumentation, and the negotiated version/flags \
+                values are exactly what the scaled-map hypothesis needs pinned per session.
+                """,
+            reference: """
+                upgrade-gate drill P1 (CapsAdvertise instrumentation, the resolver the F-1 \
+                entry and Tools/replay-diff/README.md name); rail-probe.c's \
+                probe_gfx_caps_confirm is the emitter
                 """
         ),
     ])

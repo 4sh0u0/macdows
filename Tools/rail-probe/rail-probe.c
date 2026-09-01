@@ -18,6 +18,7 @@
 #include <freerdp/config.h>
 
 #include <errno.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -100,6 +101,8 @@ typedef struct
 	pcRdpgfxMapSurfaceToWindow orig_MapSurfaceToWindow;
 	pcRdpgfxMapSurfaceToScaledWindow orig_MapSurfaceToScaledWindow;
 	pcRdpgfxResetGraphics orig_ResetGraphics;
+	pcRdpgfxCapsAdvertise orig_CapsAdvertise; /* the SENDER slot, not a notification */
+	pcRdpgfxCapsConfirm orig_CapsConfirm;
 	pcRdpgfxSurfaceCommand orig_SurfaceCommand; /* only wrapped when --decode is given */
 	uint64_t surface_command_count;
 	probeCodecCount* codec_counts;
@@ -801,6 +804,68 @@ static UINT probe_gfx_surface_command(RdpgfxClientContext* context,
 	return CHANNEL_RC_OK;
 }
 
+/* P1 (upgrade-gate drill 2026-09-drill-01 §7.2): the client's advertised capset list and
+ * the server's negotiated answer, neither observable anywhere before this. One summary
+ * event per session for the whole list -- NOT one event per capset -- so a capset-list
+ * change between captures shows up in the upgrade gate as a single value difference
+ * instead of a per-capset pairing cascade (the pre-registered ordinal-cascade trap that
+ * dominated the 2026-09-01 live diff).
+ *
+ * Unlike the Map*-and-ResetGraphics hooks above, CapsAdvertise is the SENDER slot:
+ * rdpgfx_on_open's rdpgfx_send_supported_caps builds the PDU and hands it to
+ * context->CapsAdvertise, whose default is rdpgfx_send_caps_advertise_pdu -- the function
+ * that actually puts the advertise on the wire (rdpgfx_main.c:2612). Failing to forward
+ * would not lose a log line, it would silently break GFX negotiation for the whole
+ * session; and when orig is somehow absent we mirror IFCALLRESULT's own default
+ * (ERROR_BAD_CONFIGURATION) rather than pretend the advertise was sent. */
+static UINT probe_gfx_caps_advertise(RdpgfxClientContext* context,
+                                      const RDPGFX_CAPS_ADVERTISE_PDU* pdu)
+{
+	probeContext* p = g_probe;
+	char sets[1024] = { 0 };
+	size_t off = 0;
+	for (UINT16 i = 0; pdu && pdu->capsSets && i < pdu->capsSetCount; i++)
+	{
+		int n = snprintf(sets + off, sizeof(sets) - off, "%s0x%08" PRIX32 ":0x%08" PRIX32,
+		                 (i > 0) ? "," : "", pdu->capsSets[i].version, pdu->capsSets[i].flags);
+		if (n < 0 || (size_t)n >= sizeof(sets) - off)
+		{
+			sets[off] = '\0'; /* drop the half-written pair -- short beats fake-complete */
+			break;
+		}
+		off += (size_t)n;
+	}
+	log_event(p, "GfxCapsAdvertise", "\"capsSetCount\":%u,\"capsSets\":\"%s\"",
+	          pdu ? (unsigned)pdu->capsSetCount : 0u, sets);
+	if (p->orig_CapsAdvertise)
+		return p->orig_CapsAdvertise(context, pdu);
+	return ERROR_BAD_CONFIGURATION;
+}
+
+/* The receive half. Client-side upstream leaves this slot NULL (only the server half of
+ * rdpgfx assigns it), so forwarding is a no-op today -- saved and forwarded anyway, same
+ * defensive shape as every other hook here, in case a future upstream starts consuming
+ * it. The negotiated capset is what SCALEDMAP_DISABLE reasoning needs pinned per session:
+ * the flag only exists at 10.7+, so "what did the server pick" decides whether that
+ * hypothesis is even in play. */
+static UINT probe_gfx_caps_confirm(RdpgfxClientContext* context,
+                                    const RDPGFX_CAPS_CONFIRM_PDU* pdu)
+{
+	probeContext* p = g_probe;
+	uint32_t version = 0;
+	uint32_t flags = 0;
+	if (pdu && pdu->capsSet)
+	{
+		version = pdu->capsSet->version;
+		flags = pdu->capsSet->flags;
+	}
+	log_event(p, "GfxCapsConfirm", "\"version\":\"0x%08" PRIX32 "\",\"flags\":\"0x%08" PRIX32 "\"",
+	          version, flags);
+	if (p->orig_CapsConfirm)
+		return p->orig_CapsConfirm(context, pdu);
+	return CHANNEL_RC_OK;
+}
+
 /* ------------------------------------------------------------------------------------ */
 /* Channel connect/disconnect                                                            */
 /* ------------------------------------------------------------------------------------ */
@@ -853,6 +918,16 @@ static void probe_on_channel_connected(void* context, const ChannelConnectedEven
 		gfx->MapSurfaceToWindow = probe_gfx_map_surface_to_window;
 		gfx->MapSurfaceToScaledWindow = probe_gfx_map_surface_to_scaled_window;
 		gfx->ResetGraphics = probe_gfx_reset_graphics;
+
+		/* P1: caps hooks. Timing is guaranteed by the DVC bring-up order: this handler
+		 * runs from dvcman_create_channel's OnChannelConnected, and the advertise is only
+		 * sent later, from dvcman_open_channel -> rdpgfx_on_open ->
+		 * rdpgfx_send_supported_caps -- so the wrapper is always in place before the PDU
+		 * exists. */
+		p->orig_CapsAdvertise = gfx->CapsAdvertise;
+		p->orig_CapsConfirm = gfx->CapsConfirm;
+		gfx->CapsAdvertise = probe_gfx_caps_advertise;
+		gfx->CapsConfirm = probe_gfx_caps_confirm;
 
 		if (p->cfg.decode)
 		{

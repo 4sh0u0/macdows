@@ -362,6 +362,8 @@ typedef struct
     pcRdpgfxMapSurfaceToWindow orig_MapSurfaceToWindow;
     pcRdpgfxMapSurfaceToScaledWindow orig_MapSurfaceToScaledWindow;
     pcRdpgfxResetGraphics orig_ResetGraphics;
+    pcRdpgfxCapsAdvertise orig_CapsAdvertise; /* the SENDER slot, not a notification */
+    pcRdpgfxCapsConfirm orig_CapsConfirm;
     /* W4b: saved/forwarded exactly like the three above, even though neither is expected
      * to carry a real prior value in practice (gdi_graphics_pipeline_init's plain,
      * non-`_ex` variant this file relies on -- see crb_on_channel_connected's own comment
@@ -1111,6 +1113,70 @@ static UINT crb_gfx_reset_graphics(RdpgfxClientContext *context, const RDPGFX_RE
     }
 }
 
+/* P1 (upgrade-gate drill 2026-09-drill-01 §7.2): the client's advertised capset list and
+ * the server's negotiated answer -- the two values the scaled-map hypothesis (the long
+ * comment in crb_gfx_map_surface_to_scaled_window above) names as its resolver's
+ * precondition. Same event vocabulary as rail-probe's JSONL (`GfxCapsAdvertise` /
+ * `GfxCapsConfirm`) so a directed re-record greps both stacks with one pattern; this
+ * stack logs via WLog only, like every other GFX line here (CRBridge is not a JSONL
+ * producer).
+ *
+ * Unlike the Map*-and-ResetGraphics hooks, CapsAdvertise is the SENDER slot: rdpgfx_on_open's
+ * rdpgfx_send_supported_caps hands the PDU to context->CapsAdvertise, whose default IS
+ * the function that puts the advertise on the wire (rdpgfx_main.c:2612). Not forwarding
+ * would silently break GFX negotiation for the session, so when orig is somehow absent we
+ * mirror IFCALLRESULT's own default (ERROR_BAD_CONFIGURATION) rather than pretend the
+ * advertise was sent. CapsConfirm's client-side default is NULL (only the server half of
+ * rdpgfx assigns it) -- saved and forwarded anyway, same defensive shape as every other
+ * hook here. */
+static UINT crb_gfx_caps_advertise(RdpgfxClientContext *context,
+                                    const RDPGFX_CAPS_ADVERTISE_PDU *pdu)
+{
+    @autoreleasepool
+    {
+        CRBridgeContext *p = g_crbGfxContext;
+        char sets[1024] = { 0 };
+        size_t off = 0;
+        for (UINT16 i = 0; pdu && pdu->capsSets && i < pdu->capsSetCount; i++)
+        {
+            int n = snprintf(sets + off, sizeof(sets) - off, "%s0x%08" PRIX32 ":0x%08" PRIX32,
+                             (i > 0) ? "," : "", pdu->capsSets[i].version, pdu->capsSets[i].flags);
+            if (n < 0 || (size_t)n >= sizeof(sets) - off)
+            {
+                sets[off] = '\0'; /* drop the half-written pair -- short beats fake-complete */
+                break;
+            }
+            off += (size_t)n;
+        }
+        WLog_INFO(TAG, "GfxCapsAdvertise capsSetCount=%u capsSets=%s",
+                  pdu ? (unsigned)pdu->capsSetCount : 0u, sets);
+        if (p && p->orig_CapsAdvertise)
+            return p->orig_CapsAdvertise(context, pdu);
+        return ERROR_BAD_CONFIGURATION;
+    }
+}
+
+static UINT crb_gfx_caps_confirm(RdpgfxClientContext *context,
+                                  const RDPGFX_CAPS_CONFIRM_PDU *pdu)
+{
+    @autoreleasepool
+    {
+        CRBridgeContext *p = g_crbGfxContext;
+        uint32_t version = 0;
+        uint32_t flags = 0;
+        if (pdu && pdu->capsSet)
+        {
+            version = pdu->capsSet->version;
+            flags = pdu->capsSet->flags;
+        }
+        WLog_INFO(TAG, "GfxCapsConfirm version=0x%08" PRIX32 " flags=0x%08" PRIX32, version,
+                  flags);
+        if (p && p->orig_CapsConfirm)
+            return p->orig_CapsConfirm(context, pdu);
+        return CHANNEL_RC_OK;
+    }
+}
+
 /* ==================================================================================== *
  * W4b frame pathway: gfx->UpdateWindowFromSurface / gfx->UnmapWindowForSurface, installed
  * post-hoc after gdi_graphics_pipeline_init runs (same "override after the fact" approach
@@ -1325,6 +1391,16 @@ static void crb_on_channel_connected(void *context, const ChannelConnectedEventA
         gfx->MapSurfaceToWindow = crb_gfx_map_surface_to_window;
         gfx->MapSurfaceToScaledWindow = crb_gfx_map_surface_to_scaled_window;
         gfx->ResetGraphics = crb_gfx_reset_graphics;
+
+        /* P1: caps hooks. Timing is guaranteed by the DVC bring-up order: this handler
+         * runs from dvcman_create_channel's OnChannelConnected, and the advertise is only
+         * sent later, from dvcman_open_channel -> rdpgfx_on_open ->
+         * rdpgfx_send_supported_caps -- so the wrapper is always in place before the PDU
+         * exists. */
+        p->orig_CapsAdvertise = gfx->CapsAdvertise;
+        p->orig_CapsConfirm = gfx->CapsConfirm;
+        gfx->CapsAdvertise = crb_gfx_caps_advertise;
+        gfx->CapsConfirm = crb_gfx_caps_confirm;
 
         /* W4b: adr/0005 §2's frame pathway -- "override UpdateWindowFromSurface /
          * UnmapWindowForSurface after gdi init" (X11-client style post-hoc override, not
