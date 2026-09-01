@@ -3,6 +3,13 @@ import Foundation
 /// A window rectangle in Windows screen-space coordinates: origin at the top-left of the
 /// (virtual) desktop, Y increasing downward. `x`/`y` may be negative for monitors placed
 /// left of or above the primary monitor in a multi-monitor layout.
+///
+/// UNIT (M1/W1, phase3.md §1 F1): **remote pixels** -- the RDP wire's own unit, what RAIL
+/// window orders and GFX surface maps count in. Not mac points. On every configuration that
+/// exists today the two are numerically identical (we advertise no `DesktopScaleFactor`, so
+/// the server's pixel grid is our point grid -- see `DisplayScale.remotePixelsPerPoint`),
+/// which is exactly why the distinction had to be made in the type system before it could be
+/// made anywhere else.
 public struct WindowsRect: Equatable, Sendable {
     public var x: Double
     public var y: Double
@@ -20,6 +27,10 @@ public struct WindowsRect: Equatable, Sendable {
 /// A window rectangle in macOS screen-space coordinates: origin at the bottom-left of the
 /// primary screen, Y increasing upward — the convention `NSScreen`/`NSWindow`/`CGRect`
 /// already use on macOS.
+///
+/// UNIT (M1/W1): **mac points**, never backing pixels. Backing pixels are the third space
+/// phase3.md §1 F1 names and the one this milestone deliberately does not enter -- see
+/// `DisplayScale.backingPixelsPerPoint`, recorded and unapplied.
 public struct MacRect: Equatable, Sendable {
     public var x: Double
     public var y: Double
@@ -72,27 +83,97 @@ public struct MacPoint: Equatable, Sendable {
 /// actual screen topology is an AppKit/CoreGraphics concern that lives above this
 /// package's no-AppKit boundary (adr/0006 §2); `WindowGeometry` only does the arithmetic
 /// once a caller has that number in hand.
+///
+/// M1/W1 UPDATE (`docs/plans/phase3.md:109`, §1 F1). The four conversions no longer take a
+/// bare `primaryMonitorHeight: Double`; they take a `DisplayFlipAnchor` obtained from a
+/// `DisplayTopology`, or the topology itself. Two things changed and it is worth being
+/// precise about which:
+///
+///  1. **The anchor became un-mistakable, through the topology-taking API.** Everything the
+///     paragraph above argues is still exactly true; what changed is that a topology value
+///     puts a *union* height within reach for the first time, so the argument needed to stop
+///     being an argument. ADR §4.A.1/§4.A.2 require two mechanisms and both are in place:
+///     `DisplayFlipAnchor` has no public initializer, so the height inside it can only have
+///     come from `DisplayTopology.primary.size.height`; and
+///     `DisplayTopology.unionBoundsInPoints` vends `DesktopUnionBoundsInPoints.Scalar`, not
+///     `Double`, so a union height cannot be handed to anything that takes a length.
+///     **Scope of that claim, stated precisely because r1 review found it over-stated:** it
+///     holds for this API. The deprecated `primaryMonitorHeight:` shims below still accept a
+///     bare `Double` -- they must, or un-migrated call sites would not compile -- and they are
+///     therefore the one remaining door, which is exactly why the extension must be deleted in
+///     wave 2 (ADR §9's L9 row assigns the deletion). Feeding a union height through that door
+///     now requires the explicit `.inPoints` step, which reads as the deliberate act it is.
+///  2. **A scale dimension appeared.** `DisplayFlipAnchor.remotePixelsPerPoint` -- the
+///     topology's `rasterScale`, i.e. the primary display's ratio (ADR §2 rule 2) -- divides on
+///     the way in and multiplies on the way out, which is what makes `WindowsRect` (remote
+///     pixels) and `MacRect` (mac points) genuinely different units rather than the same
+///     `Double` twice. It is **1** in every configuration that exists today -- we advertise no
+///     `DesktopScaleFactor` (F3, ADR §0c) -- so this is not a behavior change; at scale 1 the
+///     expressions below are literally the old ones. The 2x fixtures in
+///     `WindowGeometryTests` are offline coverage for the path W3 will eventually turn on,
+///     not a claim that anything measures 2x today (`docs/plans/phase3.md:219`, §8.5).
+///
+/// The pre-M1 `primaryMonitorHeight:` entry points survive as deprecated shims at the bottom
+/// of this file, purely so the tree keeps building across the wave boundary; see their note.
 public enum WindowGeometry {
-    /// Converts a Windows-space rect to macOS-space, given the primary monitor's height.
-    public static func macRect(from windowsRect: WindowsRect, primaryMonitorHeight: Double) -> MacRect {
-        MacRect(
-            x: windowsRect.x,
-            y: primaryMonitorHeight - windowsRect.y - windowsRect.height,
-            width: windowsRect.width,
-            height: windowsRect.height
+    // MARK: - The four conversions (M1/W1 signatures)
+    //
+    // ADR §9's L2 row says the new entries take "only the topology". Each conversion has two:
+    // `in topology:` and `anchoredTo anchor:`. That is conformant, and the reason is worth one
+    // note so a later conformance pass does not re-open it (r2 review N-4b). §4.A.1 states two
+    // literal prohibitions -- no bare-`Double` height overload, and no `unionBounds` overload --
+    // and both hold: a `DisplayFlipAnchor` is obtainable only from a `DisplayTopology`
+    // (its initializer is internal), so `anchoredTo:` cannot express a scale or a height the
+    // topology did not produce. The form exists because the deprecated shims must forward into
+    // something, and because it is what lets the tests build an anchor once per case.
+
+    /// Converts a Windows-space rect (remote pixels) to macOS-space (points), anchored on the
+    /// topology's primary display.
+    public static func macRect(from windowsRect: WindowsRect, in topology: DisplayTopology) -> MacRect {
+        macRect(from: windowsRect, anchoredTo: topology.flipAnchor)
+    }
+
+    /// Converts a Windows-space rect (remote pixels) to macOS-space (points).
+    ///
+    /// The Y term is written as `primaryHeight - y/s - height/s` rather than the algebraically
+    /// equal `primaryHeight - (y + height)/s` so that at `s == 1` it is character-for-character
+    /// the pre-M1 expression: this conversion is on the live window-placement path, and "the
+    /// arithmetic is provably unchanged where nothing is scaled" is worth more than one saved
+    /// division.
+    public static func macRect(from windowsRect: WindowsRect, anchoredTo anchor: DisplayFlipAnchor) -> MacRect {
+        let scale = anchor.remotePixelsPerPoint
+        return MacRect(
+            x: windowsRect.x / scale,
+            y: anchor.primaryHeightInPoints - windowsRect.y / scale - windowsRect.height / scale,
+            width: windowsRect.width / scale,
+            height: windowsRect.height / scale
         )
     }
 
-    /// Converts a macOS-space rect back to Windows-space, given the same primary monitor
-    /// height used to produce it. This is the exact inverse of
-    /// `macRect(from:primaryMonitorHeight:)` — round-tripping through both directions
-    /// with the same `primaryMonitorHeight` returns the original rect.
-    public static func windowsRect(from macRect: MacRect, primaryMonitorHeight: Double) -> WindowsRect {
-        WindowsRect(
-            x: macRect.x,
-            y: primaryMonitorHeight - macRect.y - macRect.height,
-            width: macRect.width,
-            height: macRect.height
+    /// Converts a macOS-space rect (points) back to Windows-space (remote pixels), anchored on
+    /// the topology's primary display.
+    public static func windowsRect(from macRect: MacRect, in topology: DisplayTopology) -> WindowsRect {
+        windowsRect(from: macRect, anchoredTo: topology.flipAnchor)
+    }
+
+    /// Converts a macOS-space rect (points) back to Windows-space (remote pixels), given the
+    /// same anchor used to produce it. This is the exact inverse of
+    /// `macRect(from:anchoredTo:)` — round-tripping through both directions with the same
+    /// anchor returns the original rect.
+    ///
+    /// "Exact" is meant literally and is tested as such
+    /// (`WindowGeometryTests.rectRoundTripIsIdentityAcrossScalesAndOffsets`). It holds for the
+    /// documented fixture range -- integer-valued remote pixels at `remotePixelsPerPoint ∈
+    /// {1, 2}` -- because both factors are powers of two, so every division and multiplication
+    /// here is exact in binary floating point and nothing accumulates. A future non-power-of-two
+    /// scale would need that claim re-examined rather than assumed; there is no such scale today.
+    public static func windowsRect(from macRect: MacRect, anchoredTo anchor: DisplayFlipAnchor) -> WindowsRect {
+        let scale = anchor.remotePixelsPerPoint
+        return WindowsRect(
+            x: macRect.x * scale,
+            y: (anchor.primaryHeightInPoints - macRect.y - macRect.height) * scale,
+            width: macRect.width * scale,
+            height: macRect.height * scale
         )
     }
 
@@ -101,20 +182,99 @@ public enum WindowGeometry {
     /// `locationInWindow`, which `NSEvent` itself always reports bottom-left-origin/Y-up
     /// regardless of whether the receiving view opts into `isFlipped`) — into the
     /// corresponding Windows-space absolute desktop coordinate a RAIL mouse input PDU
-    /// needs. Same Y-flip as `windowsRect(from:primaryMonitorHeight:)`, but without that
+    /// needs. Same Y-flip as `windowsRect(from:anchoredTo:)`, but without that
     /// function's `- height` term: a bare point has no height to anchor against, only the
     /// rect case needs to map a rect's *top* edge (Windows convention) onto mac's
     /// bottom-anchored origin.
-    public static func windowsPoint(from macPoint: MacPoint, primaryMonitorHeight: Double) -> WindowsPoint {
-        WindowsPoint(x: macPoint.x, y: primaryMonitorHeight - macPoint.y)
+    public static func windowsPoint(from macPoint: MacPoint, anchoredTo anchor: DisplayFlipAnchor) -> WindowsPoint {
+        let scale = anchor.remotePixelsPerPoint
+        return WindowsPoint(
+            x: macPoint.x * scale,
+            y: (anchor.primaryHeightInPoints - macPoint.y) * scale
+        )
     }
 
-    /// The exact inverse of `windowsPoint(from:primaryMonitorHeight:)` — not needed by any
+    /// W4c point transform, anchored on the topology's primary display.
+    public static func windowsPoint(from macPoint: MacPoint, in topology: DisplayTopology) -> WindowsPoint {
+        windowsPoint(from: macPoint, anchoredTo: topology.flipAnchor)
+    }
+
+    /// The exact inverse of `windowsPoint(from:anchoredTo:)` — not needed by any
     /// current caller (RAIL only ever tells this project window *rectangles*, never bare
     /// points, on the inbound side), provided for symmetry and because it's what makes the
     /// round-trip identity actually testable in both directions.
+    public static func macPoint(from windowsPoint: WindowsPoint, anchoredTo anchor: DisplayFlipAnchor) -> MacPoint {
+        let scale = anchor.remotePixelsPerPoint
+        return MacPoint(
+            x: windowsPoint.x / scale,
+            y: anchor.primaryHeightInPoints - windowsPoint.y / scale
+        )
+    }
+
+    /// The exact inverse of `windowsPoint(from:in:)`, anchored on the topology's primary
+    /// display.
+    public static func macPoint(from windowsPoint: WindowsPoint, in topology: DisplayTopology) -> MacPoint {
+        macPoint(from: windowsPoint, anchoredTo: topology.flipAnchor)
+    }
+}
+
+// MARK: - Pre-M1 signatures, kept only across the wave boundary
+
+/// The four `primaryMonitorHeight: Double` entry points, unchanged in behavior, retained ONLY
+/// so that the App and `Tools/window-smoke` keep compiling between the moment this package
+/// gains a topology and the moment their own call sites migrate onto it (M1 waves 1 → 2:
+/// `RemoteWindowRegistry.swift:1262,1770,1827-1829` and
+/// `Tools/window-smoke/main.swift:2606-2608`).
+///
+/// ADR §9 ratifies keeping them and explains why the wave order forces it: `window-smoke` is
+/// L9's file and L9 is wave **3**, while the `window-smoke` target also compiles
+/// `RemoteWindowRendering` (`App/project.yml:395-397`), so deleting the bare-`Double` entry
+/// points in wave 1 would break wave 2's "full build" gate with an error no wave-2 lane owns a
+/// file to fix.
+///
+/// They are `deprecated` rather than merely commented so that the migration list is a compiler
+/// warning -- i.e. so it cannot be partially done and forgotten, which phase3.md §5 risk 5
+/// names as the specific failure mode of a cross-cutting unit change. Each forwards to a
+/// scale-1 anchor, which is what these call sites have always effectively passed.
+///
+/// **DO NOT MIGRATE A CALL SITE BY PASSING A UNION HEIGHT HERE.** These four are the only
+/// remaining place in this package where a bare length can reach the Y flip, and the most
+/// available wrong move while migrating is to silence the deprecation warning with whatever
+/// height is in scope. `DisplayTopology.unionBoundsInPoints` deliberately does not vend a
+/// `Double` for that reason (ADR §4.A.2), so reaching one requires writing `.inPoints`
+/// explicitly -- if a migration diff contains that, it is the exact mistake `DisplayFlipAnchor`
+/// exists to prevent. The migration target is always `…(in: topology)`.
+///
+/// **Delete this extension once the four call sites above are migrated** -- ADR §9's L9 row
+/// assigns the deletion to L9, and it is an explicit item on the wave-2/wave-3 exit gate, not
+/// merely this comment. `deprecatedShimsForwardToAScaleOneAnchor` in the tests goes with it.
+/// Nothing else should ever be added to this extension.
+extension WindowGeometry {
+    /// Builds the scale-1 anchor the pre-M1 signatures imply. Not `public`: a public
+    /// `Double`-taking anchor factory would reopen exactly the hole `DisplayFlipAnchor`'s
+    /// missing initializer closes.
+    static func legacyAnchor(primaryMonitorHeight: Double) -> DisplayFlipAnchor {
+        DisplayFlipAnchor(primaryHeightInPoints: primaryMonitorHeight, remotePixelsPerPoint: 1)
+    }
+
+    @available(*, deprecated, message: "M1/W1: pass a DisplayTopology (macRect(from:in:)) or its flipAnchor. This shim assumes remotePixelsPerPoint == 1 and disappears when the wave-2 call sites migrate.")
+    public static func macRect(from windowsRect: WindowsRect, primaryMonitorHeight: Double) -> MacRect {
+        macRect(from: windowsRect, anchoredTo: legacyAnchor(primaryMonitorHeight: primaryMonitorHeight))
+    }
+
+    @available(*, deprecated, message: "M1/W1: pass a DisplayTopology (windowsRect(from:in:)) or its flipAnchor. This shim assumes remotePixelsPerPoint == 1 and disappears when the wave-2 call sites migrate.")
+    public static func windowsRect(from macRect: MacRect, primaryMonitorHeight: Double) -> WindowsRect {
+        windowsRect(from: macRect, anchoredTo: legacyAnchor(primaryMonitorHeight: primaryMonitorHeight))
+    }
+
+    @available(*, deprecated, message: "M1/W1: pass a DisplayTopology (windowsPoint(from:in:)) or its flipAnchor. This shim assumes remotePixelsPerPoint == 1 and disappears when the wave-2 call sites migrate.")
+    public static func windowsPoint(from macPoint: MacPoint, primaryMonitorHeight: Double) -> WindowsPoint {
+        windowsPoint(from: macPoint, anchoredTo: legacyAnchor(primaryMonitorHeight: primaryMonitorHeight))
+    }
+
+    @available(*, deprecated, message: "M1/W1: pass a DisplayTopology (macPoint(from:in:)) or its flipAnchor. This shim assumes remotePixelsPerPoint == 1 and disappears when the wave-2 call sites migrate.")
     public static func macPoint(from windowsPoint: WindowsPoint, primaryMonitorHeight: Double) -> MacPoint {
-        MacPoint(x: windowsPoint.x, y: primaryMonitorHeight - windowsPoint.y)
+        macPoint(from: windowsPoint, anchoredTo: legacyAnchor(primaryMonitorHeight: primaryMonitorHeight))
     }
 }
 
@@ -144,6 +304,16 @@ public enum WindowGeometry {
 /// documented, deliberate "no evidence for a nonzero value" finding rather than a silent
 /// structural absence -- flagged for W4's shaped-window work to revisit if a future PDU or
 /// sample ever supplies an independent position measurement to correct against.
+///
+/// UNIT (M1/W1 tagging pass; U5 ruling = record-only): all four components are **remote
+/// pixels**. Both quantities they are derived from are wire values in remote pixels -- RAIL's
+/// `windowWidth`/`windowHeight` and GFX's `mappedWidth`/`mappedHeight` -- so this correction
+/// composes with `displayRect`/`railRect` entirely inside Windows space, BEFORE any Y flip or
+/// point conversion, and carries no scale dimension of its own. W3 TRIGGER: if a session ever
+/// runs with `DisplayScale.remotePixelsPerPoint != 1`, re-measure -- these numbers came off a
+/// 1x host (`docs/plans/phase3.md:219`) and nothing establishes that a window-manager border
+/// delta scales linearly with DPI. No value changes in M1 (§3 item 5: this batch moves units
+/// only; the values wait for W3's real-host data).
 public struct WindowGeometryCorrection: Equatable, Sendable {
     public var originX: Double
     public var originY: Double
@@ -164,9 +334,10 @@ extension WindowGeometry {
     /// Applies `correction` to `railRect` (RAIL's own reported Windows-space rect),
     /// producing the rect that should actually be displayed -- the inbound direction.
     /// `RemoteWindowRegistry.macContentRect(for:windowId:)` calls this before the existing
-    /// `macRect(from:primaryMonitorHeight:)` conversion, so the two corrections (RAIL-size
+    /// `macRect(from:anchoredTo:)` conversion, so the two corrections (RAIL-size
     /// vs display-size, then Windows-space vs mac-space) compose rather than duplicate each
-    /// other's job.
+    /// other's job. Both input and output are remote pixels (see
+    /// `WindowGeometryCorrection`'s unit note); the point conversion happens strictly after.
     public static func displayRect(from railRect: WindowsRect, correction: WindowGeometryCorrection) -> WindowsRect {
         WindowsRect(
             x: railRect.x + correction.originX, y: railRect.y + correction.originY,
@@ -176,7 +347,7 @@ extension WindowGeometry {
 
     /// The exact inverse of `displayRect(from:correction:)` -- the outbound direction.
     /// `RemoteWindowRegistry.handleLocalGeometrySettled` calls this after
-    /// `windowsRect(from:primaryMonitorHeight:)`, before turning the result into the
+    /// `windowsRect(from:anchoredTo:)`, before turning the result into the
     /// `left`/`top`/`right`/`bottom` `ClientWindowMove` sends. Round-tripping any
     /// `WindowsRect` through `displayRect(from:correction:)` then this function, with the
     /// SAME `correction`, is always the identity — verified by
@@ -239,6 +410,19 @@ extension WindowGeometry {
     /// width, the opposite direction a left+right-inflating border would imply for an
     /// "outer" rect) -- left uncorrected pending real evidence, not silently assumed either
     /// way.
+    ///
+    /// UNIT (M1/W1 tagging pass; U5 ruling = record-only): both parameters and the result are
+    /// **remote pixels**, in Windows space -- this subtraction happens after
+    /// `railRect(from:correction:)` and before the `left`/`top`/`right`/`bottom` integers go
+    /// on the wire, so no point conversion or Y flip is involved and no scale applies. The 7
+    /// this is called with lives at its own call site
+    /// (`RemoteWindowRegistry.swift:1818-1820`, F6(a)); M1 changes neither that value nor this
+    /// function's arithmetic. W3 TRIGGER: re-measure the border on a session where
+    /// `DisplayScale.remotePixelsPerPoint != 1`. A window-manager border is plausibly a
+    /// DPI-dependent quantity, and all three real-host measurements behind the 7 were taken on
+    /// the same 1x host (`docs/plans/phase3.md:219`), so "7 remote pixels" and "7 points"
+    /// are indistinguishable in the existing evidence -- which is exactly why the value is
+    /// recorded rather than migrated (§3 item 5, §8.5: no 2x measurement exists yet).
     public static func clientWindowMoveLeft(fromVisibleLeft visibleLeft: Double, measuredLeftBorder: Double) -> Double {
         visibleLeft - measuredLeftBorder
     }

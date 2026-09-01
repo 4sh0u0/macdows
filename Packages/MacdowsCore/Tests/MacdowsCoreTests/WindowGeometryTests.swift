@@ -6,10 +6,35 @@ struct WindowGeometryTests {
     // Primary 1920x1080 monitor as the reference frame for most cases below.
     static let primaryHeight = 1080.0
 
+    /// M1/W1: the four conversions no longer take a bare `primaryMonitorHeight: Double`, they
+    /// take a `DisplayFlipAnchor` that only a `DisplayTopology` can produce. Every pre-M1 test
+    /// below is unchanged except for routing its height through this helper -- deliberately,
+    /// so that the real-host algebra those tests pin down (rounds 3-6 of the 2026-08-23
+    /// investigation) is re-verified against the new signature rather than rewritten under it.
+    ///
+    /// Scale defaults to 1 because that is what every one of those tests measured: they all
+    /// predate the scale dimension and were taken on a 1x host (`docs/plans/phase3.md:219`).
+    /// Force-unwrapping is safe and intended here -- these are constant, obviously-valid
+    /// layouts, and a `nil` would mean this helper itself is broken.
+    static func anchor(
+        _ primaryHeightInPoints: Double,
+        remotePixelsPerPoint: Double = 1,
+        widthInPoints: Double = 1920
+    ) -> DisplayFlipAnchor {
+        DisplayTopology.single(
+            widthInPoints: widthInPoints,
+            heightInPoints: primaryHeightInPoints,
+            scale: DisplayScale(
+                remotePixelsPerPoint: remotePixelsPerPoint,
+                backingPixelsPerPoint: remotePixelsPerPoint
+            )
+        )!.flipAnchor
+    }
+
     @Test("origin-anchored window maps to the top of mac screen space")
     func originWindow() {
         let windowsRect = WindowsRect(x: 0, y: 0, width: 800, height: 600)
-        let mac = WindowGeometry.macRect(from: windowsRect, primaryMonitorHeight: Self.primaryHeight)
+        let mac = WindowGeometry.macRect(from: windowsRect, anchoredTo: Self.anchor(Self.primaryHeight))
 
         // Windows (0,0) is the top-left of the primary monitor; in mac space (bottom-left
         // origin, Y up) that same physical spot is at y = primaryMonitorHeight - height.
@@ -19,7 +44,7 @@ struct WindowGeometryTests {
     @Test("window flush with the bottom of the primary monitor maps to mac y = 0")
     func bottomAlignedWindow() {
         let windowsRect = WindowsRect(x: 100, y: 880, width: 400, height: 200)
-        let mac = WindowGeometry.macRect(from: windowsRect, primaryMonitorHeight: Self.primaryHeight)
+        let mac = WindowGeometry.macRect(from: windowsRect, anchoredTo: Self.anchor(Self.primaryHeight))
 
         #expect(mac == MacRect(x: 100, y: 0, width: 400, height: 200))
     }
@@ -29,7 +54,7 @@ struct WindowGeometryTests {
         // A 1920x300 secondary monitor docked directly above the primary, left edges
         // aligned: its Windows-space rect spans y ∈ [-300, 0].
         let windowsRect = WindowsRect(x: 0, y: -300, width: 1920, height: 300)
-        let mac = WindowGeometry.macRect(from: windowsRect, primaryMonitorHeight: Self.primaryHeight)
+        let mac = WindowGeometry.macRect(from: windowsRect, anchoredTo: Self.anchor(Self.primaryHeight))
 
         // In mac space the primary spans y ∈ [0, 1080], so a monitor docked above it
         // should start exactly at the primary's top edge and extend past it.
@@ -41,7 +66,7 @@ struct WindowGeometryTests {
         // A 1920x1080 secondary monitor docked to the left of the primary, top edges
         // aligned: its Windows-space rect spans x ∈ [-1920, 0], y ∈ [0, 1080].
         let windowsRect = WindowsRect(x: -1920, y: 0, width: 1920, height: 1080)
-        let mac = WindowGeometry.macRect(from: windowsRect, primaryMonitorHeight: Self.primaryHeight)
+        let mac = WindowGeometry.macRect(from: windowsRect, anchoredTo: Self.anchor(Self.primaryHeight))
 
         #expect(mac == MacRect(x: -1920, y: 0, width: 1920, height: 1080))
     }
@@ -52,7 +77,7 @@ struct WindowGeometryTests {
         // 1920x1080 — the primary-monitor-height anchor, not any hardcoded 1080, is what
         // must drive the flip.
         let windowsRect = WindowsRect(x: 0, y: 0, width: 800, height: 600)
-        let mac = WindowGeometry.macRect(from: windowsRect, primaryMonitorHeight: 1440)
+        let mac = WindowGeometry.macRect(from: windowsRect, anchoredTo: Self.anchor(1440))
 
         #expect(mac == MacRect(x: 0, y: 840, width: 800, height: 600))
     }
@@ -67,8 +92,8 @@ struct WindowGeometryTests {
         let heightA = Self.primaryHeight // 1080
         let heightB = 1440.0
 
-        let macA = WindowGeometry.macRect(from: windowsRect, primaryMonitorHeight: heightA)
-        let macB = WindowGeometry.macRect(from: windowsRect, primaryMonitorHeight: heightB)
+        let macA = WindowGeometry.macRect(from: windowsRect, anchoredTo: Self.anchor(heightA))
+        let macB = WindowGeometry.macRect(from: windowsRect, anchoredTo: Self.anchor(heightB))
 
         // macRect.y = primaryMonitorHeight - windowsRect.y - windowsRect.height, so
         // changing only primaryMonitorHeight shifts mac.y by exactly the same delta —
@@ -79,7 +104,7 @@ struct WindowGeometryTests {
         #expect(macA.height == macB.height)
     }
 
-    @Test("windowsRect(from:primaryMonitorHeight:) is the exact inverse of macRect(from:primaryMonitorHeight:)",
+    @Test("windowsRect(from:anchoredTo:) is the exact inverse of macRect(from:anchoredTo:)",
           arguments: [
             WindowsRect(x: 0, y: 0, width: 800, height: 600),
             WindowsRect(x: -1920, y: -300, width: 1920, height: 300),
@@ -87,8 +112,8 @@ struct WindowGeometryTests {
             WindowsRect(x: -37, y: 1200, width: 1, height: 1),
           ])
     func roundTrip(_ original: WindowsRect) {
-        let mac = WindowGeometry.macRect(from: original, primaryMonitorHeight: Self.primaryHeight)
-        let roundTripped = WindowGeometry.windowsRect(from: mac, primaryMonitorHeight: Self.primaryHeight)
+        let mac = WindowGeometry.macRect(from: original, anchoredTo: Self.anchor(Self.primaryHeight))
+        let roundTripped = WindowGeometry.windowsRect(from: mac, anchoredTo: Self.anchor(Self.primaryHeight))
 
         #expect(roundTripped == original)
     }
@@ -106,14 +131,14 @@ struct WindowGeometryTests {
         let mac = MacPoint(x: 250, y: 640)
         let macAsRect = MacRect(x: mac.x, y: mac.y, width: 0, height: 0)
 
-        let point = WindowGeometry.windowsPoint(from: mac, primaryMonitorHeight: Self.primaryHeight)
-        let rect = WindowGeometry.windowsRect(from: macAsRect, primaryMonitorHeight: Self.primaryHeight)
+        let point = WindowGeometry.windowsPoint(from: mac, anchoredTo: Self.anchor(Self.primaryHeight))
+        let rect = WindowGeometry.windowsRect(from: macAsRect, anchoredTo: Self.anchor(Self.primaryHeight))
 
         #expect(point.x == rect.x)
         #expect(point.y == rect.y)
     }
 
-    @Test("windowsPoint(from:primaryMonitorHeight:) is the exact inverse of macPoint(from:primaryMonitorHeight:)",
+    @Test("windowsPoint(from:anchoredTo:) is the exact inverse of macPoint(from:anchoredTo:)",
           arguments: [
             WindowsPoint(x: 0, y: 0),
             WindowsPoint(x: 466, y: 489),                 // a plausible in-window click location
@@ -122,8 +147,8 @@ struct WindowGeometryTests {
             WindowsPoint(x: -37, y: 1200),
           ])
     func pointRoundTrip(_ original: WindowsPoint) {
-        let mac = WindowGeometry.macPoint(from: original, primaryMonitorHeight: Self.primaryHeight)
-        let roundTripped = WindowGeometry.windowsPoint(from: mac, primaryMonitorHeight: Self.primaryHeight)
+        let mac = WindowGeometry.macPoint(from: original, anchoredTo: Self.anchor(Self.primaryHeight))
+        let roundTripped = WindowGeometry.windowsPoint(from: mac, anchoredTo: Self.anchor(Self.primaryHeight))
 
         #expect(roundTripped == original)
     }
@@ -134,31 +159,31 @@ struct WindowGeometryTests {
         // it has BOTH Windows-space coordinates negative (x < 0 from being left of the
         // primary's left edge, y < 0 from being above the primary's top edge).
         let original = WindowsPoint(x: -960, y: -540)
-        let mac = WindowGeometry.macPoint(from: original, primaryMonitorHeight: Self.primaryHeight)
+        let mac = WindowGeometry.macPoint(from: original, anchoredTo: Self.anchor(Self.primaryHeight))
 
         // Windows y=-540 is 540px above the primary's top edge (Windows y=0); in mac space
         // (bottom-left origin, Y up) the primary's top edge is at y=primaryMonitorHeight,
         // so this point must land 540px *above* that.
         #expect(mac == MacPoint(x: -960, y: Self.primaryHeight + 540))
 
-        let roundTripped = WindowGeometry.windowsPoint(from: mac, primaryMonitorHeight: Self.primaryHeight)
+        let roundTripped = WindowGeometry.windowsPoint(from: mac, anchoredTo: Self.anchor(Self.primaryHeight))
         #expect(roundTripped == original)
     }
 
     // W4c review M1: the point-level transform's own primaryMonitorHeight-scaling
     // coverage, mirroring tallerPrimaryMonitor()/macYScalesLinearlyWithPrimaryMonitorHeight()
     // above for the rect side -- without this, a caller could hardcode 1080 inside
-    // macPoint(from:primaryMonitorHeight:)/windowsPoint(from:primaryMonitorHeight:) and every
+    // macPoint(from:anchoredTo:)/windowsPoint(from:anchoredTo:) and every
     // *other* point test above would still pass (they all use Self.primaryHeight == 1080
     // exclusively), silently breaking any real screen whose primary monitor isn't 1080
     // tall.
 
-    @Test("macPoint(from:primaryMonitorHeight:) against a taller (1440p) primary monitor produces the same shape, anchored differently")
+    @Test("macPoint(from:anchoredTo:) against a taller (1440p) primary monitor produces the same shape, anchored differently")
     func pointTallerPrimaryMonitor() {
         // Same worked point as pointRoundTrip's "plausible in-window click location" case,
         // but against a 2560x1440 primary instead of 1920x1080.
         let windowsPoint = WindowsPoint(x: 466, y: 489)
-        let mac = WindowGeometry.macPoint(from: windowsPoint, primaryMonitorHeight: 1440)
+        let mac = WindowGeometry.macPoint(from: windowsPoint, anchoredTo: Self.anchor(1440))
 
         #expect(mac == MacPoint(x: 466, y: 1440 - 489))
     }
@@ -173,8 +198,8 @@ struct WindowGeometryTests {
         let heightA = Self.primaryHeight // 1080
         let heightB = 1440.0
 
-        let macA = WindowGeometry.macPoint(from: windowsPoint, primaryMonitorHeight: heightA)
-        let macB = WindowGeometry.macPoint(from: windowsPoint, primaryMonitorHeight: heightB)
+        let macA = WindowGeometry.macPoint(from: windowsPoint, anchoredTo: Self.anchor(heightA))
+        let macB = WindowGeometry.macPoint(from: windowsPoint, anchoredTo: Self.anchor(heightB))
 
         // macPoint.y = primaryMonitorHeight - windowsPoint.y, so changing only
         // primaryMonitorHeight shifts mac.y by exactly the same delta -- x must not move.
@@ -202,8 +227,8 @@ struct WindowGeometryTests {
           ])
     func integerRoundTrip(_ original: WindowsRect) {
         let primaryMonitorHeight = 2160.0
-        let mac = WindowGeometry.macRect(from: original, primaryMonitorHeight: primaryMonitorHeight)
-        let roundTripped = WindowGeometry.windowsRect(from: mac, primaryMonitorHeight: primaryMonitorHeight)
+        let mac = WindowGeometry.macRect(from: original, anchoredTo: Self.anchor(primaryMonitorHeight))
+        let roundTripped = WindowGeometry.windowsRect(from: mac, anchoredTo: Self.anchor(primaryMonitorHeight))
 
         #expect(roundTripped == original)
         #expect(roundTripped.x == roundTripped.x.rounded())
@@ -213,7 +238,7 @@ struct WindowGeometryTests {
     @Test("width and height are never touched by the conversion")
     func dimensionsUnchanged() {
         let windowsRect = WindowsRect(x: -500, y: -500, width: 1234.5, height: 567.25)
-        let mac = WindowGeometry.macRect(from: windowsRect, primaryMonitorHeight: Self.primaryHeight)
+        let mac = WindowGeometry.macRect(from: windowsRect, anchoredTo: Self.anchor(Self.primaryHeight))
 
         #expect(mac.width == windowsRect.width)
         #expect(mac.height == windowsRect.height)
@@ -272,7 +297,7 @@ struct WindowGeometryTests {
     /// Team-lead review round 4 (2026-08-23, real-host move-leg mismatch after round 3's
     /// mapped-canonical fix): reproduces `RemoteWindowRegistry.handleLocalGeometrySettled`'s
     /// EXACT outbound conversion chain (mac content rect -> `windowsRect(from:
-    /// primaryMonitorHeight:)` -> `railRect(from:correction:)` -> rounded left/top/right/
+    /// anchoredTo:)` -> `railRect(from:correction:)` -> rounded left/top/right/
     /// bottom), step for step, using this run's own real numbers -- offline, no host needed,
     /// per the team-lead's own instruction that this test's verdict decides whether another
     /// host round is even necessary before fixing.
@@ -283,7 +308,7 @@ struct WindowGeometryTests {
     /// own measured mapped-minus-RAIL delta, unchanged by a pure move).
     ///
     /// THE ALGEBRA, worked by hand and then asserted by this test:
-    /// 1. `windowsRect(from: macRect(331,917,536,521), primaryMonitorHeight: 1440)`:
+    /// 1. `windowsRect(from: macRect(331,917,536,521), anchoredTo: Self.anchor(1440))`:
     ///    `y = 1440 - 917 - 521 = 2`. -> `WindowsRect(x: 331, y: 2, width: 536, height: 521)`.
     /// 2. `railRect(from: that, correction: (14, 7))`: `width = 536-14 = 522`,
     ///    `height = 521-7 = 514`, origin unchanged (zero origin correction).
@@ -324,7 +349,7 @@ struct WindowGeometryTests {
         let primaryMonitorHeight = 1440.0
         let correction = WindowGeometryCorrection(originX: 0, originY: 0, width: 14, height: 7)
 
-        let displayedWindowsRect = WindowGeometry.windowsRect(from: macRect, primaryMonitorHeight: primaryMonitorHeight)
+        let displayedWindowsRect = WindowGeometry.windowsRect(from: macRect, anchoredTo: Self.anchor(primaryMonitorHeight))
         #expect(displayedWindowsRect == WindowsRect(x: 331, y: 2, width: 536, height: 521))
 
         let railWindowsRect = WindowGeometry.railRect(from: displayedWindowsRect, correction: correction)
@@ -452,5 +477,432 @@ struct WindowGeometryTests {
         // state, not a stateful accumulator.
         #expect(finalContentRectPathA == finalContentRectPathB)
         #expect(finalContentRectPathA == WindowsRect(x: 0, y: 0, width: 2560, height: 1440))
+    }
+
+    // MARK: - Phase 3 M1 / W1: the topology-anchored signatures
+
+    /// THE anchor-invariant test M1's acceptance asks for by name.
+    ///
+    /// `WindowGeometry.swift:61-74` has always argued that the Y flip must anchor on the
+    /// PRIMARY display's height and never on the bounding height of the whole virtual desktop.
+    /// Until this milestone that argument was cheap to honour because no caller had a union
+    /// height available to get it wrong with. A `DisplayTopology` changes that:
+    /// `unionBoundsInPoints.height` is now one property access away, reads perfectly
+    /// plausibly, and -- this is the dangerous part -- would produce IDENTICAL results on the
+    /// single-display layout that is the only thing anybody can test against on real hardware
+    /// (`docs/plans/phase3.md:219`). So the fixture here is deliberately one where the two
+    /// numbers differ by a factor of two, and the assertions pin down both the right answer
+    /// and the wrong one.
+    ///
+    /// The structural half of the defence lives in the production types rather than here:
+    /// `DisplayFlipAnchor` has no public initializer, so a union height cannot be turned into
+    /// an anchor at all. This test covers the arithmetic; the type covers the mistake.
+    @Test("the flip anchors on the primary display's height, never on the union height, even when they differ")
+    func flipAnchorIsThePrimaryHeightNotTheUnionHeight() throws {
+        // Primary 1920x1080 at the mac origin, secondary 1920x1080 placed LEFT OF and ABOVE it
+        // -- so the union is 3840x2160 points and its height is exactly twice the primary's.
+        let topology = try #require(DisplayTopology(displays: [
+            DisplayTopology.Display(origin: MacPoint(x: 0, y: 0), size: MacSize(width: 1920, height: 1080),
+                    scale: .unscaled, isPrimary: true),
+            DisplayTopology.Display(origin: MacPoint(x: -1920, y: 1080), size: MacSize(width: 1920, height: 1080),
+                    scale: .unscaled, isPrimary: false),
+        ]))
+
+        let primaryHeight = 1080.0
+        let unionHeight = 2160.0
+        #expect(topology.primary.size.height == primaryHeight)
+        #expect(topology.unionBoundsInPoints.height.inPoints == unionHeight)
+        #expect(topology.flipAnchor.primaryHeightInPoints == primaryHeight)
+
+        // A Windows-space rect at y = 0 is flush with the TOP of the primary monitor, because
+        // Windows' virtual-desktop origin is the primary's top-left corner. In mac space that
+        // spot is `primaryHeight - height` up from the bottom of the primary.
+        let atWindowsOrigin = WindowsRect(x: 0, y: 0, width: 800, height: 600)
+        let mac = WindowGeometry.macRect(from: atWindowsOrigin, in: topology)
+        #expect(mac == MacRect(x: 0, y: 480, width: 800, height: 600))
+        #expect(mac.y == primaryHeight - 600)
+        // The union-anchored answer, pinned down as an explicit negative example: it is off by
+        // the full height of the extra display, and it is what a plausible-looking
+        // `unionBoundsInPoints.height` at this call site would have produced.
+        #expect(mac.y != unionHeight - 600)
+        #expect(unionHeight - 600 == 1560)
+
+        // The other end of the same invariant: the primary monitor's own bottom edge is mac
+        // y = 0 in both coordinate systems. Anchoring on anything but the primary's height
+        // moves the primary itself away from the shared origin, which is exactly the failure
+        // `WindowGeometry.swift:66-70` describes.
+        let flushWithPrimaryBottom = WindowsRect(x: 0, y: 880, width: 400, height: 200)
+        #expect(WindowGeometry.macRect(from: flushWithPrimaryBottom, in: topology).y == 0)
+
+        // And the point transform, which has no height term to hide behind.
+        #expect(WindowGeometry.macPoint(from: WindowsPoint(x: 0, y: 0), in: topology)
+                == MacPoint(x: 0, y: primaryHeight))
+        #expect(WindowGeometry.macPoint(from: WindowsPoint(x: 0, y: 0), in: topology).y != unionHeight)
+
+        // Adding a THIRD display -- i.e. growing the union further -- must not move a single
+        // converted coordinate, because the anchor never depended on the union in the first
+        // place. This is the property that makes screen hot-plug safe for geometry that is
+        // already on screen (W1 deliverable 2's observer emits an event; it does not need to
+        // re-place anything for this reason).
+        let grown = try #require(DisplayTopology(displays: topology.displays + [
+            DisplayTopology.Display(origin: MacPoint(x: 1920, y: -1080), size: MacSize(width: 3840, height: 2160),
+                    scale: .unscaled, isPrimary: false),
+        ]))
+        #expect(grown.unionBoundsInPoints.height.inPoints > unionHeight)
+        #expect(grown.flipAnchor == topology.flipAnchor)
+        #expect(WindowGeometry.macRect(from: atWindowsOrigin, in: grown) == mac)
+    }
+
+    /// The same invariant at `rasterScale = 2`, on **ADR-0015 fixture F3** — required verbatim
+    /// by ADR §4.A.4, and the combination the scale-1 test above cannot reach: "the anchor is
+    /// the primary height" and "the scale divides" have to hold *together*, because the two
+    /// mistakes have opposite signs and a test that exercises only one of them can be passed by
+    /// an implementation that makes both.
+    ///
+    /// F3: primary 1280x720 pt @2x at the mac origin, secondary 1920x1080 pt @1x to its right,
+    /// top edges aligned. Union height is 1080 pt; the primary's is 720 pt. ADR §4.A.4 fixes the
+    /// assertion literally: a Windows-space rect at `y = 0` of height `h` remote px must land at
+    /// `mac y = 720 − h/2`, and it explicitly forbids writing that as
+    /// `topology.<some height> − h/rasterScale`, which would pass against either anchor.
+    @Test("ADR F3: at rasterScale 2 the flip still anchors on the primary's 720pt, not the union's 1080pt")
+    func flipAnchorIsThePrimaryHeightOnAdrFixtureF3() throws {
+        let topology = try #require(DisplayTopology(displays: DisplayTopologyFixtures.union[2].displays))
+
+        #expect(topology.rasterScale == 2)
+        #expect(topology.primary.size.height == 720)
+        #expect(topology.unionBoundsInPoints.height.inPoints == 1080)
+
+        // h = 480 remote px. Correct: 720 − 480/2 = 480. Union-anchored: 1080 − 240 = 840.
+        let rect = WindowsRect(x: 0, y: 0, width: 640, height: 480)
+        let mac = WindowGeometry.macRect(from: rect, in: topology)
+
+        #expect(mac == MacRect(x: 0, y: 480, width: 320, height: 240))
+        #expect(mac.y == 480)          // literal, per ADR §4.A.4 -- not derived from the topology
+        #expect(mac.y != 840)          // the union-anchored answer
+        #expect(840 - 480 == 360)      // ADR §4.A.4's stated 360 pt error
+
+        // The point transform has no `- height` term to hide a wrong anchor behind, so it needs
+        // its own assertion (ADR §4.A.5): Windows y = 0 is the primary's top edge, which in mac
+        // space is the primary's own height, in points.
+        #expect(WindowGeometry.macPoint(from: WindowsPoint(x: 0, y: 0), in: topology)
+                == MacPoint(x: 0, y: 720))
+
+        // And the round trip closes at this scale too.
+        #expect(WindowGeometry.windowsRect(from: mac, in: topology) == rect)
+    }
+
+    /// M1 acceptance: round-trip identity in BOTH directions, for rect and point,
+    /// parameterised over `scale ∈ {1, 2}` × multi-screen offsets. Extends the property style
+    /// of `railDisplayRoundTripIsIdentity` above onto the new signature.
+    ///
+    /// The probes are not arbitrary constants: they are derived from each display's OWN
+    /// Windows-space frame, so a layout that puts a display left of or above the primary
+    /// automatically produces negative coordinates in the region that display occupies, and a
+    /// 2x layout automatically produces the doubled ones. That is what makes "multi-screen
+    /// offsets" a real axis here rather than a label on a fixed list of numbers.
+    @Test("rect round-trip is the exact identity in both directions across scales and screen offsets",
+          arguments: WindowGeometryFixtures.scales, WindowGeometryFixtures.layouts)
+    func rectRoundTripIsIdentityAcrossScalesAndOffsets(_ scale: Double, _ layout: ScreenLayoutFixture) throws {
+        let topology = try #require(layout.topology(scale: scale))
+        let anchor = topology.flipAnchor
+        #expect(anchor.remotePixelsPerPoint == scale)
+
+        for index in topology.displays.indices {
+            let frame = try #require(topology.frameInRemotePixels(ofDisplayAt: index))
+
+            for probe in WindowGeometryFixtures.probeRects(on: frame) {
+                // Direction 1: Windows -> mac -> Windows.
+                let mac = WindowGeometry.macRect(from: probe, anchoredTo: anchor)
+                #expect(WindowGeometry.windowsRect(from: mac, anchoredTo: anchor) == probe)
+
+                // Direction 2: mac -> Windows -> mac, starting from the mac-space value rather
+                // than re-deriving it. Both directions matter: `handleLocalGeometrySettled`
+                // enters the chain from the mac side (a user drag) while `macContentRect`
+                // enters it from the Windows side (a RAIL WindowUpdate), and only asserting
+                // one of them would leave the other's inverse unproven.
+                let backToWindows = WindowGeometry.windowsRect(from: mac, anchoredTo: anchor)
+                #expect(WindowGeometry.macRect(from: backToWindows, anchoredTo: anchor) == mac)
+
+                // The topology-taking overload must be the same function.
+                #expect(WindowGeometry.macRect(from: probe, in: topology) == mac)
+                #expect(WindowGeometry.windowsRect(from: mac, in: topology) == probe)
+            }
+
+            // A mac-space start that was never produced by a forward conversion: the display's
+            // own frame in points, plus a fractional-point rect, since AppKit frames are not
+            // obliged to be integral.
+            let macStarts = [
+                topology.displays[index].frameInPoints,
+                MacRect(x: topology.displays[index].origin.x + 12.5,
+                        y: topology.displays[index].origin.y + 37.25,
+                        width: 536.5, height: 521.75),
+            ]
+            for macStart in macStarts {
+                let windows = WindowGeometry.windowsRect(from: macStart, anchoredTo: anchor)
+                #expect(WindowGeometry.macRect(from: windows, anchoredTo: anchor) == macStart)
+            }
+        }
+    }
+
+    @Test("point round-trip is the exact identity in both directions across scales and screen offsets",
+          arguments: WindowGeometryFixtures.scales, WindowGeometryFixtures.layouts)
+    func pointRoundTripIsIdentityAcrossScalesAndOffsets(_ scale: Double, _ layout: ScreenLayoutFixture) throws {
+        let topology = try #require(layout.topology(scale: scale))
+        let anchor = topology.flipAnchor
+
+        for index in topology.displays.indices {
+            let frame = try #require(topology.frameInRemotePixels(ofDisplayAt: index))
+
+            for probe in WindowGeometryFixtures.probePoints(on: frame) {
+                // Windows -> mac -> Windows.
+                let mac = WindowGeometry.macPoint(from: probe, anchoredTo: anchor)
+                #expect(WindowGeometry.windowsPoint(from: mac, anchoredTo: anchor) == probe)
+
+                // mac -> Windows -> mac.
+                let backToWindows = WindowGeometry.windowsPoint(from: mac, anchoredTo: anchor)
+                #expect(WindowGeometry.macPoint(from: backToWindows, anchoredTo: anchor) == mac)
+
+                #expect(WindowGeometry.macPoint(from: probe, in: topology) == mac)
+                #expect(WindowGeometry.windowsPoint(from: mac, in: topology) == probe)
+            }
+        }
+    }
+
+    /// The rect and point transforms must stay in agreement under scale too -- the same
+    /// cross-check `pointMatchesZeroSizeRect` makes at 1x, re-run across the whole fixture
+    /// matrix. A zero-height rect has no `- height` term to apply, so the two formulas must
+    /// coincide exactly; if a future edit scales one of them and not the other, this catches
+    /// it even where the round-trip identity (which is symmetric in the error) would not.
+    @Test("the point transform agrees with a zero-size rect at every scale and offset",
+          arguments: WindowGeometryFixtures.scales, WindowGeometryFixtures.layouts)
+    func pointAgreesWithZeroSizeRectAcrossScalesAndOffsets(_ scale: Double, _ layout: ScreenLayoutFixture) throws {
+        let topology = try #require(layout.topology(scale: scale))
+        let anchor = topology.flipAnchor
+
+        for index in topology.displays.indices {
+            let frame = try #require(topology.frameInRemotePixels(ofDisplayAt: index))
+            for probe in WindowGeometryFixtures.probePoints(on: frame) {
+                let mac = WindowGeometry.macPoint(from: probe, anchoredTo: anchor)
+                let asRect = WindowGeometry.macRect(
+                    from: WindowsRect(x: probe.x, y: probe.y, width: 0, height: 0),
+                    anchoredTo: anchor
+                )
+                #expect(mac.x == asRect.x)
+                #expect(mac.y == asRect.y)
+            }
+        }
+    }
+
+    /// Round-trip identity alone would still pass if the scale were silently ignored (an
+    /// identity is symmetric in its own mistakes), so this pins the actual numbers down.
+    ///
+    /// The layout is `docs/plans/phase3.md:219`'s own planned 2x test session: the 2560x1440
+    /// panel switched to "looks like 1280x720", which is a zero-downsample exact 2x. NOTE what
+    /// this test is and is not: it is offline coverage for the arithmetic that a
+    /// `remotePixelsPerPoint == 2` session would need. It is not a claim that any session runs
+    /// at 2x today -- reaching that requires the `DesktopScaleFactor` advertising W3 owns, and
+    /// M1's MUST-NOT list forbids it.
+    @Test("at remotePixelsPerPoint == 2 the conversion really halves, and the 1x answer differs")
+    func scaleIsActuallyApplied() {
+        let scaled = Self.anchor(720, remotePixelsPerPoint: 2, widthInPoints: 1280)
+        let unscaled = Self.anchor(720, remotePixelsPerPoint: 1, widthInPoints: 1280)
+
+        // 1024x768 remote pixels at remote (640, 200):
+        //   x = 640/2 = 320, w = 1024/2 = 512, h = 768/2 = 384
+        //   y = 720 - 200/2 - 768/2 = 720 - 100 - 384 = 236
+        let windows = WindowsRect(x: 640, y: 200, width: 1024, height: 768)
+        let mac = WindowGeometry.macRect(from: windows, anchoredTo: scaled)
+        #expect(mac == MacRect(x: 320, y: 236, width: 512, height: 384))
+        #expect(WindowGeometry.windowsRect(from: mac, anchoredTo: scaled) == windows)
+
+        // The same input under a 1x anchor must NOT agree -- i.e. the factor is load-bearing,
+        // not decorative.
+        #expect(WindowGeometry.macRect(from: windows, anchoredTo: unscaled) != mac)
+        #expect(WindowGeometry.macRect(from: windows, anchoredTo: unscaled)
+                == MacRect(x: 640, y: 720 - 200 - 768, width: 1024, height: 768))
+
+        // Points scale the same way, without the height term.
+        let point = WindowsPoint(x: 640, y: 200)
+        #expect(WindowGeometry.macPoint(from: point, anchoredTo: scaled) == MacPoint(x: 320, y: 620))
+        #expect(WindowGeometry.windowsPoint(from: MacPoint(x: 320, y: 620), anchoredTo: scaled) == point)
+
+        // Width and height are pure scalings -- no anchor term leaks into them.
+        #expect(mac.width * 2 == windows.width)
+        #expect(mac.height * 2 == windows.height)
+    }
+
+    /// At `remotePixelsPerPoint == 1` -- every configuration that exists today -- the new
+    /// signature must compute bit-for-bit what the pre-M1 one did. This is the "the unit
+    /// separation changed no behavior" claim M1's acceptance makes (§3 验收, replay-gate
+    /// clause), asserted directly rather than inferred from the suite still being green.
+    @Test("at scale 1 the topology-anchored conversion equals the pre-M1 arithmetic, exactly",
+          arguments: [
+            WindowsRect(x: 0, y: 0, width: 800, height: 600),
+            WindowsRect(x: -1920, y: -300, width: 1920, height: 300),
+            WindowsRect(x: 250, y: 940, width: 640, height: 480),
+            WindowsRect(x: -37, y: 1200, width: 1, height: 1),
+            WindowsRect(x: 338, y: 62, width: 494, height: 500), // the real-host About window
+          ])
+    func scaleOneReproducesThePreM1Arithmetic(_ windowsRect: WindowsRect) {
+        let height = Self.primaryHeight
+        let anchor = Self.anchor(height)
+
+        // The literal pre-M1 expressions from `WindowGeometry.swift` before this milestone.
+        let expectedMac = MacRect(
+            x: windowsRect.x,
+            y: height - windowsRect.y - windowsRect.height,
+            width: windowsRect.width,
+            height: windowsRect.height
+        )
+        #expect(WindowGeometry.macRect(from: windowsRect, anchoredTo: anchor) == expectedMac)
+        #expect(WindowGeometry.windowsRect(from: expectedMac, anchoredTo: anchor) == WindowsRect(
+            x: expectedMac.x,
+            y: height - expectedMac.y - expectedMac.height,
+            width: expectedMac.width,
+            height: expectedMac.height
+        ))
+
+        let windowsPoint = WindowsPoint(x: windowsRect.x, y: windowsRect.y)
+        #expect(WindowGeometry.macPoint(from: windowsPoint, anchoredTo: anchor)
+                == MacPoint(x: windowsPoint.x, y: height - windowsPoint.y))
+        #expect(WindowGeometry.windowsPoint(from: MacPoint(x: windowsPoint.x, y: height - windowsPoint.y),
+                                            anchoredTo: anchor) == windowsPoint)
+    }
+    /// The four pre-M1 `primaryMonitorHeight:` entry points still exist, deprecated, purely so
+    /// the App and `Tools/window-smoke` keep compiling until their own call sites migrate
+    /// (M1 wave 2: `RemoteWindowRegistry.swift:1262,1770,1827-1829`,
+    /// `Tools/window-smoke/main.swift:2606-2608`). They are on the live window-placement path
+    /// for exactly that long, so "trivial forwarder" is not a reason to leave them unproven --
+    /// a mis-wired shim would be a real positioning bug with a plausible-looking diff.
+    ///
+    /// **Delete this test together with the shims.** It is annotated deprecated itself so that
+    /// exercising them here does not drown the wave-2 migration list in noise from this file;
+    /// the warnings that matter are the ones in `App/` and `Tools/`.
+    @available(*, deprecated, message: "Exercises the pre-M1 shims on purpose; delete with them in M1 wave 2.")
+    @Test("the deprecated primaryMonitorHeight shims forward to a scale-1 topology anchor, unchanged")
+    func deprecatedShimsForwardToAScaleOneAnchor() {
+        let height = 1440.0
+        let anchor = Self.anchor(height)
+
+        let windowsRect = WindowsRect(x: -337, y: 1201, width: 494, height: 500)
+        #expect(WindowGeometry.macRect(from: windowsRect, primaryMonitorHeight: height)
+                == WindowGeometry.macRect(from: windowsRect, anchoredTo: anchor))
+
+        let macRect = MacRect(x: 331.5, y: 917.25, width: 536, height: 521)
+        #expect(WindowGeometry.windowsRect(from: macRect, primaryMonitorHeight: height)
+                == WindowGeometry.windowsRect(from: macRect, anchoredTo: anchor))
+
+        let macPoint = MacPoint(x: 466, y: 489)
+        #expect(WindowGeometry.windowsPoint(from: macPoint, primaryMonitorHeight: height)
+                == WindowGeometry.windowsPoint(from: macPoint, anchoredTo: anchor))
+
+        let windowsPoint = WindowsPoint(x: -960, y: -540)
+        #expect(WindowGeometry.macPoint(from: windowsPoint, primaryMonitorHeight: height)
+                == WindowGeometry.macPoint(from: windowsPoint, anchoredTo: anchor))
+    }
+}
+
+// MARK: - Fixtures for the scale × offset matrix
+
+/// A multi-screen layout, parameterised over the scale every display in it runs at.
+///
+/// Uniform scale per layout on purpose: the anchor takes the PRIMARY's scale, so a mixed-scale
+/// layout would exercise "which display governs this window" -- an open ADR-0015 question
+/// (U1's per-window/per-surface half) that no lane may answer. Mixed scale IS covered where it
+/// is well-defined, in `DisplayTopologyFixtures.union`'s bounding-box row.
+struct ScreenLayoutFixture: Sendable, CustomStringConvertible {
+    let name: String
+    /// Secondary display origins in mac points, relative to a primary whose own origin is
+    /// (0, 0). Empty means a single-display layout.
+    let secondaryOriginsInPoints: [MacPoint]
+
+    var description: String { name }
+
+    /// Primary is always 1920x1080 POINTS; the scale multiplies its remote-pixel extent, not
+    /// its point extent, which is what a "looks like NxM" display mode actually does.
+    func topology(scale: Double) -> DisplayTopology? {
+        let displayScale = DisplayScale(remotePixelsPerPoint: scale, backingPixelsPerPoint: scale)
+        let primary = DisplayTopology.Display(
+            origin: MacPoint(x: 0, y: 0),
+            size: MacSize(width: 1920, height: 1080),
+            scale: displayScale,
+            isPrimary: true
+        )
+        let secondaries = secondaryOriginsInPoints.map {
+            DisplayTopology.Display(origin: $0, size: MacSize(width: 1920, height: 1080),
+                    scale: displayScale, isPrimary: false)
+        }
+        return DisplayTopology(displays: [primary] + secondaries)
+    }
+}
+
+enum WindowGeometryFixtures {
+    /// `scale ∈ {1, 2}` exactly as M1's acceptance names it. 1 is today's real configuration;
+    /// 2 is the offline fixture for the mode-switch session phase3.md §8.1② plans.
+    static let scales: [Double] = [1, 2]
+
+    /// Every placement that produces a distinct sign pattern in Windows space, plus a
+    /// three-display layout so nothing quietly assumes "at most two".
+    static let layouts: [ScreenLayoutFixture] = [
+        ScreenLayoutFixture(name: "single display", secondaryOriginsInPoints: []),
+        ScreenLayoutFixture(name: "secondary right", secondaryOriginsInPoints: [MacPoint(x: 1920, y: 0)]),
+        ScreenLayoutFixture(name: "secondary left (negative Windows x)",
+                            secondaryOriginsInPoints: [MacPoint(x: -1920, y: 0)]),
+        ScreenLayoutFixture(name: "secondary above (negative Windows y)",
+                            secondaryOriginsInPoints: [MacPoint(x: 0, y: 1080)]),
+        ScreenLayoutFixture(name: "secondary left and above (both negative)",
+                            secondaryOriginsInPoints: [MacPoint(x: -1920, y: 1080)]),
+        ScreenLayoutFixture(name: "secondary below and right (positive Windows y past the primary)",
+                            secondaryOriginsInPoints: [MacPoint(x: 1920, y: -1080)]),
+        ScreenLayoutFixture(name: "three displays: left, above, right",
+                            secondaryOriginsInPoints: [
+                                MacPoint(x: -1920, y: 0),
+                                MacPoint(x: 0, y: 1080),
+                                MacPoint(x: 1920, y: 0),
+                            ]),
+        ScreenLayoutFixture(name: "secondary offset diagonally by a non-multiple of its own size",
+                            secondaryOriginsInPoints: [MacPoint(x: -777, y: 333)]),
+    ]
+
+    /// Probes anchored to a specific display's Windows-space frame, so each layout exercises
+    /// coordinates in the region that layout actually occupies -- including the negative ones.
+    ///
+    /// Odd offsets and odd sizes are deliberate: at scale 2 they produce half-point mac values,
+    /// which is where a rounding step sneaking into a conversion would show up.
+    ///
+    /// What they do NOT catch, stated because the earlier version of this comment claimed
+    /// otherwise and r1 review disproved it by mutation: rewriting `macRect`'s Y term as
+    /// `primaryHeight - (y + height)/s` leaves every test in this file green. It cannot be
+    /// otherwise -- at `s ∈ {1, 2}` with dyadic inputs both groupings are exact, which is
+    /// precisely what ADR §9's floating-point clause asserts. The grouping is chosen for
+    /// textual identity with the pre-M1 source at `s == 1` and is protected by
+    /// `scaleOneReproducesThePreM1Arithmetic` plus source review, not by a discriminating
+    /// assertion; there is nothing here to discriminate, and a test pretending otherwise would
+    /// be worse than none.
+    static func probeRects(on frame: WindowsRect) -> [WindowsRect] {
+        [
+            // Flush with the display's own top-left corner.
+            WindowsRect(x: frame.x, y: frame.y, width: 640, height: 480),
+            // Flush with its bottom-right corner.
+            WindowsRect(x: frame.x + frame.width - 640, y: frame.y + frame.height - 480,
+                        width: 640, height: 480),
+            // Odd offsets and odd extents, interior.
+            WindowsRect(x: frame.x + 337, y: frame.y + 129, width: 501, height: 373),
+            // Straddling the display's top-left corner -- i.e. partly on a neighbour, which is
+            // the case a per-display scale rule would eventually have to answer for.
+            WindowsRect(x: frame.x - 101, y: frame.y - 97, width: 203, height: 199),
+            // Degenerate but legal: a zero-size rect, which is what the point transform must
+            // agree with.
+            WindowsRect(x: frame.x + 1, y: frame.y + 1, width: 0, height: 0),
+        ]
+    }
+
+    static func probePoints(on frame: WindowsRect) -> [WindowsPoint] {
+        [
+            WindowsPoint(x: frame.x, y: frame.y),
+            WindowsPoint(x: frame.x + frame.width, y: frame.y + frame.height),
+            WindowsPoint(x: frame.x + 337, y: frame.y + 129),
+            WindowsPoint(x: frame.x - 101, y: frame.y - 97),
+        ]
     }
 }
