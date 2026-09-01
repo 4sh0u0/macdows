@@ -58,7 +58,7 @@ fail() { printf 'FAIL  %s\n' "$*"; FAILURES=$((FAILURES + 1)); }
 note() { printf '        %s\n' "$*"; }
 
 SB="$(mktemp -d "${TMPDIR:-/tmp}/macdows-matrix-offline.XXXXXX")" || exit 1
-# shellcheck disable=SC2329  # invoked by the EXIT trap below
+# shellcheck disable=SC2329,SC2317  # invoked by the EXIT trap below (0.11 emits SC2329, older CI shellcheck emits SC2317 for the same indirect-invocation shape)
 cleanup() {
 	if [ "$KEEP" -eq 1 ]; then
 		printf 'sandbox kept: %s\n' "$SB"
