@@ -12,6 +12,10 @@ public enum WindowShape {
     /// One wire `RECTANGLE_16` as `Double`s (never `UInt16` here — the transform's additive
     /// terms, `Δx`/`Δy` below, can legitimately go negative before clipping, and Swift's
     /// `UInt16` would trap). Field names/order match `crdpq_rect_t` exactly.
+    ///
+    /// UNIT (ADR-0015 §1 vocabulary, M1/L8 tagging pass): **remote px** — the RDP wire's own
+    /// unit, the same one `WindowsRect` carries, and the reason `ContentSize` (mac pt) needed
+    /// the unit contract spelled out on it: these two types meet inside `computeMask`.
     public struct WireRect: Sendable, Equatable {
         public var left: Double
         public var top: Double
@@ -32,6 +36,20 @@ public enum WindowShape {
     /// (mac SCREEN space, anchored on the primary screen's height — a completely different
     /// flip than this one; adr/0010 §2 explicitly warns against reusing `WindowGeometry.
     /// macRect` here for exactly this reason).
+    ///
+    /// UNIT (ADR-0015 §1 vocabulary, M1/L8 tagging pass): **mac pt**, measured from the
+    /// layer's own bottom-left corner rather than the primary screen's — the two differ in
+    /// origin, not in unit. `ContentSize`'s own note carries the pipeline's full unit
+    /// contract; the only consumer is `RemoteWindow.applyMaskNow`, which turns each of these
+    /// into a `CGRect` in the same points through one named, identity conversion
+    /// (`App/RemoteWindowRendering/RemoteWindow.swift`, `CGRect.init(layerPoints:)`).
+    ///
+    /// THE adr/0010 §2 BAN IS NOW PINNED, not merely documented: ADR-0015 §7's "(c) 的位置
+    /// 更正" warns that an implementer told to "route the mask through a named conversion"
+    /// is most likely to reach for `WindowGeometry.macRect` — the one function this
+    /// paragraph forbids. `WindowShapeTests.maskFlipAnchorsOnContentHeightNotThePrimaryScreenHeight`
+    /// asserts the difference numerically (a fixture where the two flips disagree by 660 pt),
+    /// so the ban fails a test rather than a code review from here on.
     public struct LayerRect: Sendable, Equatable {
         public var x: Double
         public var y: Double
@@ -68,6 +86,42 @@ public enum WindowShape {
     /// The content layer's own size in points — mapped-canonical (adr/0010 §2: "内容视图尺寸已
     /// 与 mapped 像素等值"), i.e. the same size the caller already computed for
     /// `RemoteWindow.updateFrame(contentRect:)`'s content rect.
+    ///
+    /// UNIT CONTRACT (ADR-0015 §7 (c) + §9's L8 row; the tag is **record-only**, U5 —
+    /// `m1-wave1-rulings.md:4`). §7 requires three elements at every F6 site, in this order:
+    ///
+    /// 1. **CURRENT UNIT: mac pt** (ADR-0015 §1's vocabulary). This value reaches
+    ///    `computeMask` from `RemoteWindowRegistry.computeMaskResult`
+    ///    (`RemoteWindowRegistry.swift:1086-1098`) as `macContentRect(...)`'s `NSSize` — an
+    ///    AppKit size, therefore points, and specifically the output side of
+    ///    `WindowGeometry.macRect`'s remote-px → mac-pt conversion. The `visibilityRects`
+    ///    handed to that SAME call are **remote px**, straight off the wire (`WireRect`'s own
+    ///    note). That one call is therefore the mask pipeline's unit boundary — ADR-0015 §7's
+    ///    "(c) 的位置更正" locates the boundary at the registry, explicitly **not** in this
+    ///    file and **not** in `RemoteWindow`. This type's job is to state which side of the
+    ///    boundary it stands on; crossing it is the caller's.
+    /// 2. **W3 TRIGGER: the first session with `DisplayScale.remotePixelsPerPoint != 1`.**
+    ///    `computeMask` below clips remote-px wire rects against this mac-pt bounds and flips
+    ///    them around this mac-pt height. That arithmetic is unit-homogeneous only while one
+    ///    remote pixel is one point, which ADR-0015 §0a/§0c record as true of every
+    ///    configuration that exists today (we advertise no `DesktopScaleFactor`; `docs/plans/
+    ///    phase3.md:219`: the single display is 1x). It is not a coincidence to rely on
+    ///    silently, which is why it is written down here rather than left to the reader.
+    /// 3. **WHAT CHANGES WHEN IT FIRES (shape, not value — U5 is record-only).** The caller's
+    ///    boundary conversion becomes explicit at the registry: wire rects are divided into
+    ///    layer points there, before they ever meet this size, and this type goes on meaning
+    ///    exactly "the layer's own bounds, in mac pt". **Whether that divisor really is
+    ///    `rasterScale` is W3's to measure, not M1's to guess** (ADR-0015 §7 (c) row, §8), so
+    ///    this milestone adds no scale arithmetic anywhere in this file — ADR-0015 §9's L8
+    ///    row: "L8 不在本波次引入任何比例乘法". At `remotePixelsPerPoint == 1` every form of
+    ///    that future conversion is the identity, which is what "no rendering behavior change"
+    ///    means concretely for this wave.
+    ///
+    /// AND THE OUTPUT IS `LayerRect`, NOT `MacRect`: this height is the mask's flip anchor, in
+    /// the layer's OWN space. The primary screen's height (`DisplayFlipAnchor.
+    /// primaryHeightInPoints`) is a different anchor for a different space and must never be
+    /// substituted here — adr/0010 §2's ban, restated by ADR-0015 §7 and now pinned by
+    /// `WindowShapeTests.maskFlipAnchorsOnContentHeightNotThePrimaryScreenHeight`.
     public struct ContentSize: Sendable, Equatable {
         public var width: Double
         public var height: Double

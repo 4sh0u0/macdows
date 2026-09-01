@@ -291,6 +291,71 @@ struct WindowShapeTests {
         #expect(corr[0] == WindowShape.LayerRect(x: base[0].x - 3, y: base[0].y + 4, width: base[0].width, height: base[0].height))
     }
 
+    // MARK: - adr/0010 §2's ban on the screen-space flip (M1/L8: pinned, not just documented)
+
+    /// ADR-0015 §7's "(c) 的位置更正" ends with a warning aimed at this exact test's absence:
+    /// an implementer told to route the mask "through a named conversion" is most likely to
+    /// reach for `WindowGeometry.macRect`, which is the one conversion adr/0010 §2 forbids
+    /// here (`WindowShape.swift`'s `LayerRect`/`ContentSize` notes). Until now that ban lived
+    /// only in comments — three of them, all correct, none executable. This test makes the
+    /// two flips disagree by a number.
+    ///
+    /// The fixture keeps the two candidate anchors far apart on purpose: a 100x60 pt window on
+    /// a 1280x720 pt primary display. On any fixture where content height happens to equal
+    /// screen height, the banned implementation would pass too — which is precisely how a
+    /// coordinate bug of this shape survives a test suite (the same "today it is unobservable"
+    /// trap ADR-0015 §4 documents for the union-vs-primary anchor).
+    @Test("the mask's Y flip anchors on contentSize.height, never on the primary screen height (adr/0010 §2 ban, ADR-0015 §7)")
+    func maskFlipAnchorsOnContentHeightNotThePrimaryScreenHeight() throws {
+        let wire = WindowShape.WireRect(left: 0, top: 0, right: 50, bottom: 30)
+        let result = Self.computeUnoccluded(rects: [wire], contentSize: .init(width: 100, height: 60))
+        guard case .rects(let rects) = result else {
+            Issue.record("expected .rects, got \(result)")
+            return
+        }
+        #expect(rects.count == 1)
+        // Layer space (adr/0010 §2 step 2): y = contentSize.height - local.bottom = 60 - 30.
+        #expect(rects[0] == WindowShape.LayerRect(x: 0, y: 30, width: 50, height: 30))
+
+        // What the BANNED path would have produced from the identical wire rect. Computed
+        // here rather than asserted in prose so that "these two are different functions" is
+        // itself a checked fact: mac SCREEN space anchors on the primary's 720 pt, giving
+        // y = 720 - 0 - 30 = 690 -- 660 pt away from the correct layer-space 30, i.e. entirely
+        // outside a 60 pt-tall window, which is what a mask built this way would clip to
+        // (nothing at all).
+        let topology = try #require(DisplayTopology.single(widthInPoints: 1280, heightInPoints: 720))
+        let banned = WindowGeometry.macRect(
+            from: WindowsRect(
+                x: wire.left, y: wire.top,
+                width: wire.right - wire.left, height: wire.bottom - wire.top
+            ),
+            in: topology
+        )
+        #expect(banned == MacRect(x: 0, y: 690, width: 50, height: 30))
+        #expect(rects[0].y != banned.y)
+        #expect(banned.y - rects[0].y == 660)
+    }
+
+    /// The positive half of the same contract: `ContentSize` is not merely the clip bounds,
+    /// it IS the flip anchor. Moving the content box's height moves every mask rect by exactly
+    /// that delta and changes nothing else — a property no screen-anchored implementation has
+    /// (a `macRect`-based one would be invariant under this change, since the primary height
+    /// it reads never moved).
+    @Test("contentSize.height is the flip anchor itself: a taller content box shifts every rect by exactly the height delta")
+    func maskFlipAnchorIsTheContentBoxItself() {
+        let shortBox = Self.computeUnoccluded(rects: [Self.interiorRect], contentSize: .init(width: 100, height: 60))
+        let tallBox = Self.computeUnoccluded(rects: [Self.interiorRect], contentSize: .init(width: 100, height: 100))
+        guard case .rects(let short) = shortBox, case .rects(let tall) = tallBox else {
+            Issue.record("expected .rects for both")
+            return
+        }
+        // interiorRect is deliberately clear of every edge in BOTH boxes, so step 3's clipping
+        // cannot contribute to the difference (see that fixture's own note).
+        #expect(short[0] == WindowShape.LayerRect(x: 20, y: 20, width: 50, height: 20))
+        #expect(tall[0] == WindowShape.LayerRect(x: 20, y: 60, width: 50, height: 20))
+        #expect(tall[0].y - short[0].y == 40)
+    }
+
     // MARK: - Zero/degenerate content size (defensive -- should not occur in practice)
 
     @Test("a zero content size fails open to no mask rather than dividing by / clipping against nothing")

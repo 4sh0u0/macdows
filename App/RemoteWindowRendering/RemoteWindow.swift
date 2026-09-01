@@ -417,6 +417,14 @@ final class RemoteWindow {
         win.backgroundColor = .black
 
         let layer = CALayer()
+        // M1/L8 (ADR-0015 §7 (c)/§9, U5 record-only): both VALUES below are deliberately
+        // untouched this wave -- `contentsGravity`, `contentsScale` and `masksToBounds` are
+        // W3's (ADR-0015 §8, and M1's own global MUST-NOT list). What M1 adds is the unit
+        // statement `.resize` never had: it stretches a **remote px** source raster onto a
+        // **mac pt** destination, so the ratio it silently applies is exactly this window's
+        // remote-pixels-per-point. See `present(surface:mappedSize:via:)`'s doc comment for
+        // the full derivation, why that ratio is 1:1 on today's hardware, and what W3 has to
+        // measure before touching any of it.
         layer.contentsGravity = .resize
         layer.masksToBounds = true
         // GFX surfaces observed against a real host carry PIXEL_FORMAT_BGRX32 -- 32bpp
@@ -905,6 +913,15 @@ final class RemoteWindow {
     /// mask genuinely stopped mattering would itself violate the same "keep the fast path
     /// for non-masked windows" principle the ADR states for the forward case.
     private func applyMaskNow(_ result: WindowShape.MaskResult) {
+        // UNIT (ADR-0015 §1 vocabulary, M1/L8 tagging pass): `contentView.bounds.size` is
+        // **mac pt** -- an AppKit view's own bounds -- and so is every `LayerRect` in
+        // `result` (`WindowShape.LayerRect`'s unit note: layer-local points, same unit,
+        // bottom-left origin of this layer rather than of the screen). The two are therefore
+        // directly comparable below with no conversion, which is the whole reason this method
+        // is a *consumer* of the unit contract and not the place that establishes it: the one
+        // remote-px/mac-pt boundary in the mask pipeline is the registry call that produced
+        // `result` (`RemoteWindowRegistry.computeMaskResult`, ADR-0015 §7's "(c) 的位置更正";
+        // §9's L8 row states plainly that the boundary is not in this file).
         let contentSize = contentView.bounds.size
         let material = Self.isMaterialMask(result, contentSize: contentSize)
 
@@ -919,10 +936,15 @@ final class RemoteWindow {
                 maskLayer = layer
                 return layer
             }()
+            // Both lines below are in mac pt: the mask layer covers the content view exactly,
+            // and each path rect is a `LayerRect` in that same space. `CGRect(layerPoints:)`
+            // (bottom of this file) is the one named conversion the four `Double`s go through
+            // -- identity by construction, so the emitted path is bit-for-bit what the
+            // previous bare `CGRect(x:y:width:height:)` splat produced.
             shape.frame = CGRect(origin: .zero, size: contentSize)
             let path = CGMutablePath()
             for rect in rects {
-                path.addRect(CGRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height))
+                path.addRect(CGRect(layerPoints: rect))
             }
             shape.path = path
             contentLayer.mask = shape
@@ -939,6 +961,16 @@ final class RemoteWindow {
 
     /// See `applyMaskNow`'s own doc comment for the full materiality definition this
     /// implements.
+    ///
+    /// UNIT (ADR-0015 §1, M1/L8): both sides of the comparison below are **mac pt** -- a
+    /// `LayerRect`'s layer-local points against an AppKit `NSSize` -- so `epsilon` is half a
+    /// **point**, not half a remote pixel and not half a backing pixel. It is a
+    /// floating-point-slop tolerance for a "do these two rects coincide" test, NOT a geometry
+    /// tolerance in ADR-0015 §6's sense (that one is L9's, priced by the owner at U6, and
+    /// expressed in remote px); nothing here should ever be re-derived from that constant.
+    /// At `remotePixelsPerPoint != 1` this comparison stays correct without change precisely
+    /// because both sides are points -- W3 would have to move a scale into the pipeline
+    /// UPSTREAM of here (ADR-0015 §7 (c)), never into this predicate.
     private static func isMaterialMask(_ result: WindowShape.MaskResult, contentSize: NSSize) -> Bool {
         switch result {
         case .none:
@@ -1058,6 +1090,48 @@ final class RemoteWindow {
     /// anywhere else) ever detecting or reporting it. Now that the content view's size is
     /// kept equal to `mappedSize` whenever one is known, this stretch's ratio degrades to
     /// 1:1 as a side effect -- not a change to this method itself.
+    ///
+    /// STRETCH SEMANTICS IN ADR-0015 §1'S VOCABULARY (M1/L8; documentation only -- the U5
+    /// ruling is record-only and no value in this method or in `init` changes). The paragraph
+    /// above says "stretches the cropped image to fill whatever size the layer has"; the three
+    /// quantities involved are in three different units, which is precisely the confusion
+    /// F1/F6 are made of, so they are now named:
+    ///
+    /// * SOURCE: the `mappedSize` sub-rect of the GFX surface -- **remote px** (GFX
+    ///   `mappedWidth`/`mappedHeight` are wire values). `contentsRect` below selects it in the
+    ///   contents' own *normalized* [0,1] space, which is unitless by construction and
+    ///   therefore neutral in this accounting.
+    /// * DESTINATION: `contentLayer.bounds` -- **mac pt**, tracking `contentView`'s size,
+    ///   which `RemoteWindowRegistry.macContentRect(for:windowId:)` keeps mapped-canonical.
+    /// * THE RATIO `.resize` APPLIES is therefore source remote px : destination mac pt --
+    ///   i.e. this window's own remote-pixels-per-point (`DisplayScale.remotePixelsPerPoint`,
+    ///   ADR-0015 §2). It is **1** on every configuration that exists today, for the two
+    ///   independent reasons ADR-0015 §0a/§0c record: we advertise no `DesktopScaleFactor`, so
+    ///   the server's raster is numerically our point grid, and the sole physical display is
+    ///   1x (`docs/plans/phase3.md:219`). That is why this comment can be added without
+    ///   changing a pixel: naming a ratio of 1 does not move anything.
+    /// * The third unit, **backing px**, enters only through `contentsScale`, which this
+    ///   project sets nowhere (repo-wide grep empty, ADR-0015 §0a) and which M1's MUST-NOT
+    ///   list forbids touching -- AppKit's own handling of a view-backing layer is what
+    ///   decides it today. Whether we should manage it, and whether the ratio above should
+    ///   stop being 1, are the same W3 question (ADR-0015 §8), gated on a real 2x session
+    ///   (§8.5: no such measurement exists yet).
+    ///
+    /// W3 TRIGGER, stated so the next reader does not have to re-derive it. There are TWO, and
+    /// the EARLIER one is what `docs/plans/phase3.md:130` is actually about:
+    /// * `backingPixelsPerPoint != 1` -- i.e. simply moving this window onto a Retina display.
+    ///   `.resize`'s true destination is the layer's backing store, and AppKit gives a
+    ///   view-backing layer `contentsScale == backingScaleFactor`, so a remote-px raster is
+    ///   already upsampled 2x there while `remotePixelsPerPoint` is still 1. That is
+    ///   `DisplayScale.retinaBackingOnly` (`DisplayTopology.swift:104-107`) and it is the
+    ///   `backingScaleFactor` factor phase3.md §1 F1 names; the "red today, green on delivery"
+    ///   assertion (`docs/plans/phase3.md:130`: an `NSWindow`'s backing-pixel size == its GFX
+    ///   `mappedSize`) is the measurement for THIS trigger, not the one below.
+    /// * `remotePixelsPerPoint != 1` -- the ratio named above stops being 1, i.e. the
+    ///   point-level mapping itself is no longer 1:1 and `.resize` upsamples/downsamples even
+    ///   before the backing store is considered.
+    /// Both are W3's (ADR-0015 §8); M1 changes neither, and today's sole display is 1x on both
+    /// counts (`docs/plans/phase3.md:219`).
     func present(surface: IOSurface, mappedSize: CGSize?, via session: CRSession) {
         let outgoing = displayedSurface
         CATransaction.begin()
@@ -1207,4 +1281,34 @@ final class RemoteWindow {
     // teardown ("call exactly once, from RemoteWindowRegistry only") and already removes
     // the observer; nothing in this codebase deallocates a RemoteWindow without going
     // through it first.
+}
+
+// MARK: - The mask pipeline's one crossing into CoreGraphics (M1/L8, ADR-0015 §9's L8 row)
+
+private extension CGRect {
+    /// The named conversion `applyMaskNow` builds its mask path through, replacing a bare
+    /// `CGRect(x:y:width:height:)` splat of a `LayerRect`'s four `Double`s.
+    ///
+    /// WHAT IT CONVERTS, in ADR-0015 §1's vocabulary: **mac pt → mac pt**. `LayerRect` is
+    /// already layer-local points (`MacdowsCore.WindowShape.LayerRect`'s own unit note); the
+    /// only thing crossed here is the module boundary — `MacdowsCore` is AppKit- and
+    /// CoreGraphics-free by charter (`Packages/MacdowsCore/Package.swift:21-24`, adr/0006 §2),
+    /// so it models this rect with four plain `Double`s and the App target is where they
+    /// become a `CGRect`. Hence the body is, and must remain, the **identity**: no scale, no
+    /// flip, no rounding. ADR-0015 §9's L8 row states the acceptance criterion in exactly
+    /// those terms — the mask conversion is the identity at `remotePixelsPerPoint == 1`
+    /// (today's only hardware, `docs/plans/phase3.md:219`), and whether any scale factor ever
+    /// enters this pipeline is W3's decision on the strength of a real 2x measurement
+    /// (ADR-0015 §7 (c), §8). This wave introduces none.
+    ///
+    /// WHAT IT IS NOT, because ADR-0015 §7 predicts this specific wrong turn: this is **not**
+    /// `WindowGeometry.macRect`. That function flips into mac SCREEN space around the primary
+    /// display's height; a mask path lives in the layer's own bottom-left-origin space and
+    /// adr/0010 §2 bans the substitution outright (`WindowShape.swift`'s `LayerRect` note,
+    /// pinned by `WindowShapeTests.maskFlipAnchorsOnContentHeightNotThePrimaryScreenHeight`).
+    /// The flip this pipeline does need already happened, once, inside
+    /// `WindowShape.computeMask`'s step 2 — anything further here would be a second one.
+    init(layerPoints rect: WindowShape.LayerRect) {
+        self.init(x: rect.x, y: rect.y, width: rect.width, height: rect.height)
+    }
 }
