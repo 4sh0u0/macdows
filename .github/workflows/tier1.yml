@@ -205,6 +205,15 @@ jobs:
         # Two mutation proofs (gate bypassed / kill removed) keep the pins honest.
         run: ./Scripts/lab/test-relay-offline.sh
 
+      - name: Lab probe offline suite
+        # probe.command's one-word verdict (BOUNDARY-REFUSED / REACHABLE / UNREACHABLE) gates every
+        # run-matrix.sh job, and the sibling suite writes that word itself through its `open` shim.
+        # This suite drives the REAL probe.command in a mktemp sandbox: `nc`/`osascript` are
+        # PATH-shimmed (the nc shim records argv and answers open/closed; it opens no socket), HOME is
+        # redirected to a sandbox host.env carrying an RFC 5737 address, TERM_PROGRAM is cleared, and
+        # one mutation proof (gate bypassed) keeps the refusal pin honest.
+        run: ./Scripts/lab/test-probe-offline.sh
+
       - name: Lab host-side PowerShell suites
         # The two host-side scripts that carry real consequences: Set-TsAllowListMatrix.ps1
         # (elevated, owner-manual, rewrites HKLM TSAppAllowList and owns the backup/restore
