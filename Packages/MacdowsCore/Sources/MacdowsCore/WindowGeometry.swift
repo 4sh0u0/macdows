@@ -97,12 +97,14 @@ public struct MacPoint: Equatable, Sendable {
 ///     come from `DisplayTopology.primary.size.height`; and
 ///     `DisplayTopology.unionBoundsInPoints` vends `DesktopUnionBoundsInPoints.Scalar`, not
 ///     `Double`, so a union height cannot be handed to anything that takes a length.
-///     **Scope of that claim, stated precisely because r1 review found it over-stated:** it
-///     holds for this API. The deprecated `primaryMonitorHeight:` shims below still accept a
-///     bare `Double` -- they must, or un-migrated call sites would not compile -- and they are
-///     therefore the one remaining door, which is exactly why the extension must be deleted in
-///     wave 2 (ADR §9's L9 row assigns the deletion). Feeding a union height through that door
-///     now requires the explicit `.inPoints` step, which reads as the deliberate act it is.
+///     **Scope of that claim, stated precisely because r1 review found the wave-1 version of it
+///     over-stated:** it held only for this API while the deprecated `primaryMonitorHeight:`
+///     shims still accepted a bare `Double` -- they had to, or un-migrated call sites would not
+///     compile, and they were therefore the one remaining door. **Wave 3 (L9) deleted them**
+///     once the last call site migrated (see the MARK below), so the claim is now unqualified:
+///     no entry point in this file takes a primary-display height. (Precise wording matters in this
+///     file: `MacRect`/`WindowsRect` obviously still take a `height` -- what no longer exists is a
+///     way to supply the Y-flip ANCHOR as a bare `Double`.)
 ///  2. **A scale dimension appeared.** `DisplayFlipAnchor.remotePixelsPerPoint` -- the
 ///     topology's `rasterScale`, i.e. the primary display's ratio (ADR §2 rule 2) -- divides on
 ///     the way in and multiplies on the way out, which is what makes `WindowsRect` (remote
@@ -113,8 +115,9 @@ public struct MacPoint: Equatable, Sendable {
 ///     `WindowGeometryTests` are offline coverage for the path W3 will eventually turn on,
 ///     not a claim that anything measures 2x today (`docs/plans/phase3.md:219`, §8.5).
 ///
-/// The pre-M1 `primaryMonitorHeight:` entry points survive as deprecated shims at the bottom
-/// of this file, purely so the tree keeps building across the wave boundary; see their note.
+/// The pre-M1 `primaryMonitorHeight:` entry points survived as deprecated shims at the bottom of
+/// this file for waves 1-2 and were deleted in wave 3; the MARK there records why they existed
+/// and why nothing of that shape may come back.
 public enum WindowGeometry {
     // MARK: - The four conversions (M1/W1 signatures)
     //
@@ -124,8 +127,9 @@ public enum WindowGeometry {
     // literal prohibitions -- no bare-`Double` height overload, and no `unionBounds` overload --
     // and both hold: a `DisplayFlipAnchor` is obtainable only from a `DisplayTopology`
     // (its initializer is internal), so `anchoredTo:` cannot express a scale or a height the
-    // topology did not produce. The form exists because the deprecated shims must forward into
-    // something, and because it is what lets the tests build an anchor once per case.
+    // topology did not produce. The form existed originally because the (now deleted) deprecated
+    // shims had to forward into something; it stays because it is what lets a caller -- and the
+    // tests -- build one anchor per case instead of re-deriving it per conversion.
 
     /// Converts a Windows-space rect (remote pixels) to macOS-space (points), anchored on the
     /// topology's primary display.
@@ -218,65 +222,23 @@ public enum WindowGeometry {
     }
 }
 
-// MARK: - Pre-M1 signatures, kept only across the wave boundary
-
-/// The four `primaryMonitorHeight: Double` entry points, unchanged in behavior, retained ONLY
-/// so that the App and `Tools/window-smoke` keep compiling between the moment this package
-/// gains a topology and the moment their own call sites migrate onto it (M1 waves 1 → 2:
-/// `RemoteWindowRegistry.swift:1262,1770,1827-1829` and
-/// `Tools/window-smoke/main.swift:2606-2608`).
-///
-/// ADR §9 ratifies keeping them and explains why the wave order forces it: `window-smoke` is
-/// L9's file and L9 is wave **3**, while the `window-smoke` target also compiles
-/// `RemoteWindowRendering` (`App/project.yml:395-397`), so deleting the bare-`Double` entry
-/// points in wave 1 would break wave 2's "full build" gate with an error no wave-2 lane owns a
-/// file to fix.
-///
-/// They are `deprecated` rather than merely commented so that the migration list is a compiler
-/// warning -- i.e. so it cannot be partially done and forgotten, which phase3.md §5 risk 5
-/// names as the specific failure mode of a cross-cutting unit change. Each forwards to a
-/// scale-1 anchor, which is what these call sites have always effectively passed.
-///
-/// **DO NOT MIGRATE A CALL SITE BY PASSING A UNION HEIGHT HERE.** These four are the only
-/// remaining place in this package where a bare length can reach the Y flip, and the most
-/// available wrong move while migrating is to silence the deprecation warning with whatever
-/// height is in scope. `DisplayTopology.unionBoundsInPoints` deliberately does not vend a
-/// `Double` for that reason (ADR §4.A.2), so reaching one requires writing `.inPoints`
-/// explicitly -- if a migration diff contains that, it is the exact mistake `DisplayFlipAnchor`
-/// exists to prevent. The migration target is always `…(in: topology)`.
-///
-/// **Delete this extension once the four call sites above are migrated** -- ADR §9's L9 row
-/// assigns the deletion to L9, and it is an explicit item on the wave-2/wave-3 exit gate, not
-/// merely this comment. `deprecatedShimsForwardToAScaleOneAnchor` in the tests goes with it.
-/// Nothing else should ever be added to this extension.
-extension WindowGeometry {
-    /// Builds the scale-1 anchor the pre-M1 signatures imply. Not `public`: a public
-    /// `Double`-taking anchor factory would reopen exactly the hole `DisplayFlipAnchor`'s
-    /// missing initializer closes.
-    static func legacyAnchor(primaryMonitorHeight: Double) -> DisplayFlipAnchor {
-        DisplayFlipAnchor(primaryHeightInPoints: primaryMonitorHeight, remotePixelsPerPoint: 1)
-    }
-
-    @available(*, deprecated, message: "M1/W1: pass a DisplayTopology (macRect(from:in:)) or its flipAnchor. This shim assumes remotePixelsPerPoint == 1 and disappears when the wave-2 call sites migrate.")
-    public static func macRect(from windowsRect: WindowsRect, primaryMonitorHeight: Double) -> MacRect {
-        macRect(from: windowsRect, anchoredTo: legacyAnchor(primaryMonitorHeight: primaryMonitorHeight))
-    }
-
-    @available(*, deprecated, message: "M1/W1: pass a DisplayTopology (windowsRect(from:in:)) or its flipAnchor. This shim assumes remotePixelsPerPoint == 1 and disappears when the wave-2 call sites migrate.")
-    public static func windowsRect(from macRect: MacRect, primaryMonitorHeight: Double) -> WindowsRect {
-        windowsRect(from: macRect, anchoredTo: legacyAnchor(primaryMonitorHeight: primaryMonitorHeight))
-    }
-
-    @available(*, deprecated, message: "M1/W1: pass a DisplayTopology (windowsPoint(from:in:)) or its flipAnchor. This shim assumes remotePixelsPerPoint == 1 and disappears when the wave-2 call sites migrate.")
-    public static func windowsPoint(from macPoint: MacPoint, primaryMonitorHeight: Double) -> WindowsPoint {
-        windowsPoint(from: macPoint, anchoredTo: legacyAnchor(primaryMonitorHeight: primaryMonitorHeight))
-    }
-
-    @available(*, deprecated, message: "M1/W1: pass a DisplayTopology (macPoint(from:in:)) or its flipAnchor. This shim assumes remotePixelsPerPoint == 1 and disappears when the wave-2 call sites migrate.")
-    public static func macPoint(from windowsPoint: WindowsPoint, primaryMonitorHeight: Double) -> MacPoint {
-        macPoint(from: windowsPoint, anchoredTo: legacyAnchor(primaryMonitorHeight: primaryMonitorHeight))
-    }
-}
+// MARK: - Pre-M1 signatures: DELETED in M1 wave 3 (L9)
+//
+// Four `primaryMonitorHeight: Double` entry points lived here, `@available(*, deprecated)`, from
+// wave 1 until wave 3. They existed only so the tree kept building across the wave boundary: the
+// `window-smoke` target compiles `RemoteWindowRendering` too (`App/project.yml:395-397`), so
+// removing the bare-`Double` entries in wave 1 would have broken wave 2's full-build gate with an
+// error no wave-2 lane owned a file to fix. ADR-0015 §9's L9 row assigned the deletion to the lane
+// that migrated the last call site (`Tools/window-smoke/main.swift`'s `evaluateMoveResizeLeg`),
+// and this is that deletion; a repo-wide grep over `App/`, `Packages/`, `Tools/` and `Scripts/`
+// found no remaining caller first.
+//
+// The point of recording it here rather than deleting silently: with the shims gone, **there is
+// no longer any way in this package to reach the Y flip with a bare length**. `DisplayFlipAnchor`
+// has no public initializer and `DisplayTopology.unionBoundsInPoints` vends `Scalar`, not
+// `Double`, so ADR §4.A.1/§4.A.2's two mechanisms now hold without the exception the header above
+// used to have to state. Nothing bare-`Double`-taking may be added back: that would reopen the
+// door on purpose, and the migration target is always `…(in: topology)`.
 
 /// Phase 2 W3 round 3 (2026-08-23, real-host regression, team-lead review): a signed,
 /// per-window correction between RAIL's own reported `WINDOW_ORDER_FIELD_WND_SIZE`

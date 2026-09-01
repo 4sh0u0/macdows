@@ -768,38 +768,14 @@ struct WindowGeometryTests {
         #expect(WindowGeometry.windowsPoint(from: MacPoint(x: windowsPoint.x, y: height - windowsPoint.y),
                                             anchoredTo: anchor) == windowsPoint)
     }
-    /// The four pre-M1 `primaryMonitorHeight:` entry points still exist, deprecated, purely so
-    /// the App and `Tools/window-smoke` keep compiling until their own call sites migrate
-    /// (M1 wave 2: `RemoteWindowRegistry.swift:1262,1770,1827-1829`,
-    /// `Tools/window-smoke/main.swift:2606-2608`). They are on the live window-placement path
-    /// for exactly that long, so "trivial forwarder" is not a reason to leave them unproven --
-    /// a mis-wired shim would be a real positioning bug with a plausible-looking diff.
-    ///
-    /// **Delete this test together with the shims.** It is annotated deprecated itself so that
-    /// exercising them here does not drown the wave-2 migration list in noise from this file;
-    /// the warnings that matter are the ones in `App/` and `Tools/`.
-    @available(*, deprecated, message: "Exercises the pre-M1 shims on purpose; delete with them in M1 wave 2.")
-    @Test("the deprecated primaryMonitorHeight shims forward to a scale-1 topology anchor, unchanged")
-    func deprecatedShimsForwardToAScaleOneAnchor() {
-        let height = 1440.0
-        let anchor = Self.anchor(height)
-
-        let windowsRect = WindowsRect(x: -337, y: 1201, width: 494, height: 500)
-        #expect(WindowGeometry.macRect(from: windowsRect, primaryMonitorHeight: height)
-                == WindowGeometry.macRect(from: windowsRect, anchoredTo: anchor))
-
-        let macRect = MacRect(x: 331.5, y: 917.25, width: 536, height: 521)
-        #expect(WindowGeometry.windowsRect(from: macRect, primaryMonitorHeight: height)
-                == WindowGeometry.windowsRect(from: macRect, anchoredTo: anchor))
-
-        let macPoint = MacPoint(x: 466, y: 489)
-        #expect(WindowGeometry.windowsPoint(from: macPoint, primaryMonitorHeight: height)
-                == WindowGeometry.windowsPoint(from: macPoint, anchoredTo: anchor))
-
-        let windowsPoint = WindowsPoint(x: -960, y: -540)
-        #expect(WindowGeometry.macPoint(from: windowsPoint, primaryMonitorHeight: height)
-                == WindowGeometry.macPoint(from: windowsPoint, anchoredTo: anchor))
-    }
+    // `deprecatedShimsForwardToAScaleOneAnchor` stood here from wave 1 until wave 3. It pinned the
+    // four `primaryMonitorHeight:` shims' forwarding to a scale-1 anchor for exactly as long as
+    // those shims sat on the live window-placement path. L9 deleted the shims once the last call
+    // site (`Tools/window-smoke/main.swift`'s `evaluateMoveResizeLeg`) migrated onto the topology
+    // entries, and this test went with them, as ADR-0015 §9's L9 row and the shims' own header
+    // both required. Nothing is left uncovered by its removal: it only ever asserted that the
+    // deleted forwarders agreed with the `anchoredTo:` entries the rest of this suite exercises
+    // directly.
 }
 
 // MARK: - Fixtures for the scale × offset matrix

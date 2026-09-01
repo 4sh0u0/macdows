@@ -30,11 +30,526 @@
 // resolve and before any CRSession exists, and exits 78 on a refusal. That gate lives here, and
 // not only in run-window-smoke.command, because this binary is directly runnable out of
 // DerivedData without the launcher.
+//
+// `WINDOW_SMOKE_SELFTEST=1` (M1 L9) runs this harness's own offline decision logic against
+// fixtures and exits, touching no credential, no host.env and no socket -- see
+// `WindowSmokeGateSelfTest` below for what it covers and why a tool target needs it at all.
 
 import AppKit
 import CoreGraphics
 import Foundation
 import MacdowsCore
+
+// MARK: - The offline decision logic this harness gates on (M1 L9; adr/0015 §6)
+//
+// Everything between here and `WindowSmokeGateSelfTest` is PURE: no AppKit, no session, no
+// clock, no host. It is lifted out of `WindowSmokeDelegate` for one reason -- `window-smoke` is
+// a tool target with no test bundle, so decision arithmetic that lives inside the delegate is
+// unreachable by `swift test` and unfalsifiable by anything short of a live host, which is
+// exactly the shape adr/0015 §9's L9 row must not have.
+//
+// Two rules this section is written to:
+//  1. **Every geometry conversion delegates to `MacdowsCore.WindowGeometry` / `DisplayTopology`**
+//     -- the already-tested entries -- and never re-implements a flip here. `evaluateMoveResizeLeg`'s
+//     round-7 note records what a second, ad hoc implementation costs.
+//  2. **Every decision made here is exercised offline** by `WindowSmokeGateSelfTest`, which
+//     `WINDOW_SMOKE_SELFTEST=1` runs below, BEFORE this file reads a credential, consults the lab
+//     boundary or constructs a session. That mode is the mutation-testing surface for the two
+//     load-bearing choices in this file (the tolerance's value, and the space the comparison
+//     happens in); see the self-test's own header.
+
+/// The move/resize round-trip gate: did an observed window rect reach the rect this harness
+/// asked for, judged **in remote pixels** (adr/0015 §6.1)?
+enum MoveResizeGate {
+    /// **The geometry tolerance. UNIT: remote px** (adr/0015 §1's vocabulary; §6.1 pins the unit,
+    /// `docs/plans/phase3.md:131` pins the gate this replaces).
+    ///
+    /// **VALUE = 0, and the value is the OWNER's, not this harness's.** U6, ruled 2026-09-01
+    /// 19:19 (recorded at adr/0015 §6's ruling note and `docs/plans/phase3.md:131`): the pre-M1
+    /// gate was "position and size each within `<= 1`", compared in mac points; M1 both changes
+    /// the unit and tightens the number, and the tightening half is a pricing decision that
+    /// belongs to the owner because only a live run can pay it.
+    ///
+    /// **RE-OPEN PATH, deliberately left visible rather than pre-applied:** if the live
+    /// checkpoints (C-1/C-3) show 0 is not reachable on a real host, `docs/plans/phase3.md:131`
+    /// is the clause to go back to the owner with -- it allows `<= 1` remote px, but only WITH
+    /// the jitter source recorded, i.e. "we measured N remote px of jitter and it comes from X",
+    /// never a bare loosening. Nothing in this file may raise this number on its own.
+    ///
+    /// Lives here, in the tool, rather than in `MacdowsCore`: it prices a smoke-test gate, not a
+    /// library contract. The package's own round-trip identities are asserted with `==` and no
+    /// tolerance at all (adr/0015 §9's offline-acceptance item 2), which is the stricter,
+    /// separate claim.
+    static let toleranceInRemotePixels: Double = 0
+
+    /// One leg's paired verdict (adr/0015 §6.3): a RECT comparison and the single-POINT reverse
+    /// mapping of the same target's top-left corner, kept as two separately-named results.
+    ///
+    /// **WHAT THE PAIRING DOES AND DOES NOT DO — stated exactly, because an earlier version of this
+    /// comment over-claimed it and review (rev-L9 I-2) disproved the claim by brute force.**
+    ///
+    /// The point half computes the same corner through a different package entry:
+    /// `WindowGeometry.windowsPoint` has **no `- height` term** (`WindowGeometry.swift`'s own note,
+    /// adr/0015 §4.5) and is the entry real mouse input travels (`RemoteWindowRegistry`'s
+    /// `windowsPoint` call site). But on **today's** formulas the two are algebraically identical
+    /// for a rect's top-left -- rect: `(H − macY − macH) * s`; point on `(x, macY + macH)`:
+    /// `(H − (macY + macH)) * s` -- so:
+    ///
+    ///  * it is NOT true that a live sign/anchor error in `windowsPoint` would show up here as a
+    ///    disagreement. A uniform error cancels in the observed-vs-target *delta*, and today's
+    ///    `rasterScale == 1` cancels a scale-placement error too. Review brute-forced 3M random
+    ///    triples: the ONLY rect-pass/point-fail cases are IEEE-754 association artifacts of ~1.1e-13
+    ///    (see `withinToleranceInRemotePixels`).
+    ///  * what the pairing DOES deliver is threefold, and all three are real: (1) adr/0015 §6.3's
+    ///    literal requirement -- both comparisons computed and asserted as a named pair, the leg
+    ///    failing if either fails, the output naming which; (2) a **guard against future divergence**
+    ///    of the two package entries, which are separate code paths that nothing else in the tree
+    ///    forces to agree; (3) offline, the point half's own **numbers** are pinned by
+    ///    `WindowSmokeGateSelfTest.pointPathPinsItsOwnNumbers` at 1x and 2x -- that pin is what
+    ///    actually caught a package-side `windowsPoint` scale-placement regression in review (R1),
+    ///    invisible at 1x.
+    ///
+    /// The honest summary: the point half's live value is contingent (it fires only if the two
+    /// package entries ever stop agreeing), its offline value is demonstrated. Neither is the
+    /// "detects present-day anchor bugs" claim this comment used to make.
+    struct LegVerdict: Equatable {
+        /// The observed rect, converted into Windows space (remote px) through the topology.
+        let observedInRemotePixels: WindowsRect
+        /// The target rect this leg asked for, same conversion, same topology.
+        let targetInRemotePixels: WindowsRect
+        /// The observed rect's TOP-LEFT corner, taken through the POINT path instead.
+        let observedTopLeftViaPointPath: WindowsPoint
+        /// The target rect's top-left corner through the point path.
+        let targetTopLeftViaPointPath: WindowsPoint
+        /// `true` when width/height are out of scope for this leg -- the move leg's round-6
+        /// finding (a pure move's size is the server's own prerogative).
+        let positionOnly: Bool
+        let rectCheckPassed: Bool
+        let pointCheckPassed: Bool
+
+        /// The leg's verdict: **a leg passes only if BOTH halves pass** (§6.3).
+        var passed: Bool { rectCheckPassed && pointCheckPassed }
+
+        /// Names WHICH half failed, so a red run never leaves that to be inferred.
+        ///
+        /// The disagreement clause deliberately does NOT say "one of the two flips must be wrong"
+        /// any more (rev-L9 I-2/M-3): the two flips are algebraically identical for a rect's
+        /// top-left today, so the only *reachable* cause of a divergence at tolerance 0 is IEEE-754
+        /// association (`(H − y − h)` vs `(H − (y + h))` differ by ~1e-13 for some non-dyadic
+        /// inputs). The first person to see this line must not be sent hunting an anchor bug that
+        /// cannot exist yet -- and must not "fix" it with an epsilon, which is a U6 re-open, not a
+        /// bug fix. Both possible causes are therefore named, smallest-first.
+        var pairedVerdictText: String {
+            var text = "rectCheck=\(rectCheckPassed ? "PASS" : "FAIL") pointCheck=\(pointCheckPassed ? "PASS" : "FAIL")"
+            if rectCheckPassed != pointCheckPassed {
+                text += " -- PATHS DISAGREE about the same rect. Two possible causes, in order of "
+                    + "likelihood: (a) IEEE-754 association between `(H − y − h)` and `(H − (y + h))` "
+                    + "at tolerance 0 -- check whether |pointDelta − rectDelta| is ~1e-13, and if so "
+                    + "this is representational, NOT an anchor bug, and NOT to be fixed with an "
+                    + "epsilon (that would overturn owner ruling U6; the re-open path is "
+                    + "docs/plans/phase3.md:131); (b) the two MacdowsCore entries "
+                    + "(`windowsRect` / `windowsPoint`) have genuinely diverged, which is the future "
+                    + "regression this pair exists to catch (adr/0015 §6.3)"
+            }
+            return text
+        }
+
+        /// The measured error, in remote px, next to the tolerance it was judged against.
+        var deltaText: String {
+            let dx = observedInRemotePixels.x - targetInRemotePixels.x
+            let dy = observedInRemotePixels.y - targetInRemotePixels.y
+            let dw = observedInRemotePixels.width - targetInRemotePixels.width
+            let dh = observedInRemotePixels.height - targetInRemotePixels.height
+            let pdx = observedTopLeftViaPointPath.x - targetTopLeftViaPointPath.x
+            let pdy = observedTopLeftViaPointPath.y - targetTopLeftViaPointPath.y
+            return "rectDelta=(dx=\(Self.fmt(dx)),dy=\(Self.fmt(dy))"
+                + (positionOnly ? "" : ",dw=\(Self.fmt(dw)),dh=\(Self.fmt(dh))")
+                + ") pointDelta=(dx=\(Self.fmt(pdx)),dy=\(Self.fmt(pdy))) remote px"
+                + " tolerance=\(Self.fmt(MoveResizeGate.toleranceInRemotePixels)) remote px (U6)"
+                + (positionOnly ? " [position-only leg: size is the server's prerogative, round 6]" : "")
+        }
+
+        private static func fmt(_ value: Double) -> String { String(format: "%.3f", value) }
+    }
+
+    /// mac screen space is bottom-left-origin/Y-up, so a rect's **top** edge -- the one Windows
+    /// space anchors on -- is `y + height`. Written once, here, rather than at each caller.
+    static func macTopLeft(of rect: MacRect) -> MacPoint {
+        MacPoint(x: rect.x, y: rect.y + rect.height)
+    }
+
+    /// `|a - b| <= tolerance`, both operands already in remote px. The comparison space is the
+    /// whole point: at `rasterScale == 1` remote px and mac pt are numerically identical, so this
+    /// function's inputs are what pins the unit, not its arithmetic.
+    ///
+    /// **THIS EXPRESSION IS THE GATE, not `toleranceInRemotePixels` alone** (rev-L9 I-1). Asserting
+    /// the constant's value proves nothing about the threshold actually in force: adding an epsilon
+    /// HERE loosens owner ruling U6 while every "the tolerance is 0" assertion stays green. That is
+    /// why `WindowSmokeGateSelfTest` pins the *effective* threshold with sub-remote-pixel rejection
+    /// cases (a 0.25 remote px error, and 1e-4/1e-7 through this function directly) rather than
+    /// only pinning the symbol. Any edit that widens this comparison -- by any amount, under any
+    /// justification -- is an owner decision, and the path for it is `docs/plans/phase3.md:131`.
+    ///
+    /// The one thing that will genuinely tempt such an edit, recorded so it is refused knowingly
+    /// (rev-L9 M-3): at tolerance 0 the rect flip `(H − y − h)` and the point flip `(H − (y + h))`
+    /// are algebraically equal but not bit-equal in IEEE-754, so non-dyadic inputs can differ by
+    /// ~1e-13 and produce a false red. Today that is essentially unreachable -- observed rects come
+    /// from integer RAIL values and AppKit targets on 1x hardware are integral or half-integral, all
+    /// exactly representable -- and adr/0015 §6.4(a) already owns the trigger that would change it
+    /// (a non-power-of-two `rasterScale` invalidates the 0-tolerance premise and must go back to the
+    /// owner). So: diagnose it, report it, do not absorb it.
+    static func withinToleranceInRemotePixels(_ a: Double, _ b: Double) -> Bool {
+        abs(a - b) <= toleranceInRemotePixels
+    }
+
+    /// Judges one observed rect against one target rect. **Both conversions go through the
+    /// session's frozen topology** -- the same value the desktop size was derived from (adr/0015
+    /// §5.A.4's same-source invariant), never a fresh screen read.
+    static func evaluate(
+        observed: MacRect, target: MacRect, in topology: DisplayTopology, positionOnly: Bool
+    ) -> LegVerdict {
+        let observedRect = WindowGeometry.windowsRect(from: observed, in: topology)
+        let targetRect = WindowGeometry.windowsRect(from: target, in: topology)
+        let observedPoint = WindowGeometry.windowsPoint(from: macTopLeft(of: observed), in: topology)
+        let targetPoint = WindowGeometry.windowsPoint(from: macTopLeft(of: target), in: topology)
+
+        // Position first, in Windows space, for both legs. Round 7's finding is why: mac-space Y
+        // entangles height (`macRect.y = primaryHeight - windowsY - height`), so comparing raw mac
+        // `y` for a rect whose height the server remapped mid-leg compares two different physical
+        // quantities. The Windows-space top edge is height-invariant by construction.
+        var rectPassed = withinToleranceInRemotePixels(observedRect.x, targetRect.x)
+            && withinToleranceInRemotePixels(observedRect.y, targetRect.y)
+        if !positionOnly {
+            rectPassed = rectPassed
+                && withinToleranceInRemotePixels(observedRect.width, targetRect.width)
+                && withinToleranceInRemotePixels(observedRect.height, targetRect.height)
+        }
+        let pointPassed = withinToleranceInRemotePixels(observedPoint.x, targetPoint.x)
+            && withinToleranceInRemotePixels(observedPoint.y, targetPoint.y)
+
+        return LegVerdict(
+            observedInRemotePixels: observedRect,
+            targetInRemotePixels: targetRect,
+            observedTopLeftViaPointPath: observedPoint,
+            targetTopLeftViaPointPath: targetPoint,
+            positionOnly: positionOnly,
+            rectCheckPassed: rectPassed,
+            pointCheckPassed: pointPassed
+        )
+    }
+}
+
+/// F2's visible half (`docs/plans/phase3.md:132`, adr/0015 §8's "measure, don't consume"): what
+/// the server's GFX surface maps actually said their **target** size was, aggregated over a run.
+///
+/// L3 promoted `targetWidth`/`targetHeight` from a log line to an event field; this is the
+/// consumer that makes the measurement visible. **Nothing here may influence rendering, sizing or
+/// coordinate conversion** -- that is W3's, and `crdpq.h`'s own note on these fields forbids it.
+///
+/// SENTINEL HANDLING, verbatim from `crdpq.h`/`CRSession.h`: `(0, 0)` means "no target hint
+/// accompanied this map" (the plain PDU, which has no such fields on the wire), and a consumer
+/// "must therefore check BOTH members against 0 before using either". So a sentinel pair is
+/// **counted, never treated as an observation** -- folding it in would report a 0x0 target size
+/// that no server ever sent. A pair with exactly ONE zero is neither: it is a malformed hint
+/// (`crdpq.h` notes the protocol does not forbid a server sending one and FreeRDP validates
+/// neither field), counted separately so it can never hide inside either bucket.
+struct GfxTargetHintTally {
+    struct SizeInRemotePixels: Hashable {
+        let width: UInt32
+        let height: UInt32
+    }
+
+    /// Every SURFACE_MAPPED event seen, both PDU variants.
+    private(set) var surfaceMapEventsSeen = 0
+    /// Events carrying the `(0, 0)` sentinel, i.e. the plain variant.
+    private(set) var hintAbsentEvents = 0
+    /// Events carrying exactly one zero dimension -- unusable, and not a sentinel.
+    private(set) var degenerateHintEvents = 0
+    /// Distinct usable target sizes, with the number of events that carried each.
+    private(set) var observations: [SizeInRemotePixels: Int] = [:]
+
+    var usableHintEvents: Int { observations.values.reduce(0, +) }
+
+    mutating func record(targetWidthInRemotePixels: UInt32, targetHeightInRemotePixels: UInt32) {
+        surfaceMapEventsSeen += 1
+        if targetWidthInRemotePixels == 0, targetHeightInRemotePixels == 0 {
+            hintAbsentEvents += 1
+            return
+        }
+        if targetWidthInRemotePixels == 0 || targetHeightInRemotePixels == 0 {
+            degenerateHintEvents += 1
+            return
+        }
+        let size = SizeInRemotePixels(width: targetWidthInRemotePixels, height: targetHeightInRemotePixels)
+        observations[size, default: 0] += 1
+    }
+
+    /// The `[gfx] target=` line, in one of its two well-formed shapes.
+    ///
+    /// **It is never empty and never absent** (`docs/plans/phase3.md:132` gates on it): "absent
+    /// because no scaled map ever arrived" and "absent because the measurement itself fell off"
+    /// would be indistinguishable to a log reader, and the second is precisely the regression
+    /// this line exists to make impossible. The counters ride along in both shapes so the
+    /// denominator is always stated.
+    var summaryLine: String {
+        var line = "[gfx] target= "
+        if observations.isEmpty {
+            line += surfaceMapEventsSeen == 0
+                ? "none (no surface-map events observed this run)"
+                : "none (no usable target hint on any of \(surfaceMapEventsSeen) surface-map event(s) -- "
+                    + "\(hintAbsentEvents) carried the (0,0) sentinel, i.e. the plain MapSurfaceToWindow PDU"
+                    + (degenerateHintEvents > 0
+                        ? ", \(degenerateHintEvents) carried an unusable one-zero hint" : "")
+                    + ")"
+        } else {
+            // Deterministic order (count desc, then size) so two runs' lines are diffable.
+            let ordered = observations.sorted {
+                $0.value != $1.value ? $0.value > $1.value
+                    : ($0.key.width != $1.key.width ? $0.key.width < $1.key.width : $0.key.height < $1.key.height)
+            }
+            line += ordered.map { "\($0.key.width)x\($0.key.height) remote px (n=\($0.value))" }
+                .joined(separator: ", ")
+        }
+        line += " [surfaceMapEvents=\(surfaceMapEventsSeen) hintAbsent=\(hintAbsentEvents) "
+            + "usableHint=\(usableHintEvents)"
+        if degenerateHintEvents > 0 {
+            line += " degenerateHint=\(degenerateHintEvents)"
+        }
+        return line + "] (measurement only, adr/0015 §8: nothing branches on it in M1)"
+    }
+}
+
+/// `WINDOW_SMOKE_SELFTEST=1`: runs the two pure gates above against fixtures and exits.
+///
+/// WHY THIS EXISTS. `window-smoke` has no test bundle and cannot get one without touching another
+/// lane's file (`App/project.yml`), yet L9's own instruction is that no assertion may be
+/// "structurally unfailable". This mode is the falsification surface: it is deterministic, needs
+/// no display, no host and no credential (it runs before `host.env` is even looked at), and each
+/// case below is written so that a specific mutation turns it red. The mutations verified when it
+/// was written, and the case that catches each:
+///
+///  * tolerance `0` -> `1` remote px   => `toleranceRejectsAOneRemotePixelError`
+///  * the comparison space put back in mac pt (compare `MacRect.y` instead of the Windows-space
+///    top edge) => `positionOnlyIsHeightInvariantInWindowsSpace`
+///  * the `(0,0)` sentinel counted as an observation => `sentinelPairIsNotAnObservation`
+///  * the paired verdict reduced to the rect half alone => `aLegFailsIfEitherHalfFails`
+///  * the point path's anchor/sign disturbed => `pointPathPinsItsOwnNumbers`
+///  * **the effective threshold loosened without touching the constant**
+///    (`<= toleranceInRemotePixels + 0.75`) => `toleranceRejectsAQuarterRemotePixelError` and
+///    `thePredicateItselfAdmitsOnlyAnExactMatch`. Added in fix round 1: review (rev-L9 I-1) found
+///    that mutation surviving, because every earlier error fixture injected exactly 1.0 remote px.
+///  * `MacdowsCore.windowsPoint` mis-scaling that is invisible at 1x (`(H − y) * s` -> `H − y * s`)
+///    => `pointPathPinsItsOwnNumbers at rasterScale 2` (found KILLED by review's own R1 mutation --
+///    the 2x pin is what makes a package-side regression visible offline).
+///
+/// **Known blind spot, stated rather than papered over** (rev-L9 I-2, R6): replacing the two
+/// `WindowGeometry.windowsPoint` calls with a copy of the rect conversion's own origin is an
+/// *equivalent* mutant -- identical values, so nothing here can see it. This surface pins the point
+/// half's NUMBERS, not that the point entry is the one travelled. Pinning the latter would need a
+/// seam this tool has no owned file to build.
+///
+/// Exit code 0/1, matching every other assertion path in this harness.
+enum WindowSmokeGateSelfTest {
+    static func run() -> Bool {
+        var ok = true
+        func expect(_ condition: Bool, _ name: String) {
+            print("[selftest] \(condition ? "PASS" : "FAIL"): \(name)")
+            if !condition { ok = false }
+        }
+
+        // A 1920x1080-point primary at 1x -- today's only real hardware shape
+        // (`docs/plans/phase3.md:219`) -- and its 2x twin, the mode-switch session M1 plans for.
+        guard
+            let topology1x = DisplayTopology.single(widthInPoints: 1920, heightInPoints: 1080),
+            let topology2x = DisplayTopology.single(
+                widthInPoints: 1920, heightInPoints: 1080, scale: .fullyScaled2x
+            )
+        else {
+            print("[selftest] FAIL: could not build the fixture topologies")
+            return false
+        }
+
+        // --- The tolerance, and the fact that it is 0 -----------------------------------------
+        expect(
+            MoveResizeGate.toleranceInRemotePixels == 0,
+            "the geometry tolerance is 0 remote px (owner ruling U6, 2026-09-01 19:19)"
+        )
+
+        let target = MacRect(x: 300, y: 400, width: 500, height: 600)
+        expect(
+            MoveResizeGate.evaluate(observed: target, target: target, in: topology1x, positionOnly: false).passed,
+            "an exactly-equal rect passes both halves of the paired verdict"
+        )
+
+        // One remote pixel of error, at 1x: must FAIL at tolerance 0. This is the case that goes
+        // green if the constant is loosened to 1, which is what makes the constant's value tested
+        // rather than merely written down.
+        let offByOneRemotePixel = MacRect(x: 301, y: 400, width: 500, height: 600)
+        let offByOne = MoveResizeGate.evaluate(
+            observed: offByOneRemotePixel, target: target, in: topology1x, positionOnly: false
+        )
+        expect(
+            !offByOne.rectCheckPassed && !offByOne.pointCheckPassed && !offByOne.passed,
+            "toleranceRejectsAOneRemotePixelError: a 1-remote-px X error fails BOTH halves at tolerance 0"
+        )
+
+        // Half a mac point at 2x is exactly one remote pixel -- the unit, not the number, decides
+        // this one, so it fails only because the comparison happens in remote px.
+        let halfPointAt2x = MacRect(x: 300.5, y: 400, width: 500, height: 600)
+        expect(
+            !MoveResizeGate.evaluate(
+                observed: halfPointAt2x, target: target, in: topology2x, positionOnly: false
+            ).passed,
+            "a half-POINT error at rasterScale 2 is one REMOTE PIXEL of error and fails"
+        )
+
+        // SUB-remote-pixel rejection (rev-L9 I-1). Everything above injects exactly 1.0 remote px of
+        // error, so any effective threshold in the open interval (0, 1) satisfied all of it -- the
+        // mutation `abs(a-b) <= toleranceInRemotePixels + 0.75` left the whole battery green while
+        // silently overturning U6. These cases pin the threshold ACTUALLY IN FORCE, not the symbol.
+        let quarterRemotePixelOff = MacRect(x: 300.25, y: 400, width: 500, height: 600)
+        let quarter = MoveResizeGate.evaluate(
+            observed: quarterRemotePixelOff, target: target, in: topology1x, positionOnly: false
+        )
+        expect(
+            !quarter.rectCheckPassed && !quarter.pointCheckPassed && !quarter.passed,
+            "toleranceRejectsAQuarterRemotePixelError: 0.25 remote px of X error fails BOTH halves "
+                + "-- the gate is the comparison, not the constant"
+        )
+        // Straight at the predicate, at two more decades, so a smaller epsilon has nowhere to hide.
+        // Bound stated honestly: this kills any loosening down to ~1e-7 remote px; a smaller one
+        // than that is not detectable here and is not distinguishable from association noise either
+        // (see `withinToleranceInRemotePixels`' own note).
+        expect(
+            MoveResizeGate.withinToleranceInRemotePixels(0, 0)
+                && !MoveResizeGate.withinToleranceInRemotePixels(0, 0.0001)
+                && !MoveResizeGate.withinToleranceInRemotePixels(100, 100.0000001),
+            "thePredicateItselfAdmitsOnlyAnExactMatch: equal passes; 1e-4 and 1e-7 remote px of "
+                + "error are both rejected at tolerance 0"
+        )
+
+        // --- The comparison space (adr/0015 §6.1, round-7 finding) ----------------------------
+        // Same Windows-space top edge, different height: mac-space `y` differs by exactly the
+        // height delta, Windows-space `y` does not move at all. A position-only leg must pass.
+        // Comparing in mac pt here yields dy = 40 and a false red -- this is the mutation guard
+        // for "put the comparison back in mac points".
+        let remappedShorter = MacRect(x: 300, y: 440, width: 500, height: 560)
+        let heightInvariant = MoveResizeGate.evaluate(
+            observed: remappedShorter, target: target, in: topology1x, positionOnly: true
+        )
+        expect(
+            heightInvariant.passed
+                && heightInvariant.observedInRemotePixels.y == heightInvariant.targetInRemotePixels.y
+                && remappedShorter.y != target.y,
+            "positionOnlyIsHeightInvariantInWindowsSpace: a mid-leg height remap moves mac y but not "
+                + "the Windows-space top edge, and the position-only leg passes"
+        )
+        expect(
+            !MoveResizeGate.evaluate(
+                observed: remappedShorter, target: target, in: topology1x, positionOnly: false
+            ).rectCheckPassed,
+            "the full-rect leg still fails on that same height change -- position-only is a scope, not a loophole"
+        )
+
+        // --- The paired assertion (adr/0015 §6.3) ---------------------------------------------
+        // Hand-computed, not derived from the code under test: Windows top edge for the target is
+        // 1080 - 400 - 600 = 80, and the point path reaches the same 80 through 1080 - (400+600)
+        // with no `- height` term of its own. Both numbers are literals here on purpose -- an
+        // anchor or sign change in either path moves one of them.
+        let pinned = MoveResizeGate.evaluate(
+            observed: target, target: target, in: topology1x, positionOnly: false
+        )
+        expect(
+            pinned.targetInRemotePixels == WindowsRect(x: 300, y: 80, width: 500, height: 600)
+                && pinned.targetTopLeftViaPointPath == WindowsPoint(x: 300, y: 80),
+            "pointPathPinsItsOwnNumbers: rect top-left (300,80) and point-path top-left (300,80) remote px"
+        )
+        // At 2x the same rect is a different set of remote pixels, and the two paths must still
+        // agree: x*2 = 600, (1080 - 400 - 600)*2 = 160.
+        let pinned2x = MoveResizeGate.evaluate(
+            observed: target, target: target, in: topology2x, positionOnly: false
+        )
+        expect(
+            pinned2x.targetInRemotePixels == WindowsRect(x: 600, y: 160, width: 1000, height: 1200)
+                && pinned2x.targetTopLeftViaPointPath == WindowsPoint(x: 600, y: 160),
+            "pointPathPinsItsOwnNumbers at rasterScale 2: (600,160) remote px on both paths"
+        )
+
+        let rectOnlyFailed = MoveResizeGate.LegVerdict(
+            observedInRemotePixels: WindowsRect(x: 0, y: 0, width: 1, height: 1),
+            targetInRemotePixels: WindowsRect(x: 0, y: 0, width: 1, height: 1),
+            observedTopLeftViaPointPath: WindowsPoint(x: 0, y: 0),
+            targetTopLeftViaPointPath: WindowsPoint(x: 0, y: 0),
+            positionOnly: false, rectCheckPassed: false, pointCheckPassed: true
+        )
+        let pointOnlyFailed = MoveResizeGate.LegVerdict(
+            observedInRemotePixels: WindowsRect(x: 0, y: 0, width: 1, height: 1),
+            targetInRemotePixels: WindowsRect(x: 0, y: 0, width: 1, height: 1),
+            observedTopLeftViaPointPath: WindowsPoint(x: 0, y: 0),
+            targetTopLeftViaPointPath: WindowsPoint(x: 0, y: 0),
+            positionOnly: false, rectCheckPassed: true, pointCheckPassed: false
+        )
+        expect(
+            !rectOnlyFailed.passed && !pointOnlyFailed.passed
+                && rectOnlyFailed.pairedVerdictText.contains("rectCheck=FAIL")
+                && pointOnlyFailed.pairedVerdictText.contains("pointCheck=FAIL")
+                && pointOnlyFailed.pairedVerdictText.contains("PATHS DISAGREE"),
+            "aLegFailsIfEitherHalfFails: either half failing fails the leg, and the text names which"
+        )
+
+        // --- The `[gfx] target=` tally --------------------------------------------------------
+        var empty = GfxTargetHintTally()
+        expect(
+            empty.summaryLine.hasPrefix("[gfx] target= ") && empty.summaryLine.contains("none (no surface-map events"),
+            "the target line is well-formed and explicit when no surface map was seen at all"
+        )
+
+        empty.record(targetWidthInRemotePixels: 0, targetHeightInRemotePixels: 0)
+        empty.record(targetWidthInRemotePixels: 0, targetHeightInRemotePixels: 0)
+        expect(
+            empty.observations.isEmpty && empty.hintAbsentEvents == 2 && empty.usableHintEvents == 0
+                && empty.summaryLine.contains("none (no usable target hint on any of 2 surface-map event(s) -- 2 carried the (0,0) sentinel"),
+            "sentinelPairIsNotAnObservation: (0,0) is counted as hint-absent, never as a 0x0 target"
+        )
+
+        var tally = GfxTargetHintTally()
+        tally.record(targetWidthInRemotePixels: 1664, targetHeightInRemotePixels: 960)
+        tally.record(targetWidthInRemotePixels: 1664, targetHeightInRemotePixels: 960)
+        tally.record(targetWidthInRemotePixels: 1280, targetHeightInRemotePixels: 720)
+        tally.record(targetWidthInRemotePixels: 0, targetHeightInRemotePixels: 0)
+        tally.record(targetWidthInRemotePixels: 1280, targetHeightInRemotePixels: 0)
+        expect(
+            tally.observations[.init(width: 1664, height: 960)] == 2
+                && tally.observations[.init(width: 1280, height: 720)] == 1
+                && tally.hintAbsentEvents == 1 && tally.degenerateHintEvents == 1
+                && tally.surfaceMapEventsSeen == 5 && tally.usableHintEvents == 3,
+            "the tally separates usable hints, the (0,0) sentinel and a one-zero degenerate hint"
+        )
+        expect(
+            tally.summaryLine.hasPrefix("[gfx] target= 1664x960 remote px (n=2), 1280x720 remote px (n=1)")
+                && tally.summaryLine.contains("hintAbsent=1") && tally.summaryLine.contains("degenerateHint=1"),
+            "the observed form lists distinct sizes with counts, most frequent first, plus the denominators"
+        )
+
+        print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
+        // rev-L9 M-4: `Scripts/run-window-smoke.command:159` records `DONE exit=$?` and its callers
+        // read that line as the whole verdict. A `WINDOW_SMOKE_SELFTEST=1` leaked into the
+        // launcher's environment would therefore print `DONE exit=0` for a run that connected to
+        // nothing -- and both modes end in a line matching `overall: PASS`. The banner is the
+        // cheapest unambiguous discriminator, and it is deliberately the LAST line of the mode.
+        print("[selftest] NOTE: SELF-TEST-ONLY run (WINDOW_SMOKE_SELFTEST=1) -- no host was "
+            + "contacted, no session was created, and NO live smoke test ran. A zero exit code here "
+            + "says nothing whatsoever about the live battery; a real run prints [assert] lines.")
+        return ok
+    }
+}
+
+// Runs before ANY of the environment/credential/boundary work below: this mode never reads
+// host.env, never resolves a credential and never constructs a session, which is what makes it
+// safe to run in an offline lane (and what makes it usable as a mutation-test surface at all).
+if ProcessInfo.processInfo.environment["WINDOW_SMOKE_SELFTEST"] == "1" {
+    exit(WindowSmokeGateSelfTest.run() ? 0 : 1)
+}
 
 // Three MacdowsCore rules and no local copy of any of them: MacdowsPaths says WHERE host.env
 // is, EnvFile.parse says HOW it is read, EnvFile.value says WHICH of the environment variable
@@ -415,6 +930,32 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private var drainTimer: Timer?
     private var startTime: Date!
 
+    /// M1 L9 (adr/0015 §5.A.5, §9's L6/L9 rows): **this run's one and only display-topology
+    /// reader**, replacing the two raw `NSScreen.screens.first` reads this file used to make (one
+    /// for the desktop size, one for the Y-flip anchor inside `evaluateMoveResizeLeg`) -- two
+    /// independent reads of a layout that can change between them, which is the defect §5.A.4
+    /// turns into an invariant.
+    ///
+    /// **The LIVE provider, deliberately not `StaticDisplayTopologyProvider`** -- and this is the
+    /// one place where this harness must NOT copy `AppDelegate.swift`'s shape. The App builds a
+    /// fresh registry per connect and never reconnects in place, so wrapping the frozen snapshot
+    /// there is exactly right. This harness REUSES one registry across a `WINDOW_SMOKE_CYCLES`
+    /// soak (`RemoteWindowRegistry.swift:479-508`), and its `prepareForReconnect()` re-take reads
+    /// `topologyProvider.currentTopology`: behind a static wrapper that re-take would return the
+    /// first cycle's data forever while `sessionTopologyFreezeCount` still counted up, i.e. the
+    /// pin would pass on a re-take that measured nothing. The invariant is preserved instead by
+    /// ORDER, which `freezeAndApplyDesktopSize(to:reason:)` owns: freeze, re-assign the desktop
+    /// size, then `prepareForReconnect()`, in one main-actor turn.
+    private let displayTopology = DisplayTopologyProvider()
+
+    /// The desktop size (remote px) this run last froze and handed to `CRSession`, or `nil` if a
+    /// freeze ever found no usable display (adr/0015 §5.A.6: in that state nothing is sent).
+    private var sessionDesktopSizeInRemotePixels: DesktopSizeInRemotePixels?
+
+    /// F2's measurement (`docs/plans/phase3.md:132`): every SURFACE_MAPPED event's target hint,
+    /// aggregated for the one `[gfx] target=` line every run prints at summary time.
+    private var gfxTargetHints = GfxTargetHintTally()
+
     // Phase 1 acceptance state (see the extraApps/cyclesTotal globals' doc comments).
     private var extraAppsLaunched = false
     /// windowIds already present the moment the extra apps were exec'd -- the multi-window
@@ -697,14 +1238,45 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// change during the move leg is expected/legitimate, not a failure, but still worth
     /// surfacing).
     private var moveResizeOriginalMappedSize: CGSize?
-    /// `(matched, oscillated)` per leg -- `matched`: did any WindowUpdate-applied content
-    /// rect for the target window round-trip to that leg's target within ±1pt inside the 3s
-    /// budget. `oscillated`: did any LATER observed content rect in the same leg diverge
-    /// from the target again after the first match (a real generic ping-pong detector isn't
-    /// needed here -- this bounded window only needs "reaches the one target this leg cares
-    /// about, and stays there").
-    private var moveResult: (matched: Bool, oscillated: Bool)?
-    private var resizeResult: (matched: Bool, oscillated: Bool)?
+    /// One leg's resolved outcome -- `matched`: did any WindowUpdate-applied content rect for
+    /// the target window round-trip to that leg's target inside the 3s budget, judged in remote
+    /// px within `MoveResizeGate.toleranceInRemotePixels` (M1 L9: the old judgement was "±1pt",
+    /// two changes at once -- unit and value, adr/0015 §6.1 + owner ruling U6). `oscillated`:
+    /// did any LATER observed content rect in the same leg diverge from the target again after
+    /// the first match (a real generic ping-pong detector isn't needed here -- this bounded
+    /// window only needs "reaches the one target this leg cares about, and stays there").
+    ///
+    /// The two named halves of adr/0015 §6.3's paired assertion ride along, because `finish()`
+    /// must be able to say WHICH half failed, and `deductionsText` carries §6.2's deduction
+    /// record for the exact comparison that produced the verdict.
+    struct MoveResizeLegOutcome {
+        /// §6.3's RECT half, and the direct descendant of the pre-M1 `matched`: did any observed
+        /// rect reach this leg's target inside the budget, judged in remote px at
+        /// `MoveResizeGate.toleranceInRemotePixels`?
+        let rectCheckPassed: Bool
+        /// §6.3's POINT half, judged on **the same observed rect** the rect half selected (or, if
+        /// the leg never matched, on the same last rect the rect half was judged against) -- the
+        /// pairing is only meaningful if both halves speak about one observation.
+        let pointCheckPassed: Bool
+        let oscillated: Bool
+        /// Human-readable paired verdict + measured deltas + the deductions in force (§6.2).
+        let detail: String
+
+        /// The leg's own verdict: both halves, per §6.3.
+        var passed: Bool { rectCheckPassed && pointCheckPassed }
+    }
+    private var moveResult: MoveResizeLegOutcome?
+    private var resizeResult: MoveResizeLegOutcome?
+    /// The most recent `ClientWindowMove` this run actually put on the wire for the move/resize
+    /// target, verbatim (adr/0015 §6.2's deduction record): the harness knows what Windows-space
+    /// rect it ASKED for, so the difference between that and these four integers IS the deduction
+    /// the send path applied, measured rather than restated. Restating it would mean copying
+    /// `RemoteWindowRegistry.measuredClientWindowMoveLeftBorder` (F6 (a)) into a second file, and
+    /// U5's record-only ruling forbids this lane from moving -- or duplicating -- that number.
+    /// Timestamped so a verdict can say whether the send it is quoting belongs to the leg being
+    /// judged or to an earlier one -- an unlabelled "the deduction was N" taken from the previous
+    /// leg's send is exactly the silent absorption §6.2 forbids.
+    private var lastClientWindowMoveSent: (left: Int32, top: Int32, right: Int32, bottom: Int32, at: Date)?
     /// Team-lead review round 4 (2026-08-23, no-false-red discipline): whether the real
     /// target window's `NSWindow.styleMask` actually included `.resizable` at the moment
     /// the resize leg was sent (About never does -- StyleTranslatorTests'
@@ -971,7 +1543,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             print("[config] forceUnicodeInputUnsupported=YES (adr/0011 §5 item 7 degradation scenario)")
         }
         session = newSession
-        registry = RemoteWindowRegistry(session: newSession)
+        // M1 L9 (adr/0015 §3 rules 1-4, §5.A.4): freeze this session's topology and hand the
+        // derived desktop size to `CRSession` BEFORE the registry is built. Order is load-bearing
+        // in both directions. `RemoteWindowRegistry.init` freezes its own snapshot from
+        // `topologyProvider.currentTopology` (`RemoteWindowRegistry.swift:389`), and
+        // `freezeSessionSnapshot()` is what refreshes that value -- so freezing first is what
+        // makes the Y-flip anchor and the desktop size come from one `NSScreen` read rather than
+        // two. Assigning the size first additionally arms the registry's own divergence check
+        // (`RemoteWindowRegistry.swift:509-534`), which is skipped while `desktopWidth` is still 0.
+        freezeAndApplyDesktopSize(to: newSession, reason: "connect")
+        registry = RemoteWindowRegistry(session: newSession, topologyProvider: displayTopology)
         // TEMPORARY debug instrumentation (2026-08-23 Z-order reversal investigation) --
         // see RemoteWindowRegistry.zOrderTraceEnabled's own doc comment. Only for the
         // multi-window scenario (task requirement: "keep it cheap, only in the multiwin
@@ -990,6 +1571,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // clock every other timestamped line in this file already uses.
         registry.onWindowMoveSent = { [weak self] windowId, left, top, right, bottom in
             guard let self, moveResizeScenarioEnabled, windowId == self.moveResizeWindowId else { return }
+            // adr/0015 §6.2: kept, not just printed, so each leg's verdict can state the deduction
+            // the send path actually applied (this rect vs the one the leg asked for).
+            self.lastClientWindowMoveSent = (left: left, top: top, right: right, bottom: bottom, at: Date())
             let elapsed = self.startTime.map { Date().timeIntervalSince($0) } ?? -1
             print(
                 "[move-resize] sent ClientWindowMove at elapsed=\(String(format: "%.3f", elapsed))s "
@@ -1019,13 +1603,13 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // are actually posted, already hopped to the main queue and coalesced -- "one
         // burst, one dispatch" -- so drainNow() runs promptly instead of waiting out
         // whatever fraction of a fixed poll interval remained.
-        // Remote desktop sized to the primary screen, matching the production
-        // AppDelegate (server clamps remote windows to this desktop; see
-        // CRSession.desktopWidth's doc for the drag-wall/click-desync failure mode).
-        if let screen = NSScreen.screens.first {
-            newSession.desktopWidth = UInt32(max(0, screen.frame.width))
-            newSession.desktopHeight = UInt32(max(0, screen.frame.height))
-        }
+        // The remote desktop size used to be set HERE, from `NSScreen.screens.first.frame` --
+        // the primary screen's height and width in mac POINTS, one screen only, read a second
+        // time and independently of the flip anchor. M1 L9 replaced it with the frozen topology's
+        // union in remote pixels (adr/0015 §3, U3 = P), assigned above at
+        // `freezeAndApplyDesktopSize(to:reason:)`, before the registry exists. The server still
+        // clamps remote windows to this desktop -- see `CRSession.desktopWidth`'s own doc for the
+        // drag-wall/click-desync failure mode an undersized one produces.
         newSession.onEventsAvailable = { [weak self] in
             MainActor.assumeIsolated {
                 self?.drainNow()
@@ -1075,6 +1659,84 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// is ready to that frame actually being presented" number the poll-vs-push
     /// architecture change directly controls, and the fair, like-for-like point of
     /// comparison against the old timer's own ~100ms average wait.
+    /// M1 L9's half of adr/0015 §5.A.4, and the whole of what `RemoteWindowRegistry.swift:500-508`
+    /// calls "what the caller still owes".
+    ///
+    /// Takes this connection's topology snapshot and assigns the desktop size derived from THAT
+    /// SAME read to `CRSession` (§3 rule 3's `desktopSizePx`, remote px). Called at exactly the
+    /// two connect moments this harness has: once before the registry is constructed, and once
+    /// per soak cycle immediately before `prepareForReconnect()` -- in that order, in the same
+    /// main-actor turn. The registry cannot re-send a desktop size itself (that is renegotiation,
+    /// W4's, and M1's MUST-NOT list forbids it), so a reconnect keeps the anchor and the desktop
+    /// size from one read only because this runs first.
+    ///
+    /// `nil` return = no usable display, and then **nothing is assigned** (§5.A.6): `0 x 0` would
+    /// make FreeRDP fall back to a 1024x768 desktop (`CRSession.h:285-286`), which is the original
+    /// invisible-wall fault under a new name. On a reconnect that means the connection keeps the
+    /// size the previous freeze gave it -- stale, and said so on the line below, rather than
+    /// silently wrong.
+    @discardableResult
+    private func freezeAndApplyDesktopSize(to session: CRSession, reason: String) -> DesktopSizeInRemotePixels? {
+        let desktop = displayTopology.freezeSessionSnapshot()
+        sessionDesktopSizeInRemotePixels = desktop
+        if let desktop {
+            // `UInt32(clamping:)` cannot actually clamp -- `DisplayTopology` guarantees
+            // `0 < value <= maxExtentInRemotePixels` -- and is written this way so that if that
+            // guarantee is ever relaxed the connect path degrades instead of trapping. Same shape
+            // as `AppDelegate.swift:264-265`, deliberately.
+            session.desktopWidth = UInt32(clamping: desktop.width)
+            session.desktopHeight = UInt32(clamping: desktop.height)
+            print(
+                "[topology] \(reason): desktop size frozen at \(desktop.width)x\(desktop.height) remote px "
+                    + "(adr/0015 §3 rule 3, union of the local screens; anchor and size from one read, §5.A.4)"
+            )
+        } else {
+            print(
+                "[topology] \(reason): no usable display -- desktopWidth/Height deliberately NOT set "
+                    + "(adr/0015 §5.A.6: 0x0 falls back to FreeRDP's 1024x768 desktop, CRSession.h:285-286). "
+                    + "Any previously negotiated size is now stale."
+            )
+        }
+        return desktop
+    }
+
+    /// The one `[gfx] target=` line (F2's visible half, `docs/plans/phase3.md:132`), printed once
+    /// per RUN from every terminal path -- `finish()` and `finishCycles()` both call it. Never
+    /// conditional: see `GfxTargetHintTally.summaryLine` for why an absent line is worse than a
+    /// "none" line.
+    private func printGfxTargetSummary() {
+        print(gfxTargetHints.summaryLine)
+    }
+
+    /// The ADR §5 reconnect re-take, pinned. `RemoteWindowRegistry.sessionTopologyFreezeCount`
+    /// (`RemoteWindowRegistry.swift:462-477`) counts 1 for `init` plus one per
+    /// `prepareForReconnect()`; the App target has no test bundle, so this harness is the only
+    /// assertion surface that re-take has. `expectedReconnects` is the number of cycles that
+    /// actually finished (0 for a single-run), not `WINDOW_SMOKE_CYCLES`, so an aborted soak
+    /// still states an exact expectation rather than an approximate one.
+    ///
+    /// **PROVENANCE — this assertion is L7's handoff, not L9 inventing a gate.** L7 could not pin
+    /// its own seam (no test bundle) and wrote the pin's exact form into the registry: "after an
+    /// N-cycle `WINDOW_SMOKE_CYCLES` soak (one `prepareForReconnect()` per finished cycle),
+    /// `sessionTopologyFreezeCount == N + 1`. A value of 1 means the re-take never fired … Handed
+    /// to L9 in `task-L7-report.md` as a wave-3 harness item" (`RemoteWindowRegistry.swift:462-477`),
+    /// and the caller's own obligation that this pin guards is stated at
+    /// **`RemoteWindowRegistry.swift:500-508` (the `:503` L9 contract)**: freeze and re-assign the
+    /// desktop size in the same turn, before `prepareForReconnect()`. This is the observable half
+    /// of that contract. It is a NEW gating assertion for live runs (rev-L9 M-2, adjudicated
+    /// ACCEPTED by the controller): a soak whose re-take is broken now goes red where before it
+    /// went green, which is the point.
+    private func topologyFreezeCountCheck(expectedReconnects: Int) -> (passed: Bool, message: String) {
+        let expected = expectedReconnects + 1
+        let actual = registry.sessionTopologyFreezeCount
+        return (
+            actual == expected,
+            "adr/0015 §5 reconnect re-take: sessionTopologyFreezeCount == \(expected) "
+                + "(1 connect + \(expectedReconnects) prepareForReconnect(); got \(actual)). "
+                + "A count of 1 after a soak means the re-take never fired"
+        )
+    }
+
     private func drainNow() {
         guard let session, let registry, startTime != nil else { return }
         let pushObservedAt = Date()
@@ -1086,6 +1748,17 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             if event.kind == .frameReady {
                 self.frameReadyCount += 1
                 sawFrameReady = true
+            }
+            // F2 (`docs/plans/phase3.md:132`, adr/0015 §8): record what the GFX map order said its
+            // TARGET size was. `CRDPEventKindSurfaceMapped` covers both PDU variants, and the
+            // plain one reports `(0, 0)` -- the sentinel, handled inside the tally, never treated
+            // as a 0x0 observation. MEASUREMENT ONLY: nothing downstream may branch on this in M1
+            // (`CRSession.h:230-233`), and nothing here does -- it feeds one summary line.
+            if event.kind == .surfaceMapped {
+                self.gfxTargetHints.record(
+                    targetWidthInRemotePixels: event.targetWidth,
+                    targetHeightInRemotePixels: event.targetHeight
+                )
             }
             // W4c deliverable 5: registry.handle(event) above already removed this
             // windowId from its own tracking for a windowDelete -- this just separately
@@ -1664,6 +2337,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // discarded (2026-08-22 review BLOCKER -- an earlier "forced drain" here delivered
         // zero events and proved nothing). The registry offers an explicit reset for
         // exactly this driver; the empty-check right after is the structural sanity assert.
+        //
+        // M1 L9 / adr/0015 §5.A.4, and the contract `RemoteWindowRegistry.swift:500-508` states
+        // in the caller's direction: `prepareForReconnect()` re-freezes the registry's snapshot
+        // from the LIVE provider, and this registry is reused across the whole soak. Re-deriving
+        // the desktop size here, immediately before it and in the same turn, is what keeps the
+        // next connection's Y-flip anchor and its negotiated desktop size from one `NSScreen`
+        // read. Reversing these two lines would freeze the registry against the OLD layout and
+        // then tell the server about the new one -- the exact divergence §5.A.4 forbids, and one
+        // that no offline test can catch because the registry's own freeze-count still counts up.
+        freezeAndApplyDesktopSize(to: session, reason: "cycle \(cycleIndex) reconnect")
         registry.prepareForReconnect()
         let leftover = registry.windowSnapshots().count
         cycleResults.append((rendered: rendered, closed: closed, clean: clean && leftover == 0,
@@ -1788,6 +2471,20 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             print("[assert] \(cond ? "PASS" : "FAIL"): \(message)")
             if !cond { ok = false }
         }
+
+        // M1 F2: the same one-per-run line `finish()` prints -- cycle mode exits through HERE, so
+        // omitting it would make the measurement silently mode-dependent.
+        printGfxTargetSummary()
+        print("[topology] session desktop size after \(cycleResults.count) cycle(s): "
+            + (sessionDesktopSizeInRemotePixels.map { "\($0.width)x\($0.height) remote px" }
+                ?? "<not set -- no usable display at the last freeze, adr/0015 §5.A.6>"))
+        // adr/0015 §5's reconnect re-take, pinned against the soak that actually ran: one freeze
+        // at connect plus one per finished cycle (`finishCycle` calls `freezeAndApplyDesktopSize`
+        // then `prepareForReconnect()`). This is the assertion the registry's own doc comment
+        // hands to this harness -- the App target has no test bundle, so there is no other place
+        // it can be made.
+        let freezePin = topologyFreezeCountCheck(expectedReconnects: cycleResults.count)
+        check(freezePin.passed, freezePin.message)
 
         let renderedCount = cycleResults.filter(\.rendered).count
         let closedCount = cycleResults.filter(\.closed).count
@@ -2109,9 +2806,12 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         case .awaitingMoveSettle(let windowId, let target, let sentAt):
             // Team-lead review round 6: position-only match -- see evaluateMoveResizeLeg's
             // own doc comment for why size is out of scope for a pure move.
-            guard let outcome = evaluateMoveResizeLeg(target: target, sentAt: sentAt, matchPositionOnly: true) else { return }
+            guard let outcome = evaluateMoveResizeLeg(
+                windowId: windowId, target: target, sentAt: sentAt, matchPositionOnly: true
+            ) else { return }
             moveResult = outcome
-            print("[move-resize] move leg resolved (position-only): matched=\(outcome.matched) oscillated=\(outcome.oscillated)")
+            print("[move-resize] move leg resolved (position-only): legPassed=\(outcome.passed) "
+                + "oscillated=\(outcome.oscillated) \(outcome.detail)")
             if let mapped = registry.debugMappedSize(forWindowId: windowId), let originalMapped = moveResizeOriginalMappedSize,
                mapped != originalMapped
             {
@@ -2161,9 +2861,12 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         case .awaitingResizeSettle(let windowId, let target, let sentAt):
             // Team-lead review round 6: full-rect match, unchanged -- this leg's whole point
             // is size, unlike the move leg above.
-            guard let outcome = evaluateMoveResizeLeg(target: target, sentAt: sentAt, matchPositionOnly: false) else { return }
+            guard let outcome = evaluateMoveResizeLeg(
+                windowId: windowId, target: target, sentAt: sentAt, matchPositionOnly: false
+            ) else { return }
             resizeResult = outcome
-            print("[move-resize] resize leg resolved: matched=\(outcome.matched) oscillated=\(outcome.oscillated)")
+            print("[move-resize] resize leg resolved: legPassed=\(outcome.passed) "
+                + "oscillated=\(outcome.oscillated) \(outcome.detail)")
             // Fix 2 (team-lead review): always attempt the close leg here, matching the
             // maximize scenario's own "still exercise the close leg even after an earlier
             // leg's failure" precedent -- cleanup shouldn't depend on the round-trip
@@ -2565,11 +3268,30 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
 
     /// Shared by both legs: within `Self.moveResizePollTimeout` (3s) of `sentAt`, has any
     /// WindowUpdate-applied content rect recorded in `moveResizeObservedContentRects`
-    /// matched `target` within ±1pt per axis -- and, once matched, did any LATER recorded
-    /// content rect in the same leg diverge from `target` again (ping-pong)? Returns `nil`
-    /// while the leg is still within budget and not yet resolved either way (neither
-    /// matched-and-settled nor timed out) -- the caller polls this once per tick until it
-    /// resolves.
+    /// matched `target` -- and, once matched, did any LATER recorded content rect in the same
+    /// leg diverge from `target` again (ping-pong)? Returns `nil` while the leg is still within
+    /// budget and not yet resolved either way (neither matched-and-settled nor timed out) -- the
+    /// caller polls this once per tick until it resolves.
+    ///
+    /// **M1 L9 (adr/0015 §6, owner ruling U6) changed what "matched" means, in three ways.** The
+    /// pre-M1 judgement was "within ±1 per axis", compared partly in mac points; all three
+    /// changes are the ADR's, not this harness's:
+    ///
+    ///  1. **The unit is remote px** (§6.1). Every comparison now happens after conversion into
+    ///     Windows space through the session's frozen topology. At today's `rasterScale == 1` the
+    ///     numbers are identical to the old ones, which is precisely why the unit had to be
+    ///     pinned before a 2x session exists to disambiguate it.
+    ///  2. **The tolerance is `MoveResizeGate.toleranceInRemotePixels` = 0** -- owner ruling U6,
+    ///     with `docs/plans/phase3.md:131` as the re-open path if a live run proves it unreachable.
+    ///     This is a tightening as well as a unit change; see that constant's own note.
+    ///  3. **Every leg asserts a PAIR** (§6.3): the rect comparison plus the single-POINT reverse
+    ///     mapping of the same target's top-left corner, which travels a code path with no
+    ///     `- height` term and therefore has failure modes no rect round-trip can see. The leg
+    ///     fails if either half fails, and the outcome names which.
+    ///
+    /// The deduction record §6.2 requires rides along in `MoveResizeLegOutcome.detail` -- see
+    /// `deductionsText(windowId:target:in:)`, which is evaluated at the comparison, not summarised
+    /// from an earlier moment.
     ///
     /// Team-lead review round 6 (2026-08-23, real-host run: position round-trip PERFECT,
     /// residual `matched=false` was size-only): `matchPositionOnly` controls whether
@@ -2582,50 +3304,90 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     ///
     /// Team-lead review round 7 (2026-08-23, real-host run: wire perfect AGAIN, yet
     /// position-only still reported `matched=false`): mac-space Y ENTANGLES height --
-    /// `WindowGeometry.macRect(from:primaryMonitorHeight:)`'s own formula is
-    /// `y = primaryMonitorHeight - windowsY - height`, so when round 6's own remap-on-move
-    /// finding changes a rect's height mid-leg, its mac-space Y shifts too even though the
-    /// underlying Windows-space TOP edge never moved at all (this run: target computed at
-    /// h=521 gave mac y=797; the observed rect, remapped to h=514, gave mac y=804 for the
-    /// IDENTICAL Windows-space top=122). Comparing raw mac-space `x`/`y` for the
-    /// `matchPositionOnly` case was therefore comparing two DIFFERENT physical quantities
-    /// whenever height changed -- not a false positive from a genuine position error, but a
-    /// coordinate-representation artifact. Fixed by converting BOTH `target` and each
-    /// observed rect through the existing, already-tested `WindowGeometry.windowsRect(from:
-    /// primaryMonitorHeight:)` (never a second, ad hoc coordinate-math implementation here,
-    /// matching every other geometry boundary crossing in this project) and comparing the
-    /// resulting Windows-space `x`/`y` (top-left, height-invariant by construction: each
-    /// rect's own height is baked into ITS OWN conversion, so two rects that agree on the
-    /// Windows-space top edge always compare equal regardless of what their heights happen
-    /// to be). Scoped to `matchPositionOnly` only, per instruction ("keep everything else as
-    /// is") -- the resize leg's full-rect path is untouched, since it already separately
-    /// requires height to match, at which point the two representations agree anyway.
-    private func evaluateMoveResizeLeg(target: NSRect, sentAt: Date, matchPositionOnly: Bool) -> (matched: Bool, oscillated: Bool)? {
-        let primaryMonitorHeight = Double(NSScreen.screens.first?.frame.height ?? 0)
-        func windowsTopLeft(_ r: NSRect) -> WindowsRect {
-            WindowGeometry.windowsRect(
-                from: MacRect(x: r.origin.x, y: r.origin.y, width: r.size.width, height: r.size.height),
-                primaryMonitorHeight: primaryMonitorHeight
+    /// `WindowGeometry.macRect`'s own formula is `y = primaryHeightInPoints - windowsY/s -
+    /// height/s`, so when round 6's own remap-on-move finding changes a rect's height mid-leg,
+    /// its mac-space Y shifts too even though the underlying Windows-space TOP edge never moved
+    /// at all (this run: target computed at h=521 gave mac y=797; the observed rect, remapped to
+    /// h=514, gave mac y=804 for the IDENTICAL Windows-space top=122). Comparing raw mac-space
+    /// `x`/`y` was therefore comparing two DIFFERENT physical quantities whenever height changed
+    /// -- not a false positive from a genuine position error, but a coordinate-representation
+    /// artifact. Fixed by converting BOTH `target` and each observed rect through the existing,
+    /// already-tested `WindowGeometry.windowsRect(from:in:)` (never a second, ad hoc
+    /// coordinate-math implementation here, matching every other geometry boundary crossing in
+    /// this project) and comparing the resulting Windows-space `x`/`y` (top-left, height-invariant
+    /// by construction: each rect's own height is baked into ITS OWN conversion, so two rects that
+    /// agree on the Windows-space top edge always compare equal regardless of what their heights
+    /// happen to be). Round 7 scoped that to `matchPositionOnly`; **M1 L9 extended it to the
+    /// full-rect leg too**, because §6.1 requires one comparison space for both -- at
+    /// `rasterScale == 1` the full-rect numbers are unchanged by that move (a leg whose size must
+    /// match anyway has no entanglement left to expose), so what changed is the unit's
+    /// provenance, not any verdict this hardware can produce.
+    ///
+    /// `WindowSmokeGateSelfTest.positionOnlyIsHeightInvariantInWindowsSpace` is the offline pin
+    /// for round 7's finding -- previously the property was argued in this comment and asserted
+    /// nowhere.
+    private func evaluateMoveResizeLeg(
+        windowId: UInt32, target: NSRect, sentAt: Date, matchPositionOnly: Bool
+    ) -> MoveResizeLegOutcome? {
+        // M1 L9: the anchor comes from the SESSION's frozen snapshot -- the same topology read the
+        // desktop size was derived from (adr/0015 §5.A.4) -- and never from a fresh `NSScreen`
+        // read, which is the pre-M1 defect this milestone deletes (§5.A.5 listed this exact line
+        // as one of the four read sites). `nil` here is a real, nameable state (no usable display,
+        // or a freeze that never happened), and the discipline for it is the project-wide one:
+        // decline and say so, never fabricate a coordinate from a substituted height.
+        guard let topology = displayTopology.sessionSnapshot else {
+            return MoveResizeLegOutcome(
+                rectCheckPassed: false, pointCheckPassed: false, oscillated: false,
+                detail: "no frozen session topology (adr/0015 §5.A.6) -- the leg cannot be judged in "
+                    + "remote px at all, so it is reported failed rather than compared against a "
+                    + "substituted primary height"
             )
         }
-        func closeEnough(_ a: NSRect) -> Bool {
-            if matchPositionOnly {
-                let aTopLeft = windowsTopLeft(a)
-                let targetTopLeft = windowsTopLeft(target)
-                return abs(aTopLeft.x - targetTopLeft.x) <= 1 && abs(aTopLeft.y - targetTopLeft.y) <= 1
-            }
-            let positionMatches = abs(a.origin.x - target.origin.x) <= 1 && abs(a.origin.y - target.origin.y) <= 1
-            return positionMatches
-                && abs(a.width - target.width) <= 1 && abs(a.height - target.height) <= 1
+        func macRect(_ r: NSRect) -> MacRect {
+            MacRect(x: r.origin.x, y: r.origin.y, width: r.size.width, height: r.size.height)
+        }
+        let targetMacRect = macRect(target)
+        func verdict(_ observed: NSRect) -> MoveResizeGate.LegVerdict {
+            MoveResizeGate.evaluate(
+                observed: macRect(observed), target: targetMacRect, in: topology,
+                positionOnly: matchPositionOnly
+            )
         }
         let contentRects = moveResizeObservedContentRects.map(\.contentRect)
-        guard let firstMatchIndex = contentRects.firstIndex(where: closeEnough) else {
+        // The SEARCH and the oscillation scan run on the RECT half alone -- deliberately, and this
+        // is the round-6/7 logic preserved verbatim except for its unit and tolerance. The point
+        // half is then judged on whichever rect the rect half selected, so the two named results
+        // always describe ONE observation (adr/0015 §6.3's "for the same target"). Searching on
+        // the conjunction instead would let a broken point path silently redefine which rect the
+        // rect half was talking about.
+        guard let firstMatchIndex = contentRects.firstIndex(where: { verdict($0).rectCheckPassed }) else {
             if Date().timeIntervalSince(sentAt) >= Self.moveResizePollTimeout {
-                return (matched: false, oscillated: false)
+                // Report against the LAST observed rect: it is the server's most recent word on
+                // this window, and adr/0015 §6.3 requires the failure to name WHICH of the paired
+                // halves failed rather than only that the leg did. Both halves are still judged on
+                // that same rect -- including the case where the point half agrees with a target
+                // the rect half did not reach, which is itself a finding worth printing.
+                guard let last = contentRects.last else {
+                    return MoveResizeLegOutcome(
+                        rectCheckPassed: false, pointCheckPassed: false, oscillated: false,
+                        detail: "no geometry-carrying WindowUpdate/WindowCreate was observed for this leg at all "
+                            + "-- neither half of the paired assertion had an observation to judge; "
+                            + deductionsText(windowId: windowId, target: targetMacRect, in: topology, legSentAt: sentAt)
+                    )
+                }
+                let failed = verdict(last)
+                return MoveResizeLegOutcome(
+                    rectCheckPassed: failed.rectCheckPassed, pointCheckPassed: failed.pointCheckPassed,
+                    oscillated: false,
+                    detail: "\(failed.pairedVerdictText) \(failed.deltaText) (judged against the LAST of "
+                        + "\(contentRects.count) observed rect(s)); "
+                        + deductionsText(windowId: windowId, target: targetMacRect, in: topology, legSentAt: sentAt)
+                )
             }
             return nil
         }
-        let oscillated = contentRects[(firstMatchIndex + 1)...].contains { !closeEnough($0) }
+        let matchedVerdict = verdict(contentRects[firstMatchIndex])
+        let oscillated = contentRects[(firstMatchIndex + 1)...].contains { !verdict($0).rectCheckPassed }
         // A brief settle window after the first match, so a late-arriving divergent
         // WindowUpdate still has a chance to be observed as oscillation before this leg
         // resolves -- unless oscillation has already been directly observed, in which case
@@ -2633,7 +3395,78 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         guard oscillated || Date().timeIntervalSince(sentAt) >= min(Self.moveResizePollTimeout, 1.0) else {
             return nil
         }
-        return (matched: true, oscillated: oscillated)
+        return MoveResizeLegOutcome(
+            rectCheckPassed: matchedVerdict.rectCheckPassed, pointCheckPassed: matchedVerdict.pointCheckPassed,
+            oscillated: oscillated,
+            detail: "\(matchedVerdict.pairedVerdictText) \(matchedVerdict.deltaText); "
+                + deductionsText(windowId: windowId, target: targetMacRect, in: topology, legSentAt: sentAt)
+        )
+    }
+
+    /// adr/0015 §6.2's deduction record, evaluated AT THE MOMENT of the comparison it is printed
+    /// next to -- never summarised from an earlier moment, because the whole reason the clause
+    /// exists is the observed mid-session remap (536x521 -> 522x514) that changes what
+    /// `sizeCorrection(for:windowId:)` returns partway through a leg.
+    ///
+    /// **SCOPE, stated precisely because §6.2's word is 逐次 / "per comparison"** (rev-L9 M-3b):
+    /// this runs once per leg **resolution** -- i.e. for the comparison that produced the verdict --
+    /// not once for each of the intermediate, non-matching comparisons the poll loop makes. That is
+    /// a deliberate narrower reading, and it is only defensible because of what covers the gap: the
+    /// harness's own comparison deducts nothing (both rects come through the registry's corrected
+    /// path), every geometry-carrying order already prints `[move-resize] raw RAIL geometry …` with
+    /// the mapped size and implied correction of THAT moment, and the move leg prints
+    /// `[move-resize] INFO: GFX-mapped size changed during the move leg` when the remap this clause
+    /// was written for actually happens. A reader can therefore reconstruct any intermediate
+    /// comparison's deductions from the log; they are not recorded on the verdict line itself.
+    ///
+    /// This harness's own comparison deducts NOTHING itself: it compares two rects that both went
+    /// through the registry's already-corrected placement path. What it must not do is let that
+    /// make the deductions invisible ("误差 0" would then be measuring our compensation table, not
+    /// the coordinate contract), so the two the registry applies are reported here:
+    ///
+    ///  * **`sizeCorrection` = GFX mapped size − accumulated RAIL size** (`RemoteWindowRegistry.
+    ///    swift:1621`), printed together with **the mapped size current at this comparison** --
+    ///    §6.2 requires both, because a deduction derived from mapped size is unreadable without
+    ///    the mapped size it came from.
+    ///  * **the outbound left-border deduction** (`WindowGeometry.clientWindowMoveLeft`, F6 (a)),
+    ///    reported as MEASURED: the Windows-space left this leg asked for, minus the `left` the
+    ///    send path actually put on the wire. Deriving it from the observed send rather than
+    ///    restating the constant keeps a single source for that number (U5 = record-only forbids
+    ///    this lane from moving or duplicating it) and means this line reports the truth even if
+    ///    W3 re-measures the constant.
+    private func deductionsText(
+        windowId: UInt32, target: MacRect, in topology: DisplayTopology, legSentAt: Date
+    ) -> String {
+        let mapped = registry.debugMappedSize(forWindowId: windowId)
+        let accumulated = registry.debugAccumulatedRailSize(forWindowId: windowId)
+        let mappedText = mapped.map { "\(Int($0.width))x\(Int($0.height)) remote px" } ?? "unknown"
+        let sizeCorrectionText: String
+        if let mapped, let accumulated {
+            sizeCorrectionText = "(dw=\(Int(mapped.width) - Int(accumulated.width)),"
+                + "dh=\(Int(mapped.height) - Int(accumulated.height))) remote px"
+        } else {
+            sizeCorrectionText = "unknown (no mapped size and/or no accumulated RAIL size for this window)"
+        }
+        let targetWindowsRect = WindowGeometry.windowsRect(from: target, in: topology)
+        let borderText: String
+        if let sent = lastClientWindowMoveSent {
+            let applied = targetWindowsRect.x - Double(sent.left)
+            // Whether the quoted send belongs to THIS leg is stated, never assumed: a leg whose
+            // own setFrame produced no send would otherwise silently borrow the previous leg's
+            // number and present it as its own deduction.
+            let provenance = sent.at >= legSentAt
+                ? "this leg's own send"
+                : "AN EARLIER LEG's send -- this leg produced no ClientWindowMove of its own"
+            borderText = String(
+                format: "%.3f remote px (measured: visible left %.3f minus the ClientWindowMove left=%d, ",
+                applied, targetWindowsRect.x, sent.left
+            ) + provenance + ")"
+        } else {
+            borderText = "n/a (no ClientWindowMove was observed for this window this run)"
+        }
+        return "deductions@comparison(adr/0015 §6.2): mappedSize=\(mappedText) "
+            + "accumulatedRAILSize=\(accumulated.map { "\($0.width)x\($0.height) remote px" } ?? "unknown") "
+            + "sizeCorrection=\(sizeCorrectionText) outboundLeftBorder=\(borderText)"
     }
 
     /// W4c deliverable 5: locates this run's own launched-app window once it's visible and
@@ -3379,6 +4212,19 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             print("[assert] \(cond ? "PASS" : "FAIL"): \(message)")
             if !cond { ok = false }
         }
+
+        // M1 F2 (`docs/plans/phase3.md:132`): once per RUN, unconditionally, in both terminal
+        // paths (`finishCycles()` prints the same line). Placed at the top of the summary so it
+        // cannot be lost behind an early `exit` in some future edit.
+        printGfxTargetSummary()
+        // The connect-time desktop size actually negotiated, and the ADR §5 re-take pin. A
+        // single-run `finish()` performed exactly one freeze (no `prepareForReconnect()` -- see
+        // this method's own note on why it never resets the registry).
+        print("[topology] session desktop size: "
+            + (sessionDesktopSizeInRemotePixels.map { "\($0.width)x\($0.height) remote px" }
+                ?? "<never set -- no usable display at connect, adr/0015 §5.A.6>"))
+        let freezePin = topologyFreezeCountCheck(expectedReconnects: 0)
+        check(freezePin.passed, freezePin.message)
 
         // Flow evidence counters (task item 1): machine-readable summary of everything
         // eb2e333's MonitoredDesktop/ZOrderSync/MinMaxInfo/LocalMoveSize plumbing actually
@@ -4145,11 +4991,25 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 // evaluateMoveResizeLeg's own doc comment for why size is out of scope for a
                 // pure move (the server's own prerogative to remap the surface mid-move,
                 // observed live this round).
+                //
+                // M1 L9 / adr/0015 §6.3: the leg's verdict is a PAIR, and the two halves are two
+                // separately-named `[assert]` lines rather than one conjunction, so a red run says
+                // WHICH path failed while `ok` still goes red if either does. `rectCheckPassed` is
+                // the pre-M1 `matched`, re-expressed in remote px; `pointCheckPassed` re-judges
+                // THE SAME observed rect through `windowsPoint`, which has no `- height` term and
+                // therefore cannot be assumed to agree just because the rect path did.
                 check(
-                    moveResult.matched,
-                    "move-resize scenario: move leg's WindowUpdate round-tripped to the new POSITION (±1pt) "
-                        + "within 3s -- size is not asserted here, it is the server's own prerogative for a pure "
-                        + "move (see runMoveResizeScenario's own doc comment)"
+                    moveResult.rectCheckPassed,
+                    "move-resize scenario: move leg RECT check -- the WindowUpdate round-tripped to the new "
+                        + "POSITION within \(MoveResizeGate.toleranceInRemotePixels) remote px (adr/0015 §6.1, "
+                        + "owner ruling U6) inside 3s; size is not asserted here, it is the server's own "
+                        + "prerogative for a pure move. \(moveResult.detail)"
+                )
+                check(
+                    moveResult.pointCheckPassed,
+                    "move-resize scenario: move leg POINT check -- the same target's top-left through "
+                        + "WindowGeometry.windowsPoint (adr/0015 §6.3's paired assertion; no `- height` term, "
+                        + "so its sign/anchor errors are invisible to the rect check above). \(moveResult.detail)"
                 )
                 check(
                     !moveResult.oscillated,
@@ -4169,17 +5029,28 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             if let resizeResult {
                 if moveResizeTargetIsResizable == true {
                     check(
-                        resizeResult.matched,
-                        "move-resize scenario: resize leg's WindowUpdate round-tripped to the new content rect "
-                            + "within ±1pt within 3s"
+                        resizeResult.rectCheckPassed,
+                        "move-resize scenario: resize leg RECT check -- the WindowUpdate round-tripped to the new "
+                            + "content rect (position AND size) within \(MoveResizeGate.toleranceInRemotePixels) "
+                            + "remote px (adr/0015 §6.1, owner ruling U6) inside 3s. \(resizeResult.detail)"
+                    )
+                    check(
+                        resizeResult.pointCheckPassed,
+                        "move-resize scenario: resize leg POINT check -- the same target's top-left through "
+                            + "WindowGeometry.windowsPoint (adr/0015 §6.3's paired assertion). \(resizeResult.detail)"
                     )
                     check(!resizeResult.oscillated, "move-resize scenario: resize leg settled without oscillation")
                 } else {
+                    // Ungated, but still PAIRED and still fully reported -- adr/0015 §6.3 is about
+                    // what a leg's verdict must SAY, and that does not change with whether the
+                    // verdict counts toward `ok`.
                     print(
                         "[info] move-resize scenario: resize leg's target window was NOT resizable at send time "
                             + "(About is never resizable -- StyleTranslatorTests' aboutWindowsDialogShape) -- "
-                            + "matched=\(resizeResult.matched) oscillated=\(resizeResult.oscillated), reported "
-                            + "informationally, not gated"
+                            + "legPassed=\(resizeResult.passed) oscillated=\(resizeResult.oscillated) "
+                            + "rectCheck=\(resizeResult.rectCheckPassed ? "PASS" : "FAIL") "
+                            + "pointCheck=\(resizeResult.pointCheckPassed ? "PASS" : "FAIL") "
+                            + "\(resizeResult.detail), reported informationally, not gated"
                     )
                 }
             } else {
@@ -4367,11 +5238,18 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// `NSApplication.shared` FIRST, then the delegate -- the same order `App/Macdows/main.swift` uses,
+// and since M1 L9 it matters here too rather than being a stylistic difference: the delegate now
+// owns a `DisplayTopologyProvider`, which reads `NSScreen` and registers for
+// `NSApplicationDidChangeScreenParameters` in its initializer. Constructing an AppKit-reading
+// object before AppKit's own singleton exists is the kind of ordering that works until it does
+// not; the connect-time `freezeSessionSnapshot()` would still re-read correctly, but the launch
+// read would be the one lying.
+let app = NSApplication.shared
 let delegate = WindowSmokeDelegate(
     host: host, user: user, pass: pass, screenshotPath: screenshotPath, launchedProgram: launchedProgram,
     launchedAppKind: launchedAppKind, inputTestMode: inputTestMode
 )
-let app = NSApplication.shared
 // .accessory: no Dock icon/menu bar needed for a CLI verification harness, but this still
 // needs to be a real running NSApplication (not headless) for NSWindow/CALayer/
 // CATransaction to actually composite -- team-lead's explicit requirement.
