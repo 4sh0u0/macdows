@@ -586,6 +586,11 @@ enum SizeBand {
 ///    **Not covered here**: the two `runMaximizeScenario` call sites reverting to `snap.frame.width`
 ///    in pt while still printing the converted value (review sizeband-maximize-r1 D2 survives) --
 ///    the live wiring has no offline seam; `grep 'frame.width >= 2000'` zero-hit is the only guard.
+///  * **the move/resize target filter** losing case-insensitivity, an empty filter no longer
+///    meaning "the About heuristic", the `|` alternatives no longer split, or their surrounding
+///    whitespace no longer trimmed => `moveResizeTargetFilterSemantics`. **Not covered here**:
+///    `runMoveResizeScenario`'s target
+///    lock calling something other than `MoveResizeTarget.matches` -- live wiring, no offline seam.
 ///
 /// **Known blind spot, stated rather than papered over** (rev-L9 I-2, R6): replacing the two
 /// `WindowGeometry.windowsPoint` calls with a copy of the rect conversion's own origin is an
@@ -934,6 +939,22 @@ enum WindowSmokeGateSelfTest {
             "sizeBandCeilingRejectsEachAxisAlone: 10000x500 fails on width, 500x10000 on height (both remote px)"
         )
 
+        // --- move/resize target filter (WINDOW_SMOKE_MOVE_TARGET) -----------------------------
+        expect(
+            MoveResizeTarget.matches(title: "About Windows", filter: nil)
+                && MoveResizeTarget.matches(title: "关于 Windows", filter: "")
+                && !MoveResizeTarget.matches(title: "Untitled - Notepad", filter: nil)
+                && MoveResizeTarget.matches(title: "Untitled - Notepad", filter: "notepad")
+                && MoveResizeTarget.matches(title: "无标题 - Notepad", filter: "Notepad")
+                && !MoveResizeTarget.matches(title: "About Windows", filter: "Notepad")
+                && MoveResizeTarget.matches(title: "无标题 - 记事本", filter: "Notepad|记事本")
+                && !MoveResizeTarget.matches(title: "无标题 - 记事本", filter: "Notepad")
+                && !MoveResizeTarget.matches(title: "About Windows", filter: "Notepad|记事本")
+                && MoveResizeTarget.matches(title: "Untitled - Notepad", filter: "Notepad | 记事本")
+                && !MoveResizeTarget.matches(title: "Untitled - Notepad", filter: " | "),
+            "moveResizeTargetFilterSemantics: nil/empty = About heuristic (incl. 关于); a filter is |-separated, whitespace-trimmed, case-insensitive substrings and excludes About"
+        )
+
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
         // rev-L9 M-4: `Scripts/run-window-smoke.command:159` records `DONE exit=$?` and its callers
         // read that line as the whole verdict. A `WINDOW_SMOKE_SELFTEST=1` leaked into the
@@ -1230,6 +1251,34 @@ let maximizeScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_
 /// acknowledged honesty gap against a genuine mouse-driven drag. Requires
 /// WINDOW_SMOKE_EXTRA_APPS (multiwin prereq), same convention as WINDOW_SMOKE_MAXIMIZE.
 let moveResizeScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_MOVE"] == "1"
+/// WINDOW_SMOKE_MOVE_TARGET=<title substring>: which visible content window the move/resize
+/// scenario locks onto. Unset (or empty) keeps the historical About-Windows heuristic. Set it to
+/// e.g. `Notepad|记事本` together with `WINDOW_SMOKE_EXTRA_APPS=notepad` to drive the legs against a
+/// window that is actually RESIZABLE -- the About dialog never is (StyleTranslatorTests'
+/// `aboutWindowsDialogShape`), which is why the 0-remote-px resize half of adr/0015 §6.3 has had
+/// no real-host data point (C-2 record, coverage gap). Pure matching logic lives in
+/// `MoveResizeTarget` so the self-test can pin it; the lock itself is live-only.
+let moveResizeTargetFilter = ProcessInfo.processInfo.environment["WINDOW_SMOKE_MOVE_TARGET"]
+
+/// Title matching for the move/resize scenario's target lock (see `moveResizeTargetFilter`).
+enum MoveResizeTarget {
+    /// `nil`/empty filter: the About-Windows heuristic every scenario in this file historically
+    /// used (`about`, case-insensitive, or the CJK `关于`). Otherwise `|`-separated alternatives,
+    /// each a case-insensitive substring -- `Notepad|记事本` finds `Untitled - Notepad`,
+    /// `无标题 - Notepad` AND the fully localised `无标题 - 记事本` a Chinese host shows (review
+    /// movetarget-r1 I-1: a single `Notepad` there locks nothing and the run stalls to a false red).
+    static func matches(title: String, filter: String?) -> Bool {
+        guard let filter, !filter.isEmpty else {
+            return title.localizedCaseInsensitiveContains("about") || title.contains("关于")
+        }
+        // Whitespace around each alternative is not part of it: `Notepad | 记事本` must behave
+        // like `Notepad|记事本` (review movetarget-r2 m-1: the untrimmed "Notepad " matched
+        // nothing while " 记事本" happened to match -- a half-working filter).
+        return filter.split(separator: "|").map { $0.trimmingCharacters(in: .whitespaces) }.contains { alternative in
+            !alternative.isEmpty && title.localizedCaseInsensitiveContains(alternative)
+        }
+    }
+}
 
 /// adr/0010 W4 first slice: menu-popup end-to-end acceptance -- activates the About window
 /// (via the real, gated `FocusAuthority` click path, same as `activateForClose`), sends
@@ -1676,6 +1725,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         var passed: Bool { rectCheckPassed && pointCheckPassed }
     }
     private var moveResult: MoveResizeLegOutcome?
+    /// Throttle for the "filter matched no window" line in the target lock (printed once).
+    private var moveResizeTargetMissLogged = false
     private var resizeResult: MoveResizeLegOutcome?
     /// The most recent `ClientWindowMove` this run actually put on the wire for the move/resize
     /// target, verbatim (adr/0015 §6.2's deduction record): the harness knows what Windows-space
@@ -3260,10 +3311,24 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         switch moveResizePhase {
         case .waitingForTarget:
             guard extraAppsLaunched else { return } // multiwin prereq, per the task spec
-            guard let w = registry.windowSnapshots().first(where: { snap in
-                snap.isVisible && snap.hasDisplayedContent
-                    && (snap.title.localizedCaseInsensitiveContains("about") || snap.title.contains("关于"))
-            }), let window = registry.window(forWindowId: w.windowId) else { return }
+            // Sorted by windowId (as `focusRotationCandidateWindows` does): `windowSnapshots()` is
+            // dictionary-ordered, and with a filter that can match several windows the lock must
+            // not depend on hash order between runs.
+            let candidates = registry.windowSnapshots().sorted(by: { $0.windowId < $1.windowId })
+                .filter { $0.isVisible && $0.hasDisplayedContent }
+            guard let w = candidates.first(where: { MoveResizeTarget.matches(title: $0.title, filter: moveResizeTargetFilter) }),
+                  let window = registry.window(forWindowId: w.windowId)
+            else {
+                // A filter that matches nothing would otherwise stall silently for the whole
+                // scenario deadline and surface as a generic "no target locked" red (review
+                // movetarget-r2 m-2). Say so once, with the titles that WERE visible.
+                if let moveResizeTargetFilter, !candidates.isEmpty, !moveResizeTargetMissLogged {
+                    moveResizeTargetMissLogged = true
+                    print("[move-resize] no visible content window matched WINDOW_SMOKE_MOVE_TARGET=\"\(moveResizeTargetFilter)\" "
+                        + "(titles seen: \(candidates.map { "\"\($0.title)\"" }.joined(separator: ", ")))")
+                }
+                return
+            }
             moveResizeWindowId = w.windowId
             // Team-lead review round 6: baseline for the move leg's own "did the mapped
             // size change mid-leg" informational report -- see that report's own comment.
@@ -5563,7 +5628,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                     // verdict counts toward `ok`.
                     print(
                         "[info] move-resize scenario: resize leg's target window was NOT resizable at send time "
-                            + "(About is never resizable -- StyleTranslatorTests' aboutWindowsDialogShape) -- "
+                            + "(the default About target never is -- StyleTranslatorTests' aboutWindowsDialogShape; "
+                            + "WINDOW_SMOKE_MOVE_TARGET picks a resizable one) -- "
                             + "legPassed=\(resizeResult.passed) oscillated=\(resizeResult.oscillated) "
                             + "rectCheck=\(resizeResult.rectCheckPassed ? "PASS" : "FAIL") "
                             + "pointCheck=\(resizeResult.pointCheckPassed ? "PASS" : "FAIL") "
