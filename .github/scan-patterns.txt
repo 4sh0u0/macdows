@@ -7,8 +7,27 @@
 # word character or another dot) — avoids matching version-ish or spec-section-number-ish
 # strings like "v10.1.1.2" or "10.1.1.2.3" while still catching a real IP written plainly.
 (?<![\w.])10\.\d{1,3}\.\d{1,3}\.\d{1,3}(?![\w.])
-\bharus\b
-\balienware\b
+#
+# Personal-machine name fragments. Deliberately NOT `\b…\b` and NOT case-sensitive -- both were
+# holes, measured 2026-09-01 against a fixture of the real forms:
+#   * `_` is a word character, so `\b<fragment>\b` finds no boundary either side of an
+#     underscore and did not match the joined `<Fragment1>_<Fragment2>` machine-name form at
+#     all. Adding `(?i)` alone does NOT close that -- the boundary class is what has to change.
+#   * the two patterns were case-sensitive while everything else in this file is `(?i)`, so the
+#     second one did not even fire on its own capitalised form.
+# The joined form is what FreeRDP's `Logon Info V2` line writes into a relay log, i.e. the
+# single likeliest thing to reach a doc or a commit message by accident. Only the fragments are
+# written below, never the joined string -- this file is tracked and public, and it publishes
+# no more of the name than it already did.
+#
+# `[a-z0-9]` rather than `\w`/`\b` on both sides makes `_`, `-` and `.` count as boundaries,
+# which is what catches the joined, hyphenated and dotted forms, while still refusing to fire
+# inside a longer alphanumeric run (a fragment embedded in an ordinary English word, or with a
+# digit suffix) -- that is what keeps the false-positive rate at zero across the tracked tree,
+# re-measured on 2026-09-01 over all 134 scanned files. `(?i)` at pattern start applies to the
+# lookaround classes too, so `[a-z0-9]` covers uppercase. Do not "simplify" these back to `\b`.
+(?i)(?<![a-z0-9])harus(?![a-z0-9])
+(?i)(?<![a-z0-9])alienware(?![a-z0-9])
 #
 # IPv6 unique-local address (fc00::/7) in any textual form -- the v6 half of the private-
 # network red line, which until now only the 10.x pattern above covered. Deliberately

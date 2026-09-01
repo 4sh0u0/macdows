@@ -51,7 +51,12 @@ jobs:
         # findings, so a script can never pass locally and fail in CI again. Also widened
         # from `Scripts/*.sh` to include `*.command` -- Scripts/run-window-smoke.command
         # was never actually covered by this glob before.
-        run: shellcheck -S style Scripts/*.sh Scripts/*.command
+        #
+        # These globs are NOT recursive: `Scripts/*.sh` does not descend into Scripts/lab/,
+        # so the lab harness needed its own pair when it was promoted into the tracked tree
+        # (2026-09-01). Any future Scripts/<subdir>/ needs adding here too -- a shell script
+        # that no one checks is exactly the one that breaks in the field.
+        run: shellcheck -S style Scripts/*.sh Scripts/*.command Scripts/lab/*.sh Scripts/lab/*.command
 
       - name: gitleaks
         uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
@@ -169,6 +174,46 @@ jobs:
             echo "::error::the boundary suite skipped a case on this runner -- see the SKIP block above. The dual-stack localhost setup at the top of this step did not take effect, so the gate's all-addresses rule went unverified. A skip is tolerated on a developer machine; in CI it is a failure."
             exit 1
           fi
+
+      - name: Lab harness offline guard suite
+        # Scripts/lab/ was promoted out of the ignored .build/lab into the tracked tree on
+        # 2026-09-01. It is the harness that drives a live Windows host, so its guards -- the
+        # fail-closed boundary gate, the one-relay-at-a-time refusal, the exit-code verdict
+        # contract, the CRLF strip -- are precisely the things that must not be allowed to rot
+        # unnoticed. This suite drives the REAL run-matrix.sh, run-scenario.sh, jobs/*.env and
+        # Scripts/lib.sh through every verdict they can produce, in a mktemp sandbox.
+        #
+        # Safe in CI, by construction rather than by promise: `open` is PATH-shimmed so the
+        # .command launchers are never executed, `xfreerdp`/`nc`/`osascript` are shimmed to
+        # refuse loudly, `pgrep` is shimmed to a fixed answer, HOME is redirected to a sandbox
+        # whose host.env carries an RFC 5737 documentation address, and relay.command and
+        # probe.command are not even copied into the sandbox. It opens no socket.
+        #
+        # Placed after the security gates for the same reason as the boundary suite above: a
+        # failure here must not be what stops gitleaks and the sensitive-content scan running.
+        run: ./Scripts/lab/test-run-matrix-offline.sh
+
+      - name: Lab host-side PowerShell suites
+        # The two host-side scripts that carry real consequences: Set-TsAllowListMatrix.ps1
+        # (elevated, owner-manual, rewrites HKLM TSAppAllowList and owns the backup/restore
+        # clobber guards) and tsallowlist-matrix-verify.ps1 (the acceptance verdict). Both
+        # suites are offline -- they dot-source their subject with the run suppressed and drive
+        # it with fixtures, touching neither the registry nor the network -- so Tier 1 can host
+        # them, and on a Linux runner the elevated paths cannot execute even in principle.
+        run: |
+          set -euo pipefail
+
+          # ubuntu-latest ships pwsh today; "ships it today" is not a contract. Probe up front
+          # and fail loudly rather than skipping: a silently skipped suite reads as coverage
+          # that is not there, which is worse than a red build. Same discipline as the grep -P
+          # probe in the sensitive-content step.
+          if ! command -v pwsh >/dev/null 2>&1; then
+            echo "::error::pwsh is not installed on this runner, so the lab's host-side PowerShell suites cannot run. They are the only automated coverage for Set-TsAllowListMatrix.ps1 (the elevated HKLM mutator and its clobber guards) and tsallowlist-matrix-verify.ps1 (the acceptance verdict). Install PowerShell on the runner -- do NOT drop or soft-skip this step."
+            exit 1
+          fi
+
+          pwsh -NoProfile -File Scripts/lab/share/Set-TsAllowListMatrix.Tests.ps1
+          pwsh -NoProfile -File Scripts/lab/share/tsallowlist-matrix-verify.Tests.ps1
 
       - name: Patch queue validation
         run: |
