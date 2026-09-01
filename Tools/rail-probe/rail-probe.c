@@ -1092,6 +1092,26 @@ static BOOL probe_post_connect(freerdp* instance)
 	probeContext* p = (probeContext*)instance->context;
 	log_event(p, "PostConnect", NULL);
 
+	/* Upgrade-gate assertion (W2 item 2, adr/0005 §7): the whole two-lane threading
+	 * model -- and the tid-separation regression assertion the replay gate now carries --
+	 * presumes the AsyncUpdate proxy thread structurally does not exist (3.30.0 forces it
+	 * off via update.c's FORCE_ASYNC_UPDATE_OFF; its shallow-copy UAF is unreachable only
+	 * because of that). An upstream that re-enables it, or a stray config that sets the
+	 * deprecated flag, must fail the run loudly, not deliver events from a thread the
+	 * model never measured. Returning FALSE here does better than refusing after the
+	 * fact: freerdp.c short-circuits on a failed PostConnect BEFORE calling
+	 * update_post_connect -- the one place the async proxy is ever created -- so the
+	 * proxy thread never comes into existence at all. Explicit check, not WINPR_ASSERT:
+	 * this tool builds
+	 * RelWithDebInfo, where NDEBUG compiles asserts out -- a gate assertion that
+	 * disappears in the gate's own build would be decoration. */
+	if (freerdp_settings_get_bool(instance->context->settings, FreeRDP_AsyncUpdate))
+	{
+		fprintf(stderr, "rail-probe: FreeRDP_AsyncUpdate is TRUE -- the adr/0005 two-lane "
+		                "threading model does not hold; refusing to record\n");
+		return FALSE;
+	}
+
 	if (!gdi_init(instance, PIXEL_FORMAT_XRGB32))
 		return FALSE;
 

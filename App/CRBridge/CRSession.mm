@@ -1607,6 +1607,24 @@ static BOOL crb_pre_connect(freerdp *instance)
 
 static BOOL crb_post_connect(freerdp *instance)
 {
+    /* Upgrade-gate assertion (W2 item 2, adr/0005 §7 "启动断言 AsyncUpdate==FALSE"): the
+     * two-lane threading model (T_rdp orders / T_dvc GFX) presumes the AsyncUpdate proxy
+     * thread structurally does not exist -- 3.30.0 forces it off (update.c
+     * FORCE_ASYNC_UPDATE_OFF) and the 2026-07 shallow-copy UAF is unreachable only
+     * because of that. If an upstream bump re-enables it or a stray setting flips the
+     * deprecated flag, fail the connection loudly instead of running a thread topology
+     * the model never measured. Returning FALSE short-circuits freerdp.c's post-connect
+     * sequence BEFORE update_post_connect -- the only creation site of the async proxy --
+     * so the proxy thread never exists rather than being rejected after the fact.
+     * Explicit check rather than WINPR_ASSERT so the guard survives any build
+     * configuration that defines NDEBUG. */
+    if (freerdp_settings_get_bool(instance->context->settings, FreeRDP_AsyncUpdate))
+    {
+        WLog_ERR(TAG, "FreeRDP_AsyncUpdate is TRUE -- adr/0005 two-lane threading model "
+                      "does not hold; refusing the session");
+        return FALSE;
+    }
+
     if (!gdi_init(instance, PIXEL_FORMAT_XRGB32))
         return FALSE;
 

@@ -113,6 +113,95 @@ struct ReplayExpansionTests {
 
     // MARK: - Portable invariants (run against frozen baseline AND any candidate)
 
+    /// Upgrade-gate assertion ② (W2 item 2; adr/0005 §7 "探针 tid 日志升级为升级门回归
+    /// 断言"): the three producer lanes must ride pairwise-DISJOINT thread ids on any
+    /// legal recording — `Gfx*` on the DVC thread, window/tray orders on the update
+    /// thread, `Server*` RAIL callbacks on the rail channel thread. The three-way split
+    /// follows the MEASURED model (`EventLane`'s three lanes; adr/0005's prose groups
+    /// RAIL control with orders on "T_rdp", which the frozen captures refine into two
+    /// distinct tids — the assertion follows the measurement). This is the recording-side
+    /// half of the AsyncUpdate guard: the runtime half (both stacks refuse a session with
+    /// `FreeRDP_AsyncUpdate=TRUE`) lives in `crb_post_connect`/`probe_post_connect`, and
+    /// this half reds if any upstream change starts delivering one lane's callbacks from
+    /// another lane's thread — and each lane must be exactly ONE thread per capture (a
+    /// capture is one connection; a thread-pooled DVC model would keep the lanes disjoint
+    /// while breaking the risk row's "改 DVC 模型" premise, so disjointness alone is not
+    /// enough — review r3 finding L3).
+    ///
+    /// Classification is by `RailEventKind` case and follows `EventLane`'s discipline
+    /// exactly, including its refusals (review r3 M1): only MEASURED lane memberships are
+    /// asserted. `windowDelete`/`nonMonitoredDesktop`/`codecStats` occur zero times in
+    /// the frozen captures AND the 2026-09-01 candidate, so they are deliberately
+    /// EXCLUDED — an unmeasured lane assignment here would feed a manufactured finding
+    /// straight into a gate assertion, the exact hazard `EventLane.ambiguous` exists to
+    /// prevent. The switch is exhaustive with no default (r3 M2): a future
+    /// `RailEventKind` case is a compile error and must be classified — or excluded — by
+    /// a reviewed edit. Other exclusions and why (r3 L1/L2): `channelConnected`/
+    /// `channelDisconnected` are the two names measured on more than one thread
+    /// (`EventLane.ambiguousEventNames`); the probe's own main-loop emissions
+    /// (Pre/PostConnect, ConnectSucceeded, DurationElapsed, SecondExec*, failure marks)
+    /// are single-threaded but are not producer-lane traffic at all; and
+    /// `clientRailServerStartCmd` is the probe's own SEND-side log line — measured riding
+    /// the order tid, but it is not a server callback, and excluding it is load-bearing
+    /// (classifying it into the server lane would break pairwise disjointness at once).
+    ///
+    /// Anti-vacuity: all three lanes are non-empty in every frozen scenario AND in the
+    /// 2026-09-01 candidate re-record (s2's no-HiDef path still carries 2
+    /// GfxResetGraphics — the RDPGFX channel connects either way). A future legal
+    /// recording with a genuinely absent gfx channel would red here — like
+    /// `s3TwoSuccessfulExecs`, that red means "check what the session did" before
+    /// blaming the recording.
+    @Test("adr/0005 tid separation: gfx / order / server lanes are one thread each, pairwise disjoint", arguments: Scenario.allCases)
+    func lanesRidePairwiseDisjointTids(_ scenario: Scenario) throws {
+        let replay = try ReplayTests.replay(scenario)
+        var gfxTids: Set<String> = []
+        var orderTids: Set<String> = []
+        var serverTids: Set<String> = []
+        for event in replay.events {
+            switch event.kind {
+            case .gfxMapSurfaceToWindow, .gfxMapSurfaceToScaledWindow, .gfxResetGraphics,
+                 .gfxCapsAdvertise, .gfxCapsConfirm:
+                gfxTids.insert(event.tid)
+            case .windowCreate, .windowUpdate, .windowIcon, .windowCachedIcon,
+                 .notifyIconCreate, .notifyIconUpdate, .notifyIconDelete,
+                 .monitoredDesktop:
+                orderTids.insert(event.tid)
+            case .serverHandshake, .serverHandshakeEx, .serverExecuteResult, .serverSystemParam,
+                 .serverLocalMoveSize, .serverMinMaxInfo, .serverZOrderSync,
+                 .serverGetAppIdResponse:
+                serverTids.insert(event.tid)
+            // Unmeasured in every frozen capture and the candidate — deliberately
+            // unclassified (see the doc comment; assigning a lane nobody measured is the
+            // manufactured-finding hazard).
+            case .windowDelete, .nonMonitoredDesktop, .codecStats:
+                continue
+            // Not producer-lane traffic: the two genuinely multi-threaded lifecycle
+            // names, the probe main loop's own emissions, and the probe's send-side RAIL
+            // log (order-tid-riding but not a server callback — load-bearing exclusion).
+            case .channelConnected, .channelDisconnected,
+                 .preConnect, .postConnect, .postDisconnect, .postFinalDisconnect,
+                 .secondExecBegin, .secondExecEnd, .connectFailed, .connectSucceeded,
+                 .eventHandlesFailed, .waitFailed, .checkEventHandlesFailed,
+                 .durationElapsed, .clientRailServerStartCmd,
+                 .verifyCertificateEx, .logonErrorInfo, .unknown:
+                continue
+            }
+        }
+        #expect(!gfxTids.isEmpty, "no gfx-lane traffic in \(scenario) — check the session before blaming the recording")
+        #expect(!orderTids.isEmpty, "no order-lane traffic in \(scenario)")
+        #expect(!serverTids.isEmpty, "no server-lane traffic in \(scenario)")
+        for (lane, tids) in [("gfx", gfxTids), ("order", orderTids), ("server", serverTids)] {
+            #expect(tids.count == 1,
+                    "\(lane) lane rode \(tids.count) threads in \(scenario) — one connection is one thread per lane")
+        }
+        #expect(gfxTids.isDisjoint(with: orderTids),
+                "gfx and order lanes shared threads \(gfxTids.intersection(orderTids)) in \(scenario)")
+        #expect(gfxTids.isDisjoint(with: serverTids),
+                "gfx and server lanes shared threads \(gfxTids.intersection(serverTids)) in \(scenario)")
+        #expect(orderTids.isDisjoint(with: serverTids),
+                "order and server lanes shared threads \(orderTids.intersection(serverTids)) in \(scenario)")
+    }
+
     // (r1 review M5: the WindowGeometry round-trip test that stood here was DELETED — see
     // the COVERAGE BOUNDARY entry in the header. `WindowGeometryTests` already pins the
     // identity over a strict superset of anything a capture can feed it.)
