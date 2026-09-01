@@ -1054,12 +1054,17 @@ static UINT crb_gfx_map_surface_to_scaled_window(RdpgfxClientContext *context,
          * own AVC-caps-flip note) -- i.e. it was seen on an H264-DISABLED build, two days
          * before the flip it was blamed on.
          *
-         * Surviving hypothesis, not a conclusion: variant choice is client-caps-dependent in
-         * some way we have not isolated (the negotiated RDPGFX capset version is the leading
-         * suspect -- our advertise set is compile-time-shaped and 10.7 carries
-         * SCALEDMAP_DISABLE, see the audit's §7b, but nothing logs what the host negotiates).
-         * RESOLVED BY the W2 drill re-record, whose precondition is a client-side CapsAdvertise
-         * log. Do not re-derive a cause from this comment until that exists.
+         * The directed re-record (P2, 2026-09-02, with P1's CapsAdvertise log in place)
+         * MEASURED the negotiation: this stack and rail-probe advertise byte-identical
+         * capsets and the server confirms 10.7 WITH SCALEDMAP_DISABLE on both -- and all
+         * three sessions produced zero scaled events. The caps-difference sub-hypothesis
+         * is thereby eliminated (the two tools' advertised caps do not differ), and the
+         * 2026-08-21 observation now reads as a scaled map sent in a session that almost
+         * certainly advertised the disable flag: suspicion narrows to server-side
+         * conditions, or to whatever else was different about that one session (the
+         * remaining confounders are unseparated). The mechanism REMAINS OPEN -- do not derive a cause from this
+         * comment; the standing record is the docs-side P2 record and the
+         * KnownDifferenceTable entry's cause text.
          *
          * None of the above changes what this callback does. Treated identically to the plain
          * variant for mapping purposes: mappedWidth/Height name the surface sub-rect the
@@ -1114,9 +1119,9 @@ static UINT crb_gfx_reset_graphics(RdpgfxClientContext *context, const RDPGFX_RE
 }
 
 /* P1 (upgrade-gate drill 2026-09-drill-01 §7.2): the client's advertised capset list and
- * the server's negotiated answer -- the two values the scaled-map hypothesis (the long
- * comment in crb_gfx_map_surface_to_scaled_window above) names as its resolver's
- * precondition. Same event vocabulary as rail-probe's JSONL (`GfxCapsAdvertise` /
+ * the server's negotiated answer -- the two values the P2 directed re-record measured
+ * (see the long comment in crb_gfx_map_surface_to_scaled_window above for what that
+ * measurement did and did not settle). Same event vocabulary as rail-probe's JSONL (`GfxCapsAdvertise` /
  * `GfxCapsConfirm`) so a directed re-record greps both stacks with one pattern; this
  * stack logs via WLog only, like every other GFX line here (CRBridge is not a JSONL
  * producer).

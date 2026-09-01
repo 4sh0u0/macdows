@@ -113,14 +113,19 @@ flip. The M1 L4 audit — recorded in `deps/freerdp.lock`'s own `CORRECTION` not
 2026-09-01 to the "Phase 2 W0(2) AVC caps flip" entry — falsified that twice over: `AVC_DISABLED` is advertised identically
 before and after the flip, and the variant was observed **two days before** the flip landed,
 on a `WITH_FFMPEG=OFF` build. Assertions are forbidden in **both** directions — not "this is
-the AVC flip", and not "this is upstream". The leading open hypothesis is the client's
-advertised RDPGFX caps (`SCALEDMAP_DISABLE`, 10.7+), unmeasured in every frozen baseline
-because nothing logged the `CapsAdvertise` PDU when they were recorded. The client-side log
-has since landed with P1 (`rail-probe.c`'s `probe_gfx_caps_advertise`/`probe_gfx_caps_confirm`
-and CRBridge's WLog twins) — the instrumented **re-record itself is still pending**, so the
-mechanism stays open. **Resolver: the W2 drill's instrumented re-record.** Until it runs, L11
-must record `freerdp_avc`, `freerdp_scaledmap_caps`, `client_tool` and `session_desktop` for
-both sides.
+the AVC flip", and not "this is upstream". The caps were unmeasured in every frozen baseline
+because nothing logged the `CapsAdvertise` PDU when they were recorded; the client-side log
+landed with P1 (`rail-probe.c`'s `probe_gfx_caps_advertise`/`probe_gfx_caps_confirm` and
+CRBridge's WLog twins), and the instrumented directed re-record **ran on 2026-09-02 (P2)**:
+both client stacks advertise and negotiate byte-identical capsets — 10.7 with
+`SCALEDMAP_DISABLE` confirmed by the server — and produced zero scaled events. That
+eliminates the caps-difference sub-hypothesis and re-frames the 2026-08-21 observation as a
+scaled map sent in a session that almost certainly advertised the disable flag; suspicion
+narrows to server-side conditions, or to whatever else was different about that one session
+(the other three confounders — session desktop size, session/date, build settings — remain
+unseparated). The mechanism **remains open**. L11 must still record
+`freerdp_avc`, `freerdp_scaledmap_caps` (now measurable), `client_tool` and
+`session_desktop` for both sides.
 
 `supersedes` survives that falsification because it is not a causal claim: it says the plain
 and scaled maps are two variants of one behaviour, which is a fact about the two payload

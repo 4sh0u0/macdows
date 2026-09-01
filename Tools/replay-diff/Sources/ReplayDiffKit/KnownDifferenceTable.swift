@@ -41,8 +41,9 @@ public struct KnownDifferenceEntry: Sendable, Equatable, Codable {
     ///
     /// An earlier revision of this comment derived the asymmetry from the FFmpeg/AVC
     /// capability flip. That attribution was falsified (see ``cause`` and
-    /// `deps/freerdp.lock`'s CORRECTION note) and the mechanism is open pending the W2
-    /// instrumented re-record. An entry states which side, and on what evidence; it never
+    /// `deps/freerdp.lock`'s CORRECTION note), and the mechanism remains open AFTER the
+    /// W2 directed re-record (P2, 2026-09-02), which narrowed the suspect space without
+    /// closing it. An entry states which side, and on what evidence; it never
     /// states why the server behaved that way.
     public let expectedSide: DiffSide
     /// The event type this one stands in for: the two names describe **the same class of
@@ -170,11 +171,13 @@ public struct KnownDifferenceTable: Sendable, Equatable {
     /// tool, session desktop size, date/session, and — only afterwards — the FreeRDP build
     /// settings), and the samples cannot separate them.
     ///
-    /// So: an **expected delta against a pre-flip-era baseline**, cause unresolved, resolver
-    /// = the W2 drill's instrumented re-record (L4 §7(g): rail-probe/CRBridge need a
-    /// client-`CapsAdvertise` log first, since `SCALEDMAP_DISABLE` only exists at 10.7+ —
-    /// that log has since landed with P1, see the two caps entries below; the re-record
-    /// itself is still pending, so the cause stays unresolved). Assertions are forbidden in **both**
+    /// So: an **expected delta against a pre-flip-era baseline**, cause unresolved. The
+    /// named resolver — the instrumented directed re-record — RAN on 2026-09-02 (P1's log
+    /// plus P2): both stacks negotiate identical caps (10.7 incl. `SCALEDMAP_DISABLE`),
+    /// zero scaled events. It narrowed the suspect space (caps-difference eliminated;
+    /// what remains is server-side conditions or whatever else was different about the
+    /// one 2026-08-21 session) without closing the cause, which stays
+    /// unresolved. Assertions are forbidden in **both**
     /// directions: not "this is the AVC flip" (falsified), and not "this is an upstream
     /// FreeRDP regression" (ruling F-1).
     ///
@@ -200,16 +203,22 @@ public struct KnownDifferenceTable: Sendable, Equatable {
                 recorded as an upstream FreeRDP regression (ruling F-1). It must equally NOT \
                 be attributed to the WITH_VIDEO_FFMPEG/AVC caps flip: L4 §7(c)(d) falsified \
                 that (AVC_DISABLED is advertised identically before and after; the variant \
-                was seen two days BEFORE the flip, on a WITH_FFMPEG=OFF build). Leading open \
-                hypothesis is the client's advertised RDPGFX caps (SCALEDMAP_DISABLE, 10.7+), \
-                unmeasured in every existing recording because nothing logged the CapsAdvertise \
-                PDU or the negotiated capset when they were made; the client-side log has since \
-                landed (P1: GfxCapsAdvertise/GfxCapsConfirm), the instrumented re-record is \
-                still pending. At least four things differ between the two recordings (client \
-                tool, session desktop size, session/date, FreeRDP build settings) and the \
-                samples cannot separate them. RESOLVER: the W2 drill's instrumented re-record. Until then \
-                L11 must record freerdp_avc, freerdp_scaledmap_caps, client_tool and \
-                session_desktop for BOTH sides and assert no mechanism in either direction.
+                was seen two days BEFORE the flip, on a WITH_FFMPEG=OFF build). The caps \
+                were unmeasured in every recording made before P1 (nothing logged the \
+                CapsAdvertise PDU or the negotiated capset). The instrumented directed \
+                re-record RAN on 2026-09-02 (P2): BOTH client stacks advertise and \
+                negotiate byte-identical capsets — 10.7 with SCALEDMAP_DISABLE confirmed \
+                by the server — and produced zero scaled events. That ELIMINATES the \
+                caps-difference sub-hypothesis (the two tools' advertised caps do not \
+                differ) and re-frames the 2026-08-21 observation as a scaled map sent in \
+                a session that almost certainly advertised the disable flag; suspicion \
+                narrows to server-side conditions, or to whatever else was different \
+                about that one session. The other three confounders (session desktop \
+                size, session/date, FreeRDP build settings) remain unseparated -- only \
+                client_tool's caps dimension was measured out. The mechanism REMAINS \
+                OPEN and assertions stay forbidden in both directions. L11 must still \
+                record freerdp_avc, freerdp_scaledmap_caps (now measurable, not \
+                lock-derived), client_tool and session_desktop for BOTH sides.
                 """,
             // Tracked-to-tracked only. This string is copied verbatim into drill artifacts
             // and read by people without the private docs repo, so it cites the lock — which
