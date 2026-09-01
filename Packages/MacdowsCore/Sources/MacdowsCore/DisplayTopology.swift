@@ -133,9 +133,11 @@ public struct DisplayScale: Equatable, Sendable {
 /// WHY THE COMPONENTS ARE NOT `Double`. ADR §4.A.2 is explicit: `unionBounds` and
 /// `desktopSizePx` must be named types rather than bare lengths, "so that passing the union
 /// height to the flip function does not even compile". A `Double` height would be usable
-/// anywhere a primary height is -- including the deprecated `primaryMonitorHeight:` shims,
-/// which are the one bare-`Double` door left in this package and which live in exactly the
-/// wave in which L7 is migrating call sites. So `height` here is a `Scalar`, not a `Double`,
+/// anywhere a primary height is. Until M1 wave 3 that included the deprecated
+/// `primaryMonitorHeight:` shims -- at the time the one bare-`Double` door left in this package.
+/// L9 deleted them once the last call site had migrated, and `WindowGeometry.swift`'s
+/// `MARK: - Pre-M1 signatures: DELETED in M1 wave 3 (L9)` records why nothing of that shape may
+/// come back. So `height` here is a `Scalar`, not a `Double`,
 /// and getting the number out is the deliberate, greppable act of reading `.inPoints`.
 public struct DesktopUnionBoundsInPoints: Equatable, Sendable {
     /// A measurement in mac points that is **not** interchangeable with a bare `Double`.
@@ -551,7 +553,8 @@ extension DisplayTopology: CustomStringConvertible {
 ///     `primary.size.height`;
 ///  2. `DisplayTopology.unionBoundsInPoints` does not vend a `Double` at all -- its components
 ///     are `DesktopUnionBoundsInPoints.Scalar` -- so the union height cannot be passed to
-///     anything that takes a length, including the deprecated `primaryMonitorHeight:` shims.
+///     anything that takes a length (the deprecated `primaryMonitorHeight:` shims that used to
+///     be such a target were deleted in M1 wave 3).
 ///
 /// Precise scope of the claim (r1 review corrected an over-statement here): what cannot be
 /// written is *feeding a union height to the flip*. A caller determined to defeat this can

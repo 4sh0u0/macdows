@@ -459,6 +459,84 @@ struct F1BackingVsMappedTally {
     }
 }
 
+/// H3's visible-window size bands, re-expressed in **remote px** (adr/0015 §6 rule 1: the unit
+/// is remote px). Both bands' constants are RAIL-observed remote-pixel facts -- the 150x80 floor
+/// from the 136x39 tray helper / 1009x4 edge strips / dxdiag's 478x188 progress dialog, the
+/// About anchor from winver's ~536x521 dialog -- but until the C-2 checkpoint (2026-09-01) they
+/// were compared against `NSWindow.frame` in mac pt, an identity that only holds at rasterScale
+/// 1. In the 2x checkpoint session the About window's own F1 line measured `mapped=522x515
+/// remote px content=261x258 mac pt`, i.e. the frame under comparison was about half the
+/// remote-px constants, and the anchor band went red against correct behaviour (C-2 run 1's
+/// only FAIL; `docs/reviews/2026-09-01-unattended/c2-checkpoint-record.md`). The frame is
+/// converted through the session's FROZEN topology first -- the same `rasterScale` the desktop
+/// size was derived from (§5.A.4's same-source invariant), never a fresh screen read -- and only
+/// then compared to the remote-px constants. Every size-band consumer in this file goes through
+/// here (`finish()`'s two asserts, `focusRotationCandidateWindows`, `runUnicodeDegradeScenario`'s
+/// target lock, the extra-apps new-window count), so the constants have exactly one home.
+///
+/// Known limit, shared with the desktop-size derivation it mirrors: `rasterScale` is the
+/// PRIMARY display's factor (adr/0015 §2 rule 2). In a non-uniform topology
+/// (`isUniformScale == false`, which `DisplayTopologyProvider` already warns about) a window on a
+/// secondary display converts with the primary's factor; today's hardware is single-display.
+/// Offline pins: `WindowSmokeGateSelfTest`'s `sizeBand*` cases.
+enum SizeBand {
+    struct RemotePixelSize: Equatable {
+        let width: Double
+        let height: Double
+    }
+
+    /// A mac-pt frame size through the session's frozen topology. adr/0015 §3 applies
+    /// `rasterScale` exactly once when turning points into remote px; this is that one
+    /// multiplication, applied to a size.
+    static func remotePixelSize(ofFrameSize size: CGSize, in topology: DisplayTopology) -> RemotePixelSize {
+        RemotePixelSize(width: size.width * topology.rasterScale, height: size.height * topology.rasterScale)
+    }
+
+    /// Plausible-content floor (inclusive) and garbage ceiling (exclusive), remote px. The floor
+    /// is 150x80, not the original 300x300: the Phase 1 acceptance matrix surfaced real, legitimate
+    /// short dialogs (dxdiag's initial progress window is 478x188 against the lab host) that
+    /// 300x300 wrongly rejected; 150x80 still excludes every RAIL helper class actually observed
+    /// (1x1 bookkeeping windows, the 136x39 tray helper, 1009x4 edge strips) -- the HEIGHT floor is
+    /// the only thing that rejects an edge strip, which is why the self-test pins each axis alone.
+    ///
+    /// The ceiling's history is a guardrail, not trivia. The band used to carry a 2000(pt) upper
+    /// bound that existed only to independently re-catch a regression in RemoteWindowRegistry's
+    /// now-removed size-only cap (`isLikelyContentWindow`, `width>=2000 && height>=1000`). Phase 2
+    /// W0(1) (docs/plans/phase2.md) replaced THAT registry cap with a style/owner-based filter
+    /// (adr/0008 §3), and a maximized real content window is now explicitly SUPPOSED to become a
+    /// large visible RemoteWindow -- so re-imposing a 2000 ceiling here would silently reintroduce
+    /// the exact regression W0(1) fixed. The desktop-container window itself ("Program Manager")
+    /// is excluded by the registry's style check, not by any size heuristic in this harness, so no
+    /// upper bound is needed to catch it. What remains is a garbage-value net at 10000 remote px,
+    /// comfortably under RemoteWindowRegistry's own 16384 hard limit
+    /// (`WindowMappability.isMappableWindow`) and loose enough that no plausible maximized window
+    /// on any real display trips it.
+    static let plausibleContentFloor = RemotePixelSize(width: 150, height: 80)
+    static let garbageCeiling: Double = 10000
+    static func isPlausibleContent(_ size: RemotePixelSize) -> Bool {
+        size.width >= plausibleContentFloor.width && size.height >= plausibleContentFloor.height
+            && size.width < garbageCeiling && size.height < garbageCeiling
+    }
+
+    /// winver.exe's About Windows dialog: consistently ~536x521 remote px against the real lab
+    /// host; 400...700 on BOTH axes leaves slack for theme differences while still meaning
+    /// something as an anchor. DPI is no longer a reason for slack: the conversion above absorbs
+    /// the scale factor, and the residual F1 records on odd remote-px dimensions (±1 remote px on
+    /// the return trip: 515 remote px -> 257.5 pt -> 258 backing px -> 516, C-2's `delta=(0,1)`) is
+    /// two orders under the band's ±100.
+    static let aboutWindowsRange: ClosedRange<Double> = 400...700
+    static func isAboutWindowsDialog(_ size: RemotePixelSize) -> Bool {
+        aboutWindowsRange.contains(size.width) && aboutWindowsRange.contains(size.height)
+    }
+
+    /// The converted size plus the one-line rendering every band assertion prints, so a failure
+    /// names both units and the factor that linked them.
+    static func describe(frameSize: CGSize, in topology: DisplayTopology) -> (RemotePixelSize, String) {
+        let px = remotePixelSize(ofFrameSize: frameSize, in: topology)
+        return (px, "\(px.width)x\(px.height) remote px = \(frameSize.width)x\(frameSize.height) pt at rasterScale \(topology.rasterScale)")
+    }
+}
+
 /// `WINDOW_SMOKE_SELFTEST=1`: runs the pure gates above against fixtures and exits.
 ///
 /// WHY THIS EXISTS. `window-smoke` has no test bundle and cannot get one without touching another
@@ -485,6 +563,11 @@ struct F1BackingVsMappedTally {
 ///    step) => `f1RedAtTwoX` / `f1AdmitsOnlyExactEquality` (L9b). F1 is measurement-only and never
 ///    touches the exit code, which is exactly why its own logic has to be pinned here: nothing in a
 ///    live run can fail because of it, so nothing in a live run can reveal it broken either.
+///  * **the size bands' pt->remote px scaling dropped** (compare `NSWindow.frame` pt directly, the
+///    pre-C-2 shape) => `sizeBandJudgesAboutInRemotePixelsAt2x` / `sizeBandFloorIsInclusiveInRemotePixels`;
+///    the band loosened to hide the 2x red instead => `sizeBandAboutRejectsHalfSizeAt1x`; one axis
+///    of either band dropped => `sizeBandFloorRejectsEachAxisAlone` / `sizeBandAboutNeedsBothAxes` /
+///    `sizeBandCeilingRejectsEachAxisAlone`.
 ///
 /// **Known blind spot, stated rather than papered over** (rev-L9 I-2, R6): replacing the two
 /// `WindowGeometry.windowsPoint` calls with a copy of the rect conversion's own origin is an
@@ -745,6 +828,74 @@ enum WindowSmokeGateSelfTest {
                 && f1Tally.summaryLine.contains("windows=1 GREEN=1 RED=0")
                 && f1Tally.summaryLine.contains("everRed=1"),
             "f1TallyKeepsTheLastStateAndRemembersAnEarlierRed: a verdict that flips is still visible"
+        )
+
+        // --- H3 size bands judged in remote px (adr/0015 §6.1; C-2 run 1's only FAIL) -----------
+        let aboutAt1x = SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 536, height: 521), in: topology1x)
+        expect(
+            aboutAt1x == SizeBand.RemotePixelSize(width: 536, height: 521) && SizeBand.isAboutWindowsDialog(aboutAt1x),
+            "sizeBandAboutAt1x: a 536x521 pt frame is 536x521 remote px and inside the About band"
+        )
+        // The C-2 shape, as a synthetic half-size frame (the real C-2 F1 line read content 261x258
+        // mac pt for mapped 522x515 remote px; 268x260.5 is exactly 536x521 / 2 so the pin stays
+        // arithmetic). Judged in pt it is "too small"; judged in remote px it is the same 536x521
+        // dialog. Killed by dropping the scaling (comparing frame pt directly) -- the pre-C-2 defect.
+        let aboutAt2x = SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 268, height: 260.5), in: topology2x)
+        expect(
+            aboutAt2x == SizeBand.RemotePixelSize(width: 536, height: 521) && SizeBand.isAboutWindowsDialog(aboutAt2x),
+            "sizeBandJudgesAboutInRemotePixelsAt2x: 268x260.5 pt at rasterScale 2 is 536x521 remote px, inside the band"
+        )
+        // Guard against "fixing" the 2x red by loosening the band instead of scaling: the same
+        // half-size frame at 1x really IS a 268x260 remote-px window and must stay outside.
+        expect(
+            !SizeBand.isAboutWindowsDialog(
+                SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 268, height: 260.5), in: topology1x)),
+            "sizeBandAboutRejectsHalfSizeAt1x: 268x260.5 remote px is not the About dialog"
+        )
+        // The plausible-content floor is a remote-px fact too: 75x40 pt at 2x is exactly the
+        // 150x80 floor (inclusive); one pt narrower (74 -> 148 remote px) is out, and 75x40 pt at
+        // 1x is 75x40 remote px -- under the floor.
+        expect(
+            SizeBand.isPlausibleContent(
+                SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 75, height: 40), in: topology2x))
+                && !SizeBand.isPlausibleContent(
+                    SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 74, height: 40), in: topology2x))
+                && !SizeBand.isPlausibleContent(
+                    SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 75, height: 40), in: topology1x)),
+            "sizeBandFloorIsInclusiveInRemotePixels: 75x40 pt passes only at 2x; 74x40 pt at 2x and 75x40 pt at 1x are under the floor"
+        )
+        // Each axis alone must be able to fail (review sizeband-r1 I1: dropping the HEIGHT floor,
+        // or judging the About band on width only, survived every earlier pin). The 1009x4 edge
+        // strip is the real helper class only the height floor rejects; 100x500 is its transpose.
+        expect(
+            !SizeBand.isPlausibleContent(
+                SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 1009, height: 4), in: topology1x))
+                && !SizeBand.isPlausibleContent(
+                    SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 100, height: 500), in: topology1x)),
+            "sizeBandFloorRejectsEachAxisAlone: a 1009x4 edge strip fails on height, a 100x500 sliver on width"
+        )
+        expect(
+            !SizeBand.isAboutWindowsDialog(SizeBand.RemotePixelSize(width: 536, height: 300))
+                && !SizeBand.isAboutWindowsDialog(SizeBand.RemotePixelSize(width: 300, height: 521)),
+            "sizeBandAboutNeedsBothAxes: 536x300 and 300x521 remote px are each outside the About band"
+        )
+        // The ceiling stays a remote-px number as well: 5000x5000 pt at 2x is 10000x10000 remote px
+        // and hits the exclusive ceiling, while the same frame at 1x is a legitimate large window.
+        expect(
+            !SizeBand.isPlausibleContent(
+                SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 5000, height: 5000), in: topology2x))
+                && SizeBand.isPlausibleContent(
+                    SizeBand.remotePixelSize(ofFrameSize: CGSize(width: 5000, height: 5000), in: topology1x)),
+            "sizeBandCeilingIsExclusiveInRemotePixels: 5000x5000 pt is garbage at 2x (10000) and plausible at 1x"
+        )
+        // ...and on each axis alone (review sizeband-r2 I-A2: with only the square sample, dropping
+        // one ceiling axis survived every pin). The other axis sits INSIDE the floor on purpose --
+        // a 100-px sample here would be rejected by the floor, not the ceiling, and the mutation
+        // would survive again (it did, on this pin's first draft).
+        expect(
+            !SizeBand.isPlausibleContent(SizeBand.RemotePixelSize(width: 10000, height: 500))
+                && !SizeBand.isPlausibleContent(SizeBand.RemotePixelSize(width: 500, height: 10000)),
+            "sizeBandCeilingRejectsEachAxisAlone: 10000x500 fails on width, 500x10000 on height (both remote px)"
         )
 
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
@@ -2759,6 +2910,15 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // it can be made.
         let freezePin = topologyFreezeCountCheck(expectedReconnects: cycleResults.count)
         check(freezePin.passed, freezePin.message)
+        // Same frozen-topology precondition `finish()` asserts: every size-band consumer on the
+        // per-tick path (`runUnicodeDegradeScenario`'s target lock, `focusRotationCandidateWindows`)
+        // passes nothing when no topology is frozen, and cycle mode exits through HERE -- without
+        // this line that state would be a silent empty candidate pool (review sizeband-r2 I-A1).
+        check(
+            displayTopology.sessionSnapshot != nil,
+            "size bands have a frozen session topology to convert NSWindow.frame pt into remote px "
+                + "(adr/0015 §5.A.6: none frozen -- every size-band selection this run made passed nothing)"
+        )
 
         let renderedCount = cycleResults.filter(\.rendered).count
         let closedCount = cycleResults.filter(\.closed).count
@@ -2935,6 +3095,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
 
         case .awaitingMaximize(let windowId, let sentAt):
             let snap = registry.windowSnapshots().first { $0.windowId == windowId }
+            // KNOWN pt/remote-px confusion, deliberately left as is (review sizeband-r1 I2 -> the
+            // follow-up pool in docs STATUS): this 2000 is a mac-pt frame threshold that only means "maximized" at rasterScale
+            // 1 -- a 2x session's maximized 2560-remote-px window is a 1280 pt frame and would read as
+            // "did not grow". Not exercised by C-2's four runs (scenario was off). Re-express through
+            // `SizeBand`'s conversion when this scenario is next run on a 2x session.
             if let snap, snap.frame.width >= 2000, snap.isVisible, snap.hasDisplayedContent {
                 maximizeResult = (grew: true, mappedWithContent: true)
                 print("[maximize] windowId=\(windowId) grew to \(Int(snap.frame.width))x\(Int(snap.frame.height)), still mapped with content")
@@ -2957,6 +3122,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
 
         case .awaitingRestore(let windowId, let sentAt):
             let snap = registry.windowSnapshots().first { $0.windowId == windowId }
+            // Same pt/remote-px caveat as the maximize check above (review sizeband-r1 I2).
             if let snap, snap.frame.width < 1000 {
                 restoreResult = true
                 print("[maximize] windowId=\(windowId) restored to \(Int(snap.frame.width))x\(Int(snap.frame.height))")
@@ -4136,10 +4302,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private func runUnicodeDegradeScenario(elapsed: TimeInterval, registry: RemoteWindowRegistry) {
         guard unicodeDegradeScenarioEnabled, inputTestMode == nil else { return }
         guard inputScriptSteps.isEmpty, !inputScriptComplete, elapsed >= 5 else { return }
-        // Same plausible-content band (>=150x80) `finish()`'s own per-window size assertion
-        // and `focusRotationCandidateWindows` use -- never a sliver/ghost window.
+        // Same plausible-content band (150x80 remote px, `isInPlausibleContentBand`) `finish()`'s
+        // own per-window size assertion and `focusRotationCandidateWindows` use -- never a
+        // sliver/ghost window.
         guard let snapshot = registry.windowSnapshots().first(where: {
-            $0.isVisible && $0.hasDisplayedContent && $0.frame.width >= 150 && $0.frame.height >= 80
+            $0.isVisible && $0.hasDisplayedContent && isInPlausibleContentBand($0)
         }), let window = registry.window(forWindowId: snapshot.windowId) else { return }
 
         // Identical to `runInputTest`'s preamble, and for the identical reason: an IME commit
@@ -4283,12 +4450,13 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// The round-robin candidate pool for `runFocusRotation` -- visible windows with real
-    /// displayed content, same plausible-content band (`>=150x80`) `finish()`'s own
-    /// per-window size assertion uses, sorted by windowId for a deterministic rotation
-    /// order (window creation/arrival order is not guaranteed stable across a run).
+    /// displayed content, same plausible-content band (150x80 remote px,
+    /// `isInPlausibleContentBand`) `finish()`'s own per-window size assertion uses, sorted by
+    /// windowId for a deterministic rotation order (window creation/arrival order is not
+    /// guaranteed stable across a run).
     private func focusRotationCandidateWindows(_ registry: RemoteWindowRegistry) -> [RemoteWindowRegistry.WindowSnapshot] {
         registry.windowSnapshots()
-            .filter { $0.isVisible && $0.hasDisplayedContent && $0.frame.width >= 150 && $0.frame.height >= 80 }
+            .filter { $0.isVisible && $0.hasDisplayedContent && isInPlausibleContentBand($0) }
             .sorted { $0.windowId < $1.windowId }
     }
 
@@ -4456,6 +4624,18 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             return (false, "\(screenshotPath) does not start with a PNG signature")
         }
         return (true, "\(screenshotPath) (\(size) bytes, mtime \(modDate))")
+    }
+
+    /// The plausible-content band every visible-window selection and assertion in this file
+    /// shares, judged in REMOTE PX through the session's frozen topology (`SizeBand`). With no
+    /// frozen topology nothing passes: the band cannot be judged in remote px at all, and
+    /// comparing frame pt against remote-px constants (correct only at rasterScale 1) is the
+    /// pre-C-2 defect this predicate exists to retire -- both exits (`finish()` and
+    /// `finishCycles()`) report that state as their own failed check, so a selection that finds
+    /// no candidate here never fails silently.
+    private func isInPlausibleContentBand(_ snapshot: RemoteWindowRegistry.WindowSnapshot) -> Bool {
+        guard let topology = displayTopology.sessionSnapshot else { return false }
+        return SizeBand.isPlausibleContent(SizeBand.remotePixelSize(ofFrameSize: snapshot.frame.size, in: topology))
     }
 
     private func finish() {
@@ -4688,8 +4868,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // apps actually launching (2026-08-22 review HIGH).
             if !extraApps.isEmpty {
                 let newContentWindows = visibleWindows.filter {
-                    // Same 150x80 floor as the per-window band assert below.
-                    $0.frame.width >= 150 && $0.frame.height >= 80 && $0.hasDisplayedContent
+                    // Same 150x80 remote-px floor as the per-window band assert below.
+                    isInPlausibleContentBand($0) && $0.hasDisplayedContent
                         && !windowIdsBeforeExtraApps.contains($0.windowId)
                 }
                 check(
@@ -4753,36 +4933,30 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 + "leave zero if this was the only window open)")
         }
 
-        // H3, revised for Phase 2 W0① (docs/plans/phase2.md W0①): every visible window's
-        // size must clear a broad, non-brittle plausible-content floor. The upper bound
-        // this band used to carry (2000pt) existed only to independently catch a
-        // regression in RemoteWindowRegistry's now-removed size-only cap (`isLikelyContentWindow`,
-        // `width>=2000 && height>=1000`) -- W0① replaced that cap with a style/owner-based
-        // filter (adr/0008 §3), and a maximized real content window is now explicitly
-        // SUPPOSED to become a large visible RemoteWindow, so re-imposing that same 2000pt
-        // ceiling here would silently reintroduce the exact regression this pass exists to
-        // fix. The desktop-container window itself ("Program Manager") is still excluded
-        // -- now by RemoteWindowRegistry's style check, not by this harness duplicating a
-        // size heuristic -- so no upper bound is needed to catch that specific case
-        // anymore. What remains is a generous garbage-value sanity net only, one order of
-        // magnitude under RemoteWindowRegistry's own 16384 hard ceiling
-        // (WindowMappability.isMappableWindow), loose enough that no plausible maximized
-        // window on any real display trips it. No maximize e2e is added here (deferred to
-        // W2 -- no SysCommand lever exposed yet); this only stops the band itself from
-        // becoming a second place a maximize regression would need fixing.
-        for w in visibleWindows {
-            let width = w.frame.width
-            let height = w.frame.height
-            // Band floor 150x80, not the original 300x300: the Phase 1 acceptance matrix
-            // surfaced real, legitimate short dialogs (dxdiag's initial progress window is
-            // 478x188 against the lab host) that 300x300 wrongly rejected. 150x80 still
-            // excludes every RAIL helper class actually observed (1x1 bookkeeping windows,
-            // the 136x39 tray helper, 1009x4 edge strips) -- which is this band's job.
-            check(
-                width >= 150 && height >= 80 && width < 10000 && height < 10000,
-                "visible window \"\(w.title)\" (id \(w.windowId)) size is in the plausible-content band "
-                    + "(got \(width)x\(height))"
-            )
+        // H3, revised for Phase 2 W0① (docs/plans/phase2.md W0①) and re-expressed in REMOTE PX for
+        // M1 (adr/0015 §6 rule 1; C-2 run 1's only FAIL): every visible window's size must clear
+        // a broad plausible-content floor and stay under a garbage ceiling. `SizeBand` owns both
+        // constants, their history (the 150x80 floor, the removed 2000 ceiling, the 10000 net) and
+        // the pt->remote px conversion through the session's FROZEN topology -- the same
+        // `rasterScale` the desktop size was derived from (§5.A.4), never a fresh screen read. No
+        // frozen topology means the sizes cannot be judged in remote px at all; the discipline is
+        // the move-resize leg's: report that as a failed check, never fall back to comparing frame
+        // pt against remote-px constants (the pre-C-2 shape, correct only at rasterScale 1).
+        let sizeBandTopology = displayTopology.sessionSnapshot
+        check(
+            sizeBandTopology != nil,
+            "size bands have a frozen session topology to convert NSWindow.frame pt into remote px "
+                + "(adr/0015 §5.A.6: none frozen -- the band checks below are skipped, not judged in pt)"
+        )
+        if let sizeBandTopology {
+            for w in visibleWindows {
+                let (px, detail) = SizeBand.describe(frameSize: w.frame.size, in: sizeBandTopology)
+                check(
+                    SizeBand.isPlausibleContent(px),
+                    "visible window \"\(w.title)\" (id \(w.windowId)) size is in the plausible-content band "
+                        + "(150x80 remote px floor; got \(detail))"
+                )
+            }
         }
 
         // H3: anchor the size assertion on the actual winver.exe "About Windows" dialog by
@@ -4812,16 +4986,18 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // exclusion, same reasoning.
         if launchedAppKind == .winver, inputTestMode == nil, !maximizeScenarioEnabled, !moveResizeScenarioEnabled, !popupScenarioEnabled {
             if let aboutWindow {
-                let w = aboutWindow.frame.width
-                let h = aboutWindow.frame.height
-                // Tighter band than the general one above: the actual About Windows dialog
-                // is consistently ~536x521 against the real lab host; some slack for
-                // DPI/theme differences, but tight enough to still mean something as an
-                // anchor.
-                check(
-                    w >= 400 && w <= 700 && h >= 400 && h <= 700,
-                    "the About-Windows-anchored window's size matches winver.exe's dialog (got \(w)x\(h))"
-                )
+                // Tighter band than the general one above, judged in remote px through the same
+                // frozen topology (`SizeBand.aboutWindowsRange`). C-2 run 1 went red exactly here
+                // at 2x: the About window's F1 line read 522x515 remote px as a 261x258 pt content
+                // rect, and the pt frame was compared against remote-px constants.
+                if let sizeBandTopology {
+                    let (px, detail) = SizeBand.describe(frameSize: aboutWindow.frame.size, in: sizeBandTopology)
+                    check(
+                        SizeBand.isAboutWindowsDialog(px),
+                        "the About-Windows-anchored window's size matches winver.exe's dialog "
+                            + "(400...700 remote px on both axes; got \(detail))"
+                    )
+                }
                 // H2/H3 round 2, experiment 2 (control group, W4b review): a *freshly
                 // launched* window's own content -- not a stale/backgrounded one -- should
                 // paint completely, including its bottom region. Lower threshold than

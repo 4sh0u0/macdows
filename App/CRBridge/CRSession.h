@@ -124,8 +124,9 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 @property (nonatomic, readonly) NSString *title;
 /// WindowCreate/Update only, meaningful only when `fieldFlags` sets the offset bit
 /// (0x0800). Windows-space desktop offset, top-left origin, Y down — feed straight into
-/// `MacdowsCore.WindowGeometry.macRect(from:primaryMonitorHeight:)`, never used directly
-/// as an NSWindow frame origin.
+/// `MacdowsCore.WindowGeometry.macRect(from:in:)` (the `DisplayTopology`-taking M1 signature;
+/// the pre-M1 `primaryMonitorHeight:` shims are gone), never used directly as an NSWindow
+/// frame origin.
 @property (nonatomic, readonly) int32_t offsetX;
 @property (nonatomic, readonly) int32_t offsetY;
 /// WindowCreate/Update only, meaningful only when `fieldFlags` sets the size bit (0x0400).
@@ -568,8 +569,8 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// `crdpq_cmd_window_move_t`'s own field names already match 1:1, so this method does no
 /// coordinate math of its own, the same "dumb pipe" contract every other outbound method on
 /// this header already has. The caller (`RemoteWindowRegistry`) computes these four values
-/// from the local `NSWindow` frame via `MacdowsCore.WindowGeometry.windowsRect(from:
-/// primaryMonitorHeight:)` (the exact inverse of the conversion `handleWindowOrder` already
+/// from the local `NSWindow` frame via `MacdowsCore.WindowGeometry.windowsRect(from:in:)`
+/// (the exact inverse of the conversion `handleWindowOrder` already
 /// applies inbound), then `right = left + width` / `bottom = top + height` -- never handed
 /// a width/height pair directly, so a caller can't accidentally reintroduce the classic
 /// RECT-vs-x/y/w/h off-by-frame bug this method's own signature is shaped to avoid.
@@ -651,7 +652,7 @@ typedef NS_ENUM(NSInteger, CRModifierKey) {
 /// are a direct, undecorated port of what FreeRDP's own Mac client already does for the
 /// same input, not a design choice made here). The caller (`RemoteWindowRegistry`) is
 /// responsible for converting a mac-screen point to Windows-space absolute desktop
-/// coordinates via `MacdowsCore.WindowGeometry.windowsPoint(from:primaryMonitorHeight:)`
+/// coordinates via `MacdowsCore.WindowGeometry.windowsPoint(from:in:)`
 /// before calling any of the coordinate-taking methods here -- RAIL mouse input always
 /// targets the *whole remote desktop's* absolute coordinate space, not a window-local one,
 /// even though each RAIL window is rendered here as its own separate NSWindow. All six
