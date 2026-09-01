@@ -159,19 +159,19 @@ struct CommandLineOptions {
           Timestamps (t_ms), thread ids (tid) and run duration (sinceConnectMs) are
           ignored. Session-scoped handles (windowId/ownerWindowId/activeWindowId/
           windowIdMarker, surfaceId, notifyIconId) are compared as per-side canonical
-          tokens — a window handle with a UNIQUE title anchors on it; an untitled window
-          takes its position from WindowCreate ORDER (window#k); a handle referenced but
-          never created in the capture gets its own late pool (window?#k); same-title
-          groups, surfaces and notify icons get first-appearance positions; the constants
-          0 (null handle) and, for window fields, 0xFFFFFFFF (no active window) are fixed
-          tokens and take no position — so a re-record's fresh HWNDs do not read
-          as changes while "these events are about the same window" still does. Events
-          are matched per event type and identity tuple, so cross-type reordering is
-          tolerated exactly. Residual movement is checked twice: within the event's own
-          producer lane (main / gfx / server, derived from the ev name and verified against
-          the frozen captures) at --lane-order-tolerance, because one lane is one thread
-          and its order is causal; and across lanes at --order-tolerance, because
-          interleaving between three concurrent producers is real run-to-run noise.
+          tokens — a window handle with a UNIQUE title anchors on it; an untitled window is
+          keyed by its WindowCreate payload class plus creation order within that class
+          (window+<style>+<styleEx>+<w>x<h>#k); a handle referenced but never created in the
+          capture gets its own late pool (window?#k); same-title groups, surfaces and notify
+          icons get first-appearance positions; the constants 0 (null handle) and, for window
+          fields, 0xFFFFFFFF (no active window) are fixed tokens and take no position — so a
+          re-record's fresh HWNDs do not read as changes while "these events are about the
+          same window" still does. Events are matched per event type and identity tuple, so
+          cross-type reordering is tolerated exactly. Residual movement is checked twice:
+          within the event's own producer lane (main / gfx / server, derived from the ev name
+          and verified against the frozen captures) at --lane-order-tolerance, because one
+          lane is one thread and its order is causal; and across lanes at --order-tolerance,
+          because interleaving between three concurrent producers is real run-to-run noise.
 
         OPTIONS
           --format text|json        Output format (default: text).

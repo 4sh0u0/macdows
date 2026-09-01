@@ -12,7 +12,7 @@ import Testing
 /// when the probe attached; a notify icon's owner) consumed an ordinal too. Referencing events
 /// now look the created handle's token up; handles with no WindowCreate at all live in their own
 /// late pool `window?#k`, so they cannot shift the created windows' positions.
-@Suite("untitled anchoring step 2: ordinals come from WindowCreate order, late handles get their own pool")
+@Suite("untitled anchoring step 2: ordinals come from WindowCreate order (within the payload class since step 3), late handles get their own pool")
 struct CreationOrderedIdentityTests {
     static func gfxMap(tMs: Int, surface: UInt32, window: UInt32) -> String {
         #"{"t_ms":\#(tMs),"tid":"0x16f0f7000","ev":"GfxMapSurfaceToWindow","surfaceId":\#(surface),"windowId":\#(window),"mappedWidth":320,"mappedHeight":240}"#

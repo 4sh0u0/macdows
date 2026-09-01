@@ -28,8 +28,9 @@ and thread fields outright, and compares session-scoped handles
 (`windowId`/`ownerWindowId`/`activeWindowId`/`windowIdMarker`, `surfaceId`, `notifyIconId`)
 as per-side canonical tokens: a `window` handle that ever carries a non-empty `title`
 anchors on it (same-title duplicates disambiguate by a per-side first-appearance index —
-see the known-limitations section for what that index does NOT buy); an untitled window
-takes its position from WindowCreate ORDER (`window#k`); a handle referenced but never
+see the known-limitations section for what that index does NOT buy); an untitled window is
+keyed by its WindowCreate payload class and its creation order within that class
+(`window+<style>+<styleEx>+<w>x<h>#k`); a handle referenced but never
 created in the capture goes to the late pool (`window?#k`); `surface` and `notifyIcon` get
 per-side first-appearance ordinals; `0` and (for window fields) `0xFFFFFFFF` are constants
 — so "the window ids changed" is silence while
@@ -210,21 +211,37 @@ population: they enter no pool). The runtime note issues one line per pool whose
 count changed — `window` (created untitled windows and same-title-group members share it),
 `window?`, `surface`, `notifyIcon` — so a report carries as many such lines as pools that moved.
 
-- **Untitled `window` handles with a WindowCreate** take their ordinal from **creation
-  order** (untitled anchoring step 2, `CreationOrderedIdentityTests`): the main lane is one
+- **Untitled `window` handles with a WindowCreate** are keyed by their **payload class** — the
+  `(style, styleEx, windowWidth, windowHeight)` tuple of the first WindowCreate, the four fields
+  the untitled-payload analysis found stable across recording days (style equal in 100% of 84
+  pairs, width/height 92.9%, styleEx 91.7%; every unequal sample was a same-class creation-order
+  swap, which the partition resolves, or an offset/`fieldFlags` difference, which is not in the
+  key) — with the ordinal counted
+  **within the class** (untitled anchoring step 3, `ClassPartitionedIdentityTests`; token
+  `window+<style>+<styleEx>+<w>x<h>#k`). Offsets, `show`, `numVisibilityRects` and `fieldFlags`
+  are session variables and stay out of the key, so an extra or missing untitled window shifts
+  only its own class's members. Known limit: the key holds the window's size, so a full-screen
+  untitled window would carry the desktop geometry into its class (today's untitled windows are
+  all small). The ordinal itself comes from **creation order** (step 2,
+  `CreationOrderedIdentityTests`): the main lane is one
   thread, so that order is deterministic, unlike "whichever event mentioned the handle first".
   That race is real but rare in the twelve captures — a first mention before the handle's own
   WindowCreate happens for 11 of 138 created handles on the frozen side (all via
   `GfxMapSurfaceToWindow`) and 12 of 143 on the re-record side (6 via `MonitoredDesktop` on the
   main lane itself, 6 via gfx maps); among the UNTITLED created handles step 2 governs, only 1 of
   84 and 2 of 85. First WindowCreate wins for HWND reuse (pinned by
-  `CreationOrderedIdentityTests.hwndReuseKeepsTheFirstCreationOrdinal`). The same experiment
-  with an UNTITLED extra window measures **15 `eventCountChanged` findings** (pinned,
-  interlocked with the runtime note's own text; only that count is construction-independent;
-  49 before step 2, 53 before step 1) — the extra head window still shifts every created
-  untitled window by one, which is the residual by construction. A live re-record that opens
-  one transient untitled window the baseline did not (a splash screen, a tooltip, a tray flyout)
-  lands here.
+  `CreationOrderedIdentityTests.hwndReuseKeepsTheFirstCreationOrdinal`). The head-insertion
+  experiment with an UNTITLED extra window now depends on its class (pinned against the real
+  capture, interlocked with the runtime note's own text): a window of a class s3 does not
+  contain costs exactly **1** finding; a clone of an existing class's member costs, across s3's
+  seven untitled classes, **1–11 `eventCountChanged` / 24–64 findings** — the 4-member 136x39
+  tray-helper class is the harshest by count (11 / 34), the 5-member 0x0 class the mildest
+  multi-member case (3 / 52, its members nearly indistinguishable), two singleton classes bound
+  the totals (1 / 24, 3 / 64). That within-class shift is the residual by construction (15
+  `eventCountChanged` for the class-blind experiment after step 2, 49 after step 1, 53 before). A
+  live re-record that opens one transient untitled window the baseline did not (a splash
+  screen, a tooltip, a tray flyout) lands here — invisible if its class is new, a class-local
+  shift otherwise.
 - **`window?` — handles referenced but never created in the capture** (windows that existed
   before the probe attached, notify-icon owners, z-order markers) keep first-appearance
   ordinals within their own pool, so their churn cannot shift the created windows; that pool's
@@ -247,7 +264,9 @@ count changed — `window` (created untitled windows and same-title-group member
 untitled-payload-stability record quotes at 946 (`samples-local/rerecord-2026-09-drill-01`, an
 **untracked** maintainer-local directory; contributors cannot reproduce these numbers from the
 repo alone): total findings **946 → 879** (per scenario 199/116/164/164/162/141 →
-192/104/163/165/136/119 — s4 rose by one), bare `window#` identities 295 → 271. The synthetic
+192/104/163/165/136/119 — s4 rose by one), bare `window#` identities 295 → 265 (plus 6 carrying
+the constant token `window#0xFFFFFFFF`; an earlier revision counted those as ordinals and said
+271). The synthetic
 experiment above carries the constant on both sides and is not that scenario — its
 `eventCountChanged` fell 53 → 49 while its total rose 87 → 118: the constant's MonitoredDesktop
 occurrences now pair and report their drift (`eventOrderChanged` 0 → 18 for that event) instead
@@ -258,9 +277,17 @@ pair).
 **Measured, step 2** (creation order + `window?` pool), same corpus: **879 → 831**
 (`eventCountChanged` 380 → 298, `eventOrderChanged` 295 → 340, `fieldValueChanged` 202 → 191;
 per scenario 192/104/163/165/136/119 → 192/94/145/156/133/111). Bare `window#` identities
-271 → 54 and 135 findings now carry a `window?#` token — they do not sum to 271 because 82 former
+265 → 48 and 135 findings now carry a `window?#` token (an earlier revision said 271 → 54,
+counting the 6 constant-token identities as ordinals) — they do not sum to 265 because 82 former
 mis-pairs now pair (the count-changed drop) while newly paired events report order or field
 findings instead. Synthetic experiment: `eventCountChanged` 49 → 15, total 118 → 121.
+
+**Measured, step 3** (payload-class partition), same corpus: **831 → 794** (`eventCountChanged`
+298 → 298, `eventOrderChanged` 340 → 341, `fieldValueChanged` 191 → 153; per scenario
+192/94/145/156/133/111 → 181/94/145/138/125/111): the 48 bare-ordinal identities became class
+tokens, and the field-difference drop is windows of different classes no longer being paired
+positionally. Identity kinds after step 3: 109 titled, 48 class-token, 135 `window?#`, 6
+constant, 0 bare ordinals.
 
 **Constants.** Two identifier values are constants, not handles, and never take an ordinal or
 enter any pool: `0` (`<namespace>#none`, the null handle) and — `window` namespace only —

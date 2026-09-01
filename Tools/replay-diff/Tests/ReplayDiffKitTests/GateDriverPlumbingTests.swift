@@ -237,7 +237,8 @@ struct GateDriverPlumbingTests {
     // Round-2 finding N-4's exact-pin duty (the documented cascade-experiment number must
     // be reproduced by a test against the real capture the prose names) moved with the
     // experiment itself: since W2 batch 2's title-anchored identity the TITLED variant
-    // collapses to one finding and the documented number is the UNTITLED residual (15) —
+    // collapses to one finding and the documented numbers are the UNTITLED residuals (3 within
+    // an existing payload class / 1 for a new class, since untitled anchoring step 3) —
     // both halves are pinned in `TitleAnchoredIdentityTests`.
 
     /// Negative control: the note is evidence-driven, not decoration. Equal handle counts

@@ -8,8 +8,9 @@ public struct DifferOptions: Sendable, Equatable {
     /// Replace session-scoped handle values with per-side canonical tokens before
     /// comparing: a `window` handle that ever carries a non-empty `title` anchors on it
     /// (`windowId: 65832` → `window@About Windows`; same-title duplicates disambiguate by
-    /// first appearance); an untitled window takes its position from WindowCreate ORDER
-    /// (`window#k`); a handle referenced but never created in the capture goes to the late
+    /// first appearance); an untitled window is keyed by its WindowCreate payload class and
+    /// its creation order within that class (`window+<style>+<styleEx>+<w>x<h>#k`); a handle
+    /// referenced but never created in the capture goes to the late
     /// pool (`window?#k`); `surface` and `notifyIcon` get per-side first-appearance ordinals
     /// (`surfaceId: 7` → `surface#0`); `0` and, for window fields, `0xFFFFFFFF` are constants.
     /// On by
@@ -225,21 +226,39 @@ public enum EventLane: String, Sendable, Equatable, CaseIterable {
 /// members SHARE it), `window?`, `surface`, `notifyIcon` — so a report carries as many such
 /// lines as pools that moved.
 ///
-/// - **Untitled `window` handles with a WindowCreate** take their ordinal from **creation
-///   order** (untitled anchoring step 2, `CreationOrderedIdentityTests`): the main lane
+/// - **Untitled `window` handles with a WindowCreate** are keyed by their **payload class**
+///   — the `(style, styleEx, windowWidth, windowHeight)` tuple of the first WindowCreate, the
+///   four fields the untitled-payload analysis found stable across recording days (§3, 84
+///   build-order pairs: style equal in 100%, width/height 92.9%, styleEx 91.7%; every unequal
+///   sample was a same-class creation-order swap, which the partition resolves, or an
+///   offset/`fieldFlags` difference, which is not in the key) — with the ordinal counted
+///   **within the class**
+///   (untitled anchoring step 3, `ClassPartitionedIdentityTests`; token
+///   `window+<style>+<styleEx>+<w>x<h>#k`). Offsets, `show`, `numVisibilityRects` and
+///   `fieldFlags` are session variables and stay out of the key. An extra or missing untitled
+///   window therefore shifts only its own class's members. Known limit (record §8 / review
+///   G2): the key holds the window's size, so a full-screen untitled window would carry the
+///   desktop geometry into its class and a re-record on another desktop size would report it
+///   as unpaired rather than mis-paired (today's untitled windows are all small). The ordinal
+///   itself comes from **creation order** (step 2, `CreationOrderedIdentityTests`): the main lane
 ///   (`EventLane.main`) is one thread, so that order is deterministic, unlike "whichever event
 ///   mentioned the handle first". That race is real but rare in the twelve captures: a first
 ///   mention before the handle's own WindowCreate happens for 11 of 138 created handles on the
 ///   frozen side (all via `GfxMapSurfaceToWindow`) and 12 of 143 on the re-record side (6 via
 ///   `MonitoredDesktop` — the main lane itself — and 6 via gfx maps); among the UNTITLED
 ///   created handles step 2 governs, only 1 of 84 and 2 of 85. First WindowCreate wins for
-///   HWND reuse (`hwndReuseKeepsTheFirstCreationOrdinal`). The same experiment with an
-///   UNTITLED extra window measures **15 `eventCountChanged`** findings (pinned, interlocked
-///   with the note's own text; 49 before step 2, 53 before step 1): the extra head window still
-///   shifts every created untitled window by one, which is the residual by construction. A
-///   re-record that
-///   opens one transient untitled window the baseline did not (a splash screen, a tooltip, a
-///   tray flyout) lands here.
+///   HWND reuse (`hwndReuseKeepsTheFirstCreationOrdinal`). The head-insertion experiment with
+///   an UNTITLED extra window now depends on its class (pinned against the real capture,
+///   interlocked with the note's own text): a window of a class s3 does not contain costs
+///   exactly **1** finding; a clone of an EXISTING class's member costs, across s3's seven
+///   untitled classes, **1–11 `eventCountChanged` / 24–64 findings** — the 4-member 136x39
+///   tray-helper class is the harshest by count (11 / 34), the 5-member 0x0 class the mildest
+///   multi-member case (3 / 52: its members are nearly indistinguishable, so the shift barely
+///   shows), and two singleton classes bound the totals (1 / 24 and 3 / 64). That within-class
+///   shift is the residual by construction (15 `eventCountChanged` for the class-blind
+///   experiment after step 2, 49 after step 1, 53 before). A re-record that opens one transient
+///   untitled window the baseline did not (a splash screen, a tooltip, a tray flyout) lands
+///   here — invisible if its class is new, a class-local shift otherwise.
 /// - **`window?` — handles referenced but never created in the capture** (windows that
 ///   existed before the probe attached, notify-icon owners, z-order markers) keep
 ///   first-appearance ordinals within their own pool, so their churn cannot shift the created
@@ -266,7 +285,9 @@ public enum EventLane: String, Sendable, Equatable, CaseIterable {
 /// (`samples-local/rerecord-2026-09-drill-01`, untracked): total findings **946 → 879** (per
 /// scenario 199/116/164/164/162/141 →
 /// 192/104/163/165/136/119; s4 rose by one); findings whose identity carries a bare `window#`
-/// ordinal 295 → 271. The synthetic head-insertion experiment above carries the constant on
+/// ordinal 295 → 265 (plus 6 whose identity is the constant token `window#0xFFFFFFFF`; an
+/// earlier revision of this paragraph counted those as ordinals and said 271). The synthetic
+/// head-insertion experiment above carries the constant on
 /// BOTH sides and is not that scenario: `eventCountChanged` 53 → 49 (MonitoredDesktop 2 → 0,
 /// WindowCreate 9 → 7), total 87 → 118 — `eventOrderChanged` 22 → 51 (MonitoredDesktop
 /// 0 → 18 as the constant's occurrences pair and report drift; WindowCreate 10 → 18; three other
@@ -277,11 +298,20 @@ public enum EventLane: String, Sendable, Equatable, CaseIterable {
 /// **Measured, step 2** (creation order + `window?` pool), same corpus: **879 → 831**
 /// (`eventCountChanged` 380 → 298, `eventOrderChanged` 295 → 340, `fieldValueChanged`
 /// 202 → 191, one-sided types 2 → 2; per scenario 192/104/163/165/136/119 →
-/// 192/94/145/156/133/111). Bare `window#` identities 271 → 54 and 135 findings now carry a
-/// `window?#` token — they do not sum to 271 because 82 former mis-pairs now pair (the
+/// 192/94/145/156/133/111). Bare `window#` identities 265 → 48 and 135 findings now carry a
+/// `window?#` token (an earlier revision said 271 → 54, counting the 6 constant-token
+/// identities as ordinals) — they do not sum to 265 because 82 former mis-pairs now pair (the
 /// count-changed drop) while newly paired events report order or field findings instead. The
 /// synthetic experiment: `eventCountChanged` 49 → 15, total 118 → 121 (order 51 → 71, field
 /// 18 → 35).
+///
+/// **Measured, step 3** (payload-class partition), same corpus: **831 → 794**
+/// (`eventCountChanged` 298 → 298, `eventOrderChanged` 340 → 341, `fieldValueChanged`
+/// 191 → 153, one-sided types 2 → 2; per scenario 192/94/145/156/133/111 →
+/// 181/94/145/138/125/111): the 48 findings that carried a bare `window#` ordinal now carry a
+/// class token, and the field-difference drop is windows of different classes no longer being
+/// paired positionally. Identity kinds after step 3 across the six pairs: 109 titled, 48
+/// class-token, 135 `window?#`, 6 constant, 0 bare ordinals.
 ///
 /// **Constants.** Two identifier values are constants, not handles, and never take an ordinal
 /// or enter any pool: `0` (`<namespace>#none`, the null handle) and — `window` namespace only —
@@ -494,8 +524,8 @@ public struct SemanticDiffer: Sendable {
             notes.append(
                 "identifier canonicalization ON for namespaces [\(namespaces.joined(separator: ", "))]"
                     + " — titled window handles are compared by title-anchored identity, all other"
-                    + " handle values as per-side positions (untitled windows by WindowCreate order,"
-                    + " never-created `window?` handles and the other namespaces by first appearance)"
+                    + " handle values as per-side positions (untitled windows by payload class and WindowCreate"
+                    + " order within it, never-created `window?` handles and the other namespaces by first appearance)"
             )
         } else {
             notes.append("identifier canonicalization OFF — raw handle values are compared literally")
@@ -657,20 +687,58 @@ public struct SemanticDiffer: Sendable {
     /// one IS event-name keyed, deliberately: a title is a field that may ride on either
     /// window-order event, whereas creation is the `WindowCreate` event itself and nothing else
     /// carries it.
+    ///
+    /// Step 3 partitions the ordinal by **payload class**: the `(style, styleEx, windowWidth,
+    /// windowHeight)` tuple of that first WindowCreate, with `k` counted WITHIN the class. The
+    /// key's cross-session stability is the untitled-payload analysis §3 (84 build-order pairs):
+    /// style equal in 100%, windowWidth/windowHeight in 92.9%, styleEx in 91.7% — and every
+    /// unequal sample decomposes into either a same-class creation-order swap (an identity
+    /// mis-pair the class partition resolves by construction: §5's last column measures 0 class
+    /// mismatches) or one of two content-difference families that live entirely in offsets and
+    /// `fieldFlags`, which are NOT in the key. Offsets, `show`, `numVisibilityRects` and
+    /// `fieldFlags` are session variables and stay out (`ClassPartitionedIdentityTests` pins
+    /// that). An extra or missing untitled window therefore shifts only its own class's members,
+    /// never the whole untitled population. Known limit (§8, review G2): the key contains the
+    /// window's size, and a full-screen untitled window would inherit the environment's desktop
+    /// geometry into its class — a re-record on a different desktop size would then report it as
+    /// unpaired rather than mis-paired. Both corpora's untitled windows are small (heights
+    /// 0/1/4/39, none full-screen). A payload field the decoder did not deliver renders as `?` in
+    /// the key (the RailEvent decoder requires the whole window-order payload, so this is
+    /// defensive, not a path the corpus takes).
     private func creationOrdinalsByRawHandle(
         _ records: [ReplayRecord], titles: [String: String], windowNamespace: String?
-    ) -> [String: Int] {
-        var ordinals: [String: Int] = [:]
+    ) -> [String: CreationIdentity] {
+        var identities: [String: CreationIdentity] = [:]
+        var nextInClass: [String: Int] = [:]
         for record in records where record.eventName == "WindowCreate" {
             guard let raw = record.fields["windowId"]?.integerCanonicalForm,
                   let namespace = options.fieldPolicy.namespace(of: "windowId"),
                   constantToken(raw: raw, namespace: namespace, windowNamespace: windowNamespace) == nil,
                   titles[raw] == nil,
-                  ordinals[raw] == nil
+                  identities[raw] == nil
             else { continue }
-            ordinals[raw] = ordinals.count
+            let classKey = Self.payloadClassKey(of: record)
+            let k = nextInClass[classKey, default: 0]
+            nextInClass[classKey] = k + 1
+            identities[raw] = CreationIdentity(classKey: classKey, ordinalInClass: k)
         }
-        return ordinals
+        return identities
+    }
+
+    /// What the WindowCreate-order prescan hands back per created untitled handle: the payload
+    /// class it belongs to and its creation ordinal within that class (step 3); `canonicalized`
+    /// renders the pair as `window+<classKey>#<ordinalInClass>`.
+    struct CreationIdentity: Equatable {
+        let classKey: String
+        let ordinalInClass: Int
+    }
+
+    /// `<style>+<styleEx>+<w>x<h>` from a WindowCreate's own fields — decimal integers joined by
+    /// separators outside the integer alphabet, so the class key cannot be mistaken for, or forge,
+    /// an ordinal (`#<decimal>`), a late-pool token (`?#`) or a title (`@`, which escapes `#`).
+    private static func payloadClassKey(of record: ReplayRecord) -> String {
+        func component(_ name: String) -> String { record.fields[name]?.integerCanonicalForm ?? "?" }
+        return "\(component("style"))+\(component("styleEx"))+\(component("windowWidth"))x\(component("windowHeight"))"
     }
 
     /// The late pool's namespace label: `window` handles with neither a title nor a WindowCreate
@@ -723,8 +791,9 @@ public struct SemanticDiffer: Sendable {
                     token = k == 0 ? "\(namespace)@\(escaped)" : "\(namespace)@\(escaped)#\(k)"
                 } else if namespace == windowNamespace, let created = creationOrdinals[raw] {
                     // Step 2: creation order, not first mention — an early gfx-lane reference to
-                    // this handle gets the same token its WindowCreate will.
-                    token = "\(namespace)#\(created)"
+                    // this handle gets the same token its WindowCreate will. Step 3: the order is
+                    // counted within the window's payload class, and the class is in the token.
+                    token = "\(namespace)+\(created.classKey)#\(created.ordinalInClass)"
                 } else if namespace == windowNamespace {
                     // Step 2: neither title nor WindowCreate in this capture — the late pool,
                     // position-keyed among its own members only.
@@ -885,14 +954,17 @@ public struct SemanticDiffer: Sendable {
             notes.append(
                 "CASCADE RISK: the candidate has \(after) distinct un-anchored `\(namespace)` handle(s) "
                     + "against the baseline's \(before). Un-anchored handles (`surface`/`notifyIcon` always; "
-                    + "`window` handles that never carry a title — keyed by WindowCreate order — plus every "
+                    + "`window` handles that never carry a title — keyed by payload class and WindowCreate "
+                    + "order WITHIN the class, so an extra or missing one shifts only its class-mates — plus every "
                     + "member of a same-title group, which disambiguate by a per-side first-appearance index; "
                     + "`window?` = handles referenced but never created in this capture, position-keyed among "
                     + "themselves only) are position-keyed, so an extra or missing one EARLY in the stream shifts "
-                    + "every later `\(namespace)` position and can turn one real difference into dozens "
-                    + "(measured residual: one extra UNTITLED WindowCreate at the head of a 145-line capture → "
-                    + "15 eventCountChanged findings; only UNIQUELY-titled windows are immune, since W2 batch "
-                    + "2's title-anchored identity). Read the FIRST eventCountChanged below and check "
+                    + "its class-mates' (or group-mates') positions and can turn one real difference into several "
+                    + "(measured: one extra UNTITLED WindowCreate of an EXISTING payload class at the head of a "
+                    + "145-line capture costs 1–11 eventCountChanged / 24–64 findings depending on the class — "
+                    + "the more distinguishable the class-mates, the more it shows; of a NEW class, exactly 1; "
+                    + "only UNIQUELY-titled windows are immune, since W2 batch 2's title-anchored identity). "
+                    + "Read the FIRST eventCountChanged below and check "
                     + "whether the candidate simply opened one extra transient window; if so, the rest of this "
                     + "report is one finding wearing a costume. --no-canonical-ids is NOT the remedy (it makes "
                     + "every handle differ)."

@@ -156,7 +156,8 @@ struct TitleAnchoredIdentityTests {
     /// Review W2b-r2 finding R2-2: the class doc and README quote **8** as the same-title
     /// group's only clean single-cause measurement (a pure creation-order swap: equal
     /// handle counts, no surface jitter, no note). Pinned against the real capture, same
-    /// N-4 discipline as the 15 (49 before untitled anchoring step 2, 53 before step 1).
+    /// N-4 discipline as the untitled residual pins (3 within-class / 1 new-class since untitled
+    /// anchoring step 3; 15 after step 2, 49 after step 1, 53 before).
     @Test("a two-line creation-order swap inside the same-title group measures exactly 8 findings, no note")
     func sameTitleGroupSwapMeasuresEight() throws {
         let url = try #require(PhaseSamples.url(named: "s3-multiapp"))
@@ -209,8 +210,10 @@ struct TitleAnchoredIdentityTests {
         ], label: "cand")
 
         let report = SemanticDiffer(options: options).diff(baseline: baseline, candidate: candidate)
-        // Ordinal identity still reports the migration (window#1 vs window#0) — redaction
-        // costs anchoring quality, never detection.
+        // Position-keyed identity still reports the migration — the two windows differ in
+        // width, so since untitled anchoring step 3 they are two payload classes
+        // (`window+…+400x240#0` vs `window+…+800x240#0`; before step 3, `window#0` vs
+        // `window#1`) — redaction costs anchoring quality, never detection.
         let counts = report.differences.filter { $0.diffClass == .eventCountChanged }
         #expect(counts.count == 2, "unexpected: \(report.differences)")
         for difference in report.differences {
@@ -243,9 +246,11 @@ struct TitleAnchoredIdentityTests {
 
     // MARK: - The honest residual
 
-    /// The same head-insertion experiment with an *untitled* extra window: nothing to
-    /// anchor on, so the untitled ordinal pool shifts and the cascade persists. This pin
-    /// keeps the residual named — if it ever shrinks (or grows) the note text and the
+    /// The same head-insertion experiment with an *untitled* extra window. Since untitled
+    /// anchoring step 3 the outcome depends on the extra window's PAYLOAD CLASS: a window of a
+    /// class the capture does not contain costs exactly one finding (itself); a window of an
+    /// EXISTING class shifts that class's members — the residual the note keeps naming. Both
+    /// halves are pinned against the real capture; if either moves, the note text and the
     /// README's Known-limitations section must move with it. History: 53 while the
     /// `0xFFFFFFFF` no-active-window constant was still ordinalised; 49 since untitled
     /// anchoring step 1 made it a constant (`IdentifierConstantTests`); **15** since step 2
@@ -263,7 +268,14 @@ struct TitleAnchoredIdentityTests {
     /// 12 → 18 — all six from the injected synthetic window now MIS-pairing with a real
     /// untitled one and comparing payloads instead of being a leftover).
     /// The step's own measurement is the real frozen×re-record corpus, quoted in the class
-    /// doc: 946 → 879.
+    /// doc: 946 → 879. Step 3 (payload-class partition): the fixture builder's window is a class
+    /// s3 does not contain, so that experiment collapses to **1**; the within-class residual is
+    /// measured by cloning a member of an EXISTING class at the head, and its size depends on
+    /// how distinguishable the class-mates are — so four classes are pinned, the two endpoints
+    /// by count and the two by total (review untitled-step3-r1 I1: pinning only the mildest
+    /// multi-member class read as if it were the residual): the 4-member 136x39 tray-helper
+    /// class, **11 eventCountChanged / 34 findings**; the 5-member 0x0 class, **3 / 52**; two
+    /// singleton classes, **1 / 24** and **3 / 64**. The note quotes the range 1–11 / 24–64.
     @Test("an untitled extra head window still cascades — the residual the note keeps naming")
     func untitledResidualCascades() throws {
         let url = try #require(PhaseSamples.url(named: "s3-multiapp"))
@@ -275,21 +287,59 @@ struct TitleAnchoredIdentityTests {
         // (review W2b-r1 F4 — the pin rode the deleted 98-experiment test and must not
         // be lost with it).
         #expect(lines.count == 145, "the documented experiment names a 145-line capture, got \(lines.count)")
-        let extra = Self.windowCreate(tMs: 1, id: 11111, title: "")
-        let mutated = [lines[0], extra] + lines.dropFirst()
+        let baseline = ReplayStream.parse(contents: contents, label: "s3")
 
-        let report = SemanticDiffer().diff(
-            baseline: ReplayStream.parse(contents: contents, label: "s3"),
-            candidate: ReplayStream.parse(contents: mutated.joined(separator: "\n") + "\n", label: "s3-plus-untitled")
+        // (a) A window of a payload class the capture does NOT contain (the fixture builder's
+        // 382664704/256/320x240): exactly one finding, the window itself. The note still fires
+        // — the created pool grew by one — but nothing else moved.
+        let newClass = SemanticDiffer().diff(
+            baseline: baseline,
+            candidate: ReplayStream.parse(
+                contents: ([lines[0], Self.windowCreate(tMs: 1, id: 11111, title: "")] + lines.dropFirst()).joined(separator: "\n") + "\n",
+                label: "s3-plus-new-class")
         )
-        // Exact pin, per round-2 finding N-4's lesson (pin only the construction-
-        // independent count, and pin it against the real capture the prose names) — this
-        // is the number the CASCADE note quotes, so the two must move together.
-        let counts = report.differences.filter { $0.diffClass == .eventCountChanged }.count
-        #expect(counts == 15, "the documented untitled residual drifted: \(counts)")
-        let note = try #require(report.notes.first { $0.hasPrefix("CASCADE RISK") },
+        #expect(newClass.differences.filter { $0.diffClass == .eventCountChanged }.count == 1,
+                "a new-class untitled window shifts nothing: \(newClass.differences.map(\.detail))")
+        #expect(newClass.differences.count == 1, "unexpected: \(newClass.differences)")
+        #expect(newClass.notes.contains { $0.hasPrefix("CASCADE RISK") })
+
+        // (b) A window of an EXISTING class: clone that class's first untitled WindowCreate with a
+        // fresh handle at the head; its class-mates shift by one. Four classes pinned — the
+        // harshest and mildest multi-member classes by count, and the two singleton classes that
+        // bound the total — so the range the note quotes is measured at both ends.
+        func headInsertion(style: Int, styleEx: Int, width: Int, height: Int) throws -> (count: Int, total: Int, notes: [String]) {
+            let member = try #require(lines.first {
+                $0.contains("\"ev\":\"WindowCreate\"") && $0.contains("\"title\":\"\"")
+                    && $0.contains("\"windowWidth\":\(width),\"windowHeight\":\(height)")
+                    && $0.contains("\"style\":\(style),\"styleEx\":\(styleEx)")
+            }, "s3-multiapp must still contain the \(width)x\(height) class this pin clones")
+            let clone = member
+                .replacingOccurrences(of: #""windowId":\d+"#, with: "\"windowId\":11111", options: .regularExpression)
+                .replacingOccurrences(of: #""t_ms":\d+"#, with: "\"t_ms\":1", options: .regularExpression)
+            #expect(clone != member)
+            let report = SemanticDiffer().diff(
+                baseline: baseline,
+                candidate: ReplayStream.parse(contents: ([lines[0], clone] + lines.dropFirst()).joined(separator: "\n") + "\n",
+                                              label: "s3-plus-\(width)x\(height)")
+            )
+            #expect(!report.differences.contains { $0.diffClass == .unparsableLine }, "\(report.differences)")
+            return (report.differences.filter { $0.diffClass == .eventCountChanged }.count, report.differences.count, report.notes)
+        }
+        // Exact pins, per round-2 finding N-4's lesson (pin against the real capture the prose
+        // names) — these are the numbers the CASCADE note quotes, so they must move together.
+        let trayHelpers = try headInsertion(style: 2_148_204_544, styleEx: 134_217_864, width: 136, height: 39)
+        #expect(trayHelpers.count == 11 && trayHelpers.total == 34,
+                "the harshest within-class residual (4-member 136x39 class) drifted: \(trayHelpers.count) / \(trayHelpers.total)")
+        let zeroByZero = try headInsertion(style: 2_147_483_648, styleEx: 134_217_856, width: 0, height: 0)
+        #expect(zeroByZero.count == 3 && zeroByZero.total == 52,
+                "the mildest multi-member residual (5-member 0x0 class) drifted: \(zeroByZero.count) / \(zeroByZero.total)")
+        let strip = try headInsertion(style: 2_147_483_648, styleEx: 136, width: 396, height: 0)
+        #expect(strip.count == 1 && strip.total == 24, "the lowest-total singleton class drifted: \(strip.count) / \(strip.total)")
+        let desktopLike = try headInsertion(style: 2_147_483_648, styleEx: 134_217_864, width: 0, height: 0)
+        #expect(desktopLike.count == 3 && desktopLike.total == 64, "the highest-total singleton class drifted: \(desktopLike.count) / \(desktopLike.total)")
+        let note = try #require(trayHelpers.notes.first { $0.hasPrefix("CASCADE RISK") },
                                 "an untitled handle-count change must still raise the note")
-        #expect(note.contains("15 eventCountChanged"),
-                "the note's quoted residual must match the measured one")
+        #expect(note.contains("1–11 eventCountChanged / 24–64 findings"),
+                "the note's quoted range must match the measured endpoints: \(note)")
     }
 }
