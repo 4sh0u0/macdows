@@ -338,11 +338,55 @@ final class RemoteWindowRegistry {
     /// L1 (W4b review): logged once, not on every event, so a genuinely no-display
     /// environment doesn't spam this on every drained window order — the actual skip
     /// behavior in handleWindowOrder still applies every time regardless of this flag.
-    private static var warnedZeroPrimaryMonitorHeight = false
+    ///
+    /// M1/W1 (ADR-0015 §5.A.6): renamed for the quantity it now guards, and **split in two**.
+    /// What is reported is unchanged in meaning — "there is no usable display layout, so skip
+    /// rather than compute a coordinate that was never meaningful" — only its source moved, from
+    /// a live `NSScreen.screens.first` read to this session's frozen topology snapshot.
+    ///
+    /// Two flags rather than one, because r1 review (M1) caught the single flag collapsing the
+    /// exact distinction it was introduced to preserve: pre-M1 the static bit guarded ONE
+    /// condition, whereas `sessionTopologyOrWarn()` now reports two, and first-occurrence-wins
+    /// meant a first session that legitimately ran headless would permanently silence the
+    /// "wiring defect" message for the rest of the process — the failure the adjacent comment
+    /// there says must not happen. The flags stay `static` (process-wide, never reset), which is
+    /// the pre-M1 behavior preserved deliberately rather than changed as a side effect of a unit
+    /// migration.
+    private static var warnedNoProviderInjected = false
+    private static var warnedProviderReportsNoDisplay = false
 
-    init(session: CRSession) {
+    /// One-shot for `refreshSessionTopology(reason:)`'s ADR §5.A.4 same-source check (r2 review:
+    /// it was the one diagnostic in this file without the throttle every other one has). Once per
+    /// process is the right grain even though the check itself runs at most once per connect: a
+    /// `WINDOW_SMOKE_CYCLES` soak reconnects N times, and a layout that diverged on cycle 1
+    /// diverges on all of them — the first report is the finding, the rest are volume. The exact
+    /// count is not lost either, since `sessionTopologyFreezeCount` is what a harness asserts on.
+    private static var warnedSessionTopologyDesktopDivergence = false
+
+    /// One-shot record for the MASK UNIT BOUNDARY (ADR-0015 §7 (c); U5 = record-only,
+    /// `m1-wave1-rulings.md:4`). Set the first time
+    /// `maskContentSize(fromContentRectInPoints:rasterScale:)` is asked to cross the mac-point →
+    /// wire-unit boundary at a `rasterScale` other than 1 — which is exactly the condition that
+    /// makes today's identity crossing wrong. Recorded, never acted on: M1 is a measurement
+    /// batch and the factor itself is W3's to decide from a real 2x session.
+    private static var warnedMaskUnitScaleGap = false
+
+    /// Builds the registry for one `CRSession` and freezes that session's display topology.
+    ///
+    /// - Parameter topologyProvider: the display-topology seam
+    ///   (`MacdowsCore.DisplayTopologyProviding`). See the stored property's own doc comment for
+    ///   why it is optional and what `nil` means; the short version is that this registry no
+    ///   longer knows how to find a screen by itself (ADR-0015 §5.A.5).
+    init(session: CRSession, topologyProvider: (any DisplayTopologyProviding)? = nil) {
         self.session = session
+        self.topologyProvider = topologyProvider
         self.macKeyboardType = Self.detectKeyboardType()
+        // ADR-0015 §5.A: the session's snapshot is taken at CONNECT. This initializer is that
+        // moment for a registry built per connection (`App/Macdows/AppDelegate.swift:283`,
+        // `Tools/window-smoke/main.swift:974`, both immediately before `CRSession.start()`). The
+        // only other freeze is `prepareForReconnect()`, the connect moment for a registry that a
+        // caller REUSES across connections; see `refreshSessionTopology(reason:)`.
+        refreshSessionTopology(reason: "connect")
         // adr/0014 §1: the tray's only outbound edge. Wired once, here, rather than on every
         // notify-icon order -- `trayStatusController` outlives every individual icon, and a
         // per-order assignment would silently depend on an order having arrived before a
@@ -370,15 +414,150 @@ final class RemoteWindowRegistry {
         }
     }
 
-    /// adr/0005 §2 / W4b task spec: "primaryMonitorHeight takes NSScreen.screens' primary screen" —
-    /// `NSScreen.screens.first`, not `NSScreen.main` (which tracks keyboard focus, a
-    /// different concept). `NSScreen.screens` is documented to list the primary display
-    /// (the one containing the menu bar, i.e. Windows-space origin (0,0)'s counterpart)
-    /// first.
-    private static var primaryMonitorHeight: Double {
-        // NSRect.height is CGFloat, not Double -- an explicit conversion (harmless on this
-        // 64-bit-only project, adr/0005's own target) rather than a type mismatch.
-        Double(NSScreen.screens.first?.frame.height ?? 0)
+    /// The display-topology seam (`MacdowsCore.DisplayTopologyProviding`), injected — and
+    /// deliberately the only way this class can learn anything about screens at all.
+    ///
+    /// M1/W1 replaced a `private static var primaryMonitorHeight: Double` that lived on this
+    /// exact spot and read `NSScreen.screens.first?.frame.height` on every call. Two separate
+    /// rulings removed it. ADR-0015 §5.A.5 confines every `NSScreen` read in the project to the
+    /// single App-side provider (W1 deliverable 2), because four files were each doing their own
+    /// read and nothing made them agree. ADR §5.A.4 then requires that a session's Y-flip anchor
+    /// and the desktop size it negotiated come from the SAME read — which a per-call-site live
+    /// lookup cannot satisfy even in principle. See `sessionTopology`.
+    ///
+    /// Optional with a `nil` default for one reason only: the two construction sites belong to
+    /// other lanes and migrate in their own waves (`AppDelegate.swift:283`, landed in wave 2;
+    /// `Tools/window-smoke/main.swift:974`, wave 3), and this file must not reach into theirs.
+    /// `nil` therefore behaves exactly like "no usable display": every consumer skips and warns
+    /// once, none of them invents a substitute (ADR §5.A.6). It is a wiring defect rather than a
+    /// supported mode, and `sessionTopologyOrWarn()` says so by name in the log.
+    private let topologyProvider: (any DisplayTopologyProviding)?
+
+    /// THE SESSION'S FROZEN TOPOLOGY SNAPSHOT — ADR-0015 §5 (U8, answer A), and the landing
+    /// point of its §5.A.4 invariant: *within one session, the Y-flip anchor and the desktop
+    /// size must come from the same topology read*.
+    ///
+    /// Why freezing is a deliberate behavior change and not an optimisation: the anchor used to
+    /// be re-derived from `NSScreen.screens.first` at every call, while the desktop size the
+    /// server clamps windows against is read exactly once on the connect path and never
+    /// resynced (`CRSession.h:284-286`). A display change mid-session therefore moved the anchor
+    /// immediately and left the server's desktop untouched — coordinates flipped against the new
+    /// primary height, clamped against the old desktop, silently misplaced. Freezing degrades
+    /// that into "this session keeps using the layout it negotiated until the next reconnect",
+    /// which is diagnosable, is bounded by a reconnect, and is precisely what W1's
+    /// screen-parameter observer exists to report (ADR §5.A.2's staleness boolean).
+    ///
+    /// Taken at construction (= connect) and re-taken ONLY in `prepareForReconnect()`, the
+    /// connect moment for a registry a caller reuses across connections. `nil` means "no usable
+    /// display layout": headless, every display asleep, or — transitionally — no provider
+    /// injected. ADR §5.A.6 forbids substituting anything for it, including the `0` this used to
+    /// degrade into; `handleWindowOrder`'s guard records what that costs for the session.
+    ///
+    /// The App hands over `StaticDisplayTopologyProvider(displayTopology.sessionSnapshot)`
+    /// (`AppDelegate.swift:283`) rather than the live provider, so in the App this value is the
+    /// literal same `DisplayTopology` the session's desktop size was derived from at
+    /// `AppDelegate.swift:263` — §5.A.4 holds exactly, not by same-turn reasoning.
+    private var sessionTopology: DisplayTopology?
+
+    /// How many times this registry has frozen a topology snapshot: 1 after `init`, plus one per
+    /// `prepareForReconnect()`. Diagnostics only, never read on the rendering path — the same
+    /// read-only-counter shape this project already uses for facts that are otherwise invisible
+    /// (`CRSession.staleEventsDiscardedCount`, `clicksDroppedIconGone`).
+    ///
+    /// It exists because the App target has no test bundle (`m1-execution-plan.md:38`; D7's item,
+    /// explicitly not M1 work), so the ADR §5 re-take **cannot be pinned by an offline test** —
+    /// and r1 review found the previous shape was dead code precisely because nothing pinned it.
+    /// This is the assertion surface instead, and the assertion is exact: after an
+    /// N-cycle `WINDOW_SMOKE_CYCLES` soak (one `prepareForReconnect()` per finished cycle,
+    /// `Tools/window-smoke/main.swift:1667`), **`sessionTopologyFreezeCount == N + 1`**. A value
+    /// of 1 means the re-take never fired, which is exactly the defect r1 caught. Handed to L9 in
+    /// `task-L7-report.md` as a wave-3 harness item; the registry cannot print it itself, and a
+    /// `Logger` line would not do — `Scripts/run-window-smoke.command:158` tees stdout/stderr,
+    /// while `os_log` goes to the unified log and never reaches that file.
+    private(set) var sessionTopologyFreezeCount = 0
+
+    /// Re-freezes `sessionTopology` from the provider. Called from exactly two places, and both
+    /// of them are a connect moment for this registry:
+    ///
+    ///  * `init` — for a caller that builds a registry per connection (`AppDelegate.swift:283`).
+    ///  * `prepareForReconnect()` — for a caller that REUSES one registry across connections.
+    ///    That is not hypothetical, and r1 review corrected this comment on the point:
+    ///    `CRSession.h:357-364` states the `shutdownAndWait()` → `start()` pairing *is*
+    ///    adr/0005 §4's reconnect on a surviving `CRSession`, and `window-smoke`'s
+    ///    `WINDOW_SMOKE_CYCLES` soak performs exactly it — one session (`main.swift:953`), one
+    ///    registry (`:974`), `shutdownAndWait()` at `:1660`, `prepareForReconnect()` at `:1667`,
+    ///    `start()` at `:1719`, every cycle. (The pre-fix version of this file placed the re-take
+    ///    on `handle(_:)`'s generation rollover, where `prepareForReconnect()`'s
+    ///    `currentGeneration = nil` suppressed it forever: ADR §5's re-take never happened for
+    ///    the only in-place reconnect the tree performs. The earlier claim that "nothing does
+    ///    this yet" came from grepping for `stop`; the method is `shutdownAndWait`.)
+    ///
+    /// Deliberately NOT called from the screen-parameter observer: ADR §5.A.3 forbids replacing a
+    /// live session's snapshot, and doing so would reinstate exactly the anchor-vs-desktop
+    /// divergence freezing exists to remove. Deliberately not called from `handle(_:)` either —
+    /// see that method's own note on why the first event is not a re-take moment.
+    ///
+    /// WHAT THE CALLER STILL OWES, now checked instead of merely asked for. This class cannot
+    /// re-send a desktop size: that is renegotiation, which M1's MUST-NOT list assigns to W4. So
+    /// a reconnect preserves §5.A.4's same-source invariant only if the caller re-derives the
+    /// desktop size in the same turn (for L9: `freezeSessionSnapshot()` and re-assigning
+    /// `CRSession.desktopWidth/Height` before `main.swift:1719`'s `start()`). Rather than leave
+    /// that as a comment the next implementer may not read, the check below **observes** it: if a
+    /// desktop size was negotiated and the freshly frozen topology no longer derives that same
+    /// size, it says so — once per process, on the same one-shot discipline as every other
+    /// diagnostic here. Recorded, not corrected — M1 is a measurement batch.
+    private func refreshSessionTopology(reason: String) {
+        sessionTopology = topologyProvider?.currentTopology
+        sessionTopologyFreezeCount += 1
+
+        // Skipped when nothing has been negotiated: 0/0 means either "not assigned yet" (a caller
+        // that sets `desktopWidth` after building the registry -- `window-smoke` does today) or
+        // ADR §5.A.6's "no usable display, so send nothing at all". Neither is a divergence, and
+        // warning about them would train the reader to ignore the line that matters.
+        guard let topology = sessionTopology, session.desktopWidth > 0, session.desktopHeight > 0
+        else { return }
+        let derived = topology.desktopSizeInRemotePixels
+        let negotiated = (width: Int(session.desktopWidth), height: Int(session.desktopHeight))
+        if negotiated != (derived.width, derived.height), !Self.warnedSessionTopologyDesktopDivergence {
+            Self.warnedSessionTopologyDesktopDivergence = true
+            Self.logger.warning(
+                """
+                topology snapshot (\(reason, privacy: .public)) derives a desktop of \
+                \(derived.width, privacy: .public)x\(derived.height, privacy: .public) remote px, \
+                but this session negotiated \
+                \(negotiated.width, privacy: .public)x\(negotiated.height, privacy: .public) -- \
+                the Y-flip anchor and the desktop size are no longer from the same read \
+                (adr/0015 §5.A.4). Recorded only; re-sending a desktop size is renegotiation (W4)
+                """
+            )
+        }
+    }
+
+    /// This session's topology, or `nil` after warning once. Every consumer in this file goes
+    /// through here, so the pre-M1 "skip, warn once, never fake" discipline — which ADR §5.A.6
+    /// requires be carried over unchanged rather than reinvented — exists in one place instead
+    /// of once per call site.
+    private func sessionTopologyOrWarn() -> DisplayTopology? {
+        if let sessionTopology { return sessionTopology }
+        // The two states are distinguished on purpose: one is an environment the app is expected
+        // to survive, the other is a wiring defect that should be fixed. Collapsing them is how a
+        // missing injection hides behind "no display" -- which is what a SHARED warn-once bit
+        // would have done (r1 review M1), since whichever occurred first in the process would
+        // have silenced the other forever. One bit each.
+        let reason: String
+        if topologyProvider == nil {
+            guard !Self.warnedNoProviderInjected else { return nil }
+            Self.warnedNoProviderInjected = true
+            reason = "no DisplayTopologyProviding was injected at construction (wiring defect)"
+        } else {
+            guard !Self.warnedProviderReportsNoDisplay else { return nil }
+            Self.warnedProviderReportsNoDisplay = true
+            reason = "the injected provider reports no usable display (headless, or every display asleep)"
+        }
+        Self.logger.warning(
+            "no display topology for this session -- \(reason, privacy: .public) -- skipping window positioning and input coordinate conversion rather than producing a bogus coordinate"
+        )
+        return nil
     }
 
     /// Phase 2 W0① (docs/plans/phase2.md W0①, adr/0008 §3): thin call-site wrapper over
@@ -438,6 +617,29 @@ final class RemoteWindowRegistry {
         if currentGeneration != event.generation {
             closeAllWindows()
             currentGeneration = event.generation
+            // NO TOPOLOGY RE-TAKE HERE, deliberately -- ADR §5's "a reconnect re-takes the
+            // snapshot" lands on `prepareForReconnect()` instead (see
+            // `refreshSessionTopology(reason:)`). Two reasons, and the second is the load-bearing
+            // one:
+            //
+            //  1. It would be dead anyway. The one in-place reconnect in the tree
+            //     (`window-smoke`'s cycles soak) calls `prepareForReconnect()`, which sets
+            //     `currentGeneration = nil` -- so a "was there a previous generation" test can
+            //     never be true there, and the app builds a fresh registry per connect. r1 review
+            //     found exactly this: the branch that used to live here never executed.
+            //  2. Even if it did execute, it would be wrong, and destructively so. This branch
+            //     fires on the session's FIRST event, which arrives a whole RDP connect
+            //     round-trip after the registry was built. The desktop size the server clamps
+            //     against was derived from the screens as they were BEFORE that round-trip and is
+            //     never resynced (`CRSession.h:284-286`). Re-reading here would swap in whatever
+            //     the layout looks like seconds later while the negotiated desktop stayed behind
+            //     -- §5.A.4's divergence, reached by way of the clause meant to prevent it. And
+            //     the invariant it would break currently holds EXACTLY, not approximately:
+            //     `AppDelegate.swift:263` derives the desktop size and freezes the snapshot in
+            //     one `NSScreen` read, then `:283` hands the registry
+            //     `StaticDisplayTopologyProvider(displayTopology.sessionSnapshot)` -- literally
+            //     the same value, not merely a same-turn re-read (r1 review §4). A re-take here
+            //     could only degrade that.
         }
 
         // adr/0012 §4 task item 2: opportunistic tick on every drained event -- cheap (a
@@ -502,8 +704,9 @@ final class RemoteWindowRegistry {
             // this call site does NOT need to check `hasClearedFirstFrameGate` separately;
             // a gate-held window just records the pending target and applies it once the
             // gate clears, same as every other AppKit-mutating call on this class.
-            if let existing = windows[windowId], let state = geometry[windowId], Self.primaryMonitorHeight > 0 {
-                existing.updateFrame(contentRect: macContentRect(for: state, windowId: windowId))
+            if let existing = windows[windowId], let state = geometry[windowId],
+               let topology = sessionTopologyOrWarn() {
+                existing.updateFrame(contentRect: macContentRect(for: state, windowId: windowId, in: topology))
             }
         case .frameReady:
             handleFrameReady(surfaceId: event.surfaceId)
@@ -980,25 +1183,41 @@ final class RemoteWindowRegistry {
         }
         guard let generation = currentGeneration else { return }
 
-        // L1: primaryMonitorHeight==0 means NSScreen.screens was empty (no display
-        // attached/available — plausible headless or display-asleep). WindowGeometry.
-        // macRect would still compute *something* from a zero height (a bogus, likely
-        // negative Y), silently placing/moving a window at a coordinate that was never
-        // actually meaningful. Skip positioning entirely instead — this event's geometry
-        // is still recorded above (state merge already ran), so once a real screen becomes
-        // available a later update (or this same accumulated state, re-evaluated) positions
-        // correctly rather than needing the server to resend anything.
-        guard Self.primaryMonitorHeight > 0 else {
-            if !Self.warnedZeroPrimaryMonitorHeight {
-                Self.warnedZeroPrimaryMonitorHeight = true
-                Self.logger.warning(
-                    "primaryMonitorHeight is 0 (NSScreen.screens is empty) -- skipping window positioning rather than producing a bogus coordinate"
-                )
-            }
-            return
-        }
+        // L1, carried over verbatim in meaning by ADR-0015 §5.A.6, which requires reusing this
+        // existing fail-open discipline rather than inventing new behavior for the state: no
+        // topology means there is no usable display layout — the screen list
+        // was empty (headless or display-asleep) or, transitionally, no provider was injected.
+        // `WindowGeometry.macRect` would still compute *something* from whatever anchor we
+        // invented for it (before M1: a zero height, hence a bogus and typically negative Y),
+        // silently placing/moving a window at a coordinate that was never actually meaningful.
+        // Skip positioning entirely instead — this event's geometry is still recorded above (the
+        // state merge already ran), so nothing has to be resent by the server.
+        //
+        // WHAT THIS DOES NOT PROMISE, corrected in r1 review (I2) because the pre-M1 sentence
+        // that used to sit here promised the opposite: this is fail-open for the EVENT, not
+        // recovery for the SESSION. Before M1 the anchor was re-read per call, so a screen
+        // arriving later fixed everything by itself. Under the frozen snapshot it does not:
+        // `sessionTopologyOrWarn()` reads stored state, the screen-parameter observer must not
+        // replace it (§5.A.3), and no reconnect happens without the caller driving one. A session
+        // that connects with no usable display therefore **positions nothing until it
+        // reconnects**, and the observer's event is what says why (§5.A.2).
+        //
+        // That is deliberate, not an oversight, and the alternative was considered rather than
+        // overlooked (r1 review's O4). Re-taking as soon as a display appears would make the old
+        // sentence true again — and would position windows against a desktop that was never
+        // negotiated: with no topology at connect, L6 correctly sets no `desktopWidth/Height` at
+        // all (§5.A.6 forbids 0x0), so the server is running FreeRDP's 1024x768 default
+        // (`CRSession.h:285-292`). A freshly acquired anchor would be same-read with nothing, and
+        // the result is the invisible-wall shape that section records. Waiting for a reconnect --
+        // where the anchor and the desktop size are re-derived together -- is the safer side.
+        //
+        // The binding this produces is also what threads ADR §5.A.4 through the rest of the
+        // method: every conversion below — inbound rect, mask bounds, and (via
+        // `handleLocalGeometrySettled`) the outbound rect — anchors on this one snapshot rather
+        // than on three independent reads that can disagree.
+        guard let topology = sessionTopologyOrWarn() else { return }
 
-        let contentRect = macContentRect(for: state, windowId: windowId)
+        let contentRect = macContentRect(for: state, windowId: windowId, in: topology)
         if let existing = windows[windowId] {
             existing.updateFrame(contentRect: contentRect)
             existing.updateTitle(state.title)
@@ -1030,7 +1249,8 @@ final class RemoteWindowRegistry {
             // call site's own responsibility, not `WindowShape.computeMask`'s -- see
             // `PendingWindowState.isMinimized`'s own doc comment.
             if !state.isMinimized {
-                existing.applyMask(computeMaskResult(for: state, windowId: windowId, contentSize: contentRect.size))
+                existing.applyMask(
+                    computeMaskResult(for: state, windowId: windowId, contentSize: contentRect.size, in: topology))
             }
             updateParentChild(windowId: windowId, ownerWindowId: state.ownerWindowId)
         } else {
@@ -1072,7 +1292,8 @@ final class RemoteWindowRegistry {
             window.applyChrome(chrome)
             windows[windowId] = window
             if !state.isMinimized {
-                window.applyMask(computeMaskResult(for: state, windowId: windowId, contentSize: contentRect.size))
+                window.applyMask(
+                    computeMaskResult(for: state, windowId: windowId, contentSize: contentRect.size, in: topology))
             }
             updateParentChild(windowId: windowId, ownerWindowId: state.ownerWindowId)
             window.setVisible(state.isVisible)
@@ -1083,19 +1304,106 @@ final class RemoteWindowRegistry {
     /// already tracked by `geometry`/`sizeCorrection`) and calls the pure
     /// `MacdowsCore.WindowShape.computeMask` transform -- same "translate in MacdowsCore,
     /// apply in the App target" split `isMappableWindow`/`chrome` already establish.
-    private func computeMaskResult(for state: PendingWindowState, windowId: UInt32, contentSize: NSSize) -> WindowShape.MaskResult {
+    ///
+    /// THIS CALL IS THE MASK PIPELINE'S UNIT BOUNDARY — ADR-0015 §7 (c), and specifically that
+    /// section's "(c) 的位置更正" note (its relocation of item (c)): the boundary is here, at
+    /// this single call, and NOT at
+    /// `RemoteWindow.swift:925`, which merely consumes an already-computed `LayerRect`. Read the
+    /// argument list as two columns (§1's vocabulary):
+    ///   * **remote px** — `visibilityRects` (wire `RECTANGLE_16` off `crdpq_window_order_t`),
+    ///     `windowOffset` (RAIL `offsetX`/`offsetY`), `visibleOffset` (RAIL
+    ///     `visibleOffsetX`/`Y`), `correction` (`WindowGeometryCorrection`, whose own unit note
+    ///     pins it to remote px), `topInset` (adr/0010 §6's placeholder, always 0).
+    ///   * **mac pt** — `contentSize`, which arrives from `macContentRect(for:windowId:in:)`,
+    ///     i.e. from the far side of a `WindowGeometry.macRect` conversion.
+    /// `WindowShape.computeMask` uses that second column as the BOUNDS it clips the first column
+    /// against (`WindowShape.swift:161-189`), so the two must be one unit — and today they are,
+    /// only because `rasterScale == 1`. `maskContentSize(fromContentRectInPoints:rasterScale:)`
+    /// below is the named crossing that makes that dependency visible instead of implicit; see
+    /// its own doc comment for why M1 deliberately applies no factor there.
+    ///
+    /// The named crossing is NOT `WindowGeometry.macRect`, and that is a standing ban rather
+    /// than a stylistic choice: adr/0010 §2 forbids reusing it in this pipeline
+    /// (`WindowShape.swift:29-34`) and ADR-0015 §7 restates and strengthens the ban, because
+    /// the mask lives in LAYER-local space — bottom-left origin, flipped against the content
+    /// height — a third coordinate space with nothing in common with the screen-space flip
+    /// anchored on the primary display's height. "Route it through a named conversion" must not
+    /// be read as "route it through the one named conversion this file already imports".
+    ///
+    /// `topology` is the session's frozen snapshot, threaded from `handleWindowOrder`'s guard so
+    /// that the mask's `rasterScale` and the content rect's flip anchor are the same read
+    /// (ADR §5.A.4).
+    private func computeMaskResult(
+        for state: PendingWindowState,
+        windowId: UInt32,
+        contentSize: NSSize,
+        in topology: DisplayTopology
+    ) -> WindowShape.MaskResult {
         let correction = sizeCorrection(for: state, windowId: windowId)
         return WindowShape.computeMask(
-            visibilityRects: state.visibilityRects,
-            wireCount: state.numVisibilityRects,
+            visibilityRects: state.visibilityRects, // remote px (wire RECTANGLE_16)
+            wireCount: state.numVisibilityRects, // a count, unitless
             truncated: state.visibilityRectsTruncated,
-            windowOffset: (x: Double(state.offsetX), y: Double(state.offsetY)),
-            visibleOffset: state.hasSeenVisibleOffset ? (x: Double(state.visibleOffsetX), y: Double(state.visibleOffsetY)) : nil,
-            correction: correction,
-            topInset: 0,
-            contentSize: WindowShape.ContentSize(width: Double(contentSize.width), height: Double(contentSize.height)),
+            windowOffset: (x: Double(state.offsetX), y: Double(state.offsetY)), // remote px (RAIL)
+            visibleOffset: state.hasSeenVisibleOffset
+                ? (x: Double(state.visibleOffsetX), y: Double(state.visibleOffsetY)) // remote px (RAIL)
+                : nil,
+            correction: correction, // remote px (WindowGeometryCorrection's own unit note)
+            topInset: 0, // remote px (adr/0010 §6 placeholder, always 0)
+            contentSize: Self.maskContentSize(
+                fromContentRectInPoints: contentSize, // mac pt, from macContentRect
+                rasterScale: topology.rasterScale
+            ),
             isMaximized: state.isMaximized
         )
+    }
+
+    /// THE MASK PIPELINE'S NAMED UNIT CROSSING — ADR-0015 §7 (c), under U5's record-only ruling
+    /// (`m1-wave1-rulings.md:4`).
+    ///
+    /// CURRENT UNIT: in **mac pt** (`macContentRect`'s `NSRect.size`), out a
+    /// `WindowShape.ContentSize` that `computeMask` uses as the clip bounds for **remote px**
+    /// wire rects. The crossing is therefore real, and today it is the identity — every display
+    /// this project has ever run on has `remotePixelsPerPoint == 1`, because we advertise no
+    /// `DesktopScaleFactor` (ADR §0a/§0c; `docs/plans/phase3.md:219`).
+    ///
+    /// WHY NO MULTIPLICATION HERE, stated plainly because writing `× rasterScale` would look
+    /// more finished and cost one character: it is not this milestone's call, and doing it would
+    /// be actively wrong today. ADR §7 (c) reserves "whether the conversion really multiplies by
+    /// `rasterScale`" for W3, and ADR §9's L8 row forbids introducing any scale multiplication
+    /// into the mask path in this wave. The substantive reason is that scaling here would move
+    /// only half the pipeline: `computeMask` returns `LayerRect`s that `RemoteWindow` compares
+    /// against `contentView.bounds.size` in POINTS (`RemoteWindow.swift:925`, with `:951-952` the
+    /// mask application; L8's own file reaches the same conclusion independently at `:918-924`),
+    /// so multiplying the bounds without dividing the output would change rendered
+    /// pixels — which M1 must not do (§9's L8 row spells out that "zero rendering change" means
+    /// bit-identical output on today's hardware). What M1 owes is the crossing's *point and
+    /// type*, plus a record of the moment it stops being harmless.
+    ///
+    /// W3 TRIGGER: any session where `rasterScale != 1`. Observed rather than asserted, and
+    /// recorded rather than corrected — M1 is a measurement batch, so the handling is the same
+    /// one ADR §2 rule 4 fixes for mixed-scale topologies: record once, do not degrade, do not
+    /// refuse, do not change behavior. The `!= 1` comparison is exact on purpose: `rasterScale`
+    /// is a whole display ratio the collector fills in (1 or 2 today), never an accumulated
+    /// computation, so there is no epsilon to reason about.
+    ///
+    /// TRIGGERED SHAPE (the values, and the choice between the two forms, are W3's — from a real
+    /// 2x measurement, not guessed here): convert BOTH ends coherently. Either hand `computeMask`
+    /// remote-pixel bounds and divide its `LayerRect`s back to points at the AppKit boundary, or
+    /// keep the bounds in points and divide the wire rects on the way in. Which one is a
+    /// `WindowShape` API question — it is decided by `WindowShape.ContentSize`'s unit contract —
+    /// and cannot be settled by this call site alone.
+    private static func maskContentSize(
+        fromContentRectInPoints contentSize: NSSize,
+        rasterScale: Double
+    ) -> WindowShape.ContentSize {
+        if rasterScale != 1, !warnedMaskUnitScaleGap {
+            warnedMaskUnitScaleGap = true
+            logger.warning(
+                "mask unit boundary (ADR-0015 §7 (c)): content bounds are mac points but WindowShape.computeMask clips remote-pixel wire rects against them, and rasterScale=\(rasterScale, privacy: .public) != 1 -- recorded, not corrected; the factor is W3's after a real 2x measurement"
+            )
+        }
+        return WindowShape.ContentSize(width: Double(contentSize.width), height: Double(contentSize.height))
     }
 
     /// adr/0010 §4: resolves/updates `windowId`'s real `NSWindow.addChildWindow` attachment
@@ -1199,9 +1507,16 @@ final class RemoteWindowRegistry {
     /// `RemoteWindow.init`'s own doc comment), so this conversion's result is the target
     /// window's CONTENT rect, never its `NSWindow.frame` directly. Renamed from `macFrame`
     /// to make that explicit at every call site; the arithmetic itself (`WindowGeometry.
-    /// macRect(from:primaryMonitorHeight:)`) was always correct -- only the RESULT's meaning
-    /// was mislabeled. `RemoteWindow.updateFrame(contentRect:)` is what actually derives the
-    /// real outer frame from this value, via `NSWindow.frameRect(forContentRect:)`.
+    /// macRect(from:in:)`, which before M1/W1 took a bare primary height) was always correct --
+    /// only the RESULT's meaning was mislabeled. `RemoteWindow.updateFrame(contentRect:)` is
+    /// what actually derives the real outer frame from this value, via
+    /// `NSWindow.frameRect(forContentRect:)`.
+    ///
+    /// UNITS (M1/W1, ADR-0015 §1): in **remote px** -- `state.offsetX/Y/width/height` are RAIL
+    /// wire values -- out **mac pt**, an `NSRect` in AppKit's global screen space. The single
+    /// `WindowGeometry.macRect(from:in:)` call is where the two spaces meet, and `topology` is
+    /// the session's frozen snapshot (never a fresh screen read), which is ADR §5.A.4's
+    /// same-read invariant at its inbound end.
     ///
     /// Second real-host regression (2026-08-23, W3 round 2 -> round 3, team-lead review):
     /// round 2 assumed RAIL's rect was the OUTER (larger) rect, visible content INSET from
@@ -1239,6 +1554,25 @@ final class RemoteWindowRegistry {
     /// see that function's own doc comment for the round-trip-identity guarantee
     /// `WindowGeometryTests` locks down offline.
     ///
+    /// F6 (d) -- `resizeMargin*`, the not-taken road above (M1/W1 tagging pass; U5 = record-only,
+    /// `m1-wave1-rulings.md:4`; ADR-0015 §7 (d)). Three things this paragraph adds and the one
+    /// above does not:
+    ///   * UNIT, if it is ever wired: **remote px**. `resizeMarginLeft/Top/Right/Bottom` are
+    ///     RAIL window-order fields (`ThirdParty/FreeRDP/include/freerdp/window.h:217-220`), so
+    ///     they share the wire's unit with `offsetX/Y` and `windowWidth/Height` -- Windows
+    ///     space, before any flip, no `rasterScale` term.
+    ///   * The paragraph above states adr/0008 §0's `fieldFlags` inconsistency as a settled
+    ///     finding. It is not settled: `docs/plans/phase3.md:232` (§8.14) records that very
+    ///     conclusion as still pending re-verification. That distinction is the whole
+    ///     content of F6 (d) -- a closed road and an unverified road look identical from here,
+    ///     and only one of them is worth re-walking.
+    ///   * W3 TRIGGER and TRIGGERED SHAPE (ADR §7 (d)): the trigger is the §8.14 re-verification
+    ///     itself, which must happen BEFORE anything is wired -- W3 does not get to skip it on
+    ///     the strength of a 2x measurement. If it passes, wire the field and let it replace the
+    ///     hardcoded `measuredClientWindowMoveLeftBorder` (F6 (a), below). If it fails, record
+    ///     "this road is closed" *with its evidence* at that point, so the next reader does not
+    ///     re-derive the survey a third time.
+    ///
     /// Origin is NOT corrected (`WindowGeometryCorrection.originX/Y == 0` always, this
     /// slice): `RDPGFX_MAP_SURFACE_TO_WINDOW_PDU` (`CRSession.mm`'s
     /// `crb_gfx_map_surface_to_window`) carries ONLY `mappedWidth`/`mappedHeight` -- no
@@ -1255,11 +1589,11 @@ final class RemoteWindowRegistry {
     /// story, not merely "we had no better idea." Flagged in `WindowGeometryCorrection`'s
     /// own doc comment for W4's shaped-window work to revisit if future evidence ever
     /// supplies an independent position measurement.
-    private func macContentRect(for state: PendingWindowState, windowId: UInt32) -> NSRect {
+    private func macContentRect(for state: PendingWindowState, windowId: UInt32, in topology: DisplayTopology) -> NSRect {
         let correction = sizeCorrection(for: state, windowId: windowId)
         let railRect = WindowsRect(x: Double(state.offsetX), y: Double(state.offsetY), width: Double(state.width), height: Double(state.height))
         let windowsRect = WindowGeometry.displayRect(from: railRect, correction: correction)
-        let macRect = WindowGeometry.macRect(from: windowsRect, primaryMonitorHeight: Self.primaryMonitorHeight)
+        let macRect = WindowGeometry.macRect(from: windowsRect, in: topology)
         return NSRect(x: macRect.x, y: macRect.y, width: macRect.width, height: macRect.height)
     }
 
@@ -1398,8 +1732,12 @@ final class RemoteWindowRegistry {
                 return
             }
             pendingTrailingMove.removeValue(forKey: windowId)
+            // ADR-0015 §5.A.6: no topology -> skip the conversion, do not substitute one.
+            // Ordered BEFORE the throttle stamp (r1 review M3): `lastMoveSentAt` records a send,
+            // and on the skip path no send happens -- stamping it first would let a skipped move
+            // throttle the next real one.
+            guard let point = remotePoint(from: screenPoint) else { return }
             lastMoveSentAt[windowId] = now
-            let point = remotePoint(from: screenPoint)
             session.sendMouseMoveTo(x: Int32(point.x), y: Int32(point.y))
 
         case .mouseButton(let button, let down, let screenPoint):
@@ -1420,7 +1758,10 @@ final class RemoteWindowRegistry {
                 execute(focusAuthority.localActivate(windowId: windowId, at: now))
                 scheduleFocusAuthorityTick()
             }
-            let point = remotePoint(from: screenPoint)
+            // ADR-0015 §5.A.6, as above. Placed after the focus-authority step deliberately: the
+            // local activation is this client's own state machine and is unaffected by whether a
+            // coordinate can be expressed; only the wire send is skipped.
+            guard let point = remotePoint(from: screenPoint) else { return }
             session.send(crMouseButton(for: button), down: down, atX: Int32(point.x), y: Int32(point.y))
 
         case .scrollWheel(let deltaX, let deltaY, let screenPoint):
@@ -1435,7 +1776,8 @@ final class RemoteWindowRegistry {
             // nonzero deltaY (trackpad noise), and a bare "!= 0" check let that tiny value
             // always win the vertical branch, silently swallowing every horizontal scroll
             // that happened to arrive with any deltaY noise at all.
-            let point = remotePoint(from: screenPoint)
+            // ADR-0015 §5.A.6, as above.
+            guard let point = remotePoint(from: screenPoint) else { return }
             if Float(abs(deltaY)) > Float.ulpOfOne {
                 session.sendMouseVerticalWheelDelta(deltaY, atX: Int32(point.x), y: Int32(point.y))
             } else if Float(abs(deltaX)) > Float.ulpOfOne {
@@ -1731,8 +2073,10 @@ final class RemoteWindowRegistry {
         guard let screenPoint = pendingTrailingMove.removeValue(forKey: windowId),
               windows[windowId] != nil
         else { return }
+        // ADR-0015 §5.A.6: no topology -> skip the conversion, do not substitute one. Before the
+        // throttle stamp, same reason as `.mouseMoved`'s (r1 review M3).
+        guard let point = remotePoint(from: screenPoint) else { return }
         lastMoveSentAt[windowId] = CFAbsoluteTimeGetCurrent()
-        let point = remotePoint(from: screenPoint)
         session.sendMouseMoveTo(x: Int32(point.x), y: Int32(point.y))
     }
 
@@ -1740,8 +2084,11 @@ final class RemoteWindowRegistry {
     /// window CONTENT rect becomes a `CRSession.sendWindowMove` call -- the exact inverse of
     /// `macContentRect(for:)` above, through the same `MacdowsCore.WindowGeometry` conversion
     /// every other geometry boundary crossing in this file already uses
-    /// (`WindowGeometry.windowsRect(from:primaryMonitorHeight:)` is literally
-    /// `macRect(from:primaryMonitorHeight:)`'s documented inverse). `contentRect` arrives
+    /// (`WindowGeometry.windowsRect(from:in:)` is literally `macRect(from:in:)`'s documented
+    /// inverse -- and since M1/W1 it is inverse in a stronger sense than before: both take the
+    /// same `DisplayTopology` value, so the pair cannot be anchored on two different heights
+    /// even if the screens change between the inbound and outbound halves of one drag).
+    /// UNITS (ADR-0015 §1): in **mac pt**, out **remote px**. `contentRect` arrives
     /// already converted from `NSWindow.frame` to the content rect by `RemoteWindow` itself
     /// (`window.contentRect(forFrameRect:)`, an AppKit-chrome fact that class already owns --
     /// see `RemoteWindow.onLocalGeometrySettled`'s own doc comment; real-host regression,
@@ -1765,9 +2112,13 @@ final class RemoteWindowRegistry {
     /// drift out of sync with the other since both call the same correction lookup and the
     /// same pair of inverse pure functions.
     private func handleLocalGeometrySettled(windowId: UInt32, contentRect: NSRect) {
-        guard Self.primaryMonitorHeight > 0 else { return } // L1: see macContentRect(for:)'s own guard
+        // L1 / ADR-0015 §5.A.6: same fail-open guard as `handleWindowOrder`'s, same reasons.
+        // Reading the SESSION's snapshot (rather than the live layout) is also §5.A.4's
+        // same-read invariant at its outbound end: the rect this sends back to the server is
+        // un-flipped against exactly the height the rect it came from was flipped against.
+        guard let topology = sessionTopologyOrWarn() else { return }
         let macRect = MacRect(x: contentRect.origin.x, y: contentRect.origin.y, width: contentRect.size.width, height: contentRect.size.height)
-        let displayedWindowsRect = WindowGeometry.windowsRect(from: macRect, primaryMonitorHeight: Self.primaryMonitorHeight)
+        let displayedWindowsRect = WindowGeometry.windowsRect(from: macRect, in: topology)
         let correction = sizeCorrection(for: geometry[windowId] ?? PendingWindowState(), windowId: windowId)
         let railWindowsRect = WindowGeometry.railRect(from: displayedWindowsRect, correction: correction)
         // Team-lead review round 5 (2026-08-23): `railWindowsRect.x` above is the VISIBLE
@@ -1817,17 +2168,68 @@ final class RemoteWindowRegistry {
     /// `sizeCorrection` is), so there is no "measured, not hardcoded" version of this to
     /// build yet -- flagged for revisiting if a real-host run ever shows a different value
     /// for a different window/DPI/Windows-build.
+    ///
+    /// F6 (a) -- M1/W1 tagging pass; U5 = record-only (`m1-wave1-rulings.md:4`); ADR-0015 §7 (a):
+    ///   * UNIT: **remote px**. It shares a domain with RAIL's own `offsetX` -- it is subtracted
+    ///     from `railWindowsRect.x` in Windows space, after the flip and before the
+    ///     `left`/`top`/`right`/`bottom` integers go on the wire -- so no point conversion and
+    ///     no `rasterScale` term is involved at this site.
+    ///   * WHY THE VALUE DOES NOT MOVE IN M1: all three real-host measurements behind the 7 were
+    ///     taken on the same 1x host (`docs/plans/phase3.md:219`), where "7 remote px" and
+    ///     "7 pt" are numerically indistinguishable. Picking one now would be re-guessing, not
+    ///     re-measuring (`phase3.md:223`, §8.5: no 2x measurement exists). The unit above is
+    ///     therefore an attribution of the existing evidence, not a new claim about it.
+    ///   * W3 TRIGGER: the paragraph above already named it before M1 existed -- "a different
+    ///     window/DPI/Windows-build" -- and W3's 2x session is precisely that DPI change.
+    ///   * TRIGGERED SHAPE (the value is W3's, from measurement): either ① a constant re-measured
+    ///     on a 2x session, or ② an expression derived from RAIL's own `resizeMarginLeft` -- see
+    ///     F6 (d) in `macContentRect(for:windowId:in:)`'s doc comment, and note that route
+    ///     unblocks only if the adr/0008 §0 `fieldFlags` re-verification (`phase3.md:232`, §8.14)
+    ///     passes first. Explicitly NOT "multiply by `rasterScale`": this is a server-side
+    ///     window-border thickness, and nothing in evidence says a window-manager border scales
+    ///     linearly with DPI (ADR-0015 §7 (a) rules that option out by name).
     private static let measuredClientWindowMoveLeftBorder: Double = 7
 
     /// The one and only place a mac-screen point becomes a `WindowsPoint`, exactly
     /// mirroring `macContentRect(for:)` above for the reverse (Windows-rect -> mac-rect)
     /// direction. Always through `MacdowsCore.WindowGeometry` — never a second, ad hoc
     /// coordinate-math implementation in this file or `RemoteWindowContentView`.
-    private func remotePoint(from screenPoint: NSPoint) -> WindowsPoint {
-        WindowGeometry.windowsPoint(
-            from: MacPoint(x: screenPoint.x, y: screenPoint.y),
-            primaryMonitorHeight: Self.primaryMonitorHeight
-        )
+    /// UNITS (M1/W1, ADR-0015 §1): in **mac pt** (AppKit global screen space), out
+    /// **remote px** (an absolute RAIL desktop coordinate). Anchored on the session's frozen
+    /// snapshot, like every other conversion here (§5.A.4).
+    ///
+    /// RETURNS `nil` when this session has no topology, and that is a deliberate behavior
+    /// change in that one state. The pre-M1 code fed a zero primary height into the same flip
+    /// and sent the resulting coordinate — meaningless, and negative for any point on a real
+    /// screen — to the server anyway; there was never a reading under which it was right.
+    /// ADR §5.A.6's rule for this state is that consumers *skip the conversion*, never substitute
+    /// a value, so the four callers guard instead of sending.
+    ///
+    /// THE SKIP IS UNREACHABLE, and the reason is structural ordering — not "a mouse event needs
+    /// an on-screen window, which needs a screen", which is the weaker argument this comment
+    /// carried at r1 and which stops being true the day any of these links moves (r1 review M2,
+    /// whose chain this is):
+    ///  1. `RemoteWindow` is constructed in exactly one place, in `handleWindowOrder`.
+    ///  2. That site is downstream of `guard let topology = sessionTopologyOrWarn()`, so a window
+    ///     exists only if the snapshot was non-`nil` when it was created.
+    ///  3. The snapshot can only become `nil` inside `refreshSessionTopology(reason:)`, whose two
+    ///     callers both run with no window alive — `init` predates every window, and
+    ///     `prepareForReconnect()` calls `closeAllWindows()` first, unconditionally.
+    ///  4. Input reaches `handleInput` only through `window.onInput`, i.e. only from a live
+    ///     window.
+    /// ⇒ no window outlives a non-`nil` → `nil` transition ⇒ this cannot return `nil` while any
+    /// window exists. A silent skip is acceptable only while that holds; if step 2 or 3 is ever
+    /// rearranged, this needs a counter rather than a comment.
+    ///
+    /// W3 ITEM, named rather than left implicit (r1 review M4): this project's discipline for
+    /// dropped wire traffic is a counter, not only a log (`CRSession.staleEventsDiscardedCount`,
+    /// `clicksDroppedIconGone`, `crdpq.h:260-275`'s per-cause `iconSkipped` split). These four
+    /// skips have none, which M1 can carry only because of the proof above, and adding one now
+    /// would be new surface this lane's MUST-NOT discourages. W3 is what makes the topology state
+    /// genuinely varied, so W3 is where a per-cause skip counter belongs.
+    private func remotePoint(from screenPoint: NSPoint) -> WindowsPoint? {
+        guard let topology = sessionTopologyOrWarn() else { return nil }
+        return WindowGeometry.windowsPoint(from: MacPoint(x: screenPoint.x, y: screenPoint.y), in: topology)
     }
 
     private func crMouseButton(for button: RemoteWindowMouseButton) -> CRMouseButton {
@@ -2013,9 +2415,18 @@ final class RemoteWindowRegistry {
     /// "forced drain" delivered zero events and the previous cycle's windows survived
     /// into the next). The real app never needs this: it only shuts down at
     /// `applicationWillTerminate`.
+    ///
+    /// M1/W1 (ADR-0015 §5, U8): this is also **the reconnect re-take point** for a reused
+    /// registry — the one moment ADR §5 means by "重连就是新会话、新快照". It belongs here rather
+    /// than on a generation transition for the reason this method's own existence documents: a
+    /// post-`shutdownAndWait` drain delivers nothing, so the generation change is never observed
+    /// on this side at all. Called after `shutdownAndWait()` and before the next `start()`
+    /// (`Tools/window-smoke/main.swift:1660` → `:1667` → `:1719`), which is exactly the
+    /// pre-connect moment `init` occupies for a per-connection registry.
     func prepareForReconnect() {
         closeAllWindows()
         currentGeneration = nil
+        refreshSessionTopology(reason: "reconnect")
     }
 
     private func closeAllWindows() {
