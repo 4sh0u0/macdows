@@ -134,8 +134,15 @@ BIN="$APP_DIR/build/Build/Products/Debug/window-smoke"
 
 # Every exit from here on writes a DONE line first: that line is the whole contract callers
 # poll on, and a build failure that exits silently leaves them reading an empty log.
-if [[ ! -x "$BIN" ]]; then
-    echo "[launcher] $BIN not found -- generating project and building window-smoke..." >&2
+# Generate the project only when it is missing, but ALWAYS run xcodebuild: an
+# existence-only check on $BIN ran an 8-day-stale binary against a freshly rebuilt
+# libfreerdp3 on 2026-09-01 (the patch-queue metadata commit rotated the FreeRDP config
+# hash, so the dylibs moved out from under the old binary's rpath) and dyld aborted
+# before main(). Incremental xcodebuild is a few seconds when everything is fresh --
+# that is the correct price for never again exec'ing a binary older than its sources
+# or its runtime dylibs.
+if [[ ! -d "$APP_DIR/Macdows.xcodeproj" ]]; then
+    echo "[launcher] $APP_DIR/Macdows.xcodeproj not found -- generating project..." >&2
     if ! command -v xcodegen >/dev/null 2>&1; then
         echo "[launcher] xcodegen not found on PATH -- install it (e.g. 'brew install xcodegen') and retry" >&2
         echo "DONE exit=1" >>"$LOG"
@@ -148,11 +155,11 @@ if [[ ! -x "$BIN" ]]; then
         echo "DONE exit=1" >>"$LOG"
         exit 1
     fi
-    if ! xcodebuild -project "$APP_DIR/Macdows.xcodeproj" -scheme window-smoke -configuration Debug \
-        build -derivedDataPath "$APP_DIR/build"; then
-        echo "DONE exit=1" >>"$LOG"
-        exit 1
-    fi
+fi
+if ! xcodebuild -project "$APP_DIR/Macdows.xcodeproj" -scheme window-smoke -configuration Debug \
+    build -derivedDataPath "$APP_DIR/build"; then
+    echo "DONE exit=1" >>"$LOG"
+    exit 1
 fi
 
 "$BIN" >>"$LOG" 2>&1
