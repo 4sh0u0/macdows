@@ -84,6 +84,32 @@ func makeWindowCreateEvent(windowId: UInt32, title: String = "") -> CrdpEvent {
     return ev
 }
 
+/// Builds a SURFACE_MAPPED event. One event type carries BOTH GFX map PDUs (phase3 M1 U4):
+/// `targetWidth`/`targetHeight` left at `nil` produces the PLAIN variant, whose documented
+/// sentinel is `(0, 0)` — "no target hint accompanied this map" — and any non-nil pair
+/// produces the SCALED variant. Written to mirror the two `crb_gfx_map_surface_to_*_window`
+/// callbacks in CRSession.mm exactly: same field set, same deliberate absence of a
+/// `target := mapped` fallback on the plain path.
+func makeSurfaceMappedEvent(
+    surfaceId: UInt32,
+    windowId: UInt64,
+    mappedWidth: UInt32,
+    mappedHeight: UInt32,
+    target: (width: UInt32, height: UInt32)? = nil
+) -> CrdpEvent {
+    var ev = CrdpEvent()
+    ev.type = CRDPQ_EVENT_SURFACE_MAPPED
+    ev.payload.surfaceMapped.surfaceId = surfaceId
+    ev.payload.surfaceMapped.windowId = windowId
+    ev.payload.surfaceMapped.mappedWidth = mappedWidth
+    ev.payload.surfaceMapped.mappedHeight = mappedHeight
+    if let target {
+        ev.payload.surfaceMapped.targetWidth = target.width
+        ev.payload.surfaceMapped.targetHeight = target.height
+    }
+    return ev
+}
+
 /// L3 (W3 review): `outPtr` is only valid for the synchronous, non-escaping duration of
 /// `withUnsafeMutablePointer`'s closure. That's safe here ONLY because crdpq_drain's
 /// contract (crdpq.h's threading contract comment) guarantees the visitor callback runs
@@ -265,6 +291,79 @@ struct CRDPQueueControlSingleThreadedTests {
         #expect(cjkRecovered.utf8.count % 3 == 0)
         #expect(cjkRecovered.allSatisfy { $0 == "关" })
         #expect(Int(cjkEv.payload.windowOrder.title.length) == cjkRecovered.utf8.count)
+    }
+
+    /// phase3 M1 F2/U4: the `target*` promotion's own round trip. `crdpq_post` deep-copies an
+    /// event under lock and `crdpq_drain` hands a different copy back, so "the struct grew two
+    /// fields" and "those two fields actually survive the lane" are separate claims — this
+    /// asserts the second one, which is the only one a consumer can rely on.
+    ///
+    /// Every value below is distinct from every other, deliberately: a field-order slip
+    /// (`target*` written where `mapped*` is read, or the pair swapped between themselves), a
+    /// copy that shifted the payload, or an offset mistake cannot produce a passing result by
+    /// symmetry the way it could with placeholder values like 0/1/1/0. The same reasoning the
+    /// outbound lane's `notifyEventRoundTrip` already records.
+    @Test("phase3 F2: a SCALED surface-map's targetWidth/Height survive post/drain intact")
+    func surfaceMappedTargetRoundTrip() {
+        let q = crdpq_control_create(nil, nil)
+        defer { crdpq_control_destroy(q) }
+
+        // Shaped like a real scaled map: a 64-aligned target alongside a smaller mapped
+        // sub-rect (the only relationship observed live to date), so the test reads as the
+        // thing it is measuring rather than as an arbitrary bit pattern.
+        var scaled = makeSurfaceMappedEvent(
+            surfaceId: 0x0000_002A, windowId: 0x0011_2233_4455_6677,
+            mappedWidth: 1600, mappedHeight: 900, target: (width: 1664, height: 960))
+        #expect(crdpq_post(q, &scaled))
+
+        // The PLAIN variant through the SAME event type: its documented (0, 0) sentinel must
+        // come back as (0, 0), never silently filled in with mapped* -- crdpq.h forbids this
+        // layer applying upstream's `target := mapped` default, because that would erase the
+        // one distinction the promotion exists to expose.
+        var plain = makeSurfaceMappedEvent(
+            surfaceId: 0x0000_002B, windowId: 0x7766_5544_3322_1100,
+            mappedWidth: 1280, mappedHeight: 720)
+        #expect(crdpq_post(q, &plain))
+
+        // A saturated pair, covering the narrowing this struct's own _Static_assert cannot see:
+        // sizeof would be unmoved by `target*` becoming uint16_t (the lost bytes absorbed by the
+        // struct's 8-byte alignment padding). Note the mechanism honestly -- against a uint16_t
+        // field this goes red at COMPILE time, not as a truncated runtime value: the helper's
+        // `UInt32` assignment and the 0xFFFF_FFFF literal below both stop type-checking. The
+        // width pins in the layout suite are the gate that would state the narrowing directly.
+        var saturated = makeSurfaceMappedEvent(
+            surfaceId: 0x0000_002C, windowId: 0xFFFF_FFFF_FFFF_FFFF,
+            mappedWidth: 0xFFFF_FFFE, mappedHeight: 0xFFFF_FFFD,
+            target: (width: 0xFFFF_FFFF, height: 0xFFFF_FFFC))
+        #expect(crdpq_post(q, &saturated))
+
+        let drained = drainToArray(q)
+        #expect(drained.count == 3)
+        guard drained.count == 3 else { return }
+
+        #expect(drained[0].type == CRDPQ_EVENT_SURFACE_MAPPED)
+        #expect(drained[0].payload.surfaceMapped.surfaceId == 0x0000_002A)
+        #expect(drained[0].payload.surfaceMapped.windowId == 0x0011_2233_4455_6677)
+        #expect(drained[0].payload.surfaceMapped.mappedWidth == 1600)
+        #expect(drained[0].payload.surfaceMapped.mappedHeight == 900)
+        #expect(drained[0].payload.surfaceMapped.targetWidth == 1664)
+        #expect(drained[0].payload.surfaceMapped.targetHeight == 960)
+
+        #expect(drained[1].type == CRDPQ_EVENT_SURFACE_MAPPED)
+        #expect(drained[1].payload.surfaceMapped.surfaceId == 0x0000_002B)
+        #expect(drained[1].payload.surfaceMapped.windowId == 0x7766_5544_3322_1100)
+        #expect(drained[1].payload.surfaceMapped.mappedWidth == 1280)
+        #expect(drained[1].payload.surfaceMapped.mappedHeight == 720)
+        #expect(drained[1].payload.surfaceMapped.targetWidth == 0)
+        #expect(drained[1].payload.surfaceMapped.targetHeight == 0)
+
+        #expect(drained[2].type == CRDPQ_EVENT_SURFACE_MAPPED)
+        #expect(drained[2].payload.surfaceMapped.surfaceId == 0x0000_002C)
+        #expect(drained[2].payload.surfaceMapped.windowId == 0xFFFF_FFFF_FFFF_FFFF)
+        #expect(drained[2].payload.surfaceMapped.mappedWidth == 0xFFFF_FFFE)
+        #expect(drained[2].payload.surfaceMapped.mappedHeight == 0xFFFF_FFFD)
+        #expect(drained[2].payload.surfaceMapped.targetWidth == 0xFFFF_FFFF)
+        #expect(drained[2].payload.surfaceMapped.targetHeight == 0xFFFF_FFFC)
     }
 }
 
@@ -662,6 +761,15 @@ struct CRDPQueueLayoutTests {
     /// below was re-measured with clang/arm64 after adding each ADR's fields (matching
     /// crdpq.h's own `_Static_assert`s), not estimated from either ADR's own illustrative
     /// table.
+    ///
+    /// phase3 M1 F2 grew `crdpq_surface_mapped_t` (24B -> 32B) and left the union and
+    /// `CrdpEvent` at 576B/584B. That last clause is the part worth being explicit about: it
+    /// is a MEASUREMENT, not the deduction it resembles. "The largest member didn't move, so
+    /// the union didn't move" is sound reasoning that is nevertheless wrong the moment a
+    /// growth changes the union's *alignment* rather than its maximum member size -- and
+    /// `crdpq_surface_mapped_t` is precisely the member that sets this union's 8B alignment
+    /// today. So the growth was re-run through both halves of adr/0008 §5's discipline rather
+    /// than argued about.
     @Test("CrdpEvent and CrdpCommand match their measured, known-good sizes")
     func reportSizes() {
         #expect(MemoryLayout<crdpq_text_t>.size == 260)
@@ -671,6 +779,46 @@ struct CRDPQueueLayoutTests {
         #expect(MemoryLayout<crdpq_local_move_size_t>.size == 16)
         #expect(MemoryLayout<crdpq_min_max_info_t>.size == 36)
         #expect(MemoryLayout<crdpq_zorder_sync_t>.size == 4)
+        // phase3 M1 F2 grew crdpq_surface_mapped_t with targetWidth/targetHeight: 24B -> 32B,
+        // re-MEASURED at both steps (clang's own diagnostic reported "expression evaluates to
+        // '32 == 24'" against the deliberately-stale assert, then a runtime offsetof probe
+        // confirmed the field-by-field layout the offset pins below now hold permanently).
+        //
+        // THREE INDEPENDENT PIN KINDS, because each is blind to what the next one catches --
+        // every claim here was measured by mutating the C header and re-running this test, not
+        // reasoned about (r1 review I-1: an earlier version of this block claimed coverage it
+        // did not have, which is exactly the failure adr/0008 §5 exists to prevent):
+        //   - size/alignment: catches whole-struct growth. Blind to every mutation below --
+        //     all three leave sizeof at exactly 32.
+        //   - width (`size(ofValue:)`): catches a member changing type. Narrowing target* to
+        //     uint16_t hides the 4 lost bytes in the struct's 8B tail padding, and widening
+        //     surfaceId to uint64_t fits in the padding that already followed it, so sizeof
+        //     moves for neither. `surfaceId` is pinned too and is NOT hypothetical: it is
+        //     uint32_t here while the wire field is UINT16 (channels/rdpgfx.h:390), so a future
+        //     "make the type honest" edit is a live possibility.
+        //   - offset (`offset(of:)`): catches REORDERING, which nothing else here can see --
+        //     permuting same-width members changes neither the struct's size nor any member's
+        //     width. This is what promotes the one-shot runtime offsetof probe from the F2
+        //     report into a standing gate, per adr/0008 §5's "let the compiler find it, not
+        //     convention" posture.
+        // Same three-kind reasoning crdpq_cmd_notify_event_t records on the outbound side; the
+        // union-level expectations further below cannot substitute for any of them, since at
+        // 32B this member is nowhere near crdpq_window_order_t's 572B.
+        #expect(MemoryLayout<crdpq_surface_mapped_t>.size == 32)
+        #expect(MemoryLayout<crdpq_surface_mapped_t>.alignment == 8)
+        let surfaceMappedProbe = crdpq_surface_mapped_t()
+        #expect(MemoryLayout.size(ofValue: surfaceMappedProbe.surfaceId) == 4)
+        #expect(MemoryLayout.size(ofValue: surfaceMappedProbe.windowId) == 8)
+        #expect(MemoryLayout.size(ofValue: surfaceMappedProbe.mappedWidth) == 4)
+        #expect(MemoryLayout.size(ofValue: surfaceMappedProbe.mappedHeight) == 4)
+        #expect(MemoryLayout.size(ofValue: surfaceMappedProbe.targetWidth) == 4)
+        #expect(MemoryLayout.size(ofValue: surfaceMappedProbe.targetHeight) == 4)
+        #expect(MemoryLayout<crdpq_surface_mapped_t>.offset(of: \.surfaceId) == 0)
+        #expect(MemoryLayout<crdpq_surface_mapped_t>.offset(of: \.windowId) == 8)
+        #expect(MemoryLayout<crdpq_surface_mapped_t>.offset(of: \.mappedWidth) == 16)
+        #expect(MemoryLayout<crdpq_surface_mapped_t>.offset(of: \.mappedHeight) == 20)
+        #expect(MemoryLayout<crdpq_surface_mapped_t>.offset(of: \.targetWidth) == 24)
+        #expect(MemoryLayout<crdpq_surface_mapped_t>.offset(of: \.targetHeight) == 28)
         // crdpq_window_order_t (572B, adr/0010 §1) is still this union's largest member;
         // crdpq_event_payload_t's OWN alignment is 8 (crdpq_surface_mapped_t's uint64_t
         // windowId sets that, not crdpq_window_order_t), so the union's size pads up from

@@ -93,6 +93,8 @@
 @property (nonatomic) uint64_t mappedWindowId;
 @property (nonatomic) uint32_t mappedWidth;
 @property (nonatomic) uint32_t mappedHeight;
+@property (nonatomic) uint32_t targetWidth;
+@property (nonatomic) uint32_t targetHeight;
 @property (nonatomic) NSArray<NSNumber *> *windowIds;
 @property (nonatomic) uint32_t numWindowIds;
 @property (nonatomic) BOOL windowIdsTruncated;
@@ -287,6 +289,13 @@ static CRDPEvent *CRDPEventFromCrdpEvent(const CrdpEvent *ev, crdpq_icon_store_t
             out.mappedWindowId = ev->payload.surfaceMapped.windowId;
             out.mappedWidth = ev->payload.surfaceMapped.mappedWidth;
             out.mappedHeight = ev->payload.surfaceMapped.mappedHeight;
+            /* phase3 M1 F2: carried across the header boundary unchanged, sentinel and all
+             * -- (0,0) reaches the caller as (0,0), meaning "the plain PDU, no target hint"
+             * (crdpq.h's crdpq_surface_mapped_t doc comment is the definition; CRSession.h's
+             * targetWidth restates it for callers who never see the C struct). This layer
+             * applies no fallback: see the plain GFX callback's own comment for why. */
+            out.targetWidth = ev->payload.surfaceMapped.targetWidth;
+            out.targetHeight = ev->payload.surfaceMapped.targetHeight;
             break;
         case CRDPQ_EVENT_DISCONNECTED:
             out.kind = CRDPEventKindDisconnected;
@@ -1003,6 +1012,17 @@ static UINT crb_gfx_map_surface_to_window(RdpgfxClientContext *context,
             ev.payload.surfaceMapped.windowId = pdu->windowId;
             ev.payload.surfaceMapped.mappedWidth = pdu->mappedWidth;
             ev.payload.surfaceMapped.mappedHeight = pdu->mappedHeight;
+            /* targetWidth/targetHeight deliberately left at the memset-0 above: the plain
+             * PDU (rdpgfx.h:388-394) has no such fields on the wire, and (0,0) is exactly
+             * crdpq.h's documented "no target hint accompanied this map" sentinel. NOT set to
+             * mappedWidth/Height the way upstream's own gdi handler does (gfx.c:1937-1938) --
+             * that fallback belongs to a consumer that wants an effective target, not to this
+             * transport, which must keep "the wire carried no hint" distinguishable from "the
+             * hint equalled mapped" (phase3 M1 F2 measures precisely that difference). That
+             * reason is sufficient by itself; adr/0008 §5's replay-compat rule ① (absent
+             * appended field reads as 0) is the same shape but is NOT authority here -- it
+             * governs the JSONL decoder's view of old recordings, not an in-memory sentinel
+             * for a live PDU variant. */
             crdpq_post(crb_control(p), &ev);
         }
         if (p && p->orig_MapSurfaceToWindow)
@@ -1017,14 +1037,38 @@ static UINT crb_gfx_map_surface_to_scaled_window(RdpgfxClientContext *context,
     @autoreleasepool
     {
         CRBridgeContext *p = g_crbGfxContext;
-        /* Observed in practice after all (2026-08-21, real Win11 25H2 host): the server
-         * uses the scaled variant whenever the client's GFX caps don't carry
-         * AVC_DISABLED (e.g. H264-enabled builds). Treated identically to the plain
+        /* Observed in practice after all (2026-08-21, real Win11 25H2 host): the server sent
+         * the SCALED variant. That measurement stands; the cause is UNDER INVESTIGATION and an
+         * earlier version of this comment named the wrong one.
+         *
+         * What was falsified (L4 round-2 audit, recorded in docs/matrix/sample-audit-2026-09.md
+         * §7): this comment used to say the server picks the scaled variant "whenever the
+         * client's GFX caps don't carry AVC_DISABLED (e.g. H264-enabled builds)". Our caps
+         * ALWAYS carry AVC_DISABLED -- rdpgfx_main.c:373-387 sets it in BOTH arms of its
+         * `#ifdef WITH_GFX_H264` (the H264 arm is gated on `!GfxAVC444`, and `FreeRDP_GfxAVC444`
+         * defaults FALSE and is set nowhere in this repo), so the flag does not move with the
+         * build config at all. The timeline independently rules the flip out: this observation
+         * is 2026-08-21, and WITH_VIDEO_FFMPEG=ON only landed 2026-08-23 (deps/freerdp.lock's
+         * own AVC-caps-flip note) -- i.e. it was seen on an H264-DISABLED build, two days
+         * before the flip it was blamed on.
+         *
+         * Surviving hypothesis, not a conclusion: variant choice is client-caps-dependent in
+         * some way we have not isolated (the negotiated RDPGFX capset version is the leading
+         * suspect -- our advertise set is compile-time-shaped and 10.7 carries
+         * SCALEDMAP_DISABLE, see the audit's §7b, but nothing logs what the host negotiates).
+         * RESOLVED BY the W2 drill re-record, whose precondition is a client-side CapsAdvertise
+         * log. Do not re-derive a cause from this comment until that exists.
+         *
+         * None of the above changes what this callback does. Treated identically to the plain
          * variant for mapping purposes: mappedWidth/Height name the surface sub-rect the
          * window shows (RemoteWindow crops its layer to it); targetWidth/Height (the
-         * display-scale hint) is logged but not yet applied -- the NSWindow's own frame
-         * already defines the on-screen size, and to date target has only ever been the
-         * 64-aligned allocation size. Revisit if a target != window-rect case appears. */
+         * display-scale hint) is now PROMOTED onto the event as well (phase3 M1 F2, U4
+         * ruling: one event kind, the fields appended to crdpq_surface_mapped_t) but is
+         * still not APPLIED -- the NSWindow's own frame already defines the on-screen size,
+         * and to date target has only ever been the 64-aligned allocation size. Promotion
+         * makes the difference observable (window-smoke's `[gfx] target=` line, and any
+         * consumer that wants to count target != mapped); acting on it is W3's decision,
+         * not this wave's. */
         if (p)
         {
             WLog_INFO(TAG,
@@ -1041,6 +1085,12 @@ static UINT crb_gfx_map_surface_to_scaled_window(RdpgfxClientContext *context,
             ev.payload.surfaceMapped.windowId = pdu->windowId;
             ev.payload.surfaceMapped.mappedWidth = pdu->mappedWidth;
             ev.payload.surfaceMapped.mappedHeight = pdu->mappedHeight;
+            /* The scaled PDU's own two extra fields, carried verbatim (no clamping, no
+             * fallback): a server that really sends 0 here is indistinguishable from the
+             * plain variant at the consumer, which is the correct outcome -- a zero-area
+             * target is not a usable hint either way (crdpq.h's sentinel note). */
+            ev.payload.surfaceMapped.targetWidth = pdu->targetWidth;
+            ev.payload.surfaceMapped.targetHeight = pdu->targetHeight;
             crdpq_post(crb_control(p), &ev);
         }
         if (p && p->orig_MapSurfaceToScaledWindow)

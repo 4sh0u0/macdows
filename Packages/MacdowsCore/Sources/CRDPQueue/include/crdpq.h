@@ -363,16 +363,102 @@ typedef struct {
     uint32_t railHandshakeFlags;
 } crdpq_handshake_flags_t;
 
-/** GfxMapSurfaceToWindow. `windowId` is `uint64_t`, faithful to
- *  RDPGFX_MAP_SURFACE_TO_WINDOW_PDU's actual wire type (RailEvent.swift makes the same
- *  choice, for the same reason: real window IDs always fit in 32 bits, but the type stays
- *  honest about what FreeRDP actually hands us). */
+/** GfxMapSurfaceToWindow AND GfxMapSurfaceToScaledWindow — ONE event type covers both PDUs.
+ *  `windowId` is `uint64_t`, faithful to RDPGFX_MAP_SURFACE_TO_WINDOW_PDU's actual wire type
+ *  (RailEvent.swift makes the same choice, for the same reason: real window IDs always fit in
+ *  32 bits, but the type stays honest about what FreeRDP actually hands us).
+ *
+ *  WHY ONE KIND, not a second `CRDPQ_EVENT_SURFACE_MAPPED_SCALED` (phase3 M1 U4 ruling):
+ *  `RDPGFX_MAP_SURFACE_TO_SCALED_WINDOW_PDU` (rdpgfx.h:396-403) is a strict superset of the
+ *  plain PDU (rdpgfx.h:388-394) — identical surfaceId/windowId/mappedWidth/mappedHeight, plus
+ *  targetWidth/targetHeight — and the SCALED variant is the one the server was actually
+ *  observed to send (live 2026-08-21, real Win11 25H2 host). WHY it picks that variant is an
+ *  open question, not the AVC/H264-caps story an earlier version of this comment asserted:
+ *  our caps always carry AVC_DISABLED and the observation predates the FFmpeg flip it was
+ *  blamed on — falsified in L4's audit (docs/matrix/sample-audit-2026-09.md §7), with the
+ *  evidence spelled out at `crb_gfx_map_surface_to_scaled_window` in CRSession.mm and the
+ *  question routed to the W2 drill re-record. Only the observation is load-bearing here, and
+ *  it is enough: a second event type would have turned every live surface map
+ *  into an unhandled event kind for every existing consumer, in exchange for expressing one
+ *  optional pair of fields. Appending the fields instead is exactly adr/0008 §5's append-only
+ *  rule; the two-case model in `RailEvent.swift:156-160` describes rail-probe's own JSONL
+ *  encoder (a separate, file-based format), not this queue, so nothing is inconsistent.
+ *
+ *  `targetWidth`/`targetHeight` — SENTINEL: **(0, 0) means "no target hint accompanied this
+ *  map"**, i.e. the plain PDU, whose wire form has no such fields at all. The argument for it
+ *  is the usable-hint one below, and that argument stands alone. (ANALOGY ONLY, not a governing
+ *  rule for this site: adr/0008 §5's replay-compat rule ① reads an absent appended field as
+ *  0/false, so absent-as-zero is a shape this project already thinks in. That rule is scoped to
+ *  the JSONL *decoder*'s obligation toward samples recorded before a field existed — the ADR
+ *  says in the same breath that replay compatibility is the decoder's job, not the memory
+ *  layout's — and this struct has no decoder path at all today. Protocol-variant absence is not
+ *  stale-recording absence; the resemblance is real but it licenses nothing here.)
+ *
+ *  Zero can never be a *usable* hint: upstream's own plain-variant handler models "no separate
+ *  target" as `outputTarget* = mapped*` (gdi/gfx.c:1937-1938), never as 0, and a genuine 0
+ *  would make gdi/gfx.c:204-205's `sx = outputTargetWidth / mappedWidth` a zero scale factor —
+ *  a zero-area, invisible surface. Note the precise claim: nothing in the protocol FORBIDS a
+ *  server sending a literal 0x0 target, and FreeRDP's receive path validates neither field
+ *  (channels/rdpgfx/client/rdpgfx_main.c:2031-2039 is a length check and six `Stream_Read_*`
+ *  calls), so a nonconforming server's 0x0 scaled map does alias to the plain form here. That
+ *  aliasing is harmless rather than lossy — a consumer would have to discard a zero-area hint
+ *  anyway — but it is an aliasing, not an impossibility.
+ *
+ *  A consumer must therefore check BOTH members against 0 before using either, and a consumer
+ *  that wants upstream's *effective* target must apply upstream's own `target := mapped`
+ *  fallback itself. This layer deliberately does NOT pre-apply it: it is a transport, and
+ *  collapsing "the wire carried no hint" into "the hint equalled mapped" would destroy the
+ *  single distinction F2 exists to measure.
+ *
+ *  MEASUREMENT ONLY in M1 (phase3 F2): nothing may branch rendering, window sizing, or
+ *  coordinate conversion on these two fields yet — they are promoted so the difference becomes
+ *  *observable*, not actionable. To date `target` has only ever been observed equal to the
+ *  64-aligned surface allocation size while the NSWindow's own frame already defines the
+ *  on-screen size, so no consumer has anything to gain from it. REVISIT AT W3, the wave that
+ *  owns the DPI / `DesktopScaleFactor` posture: the first observed `target != window-rect` case
+ *  is that wave's input, and this paragraph is its marker. */
 typedef struct {
     uint32_t surfaceId;
     uint64_t windowId;
     uint32_t mappedWidth;
     uint32_t mappedHeight;
+    /* Appended per adr/0008 §5 (new fields append; absent == 0/false). */
+    uint32_t targetWidth;
+    uint32_t targetHeight;
 } crdpq_surface_mapped_t;
+
+/* adr/0008 §5's measure-don't-estimate discipline, applied to this struct for the first time
+ * (it had no assert before phase3 M1 — it had also never grown before). Needed on its own
+ * because `crdpq_event_payload_t`'s union-level assert structurally CANNOT see this member: at
+ * 32 bytes it is nowhere near `crdpq_window_order_t`'s 572, so a reshaping here that changes
+ * this struct's SIZE would still leave the union's size untouched.
+ *
+ * WHAT THIS ASSERT DOES AND DOES NOT CATCH — measured by mutating this struct and re-running
+ * the suite, not reasoned about (r1 review finding I-1: the previous wording here named three
+ * mutations as though this assert caught them; it catches none of the three, because all three
+ * leave sizeof at exactly 32). It catches whole-struct SIZE drift, and nothing else. The other
+ * two failure modes are covered in `CRDPQueueTests.swift`'s layout suite, which pins every
+ * member's width AND every member's offset for this struct:
+ *   - narrowing `target*` to uint16_t   -> sizeof still 32 (bytes absorbed by tail padding);
+ *                                          caught by the width pins.
+ *   - widening `surfaceId` to uint64_t  -> sizeof still 32, every offset unchanged (it fits the
+ *                                          padding that already followed it); caught ONLY by
+ *                                          that member's width pin. Not hypothetical: the wire
+ *                                          field is UINT16 (rdpgfx.h:390), so a future
+ *                                          "make the type honest" edit is a live possibility.
+ *   - reordering `target*` ahead of `mapped*` -> sizeof, alignment and every member's width all
+ *                                          unchanged; caught ONLY by the offset pins.
+ * Keep all three kinds in step when this struct changes; any one of them alone is blind to what
+ * the other two see.
+ *
+ * 32 was MEASURED with clang/arm64, not predicted: this assert was first compiled at the
+ * pre-growth value and clang reported "expression evaluates to '32 == 24'", then a runtime
+ * sizeof/offsetof probe confirmed the layout field by field (surfaceId@0, 4B of alignment
+ * padding before windowId@8, mappedWidth@16, mappedHeight@20, targetWidth@24,
+ * targetHeight@28 — the two new fields land in what was already the struct's 8-byte-alignment
+ * footprint, which is why the union above does not move). That probe is no longer one-shot: the
+ * offset pins hold exactly those numbers permanently. */
+_Static_assert(sizeof(crdpq_surface_mapped_t) == 32, "crdpq_surface_mapped_t layout changed -- re-measure and audit consumers (adr/0008 §5 / phase3 M1 F2)");
 
 /** A lightweight "a frame became ready" notification carried on the *control* lane, so a
  *  consumer draining window orders in FIFO order can also observe frame-readiness
@@ -441,7 +527,7 @@ typedef union {
     crdpq_monitored_desktop_t monitoredDesktop;
     crdpq_exec_result_t execResult;
     crdpq_handshake_flags_t handshakeFlags;
-    crdpq_surface_mapped_t surfaceMapped;
+    crdpq_surface_mapped_t surfaceMapped; /* SURFACE_MAPPED — both the plain and the scaled PDU */
     crdpq_frame_ready_t frameReady;
     crdpq_local_move_size_t localMoveSize;   /* CRDPQ_EVENT_LOCAL_MOVE_SIZE */
     crdpq_min_max_info_t minMaxInfo;         /* CRDPQ_EVENT_MIN_MAX_INFO */
@@ -459,7 +545,23 @@ typedef union {
  * own alignment is 8 (from `crdpq_surface_mapped_t`'s `uint64_t windowId`, not from
  * `crdpq_window_order_t`), so 572 pads up to the next multiple of 8 = 576. Unchanged by
  * adr/0013 (which grew the notify-icon member to 276) or by adr/0014 §7 (280, re-measured
- * at both steps — see that struct's own assert comment); up from 568 before adr/0010. */
+ * at both steps — see that struct's own assert comment); up from 568 before adr/0010.
+ *
+ * ALSO UNCHANGED by phase3 M1 F2's `target*` growth of `crdpq_surface_mapped_t` (24 -> 32) —
+ * and that "unchanged" is a MEASUREMENT, not the prediction it looks like (adr/0008 §5 /
+ * adr/0013 §6.2: the sizeof discipline is a real gate, and "the union's largest member didn't
+ * move, so nothing moved" is exactly the reasoning that discipline exists to refuse). Both
+ * halves were re-run after the growth: clang's own diagnostic on the member's assert reported
+ * '32 == 24', and a runtime sizeof probe then read this union back at 576 and `CrdpEvent` at
+ * 584. 32 is still an order of magnitude under `crdpq_window_order_t`'s 572, so the union's
+ * size is still set by that member and its 8-byte alignment, neither of which this growth
+ * touched. Consumer audit at the same commit: the ONLY readers of this union member are
+ * `CRDPEventFromCrdpEvent` (CRSession.mm) and the two GFX callbacks that write it — every
+ * other consumer (RemoteWindowRegistry, RemoteWindow, window-smoke, bridge-smoke) reaches it
+ * through `CRDPEvent`'s ObjC properties and cannot see this struct at all; `RailEvent.swift`
+ * decodes rail-probe JSONL and never touches this type. No consumer indexes, memcpy's a fixed
+ * width out of, or serializes this struct, so none needed changing beyond the promotion
+ * itself. */
 _Static_assert(sizeof(crdpq_event_payload_t) == 576, "crdpq_event_payload_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0010 §1)");
 
 /** One control-lane event. POD, no pointers, safe to memcpy — this is the whole point

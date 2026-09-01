@@ -206,6 +206,34 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 @property (nonatomic, readonly) uint32_t mappedWidth;
 @property (nonatomic, readonly) uint32_t mappedHeight;
 
+/// SurfaceMapped only. The GFX map order's display-scale hint —
+/// `RDPGFX_MAP_SURFACE_TO_SCALED_WINDOW_PDU.targetWidth`/`targetHeight`. `CRDPEventKindSurfaceMapped`
+/// covers BOTH GFX map PDUs (the plain and the scaled one are the same event here; see
+/// `crdpq_surface_mapped_t`'s doc comment in crdpq.h for the full rationale), and these two
+/// properties are what distinguishes them whenever the server sent a usable hint.
+///
+/// **SENTINEL: `(0, 0)` means "no target hint accompanied this map"** — the plain PDU, which
+/// carries no such fields on the wire at all. The reason it is safe is the usable-hint argument,
+/// which stands on its own — adr/0008 §5's replay-compat rule ① (an absent appended field reads
+/// as 0/false) is an *analogy* worth knowing, not authority for this decision: that rule governs
+/// the JSONL decoder's treatment of old recordings, and this event has no decoder path yet.
+/// 0 is never a *usable* hint — a zero-area target describes an invisible surface, and FreeRDP's own
+/// plain-variant handler models "no separate target" as target == mapped, not as 0 — so the
+/// sentinel cannot collide with any usable server hint. It can still collide with an unusable
+/// one: nothing in the protocol forbids a server sending a literal 0x0 target, and FreeRDP
+/// validates neither field on receive, so such a map aliases to the plain form here. That is
+/// harmless, because a zero-area hint has to be discarded either way.
+/// Test BOTH against 0 before using either; a caller that wants an *effective* target must
+/// apply its own `target := mapped` fallback, because this class deliberately does not — doing
+/// so here would erase the one distinction these fields exist to expose.
+///
+/// OBSERVATION ONLY for now (phase3 M1 F2, the same posture `notifyIconVersion` already takes):
+/// nothing in this project may branch rendering, window sizing, or coordinate conversion on
+/// these yet. They are promoted so `target != mapped` stops being invisible to us; deciding
+/// what to DO about such a case belongs to the wave that owns the DPI/scale-factor posture.
+@property (nonatomic, readonly) uint32_t targetWidth;
+@property (nonatomic, readonly) uint32_t targetHeight;
+
 /// MonitoredDesktop only, meaningful only when `fieldFlags` sets the Z-order bit (0x10,
 /// `WINDOW_ORDER_FIELD_DESKTOP_ZORDER`). Ordered top-to-bottom Z order (adr/0008 §2a) as
 /// `NSNumber`-boxed `uint32_t` window ids — empty when that bit wasn't set for this order.
@@ -281,15 +309,39 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
                       program:(NSString *)program NS_DESIGNATED_INITIALIZER;
 - (instancetype)init NS_UNAVAILABLE;
 
-/// Remote session desktop size, in remote pixels. Set BOTH before `-start` (read once by
-/// the connect path on T_rdp; unsynchronized afterwards) or leave at 0/0 for FreeRDP's
-/// default (1024x768). The caller passes its screen size here -- this class deliberately
-/// knows nothing about AppKit/NSScreen. The RAIL server clamps remote window positions to
-/// this desktop, so an undersized value shows up as an "invisible wall" mid-screen that
-/// windows cannot be dragged past (established live 2026-08-21: default 1024 wide vs a
-/// 2560pt display put that wall exactly at the screen's midpoint, and the server-side
-/// clamp desynced local window frames from remote reality, breaking visually-aimed
-/// clicks after a drag).
+/// Remote session desktop size. Set BOTH before `-start` (read once by the connect path on
+/// T_rdp; unsynchronized afterwards) or leave at 0/0 for FreeRDP's default (1024x768). The
+/// caller passes its screen size here -- this class deliberately knows nothing about
+/// AppKit/NSScreen.
+///
+/// UNIT, stated unambiguously because the rest of this comment depends on it: whatever is
+/// written here goes VERBATIM into FreeRDP's `FreeRDP_DesktopWidth`/`FreeRDP_DesktopHeight`
+/// settings (see this class's connect path in CRSession.mm), so the unit is fixed by the
+/// protocol rather than chosen by this class -- it is **REMOTE DESKTOP PIXELS**, the one
+/// coordinate space every RAIL window offset/size and every GFX `mapped*`/`target*` value on
+/// this session is already expressed in, and the space the RAIL server performs its
+/// window-position clamp in. It is NOT macOS points, and it is NOT this Mac's backing-pixel
+/// count; those are local units that happen to be numerically comparable today.
+///
+/// KNOWN CALLER MISMATCH -- OPEN, and deliberately NOT resolved here (phase3 M1 "U3"). Both
+/// callers today assign a value measured in macOS POINTS: each reads `NSScreen.frame` (a
+/// points rect) for the primary screen -- see `AppDelegate`'s session-setup path and
+/// Tools/window-smoke/main.swift's matching one. On a 1x display points and backing pixels are
+/// numerically identical, so the mismatch is currently UNOBSERVABLE, which is exactly why it
+/// must not be "fixed" by whichever call site is being edited at the time: which local
+/// measurement is the right thing to put here once a scale factor exists -- the screen union
+/// measured in points, or the union measured in backing pixels -- is a single decision that
+/// also pre-commits this client's `DesktopScaleFactor` posture, and it is routed to ADR-0015.
+/// The wave that answers it changes the callers, in one place, on purpose. Until then this
+/// property's own contract is the sentence above (remote pixels) and the callers are known to
+/// be supplying an approximation of it that is exact only at 1x.
+///
+/// Sizing this correctly matters regardless of the open unit question: the RAIL server clamps
+/// remote window positions to this desktop, so an undersized value shows up as an "invisible
+/// wall" mid-screen that windows cannot be dragged past (established live 2026-08-21: the
+/// 1024-wide default against a 2560pt-wide display put that wall exactly at the screen's
+/// midpoint, and the server-side clamp desynced local window frames from remote reality,
+/// breaking visually-aimed clicks after a drag).
 @property (nonatomic) uint32_t desktopWidth;
 @property (nonatomic) uint32_t desktopHeight;
 
