@@ -82,13 +82,14 @@ public struct FieldPolicy: Sendable, Equatable {
     public static let `default` = FieldPolicy()
 
     /// Identifier field names in a fixed order. `Dictionary` iteration order is not
-    /// stable across runs, and canonical ordinals are assigned in first-appearance order —
-    /// so an unsorted walk over an event carrying two same-namespace identifiers
-    /// (`WindowUpdate` has both `windowId` and `ownerWindowId`) could hand out different
-    /// ordinals on two runs of the same input. Sorting makes the differ deterministic.
-    /// Since W2 batch 2 the same-title disambiguator `#k` is assigned on the same walk,
-    /// so title-anchored tokens depend on this order for their determinism exactly as
-    /// ordinals do — the sort is load-bearing for both branches, not just the `else`.
+    /// stable across runs, and every first-appearance position is assigned on this walk —
+    /// the `surface`/`notifyIcon` ordinals, the late pool `window?#k` (untitled anchoring
+    /// step 2), and the same-title disambiguator `#k` (W2 batch 2) — so an unsorted walk over
+    /// an event carrying two same-namespace identifiers (`WindowUpdate` has both `windowId`
+    /// and `ownerWindowId`) could hand out different positions on two runs of the same input.
+    /// Sorting makes the differ deterministic. Created untitled windows are the one branch
+    /// that no longer depends on it: their `window#k` comes from the WindowCreate-order
+    /// prescan, which reads `windowId` alone.
     public var sortedIdentifierFieldNames: [String] {
         identifierNamespaces.keys.sorted()
     }

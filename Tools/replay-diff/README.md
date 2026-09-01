@@ -28,8 +28,11 @@ and thread fields outright, and compares session-scoped handles
 (`windowId`/`ownerWindowId`/`activeWindowId`/`windowIdMarker`, `surfaceId`, `notifyIconId`)
 as per-side canonical tokens: a `window` handle that ever carries a non-empty `title`
 anchors on it (same-title duplicates disambiguate by a per-side first-appearance index —
-see the known-limitations section for what that index does NOT buy), everything else
-gets a per-side first-appearance ordinal — so "the window ids changed" is silence while
+see the known-limitations section for what that index does NOT buy); an untitled window
+takes its position from WindowCreate ORDER (`window#k`); a handle referenced but never
+created in the capture goes to the late pool (`window?#k`); `surface` and `notifyIcon` get
+per-side first-appearance ordinals; `0` and (for window fields) `0xFFFFFFFF` are constants
+— so "the window ids changed" is silence while
 "this surface now maps to a different window" is a finding. Events are matched per event type and
 identity tuple, which tolerates cross-channel reordering exactly rather than approximately.
 
@@ -202,33 +205,32 @@ the then-current implementation and no longer reproducible in-tree; only the 98 
 construction-independent, the total depended on the injected payload); it now yields
 exactly 1 finding** (the extra window itself — pinned by `TitleAnchoredIdentityTests`).
 
-Three populations still cascade:
+Four position-keyed populations remain (the constants described after them are not a
+population: they enter no pool). The runtime note issues one line per pool whose distinct-handle
+count changed — `window` (created untitled windows and same-title-group members share it),
+`window?`, `surface`, `notifyIcon` — so a report carries as many such lines as pools that moved.
 
-- **Untitled `window` handles** keep plain first-appearance ordinals. The same experiment
-  with an UNTITLED extra window measures **49 `eventCountChanged` findings** (pinned,
-  interlocked with the runtime note's own text; only that count is
-  construction-independent; it was 53 before untitled anchoring step 1, next paragraph). A
-  live re-record that opens one transient untitled window the baseline did not (a splash
-  screen, a tooltip, a tray flyout) lands here.
-
-  Two identifier values are **constants, not handles**, and never take an ordinal: `0`
-  (`<namespace>#none`, the null handle) and — `window` namespace only — `0xFFFFFFFF`
-  (`window#0xFFFFFFFF`, MonitoredDesktop's no-active-window sentinel; untitled anchoring
-  step 1, `IdentifierConstantTests`). Until step 1 the latter was ordinalised, and because
-  every frozen capture reports it early and 21–23 times it sat at `window#0` and shifted
-  every later untitled ordinal by one on whichever side carried it — a structural +1 cascade
-  against any re-record that does not report it. Neither constant counts toward the runtime
-  note's un-anchored handle totals. Measured on the step's target corpus — the six
-  frozen×re-record pairs the untitled-payload-stability record quotes at 946
-  (`samples-local/rerecord-2026-09-drill-01`, an **untracked** maintainer-local directory;
-  contributors cannot reproduce this number from the repo alone): total findings
-  **946 → 879** (per scenario 199/116/164/164/162/141 → 192/104/163/165/136/119 — s4 rose by
-  one), `window#`-ordinal identities 295 → 271. The synthetic experiment above carries the
-  constant on both sides and is not that scenario — its `eventCountChanged` fell 53 → 49
-  while its total rose 87 → 118: the constant's MonitoredDesktop occurrences now pair and
-  report their drift (`eventOrderChanged` 0 → 18 for that event) instead of counting as two
-  unmatched identities, and the injected synthetic window now mis-pairs with a real untitled
-  one and compares payloads (WindowCreate `fieldValueChanged` 12 → 18, all from that pair).
+- **Untitled `window` handles with a WindowCreate** take their ordinal from **creation
+  order** (untitled anchoring step 2, `CreationOrderedIdentityTests`): the main lane is one
+  thread, so that order is deterministic, unlike "whichever event mentioned the handle first".
+  That race is real but rare in the twelve captures — a first mention before the handle's own
+  WindowCreate happens for 11 of 138 created handles on the frozen side (all via
+  `GfxMapSurfaceToWindow`) and 12 of 143 on the re-record side (6 via `MonitoredDesktop` on the
+  main lane itself, 6 via gfx maps); among the UNTITLED created handles step 2 governs, only 1 of
+  84 and 2 of 85. First WindowCreate wins for HWND reuse (pinned by
+  `CreationOrderedIdentityTests.hwndReuseKeepsTheFirstCreationOrdinal`). The same experiment
+  with an UNTITLED extra window measures **15 `eventCountChanged` findings** (pinned,
+  interlocked with the runtime note's own text; only that count is construction-independent;
+  49 before step 2, 53 before step 1) — the extra head window still shifts every created
+  untitled window by one, which is the residual by construction. A live re-record that opens
+  one transient untitled window the baseline did not (a splash screen, a tooltip, a tray flyout)
+  lands here.
+- **`window?` — handles referenced but never created in the capture** (windows that existed
+  before the probe attached, notify-icon owners, z-order markers) keep first-appearance
+  ordinals within their own pool, so their churn cannot shift the created windows; that pool's
+  note line has its own text (pre-existing windows, not transient ones). Taking these out of
+  the created windows' ordinal space is where step 2's measured gain comes from, given how rare
+  the race above is.
 - **Same-title groups.** The `#k` disambiguator is a *per-side* first-appearance index —
   the ordinal mechanism again, reduced to the group — so a membership or creation-order
   drift inside a same-title group mis-pairs its members and reports loudly. Measured on
@@ -240,6 +242,33 @@ Three populations still cascade:
   is the majority titled case.
 - **`surface`/`notifyIcon`**: their events carry nothing stable to anchor on; ordinals as
   before.
+
+**Measured, step 1** (`0xFFFFFFFF` → constant), on the six frozen×re-record pairs the
+untitled-payload-stability record quotes at 946 (`samples-local/rerecord-2026-09-drill-01`, an
+**untracked** maintainer-local directory; contributors cannot reproduce these numbers from the
+repo alone): total findings **946 → 879** (per scenario 199/116/164/164/162/141 →
+192/104/163/165/136/119 — s4 rose by one), bare `window#` identities 295 → 271. The synthetic
+experiment above carries the constant on both sides and is not that scenario — its
+`eventCountChanged` fell 53 → 49 while its total rose 87 → 118: the constant's MonitoredDesktop
+occurrences now pair and report their drift (`eventOrderChanged` 0 → 18 for that event) instead
+of counting as two unmatched identities, and the injected synthetic window now mis-pairs with a
+real untitled one and compares payloads (WindowCreate `fieldValueChanged` 12 → 18, all from that
+pair).
+
+**Measured, step 2** (creation order + `window?` pool), same corpus: **879 → 831**
+(`eventCountChanged` 380 → 298, `eventOrderChanged` 295 → 340, `fieldValueChanged` 202 → 191;
+per scenario 192/104/163/165/136/119 → 192/94/145/156/133/111). Bare `window#` identities
+271 → 54 and 135 findings now carry a `window?#` token — they do not sum to 271 because 82 former
+mis-pairs now pair (the count-changed drop) while newly paired events report order or field
+findings instead. Synthetic experiment: `eventCountChanged` 49 → 15, total 118 → 121.
+
+**Constants.** Two identifier values are constants, not handles, and never take an ordinal or
+enter any pool: `0` (`<namespace>#none`, the null handle) and — `window` namespace only —
+`0xFFFFFFFF` (`window#0xFFFFFFFF`, MonitoredDesktop's no-active-window sentinel; untitled
+anchoring step 1, `IdentifierConstantTests`). Until step 1 the latter was ordinalised, and because
+every frozen capture reports it early and 21–23 times it sat at `window#0` and shifted every
+later untitled ordinal by one on whichever side carried it — a structural +1 cascade against any
+re-record that does not report it. Neither constant counts toward the runtime note's totals.
 
 The tool fails **loudly, never silently**, so the verdict is not misleading. The report says
 so itself: whenever the two sides have different numbers of distinct **un-anchored** handles

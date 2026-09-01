@@ -74,10 +74,12 @@ struct TimestampAndThreadNoiseTests {
         #expect(counts.count == 2, "unexpected: \(report.differences)")
         #expect(counts.allSatisfy { $0.eventName == "GfxMapSurfaceToWindow" })
         // Title anchoring (W2 batch 2): the fixture window is titled, so its identity is
-        // the anchored token; the re-attribution target 99999 never carries a title, so it
-        // is the first (and only) ordinal handle.
+        // the anchored token. The re-attribution target 99999 carries no title and has no
+        // WindowCreate anywhere in the capture, so since untitled anchoring step 2 it lives
+        // in the late pool -- `window?#0`, the first (and only) never-created handle -- rather
+        // than taking a creation-order ordinal it never earned.
         #expect(counts.contains { $0.detail.contains("windowId=\"window@Fixture Window\"") })
-        #expect(counts.contains { $0.detail.contains("windowId=\"window#0\"") })
+        #expect(counts.contains { $0.detail.contains("windowId=\"window?#0\"") })
     }
 
     /// `--no-canonical-ids` must remain a real switch: with it, raw handle values are the

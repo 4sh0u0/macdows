@@ -156,7 +156,7 @@ struct TitleAnchoredIdentityTests {
     /// Review W2b-r2 finding R2-2: the class doc and README quote **8** as the same-title
     /// group's only clean single-cause measurement (a pure creation-order swap: equal
     /// handle counts, no surface jitter, no note). Pinned against the real capture, same
-    /// N-4 discipline as the 49 (53 before untitled anchoring step 1).
+    /// N-4 discipline as the 15 (49 before untitled anchoring step 2, 53 before step 1).
     @Test("a two-line creation-order swap inside the same-title group measures exactly 8 findings, no note")
     func sameTitleGroupSwapMeasuresEight() throws {
         let url = try #require(PhaseSamples.url(named: "s3-multiapp"))
@@ -248,7 +248,13 @@ struct TitleAnchoredIdentityTests {
     /// keeps the residual named — if it ever shrinks (or grows) the note text and the
     /// README's Known-limitations section must move with it. History: 53 while the
     /// `0xFFFFFFFF` no-active-window constant was still ordinalised; 49 since untitled
-    /// anchoring step 1 made it a constant (`IdentifierConstantTests`). Per-class, the
+    /// anchoring step 1 made it a constant (`IdentifierConstantTests`); **15** since step 2
+    /// keyed untitled windows by WindowCreate order and moved never-created handles into the
+    /// `window?` pool (`CreationOrderedIdentityTests`) — the extra head window still shifts
+    /// every CREATED untitled window by one (that is the residual by construction), but the
+    /// referenced-only handles no longer move with it (step 2 total 118 → 121: count 49 → 15,
+    /// order 51 → 71, field 18 → 35 — re-paired events now report drift instead of counts).
+    /// Step 1's per-class account, kept for the record: the
     /// synthetic experiment moved MonitoredDesktop 2 → 0 and WindowCreate 9 → 7 in this
     /// class — but this experiment carries the constant on BOTH sides, which is not the
     /// scenario step 1 targets, and its TOTAL rose 87 → 118 (eventOrderChanged 22 → 51, of
@@ -265,7 +271,7 @@ struct TitleAnchoredIdentityTests {
         var lines = contents.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         while lines.last?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true { lines.removeLast() }
         // The prose (this suite's doc, the class doc, the README, the runtime note) names
-        // a 145-line capture; the number stays pinned here, with the 49 it produces
+        // a 145-line capture; the number stays pinned here, with the 15 it produces
         // (review W2b-r1 F4 — the pin rode the deleted 98-experiment test and must not
         // be lost with it).
         #expect(lines.count == 145, "the documented experiment names a 145-line capture, got \(lines.count)")
@@ -280,10 +286,10 @@ struct TitleAnchoredIdentityTests {
         // independent count, and pin it against the real capture the prose names) — this
         // is the number the CASCADE note quotes, so the two must move together.
         let counts = report.differences.filter { $0.diffClass == .eventCountChanged }.count
-        #expect(counts == 49, "the documented untitled residual drifted: \(counts)")
+        #expect(counts == 15, "the documented untitled residual drifted: \(counts)")
         let note = try #require(report.notes.first { $0.hasPrefix("CASCADE RISK") },
                                 "an untitled handle-count change must still raise the note")
-        #expect(note.contains("49 eventCountChanged"),
+        #expect(note.contains("15 eventCountChanged"),
                 "the note's quoted residual must match the measured one")
     }
 }

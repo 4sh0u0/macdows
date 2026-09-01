@@ -8,8 +8,11 @@ public struct DifferOptions: Sendable, Equatable {
     /// Replace session-scoped handle values with per-side canonical tokens before
     /// comparing: a `window` handle that ever carries a non-empty `title` anchors on it
     /// (`windowId: 65832` → `window@About Windows`; same-title duplicates disambiguate by
-    /// first appearance), everything else — untitled windows, `surface`, `notifyIcon` —
-    /// gets a per-side first-appearance ordinal (`surfaceId: 7` → `surface#0`). On by
+    /// first appearance); an untitled window takes its position from WindowCreate ORDER
+    /// (`window#k`); a handle referenced but never created in the capture goes to the late
+    /// pool (`window?#k`); `surface` and `notifyIcon` get per-side first-appearance ordinals
+    /// (`surfaceId: 7` → `surface#0`); `0` and, for window fields, `0xFFFFFFFF` are constants.
+    /// On by
     /// default; without it, *no* pair of separately recorded captures can ever match,
     /// because a re-record gets fresh HWNDs and surface ids for the same user actions.
     /// Turn off with `--no-canonical-ids` when diffing two captures from the same
@@ -173,7 +176,9 @@ public enum EventLane: String, Sendable, Equatable, CaseIterable {
 /// 1. **Parse failures** on either side become ``DiffClass/unparsableLine`` findings.
 /// 2. **Identifier canonicalization** (optional, default on) rewrites handle-valued fields
 ///    to per-side canonical tokens: title-anchored for `window` handles that ever carry
-///    a non-empty `title`, per-namespace first-appearance ordinals for the rest.
+///    a non-empty `title`, WindowCreate-order ordinals for untitled windows, a separate
+///    `window?` pool for handles referenced but never created, per-namespace
+///    first-appearance ordinals for the rest.
 /// 3. **Type census.** An `ev` name present on exactly one side is a whole-type finding:
 ///    ``DiffClass/knownLocalDifference`` when the ``KnownDifferenceTable`` claims it
 ///    on that side — as an appearance *or* as the superseded half of a substitution, see
@@ -214,34 +219,34 @@ public enum EventLane: String, Sendable, Equatable, CaseIterable {
 /// from **one** extra uniquely-titled `WindowCreate` prepended to `s3-multiapp.jsonl`
 /// (145 lines) now yields exactly **1** finding (pinned by `TitleAnchoredIdentityTests`).
 ///
-/// Three populations still cascade, and the cascade note counts all of them:
+/// Four position-keyed populations remain (the constants described further down are not a
+/// population: they enter no pool). The cascade note issues one line per pool whose
+/// distinct-handle count changed — `window` (created untitled windows and same-title-group
+/// members SHARE it), `window?`, `surface`, `notifyIcon` — so a report carries as many such
+/// lines as pools that moved.
 ///
-/// - **Untitled `window` handles** keep plain first-appearance ordinals. The same
-///   experiment with an UNTITLED extra window measures **49 `eventCountChanged`**
-///   findings (pinned, interlocked with the note's own text; 53 before untitled anchoring
-///   step 1, below). A re-record that opens one transient untitled window the baseline did
-///   not (a splash screen, a tooltip, a tray flyout) lands here.
-///
-///   Two values in the identifier fields are **constants, not handles**, and never take an
-///   ordinal: `0` (`<namespace>#none`, the null handle) and — `window` namespace only —
-///   `0xFFFFFFFF` (`window#0xFFFFFFFF`, MonitoredDesktop's no-active-window sentinel;
-///   untitled anchoring step 1, `IdentifierConstantTests`). Until step 1 the latter was
-///   ordinalised, and since every frozen capture reports it early and 21–23 times it sat at
-///   `window#0` and shifted every later untitled ordinal by one on whichever side carried
-///   it — a structural +1 cascade against any re-record that does not report it. Neither
-///   constant counts toward the cascade note's un-anchored handle totals. Measured on the
-///   step's own target corpus — the six frozen×re-record pairs the untitled-payload-stability
-///   record §6 quotes at 946 (`samples-local/rerecord-2026-09-drill-01`, untracked) — total
-///   findings fell **946 → 879** (per scenario 199/116/164/164/162/141 → 192/104/163/165/136/119;
-///   s4 rose by one) and findings whose identity carries a bare `window#` ordinal fell
-///   295 → 271. The synthetic head-insertion experiment above carries the constant on BOTH
-///   sides and is not that scenario: its `eventCountChanged` fell 53 → 49 (MonitoredDesktop
-///   2 → 0, WindowCreate 9 → 7) while its total rose 87 → 118 — `eventOrderChanged` 22 → 51
-///   (MonitoredDesktop 0 → 18: the constant's occurrences now pair and report their drift
-///   instead of being two unmatched identities; WindowCreate 10 → 18; three other events +1)
-///   and WindowCreate `fieldValueChanged` 12 → 18 — all six from ONE new pairing, the injected
-///   synthetic head window against a real untitled window (a mis-pair the shifted ordinals
-///   produce, not a correct match), whose payloads now compare instead of being leftovers.
+/// - **Untitled `window` handles with a WindowCreate** take their ordinal from **creation
+///   order** (untitled anchoring step 2, `CreationOrderedIdentityTests`): the main lane
+///   (`EventLane.main`) is one thread, so that order is deterministic, unlike "whichever event
+///   mentioned the handle first". That race is real but rare in the twelve captures: a first
+///   mention before the handle's own WindowCreate happens for 11 of 138 created handles on the
+///   frozen side (all via `GfxMapSurfaceToWindow`) and 12 of 143 on the re-record side (6 via
+///   `MonitoredDesktop` — the main lane itself — and 6 via gfx maps); among the UNTITLED
+///   created handles step 2 governs, only 1 of 84 and 2 of 85. First WindowCreate wins for
+///   HWND reuse (`hwndReuseKeepsTheFirstCreationOrdinal`). The same experiment with an
+///   UNTITLED extra window measures **15 `eventCountChanged`** findings (pinned, interlocked
+///   with the note's own text; 49 before step 2, 53 before step 1): the extra head window still
+///   shifts every created untitled window by one, which is the residual by construction. A
+///   re-record that
+///   opens one transient untitled window the baseline did not (a splash screen, a tooltip, a
+///   tray flyout) lands here.
+/// - **`window?` — handles referenced but never created in the capture** (windows that
+///   existed before the probe attached, notify-icon owners, z-order markers) keep
+///   first-appearance ordinals within their own pool, so their churn cannot shift the created
+///   windows; the pool's note line has its own text (pre-existing windows, not transient ones —
+///   a `window?` handle has no WindowCreate by definition). Taking these out of the created
+///   windows' ordinal space is where step 2's measured gain comes from, given how rare the race
+///   above is.
 /// - **Same-title groups**: duplicates disambiguate by `#k`, a *per-side*
 ///   first-appearance index — the ordinal mechanism again, reduced to the group. A
 ///   membership or creation-order drift inside the group mis-pairs its members. Measured
@@ -255,6 +260,37 @@ public enum EventLane: String, Sendable, Equatable, CaseIterable {
 ///   corner.
 /// - **`surface`/`notifyIcon`**: no anchorable payload exists on their events; ordinals
 ///   as before.
+///
+/// **Measured, step 1** (`0xFFFFFFFF` → constant), on the six frozen×re-record pairs the
+/// untitled-payload-stability record §6 quotes at 946
+/// (`samples-local/rerecord-2026-09-drill-01`, untracked): total findings **946 → 879** (per
+/// scenario 199/116/164/164/162/141 →
+/// 192/104/163/165/136/119; s4 rose by one); findings whose identity carries a bare `window#`
+/// ordinal 295 → 271. The synthetic head-insertion experiment above carries the constant on
+/// BOTH sides and is not that scenario: `eventCountChanged` 53 → 49 (MonitoredDesktop 2 → 0,
+/// WindowCreate 9 → 7), total 87 → 118 — `eventOrderChanged` 22 → 51 (MonitoredDesktop
+/// 0 → 18 as the constant's occurrences pair and report drift; WindowCreate 10 → 18; three other
+/// events +1) and WindowCreate `fieldValueChanged` 12 → 18, all six from ONE new pairing of the
+/// injected synthetic window against a real untitled one (a mis-pair the shifted ordinals
+/// produce, not a correct match).
+///
+/// **Measured, step 2** (creation order + `window?` pool), same corpus: **879 → 831**
+/// (`eventCountChanged` 380 → 298, `eventOrderChanged` 295 → 340, `fieldValueChanged`
+/// 202 → 191, one-sided types 2 → 2; per scenario 192/104/163/165/136/119 →
+/// 192/94/145/156/133/111). Bare `window#` identities 271 → 54 and 135 findings now carry a
+/// `window?#` token — they do not sum to 271 because 82 former mis-pairs now pair (the
+/// count-changed drop) while newly paired events report order or field findings instead. The
+/// synthetic experiment: `eventCountChanged` 49 → 15, total 118 → 121 (order 51 → 71, field
+/// 18 → 35).
+///
+/// **Constants.** Two identifier values are constants, not handles, and never take an ordinal
+/// or enter any pool: `0` (`<namespace>#none`, the null handle) and — `window` namespace only —
+/// `0xFFFFFFFF` (`window#0xFFFFFFFF`, MonitoredDesktop's no-active-window sentinel; untitled
+/// anchoring step 1, `IdentifierConstantTests`). Until step 1 the latter was ordinalised, and
+/// since every frozen capture reports it early and 21–23 times it sat at `window#0` and shifted
+/// every later untitled ordinal by one on whichever side carried it — a structural +1 cascade
+/// against any re-record that does not report it. Neither constant counts toward the cascade
+/// note's totals.
 ///
 /// The tool fails *loudly*, never silently, so the verdict is not misleading — and the
 /// report's **cascade note** fires on un-anchored handle-count changes (untitled and
@@ -458,7 +494,8 @@ public struct SemanticDiffer: Sendable {
             notes.append(
                 "identifier canonicalization ON for namespaces [\(namespaces.joined(separator: ", "))]"
                     + " — titled window handles are compared by title-anchored identity, all other"
-                    + " handle values as per-side first-appearance ordinals"
+                    + " handle values as per-side positions (untitled windows by WindowCreate order,"
+                    + " never-created `window?` handles and the other namespaces by first appearance)"
             )
         } else {
             notes.append("identifier canonicalization OFF — raw handle values are compared literally")
@@ -602,6 +639,45 @@ public struct SemanticDiffer: Sendable {
         return nil
     }
 
+    /// Untitled anchoring step 2: the creation-order ordinal of every untitled `window` handle
+    /// that has a `WindowCreate` anywhere in the stream — scanned before canonicalization, like
+    /// the titles. Creation order inside the main lane (`EventLane.main`, the RAIL orders
+    /// thread) is one thread's order and therefore deterministic; first-appearance order across
+    /// the whole stream was not, because a `GfxMapSurfaceToWindow` on the gfx thread can mention
+    /// a handle before or after its WindowCreate depending on the run (untitled-payload-stability
+    /// §4.2 / §7.2). Handles absent from this map — referenced but never created inside the
+    /// capture: windows that existed before the probe attached, notify-icon owners — get the late
+    /// pool `window?#k` in `canonicalized` instead, so they cannot shift the created windows'
+    /// positions (§4.3 / §7.2). **First WindowCreate wins** for HWND reuse (a handle destroyed
+    /// and re-created within one capture keeps its first position; the `ordinals[raw] == nil`
+    /// guard is what makes that so, and without it the second create would collide with the
+    /// next new handle — `hwndReuseKeepsTheFirstCreationOrdinal` pins it), the same trade-off
+    /// the title map makes. Keyed on the literal `windowId` for the same reason the title map is
+    /// (F10): the creation belongs to the window, never to a referrer. Unlike the title map this
+    /// one IS event-name keyed, deliberately: a title is a field that may ride on either
+    /// window-order event, whereas creation is the `WindowCreate` event itself and nothing else
+    /// carries it.
+    private func creationOrdinalsByRawHandle(
+        _ records: [ReplayRecord], titles: [String: String], windowNamespace: String?
+    ) -> [String: Int] {
+        var ordinals: [String: Int] = [:]
+        for record in records where record.eventName == "WindowCreate" {
+            guard let raw = record.fields["windowId"]?.integerCanonicalForm,
+                  let namespace = options.fieldPolicy.namespace(of: "windowId"),
+                  constantToken(raw: raw, namespace: namespace, windowNamespace: windowNamespace) == nil,
+                  titles[raw] == nil,
+                  ordinals[raw] == nil
+            else { continue }
+            ordinals[raw] = ordinals.count
+        }
+        return ordinals
+    }
+
+    /// The late pool's namespace label: `window` handles with neither a title nor a WindowCreate
+    /// in the capture. A separate position-keyed pool so its churn is counted and named on its
+    /// own in the cascade note, never mixed into the created windows' ordinals.
+    private static func latePoolNamespace(_ windowNamespace: String) -> String { "\(windowNamespace)?" }
+
     private func canonicalized(_ records: [ReplayRecord]) -> [ReplayRecord] {
         guard options.canonicalizeIdentifiers else { return records }
         let identifierFields = options.fieldPolicy.sortedIdentifierFieldNames
@@ -620,6 +696,7 @@ public struct SemanticDiffer: Sendable {
         // residual populations are what `cascadeNotes` counts.
         let windowNamespace = options.fieldPolicy.namespace(of: "windowId")
         let windowTitles = windowTitlesByRawHandle(records)
+        let creationOrdinals = creationOrdinalsByRawHandle(records, titles: windowTitles, windowNamespace: windowNamespace)
         var titleDisambiguator: [String: Int] = [:]
         var nextOrdinal: [String: Int] = [:]
         var tokens: [String: [String: String]] = [:]
@@ -644,6 +721,17 @@ public struct SemanticDiffer: Sendable {
                     titleDisambiguator[title] = k + 1
                     let escaped = Self.tokenEscapedTitle(title)
                     token = k == 0 ? "\(namespace)@\(escaped)" : "\(namespace)@\(escaped)#\(k)"
+                } else if namespace == windowNamespace, let created = creationOrdinals[raw] {
+                    // Step 2: creation order, not first mention — an early gfx-lane reference to
+                    // this handle gets the same token its WindowCreate will.
+                    token = "\(namespace)#\(created)"
+                } else if namespace == windowNamespace {
+                    // Step 2: neither title nor WindowCreate in this capture — the late pool,
+                    // position-keyed among its own members only.
+                    let pool = Self.latePoolNamespace(namespace)
+                    let ordinal = nextOrdinal[pool, default: 0]
+                    nextOrdinal[pool] = ordinal + 1
+                    token = "\(pool)#\(ordinal)"
                 } else {
                     let ordinal = nextOrdinal[namespace, default: 0]
                     nextOrdinal[namespace] = ordinal + 1
@@ -770,19 +858,40 @@ public struct SemanticDiffer: Sendable {
         let baselineCounts = distinctUnanchoredHandleCounts(baseline)
         let candidateCounts = distinctUnanchoredHandleCounts(candidate)
         var notes: [String] = []
+        let windowNamespace = options.fieldPolicy.namespace(of: "windowId")
         for namespace in Set(baselineCounts.keys).union(candidateCounts.keys).sorted() {
             let before = baselineCounts[namespace] ?? 0
             let after = candidateCounts[namespace] ?? 0
             guard before != after else { continue }
+            if let windowNamespace, namespace == Self.latePoolNamespace(windowNamespace) {
+                // The late pool's own diagnosis: these handles have NO WindowCreate by definition,
+                // so the created-window remedy below ("did the candidate open one extra
+                // transient window?") would send the operator to the wrong place.
+                notes.append(
+                    "CASCADE RISK: the candidate has \(after) distinct never-created `\(namespace)` handle(s) "
+                        + "against the baseline's \(before). `\(namespace)` handles are referenced (Gfx maps, "
+                        + "notify-icon owners, z-order markers) but never created inside the capture — "
+                        + "windows that pre-date the probe attaching, or whose owner lives outside the RAIL "
+                        + "session. They are position-keyed among THEMSELVES only (per-side first appearance), "
+                        + "so an extra or missing one EARLY shifts every later `\(namespace)` identity and can "
+                        + "turn one real difference into many; the created windows (`\(windowNamespace)#k`) are "
+                        + "NOT affected. Read the FIRST eventCountChanged carrying a `\(namespace)#` identity "
+                        + "and check whether the two sessions simply had different pre-existing windows (a "
+                        + "leftover RemoteApp window from an earlier session, a different shell state). "
+                        + "--no-canonical-ids is NOT the remedy (it makes every handle differ)."
+                )
+                continue
+            }
             notes.append(
                 "CASCADE RISK: the candidate has \(after) distinct un-anchored `\(namespace)` handle(s) "
                     + "against the baseline's \(before). Un-anchored handles (`surface`/`notifyIcon` always; "
-                    + "`window` handles that never carry a title, plus every member of a same-title group — "
-                    + "those disambiguate by a per-side first-appearance index, the ordinal mechanism reduced "
-                    + "to the group) are position-keyed, so an extra or missing one EARLY in the stream shifts "
+                    + "`window` handles that never carry a title — keyed by WindowCreate order — plus every "
+                    + "member of a same-title group, which disambiguate by a per-side first-appearance index; "
+                    + "`window?` = handles referenced but never created in this capture, position-keyed among "
+                    + "themselves only) are position-keyed, so an extra or missing one EARLY in the stream shifts "
                     + "every later `\(namespace)` position and can turn one real difference into dozens "
                     + "(measured residual: one extra UNTITLED WindowCreate at the head of a 145-line capture → "
-                    + "49 eventCountChanged findings; only UNIQUELY-titled windows are immune, since W2 batch "
+                    + "15 eventCountChanged findings; only UNIQUELY-titled windows are immune, since W2 batch "
                     + "2's title-anchored identity). Read the FIRST eventCountChanged below and check "
                     + "whether the candidate simply opened one extra transient window; if so, the rest of this "
                     + "report is one finding wearing a costume. --no-canonical-ids is NOT the remedy (it makes "
@@ -802,6 +911,7 @@ public struct SemanticDiffer: Sendable {
     private func distinctUnanchoredHandleCounts(_ records: [ReplayRecord]) -> [String: Int] {
         let windowNamespace = options.fieldPolicy.namespace(of: "windowId")
         let titles = windowTitlesByRawHandle(records)
+        let creationOrdinals = creationOrdinalsByRawHandle(records, titles: titles, windowNamespace: windowNamespace)
         var handlesPerTitle: [String: Int] = [:]
         for title in titles.values { handlesPerTitle[title, default: 0] += 1 }
         var seen: [String: Set<String>] = [:]
@@ -813,6 +923,12 @@ public struct SemanticDiffer: Sendable {
                 else { continue }
                 if namespace == windowNamespace, let title = titles[raw],
                    handlesPerTitle[title] == 1 { continue }
+                // Step 2: the late pool is counted as its own namespace, so a churn of
+                // never-created handles is named as such and never blamed on the created ones.
+                if namespace == windowNamespace, titles[raw] == nil, creationOrdinals[raw] == nil {
+                    seen[Self.latePoolNamespace(namespace), default: []].insert(raw)
+                    continue
+                }
                 seen[namespace, default: []].insert(raw)
             }
         }
