@@ -2791,8 +2791,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// The visible windows as they stood at the END of the most recent cycle, captured before
+    /// `shutdownAndWait()` and `prepareForReconnect()` tear the registry down (`closeAllWindows()`
+    /// -> `windows.removeAll()`). `finishCycles()` judges the size bands against THIS list: after
+    /// the teardown `windowSnapshots()` is empty by construction, and a band pass over that would
+    /// be a constant stated as evidence (review sizeband-finishcycles-r1 B1).
+    private var lastCycleVisibleWindows: [RemoteWindowRegistry.WindowSnapshot] = []
+
     private func finishCycle(session: CRSession, registry: RemoteWindowRegistry, rendered: Bool,
                              closed: Bool, seconds: Double) {
+        lastCycleVisibleWindows = registry.windowSnapshots().filter(\.isVisible)
         let clean = session.shutdownAndWait()
         // Post-shutdown, a drain can NEVER clean the registry: shutdownAndWait's own
         // step-4 loop already consumed the .disconnected event, and its final step bumped
@@ -2948,15 +2956,18 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // it can be made.
         let freezePin = topologyFreezeCountCheck(expectedReconnects: cycleResults.count)
         check(freezePin.passed, freezePin.message)
-        // Same frozen-topology precondition `finish()` asserts: every size-band consumer on the
-        // per-tick path (`runUnicodeDegradeScenario`'s target lock, `focusRotationCandidateWindows`)
-        // passes nothing when no topology is frozen, and cycle mode exits through HERE -- without
-        // this line that state would be a silent empty candidate pool (review sizeband-r2 I-A1).
-        check(
-            displayTopology.sessionSnapshot != nil,
-            "size bands have a frozen session topology to convert NSWindow.frame pt into remote px "
-                + "(adr/0015 §5.A.6: none frozen -- every size-band selection this run made passed nothing)"
-        )
+        // The same size-band pass `finish()` runs, over the windows that were visible at the END
+        // of the last cycle (review sizeband-r3 m-1). Cycle mode's `tick()` returns before the
+        // per-tick scenarios (unicode-degrade target lock, focus rotation, extra apps), so the
+        // only size-band consumer on this exit is the band loop itself and the frozen-topology
+        // precondition guards exactly that (review sizeband-finishcycles-r2 I-1 corrected the
+        // earlier "per-tick consumers" rationale). NOT over `registry.windowSnapshots()`: by the
+        // time this runs, `finishCycle` has already torn the registry down
+        // (`prepareForReconnect()` -> `closeAllWindows()`), so that list is empty by construction
+        // -- `lastCycleVisibleWindows` is the snapshot taken before the teardown. A clean cycle
+        // leaves it empty; a winver the close leg failed to close is still mapped at cycle end
+        // and is exactly what gets judged here.
+        _ = assertPlausibleContentBands(over: lastCycleVisibleWindows, check: check)
 
         let renderedCount = cycleResults.filter(\.rendered).count
         let closedCount = cycleResults.filter(\.closed).count
@@ -4681,6 +4692,34 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         return SizeBand.isPlausibleContent(SizeBand.remotePixelSize(ofFrameSize: snapshot.frame.size, in: topology))
     }
 
+    /// H3's generic plausible-content band over every visible window, asserted at BOTH exits
+    /// (`finish()` and `finishCycles()`; review sizeband-r3 m-1: cycle mode used to assert only
+    /// that a topology was frozen, never the windows themselves). The precondition check comes
+    /// first and is unconditional; with no frozen topology nothing is judged in pt -- the
+    /// windows are skipped and the failed precondition is the finding. Returns the frozen
+    /// topology so `finish()`'s About anchor can judge against the same value.
+    private func assertPlausibleContentBands(
+        over visibleWindows: [RemoteWindowRegistry.WindowSnapshot], check: (Bool, String) -> Void
+    ) -> DisplayTopology? {
+        let topology = displayTopology.sessionSnapshot
+        check(
+            topology != nil,
+            "size bands have a frozen session topology to convert NSWindow.frame pt into remote px "
+                + "(adr/0015 §5.A.6: none frozen -- the per-window band checks below are skipped, not judged "
+                + "in pt; on the single-run path the per-tick size-band selections also passed nothing)"
+        )
+        guard let topology else { return nil }
+        for w in visibleWindows {
+            let (px, detail) = SizeBand.describe(frameSize: w.frame.size, in: topology)
+            check(
+                SizeBand.isPlausibleContent(px),
+                "visible window \"\(w.title)\" (id \(w.windowId)) size is in the plausible-content band "
+                    + "(150x80 remote px floor; got \(detail))"
+            )
+        }
+        return topology
+    }
+
     private func finish() {
         drainTimer?.invalidate()
         drainTimer = nil
@@ -4985,22 +5024,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // frozen topology means the sizes cannot be judged in remote px at all; the discipline is
         // the move-resize leg's: report that as a failed check, never fall back to comparing frame
         // pt against remote-px constants (the pre-C-2 shape, correct only at rasterScale 1).
-        let sizeBandTopology = displayTopology.sessionSnapshot
-        check(
-            sizeBandTopology != nil,
-            "size bands have a frozen session topology to convert NSWindow.frame pt into remote px "
-                + "(adr/0015 §5.A.6: none frozen -- the band checks below are skipped, not judged in pt)"
-        )
-        if let sizeBandTopology {
-            for w in visibleWindows {
-                let (px, detail) = SizeBand.describe(frameSize: w.frame.size, in: sizeBandTopology)
-                check(
-                    SizeBand.isPlausibleContent(px),
-                    "visible window \"\(w.title)\" (id \(w.windowId)) size is in the plausible-content band "
-                        + "(150x80 remote px floor; got \(detail))"
-                )
-            }
-        }
+        let sizeBandTopology = assertPlausibleContentBands(over: visibleWindows, check: check)
 
         // H3: anchor the size assertion on the actual winver.exe "About Windows" dialog by
         // title, rather than "the first visible window" (non-deterministic under Z-order,
