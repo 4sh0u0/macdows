@@ -40,36 +40,68 @@ RELAY_RC=0
     # shellcheck source=/dev/null
     source "$HOME/.config/macdows/host.env"
     # shellcheck source=/dev/null
-    source "$RUNTIME/job.env"
-    # shellcheck source=/dev/null
     source "$REPO_ROOT/Scripts/lib.sh"
     # lib.sh turns on -e/pipefail for its sourcer; this relay deliberately runs with
     # neither (it kills and reaps xfreerdp by hand, and those calls are allowed to fail).
     set +e +o pipefail
+    # The boundary gate runs FIRST and judges host.env alone. job.env is a per-run file under
+    # .build/ and is never sourced into THIS shell: it is executed once, in a subshell, and only
+    # its three keys (PROGRAM, CMDARGS, TIMEOUT) come back out. That isolates what job.env can
+    # WRITE (its variables, functions, traps and `exit` die with the subshell), not what it can
+    # READ (the subshell inherits this environment) -- sourcing it here let it redefine
+    # crdp_assert_lab_boundary (review relay-offline r2 B2) and, once that was closed by
+    # ordering, overwrite WIN_HOST/WIN_USER/WIN_PASS/SHARE after the gate had passed -- the gate
+    # approving one host and xfreerdp dialling another (r3 B1). test-relay-offline.sh pins
+    # both (cases 10b/10c). Each key is then validated: a missing or PROGRAM-less job used to
+    # trip `set -u` on "${PROGRAM}" and kill this shell BEFORE the DONE line, so the caller
+    # (run-matrix.sh's run_relay_job) could only give up on its own WAIT_* timeout, and a
+    # non-numeric TIMEOUT made the poll loop's `-lt` fail so the connection was torn down at
+    # once yet reported DONE exit=0 (r4 I1). The contract is "every run writes DONE" -- the
+    # job.env refusals keep it, each with a named reason and a sysexits code the caller can
+    # tell apart (66 EX_NOINPUT / 65 EX_DATAERR; 78 EX_CONFIG stays the boundary's).
     if ! crdp_assert_lab_boundary "${WIN_HOST:-}"; then
         echo "[relay] BOUNDARY-REFUSED -- target is not a permitted lab host; no connection attempted"
         RELAY_RC=78
+    elif [ ! -r "$RUNTIME/job.env" ]; then
+        echo "[relay] JOB-ENV-MISSING -- $RUNTIME/job.env is not readable; no connection attempted"
+        RELAY_RC=66
     else
+        # One subshell, three lines out (the keys are single-line by contract; `read -r` keeps
+        # CMDARGS' backslashes). job.env therefore runs exactly once.
+        # shellcheck source=/dev/null
+        JOB_KEYS="$( . "$RUNTIME/job.env" >/dev/null 2>&1; printf '%s\n%s\n%s\n' "${PROGRAM:-}" "${CMDARGS:-}" "${TIMEOUT:-}" )"
+        PROGRAM=""; CMDARGS=""; TIMEOUT=""
+        { IFS= read -r PROGRAM; IFS= read -r CMDARGS; IFS= read -r TIMEOUT; } <<EOF_JOB_KEYS
+$JOB_KEYS
+EOF_JOB_KEYS
         TIMEOUT="${TIMEOUT:-25}"
-        APP_SPEC="/app:program:${PROGRAM}"
-        if [ -n "${CMDARGS:-}" ]; then
-            APP_SPEC="${APP_SPEC},cmd:${CMDARGS}"
+        if [ -z "$PROGRAM" ]; then
+            echo "[relay] JOB-ENV-INVALID -- job.env sets no PROGRAM; no connection attempted"
+            RELAY_RC=65
+        elif ! printf '%s' "$TIMEOUT" | grep -qE '^[1-9][0-9]*$'; then
+            echo "[relay] JOB-ENV-INVALID -- job.env TIMEOUT is not a positive integer; no connection attempted"
+            RELAY_RC=65
+        else
+            APP_SPEC="/app:program:${PROGRAM}"
+            if [ -n "${CMDARGS:-}" ]; then
+                APP_SPEC="${APP_SPEC},cmd:${CMDARGS}"
+            fi
+            echo "[relay] program=${PROGRAM} timeout=${TIMEOUT}s"
+            xfreerdp "/v:${WIN_HOST}" "/u:${WIN_USER}" "/p:${WIN_PASS}" /cert:ignore \
+                "$APP_SPEC" "/drive:lab,${SHARE}" /gfx:AVC420 &
+            XPID=$!
+            SECS=0
+            while kill -0 "$XPID" 2>/dev/null && [ "$SECS" -lt "$TIMEOUT" ]; do
+                sleep 1
+                SECS=$((SECS + 1))
+            done
+            if kill -0 "$XPID" 2>/dev/null; then
+                echo "[relay] timeout reached -- closing connection"
+                kill "$XPID" 2>/dev/null
+                wait "$XPID" 2>/dev/null
+            fi
+            echo "[relay] xfreerdp exited"
         fi
-        echo "[relay] program=${PROGRAM} timeout=${TIMEOUT}s"
-        xfreerdp "/v:${WIN_HOST}" "/u:${WIN_USER}" "/p:${WIN_PASS}" /cert:ignore \
-            "$APP_SPEC" "/drive:lab,${SHARE}" /gfx:AVC420 &
-        XPID=$!
-        SECS=0
-        while kill -0 "$XPID" 2>/dev/null && [ "$SECS" -lt "$TIMEOUT" ]; do
-            sleep 1
-            SECS=$((SECS + 1))
-        done
-        if kill -0 "$XPID" 2>/dev/null; then
-            echo "[relay] timeout reached -- closing connection"
-            kill "$XPID" 2>/dev/null
-            wait "$XPID" 2>/dev/null
-        fi
-        echo "[relay] xfreerdp exited"
     fi
 } >>"$LOG" 2>&1
 echo "DONE exit=$RELAY_RC" >>"$LOG"

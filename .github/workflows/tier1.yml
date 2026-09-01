@@ -193,6 +193,18 @@ jobs:
         # failure here must not be what stops gitleaks and the sensitive-content scan running.
         run: ./Scripts/lab/test-run-matrix-offline.sh
 
+      - name: Lab relay offline suite
+        # The sibling suite above deliberately never copies relay.command into its sandbox (a
+        # PATH shim of `open` stands in for the whole Terminal hop), so the relay's OWN logic --
+        # the fail-closed boundary refusal and its DONE exit=78, the job.env -> xfreerdp argv
+        # contract, the TIMEOUT kill, the log truncation -- had no offline coverage. This suite
+        # drives the REAL relay.command in a mktemp sandbox: xfreerdp/osascript/nc are PATH-shimmed
+        # (the xfreerdp shim records argv and exits or sleeps; it opens no socket), HOME is
+        # redirected to a sandbox whose host.env carries an RFC 5737 address and placeholder
+        # strings, and TERM_PROGRAM is cleared so the Terminal self-close branch is never taken.
+        # Two mutation proofs (gate bypassed / kill removed) keep the pins honest.
+        run: ./Scripts/lab/test-relay-offline.sh
+
       - name: Lab host-side PowerShell suites
         # The two host-side scripts that carry real consequences: Set-TsAllowListMatrix.ps1
         # (elevated, owner-manual, rewrites HKLM TSAppAllowList and owns the backup/restore

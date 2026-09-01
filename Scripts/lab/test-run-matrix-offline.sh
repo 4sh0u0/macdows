@@ -563,6 +563,24 @@ assert_rc 1
 assert_has "relay job 'regprobe' FAILED"
 assert_has "exit=78 is relay.command's own boundary refusal"
 
+# -- 9b/9c. the relay refused its own job.env (sysexits 66 / 65) ---------------------------------
+# relay.command writes DONE exit=66 (job.env unreadable) / 65 (job.env sets no PROGRAM) instead
+# of dying on `set -u` before the DONE line; run_relay_job names each so the operator does not
+# read them as a generic failure.
+begin relay-66 'relay reports DONE exit=66 -> exit 1, JOB-ENV-MISSING named'
+export LABTEST_RC_REGPROBE=66
+run_sandbox
+assert_rc 1
+assert_has "relay job 'regprobe' FAILED"
+assert_has "exit=66 is relay.command's own JOB-ENV-MISSING refusal"
+
+begin relay-65 'relay reports DONE exit=65 -> exit 1, JOB-ENV-INVALID named'
+export LABTEST_RC_REGPROBE=65
+run_sandbox
+assert_rc 1
+assert_has "relay job 'regprobe' FAILED"
+assert_has "exit=65 is relay.command's own JOB-ENV-INVALID refusal"
+
 # -- 10. the relay never reported at all --------------------------------------------------------
 # Both the job and the logoff time out, so the host is left logged in and main() has to say so.
 begin no-done 'no DONE line -> exit 1 and HOST SESSION: STILL LOGGED IN'
@@ -782,7 +800,7 @@ fi
 printf '\n'
 printf -- '---------------------------------------------------------------------\n'
 if [ "$FAILURES" -eq 0 ]; then
-	printf 'OFFLINE GUARD TEST: PASS -- %s assertions, 18 cases (15 pins + 3 mutation proofs)\n' "$PASSES"
+	printf 'OFFLINE GUARD TEST: PASS -- %s assertions, 20 cases (17 pins + 3 mutation proofs)\n' "$PASSES"
 	exit 0
 fi
 printf 'OFFLINE GUARD TEST: FAIL -- %s failed, %s passed\n' "$FAILURES" "$PASSES"

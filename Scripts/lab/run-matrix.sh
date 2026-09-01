@@ -270,6 +270,10 @@ run_relay_job() { # <job> <timeout>
 		mlog "[step] relay job '$job' FAILED after ${elapsed}s: the relay reported exit=${RELAY_DONE_RC:-<unparsed>}"
 		if [ "${RELAY_DONE_RC:-}" = "78" ]; then
 			mlog "[step]   exit=78 is relay.command's own boundary refusal -- it never contacted the host"
+		elif [ "${RELAY_DONE_RC:-}" = "66" ]; then
+			mlog "[step]   exit=66 is relay.command's own JOB-ENV-MISSING refusal -- job.env was not readable; no connection attempted"
+		elif [ "${RELAY_DONE_RC:-}" = "65" ]; then
+			mlog "[step]   exit=65 is relay.command's own JOB-ENV-INVALID refusal -- job.env set no PROGRAM; no connection attempted"
 		fi
 		return 1
 	fi
