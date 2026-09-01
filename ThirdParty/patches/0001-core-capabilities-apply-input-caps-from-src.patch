@@ -56,21 +56,24 @@
 #     reports ahead_by 19 / behind_by 0). The hunk below is byte-identical to the PR's --
 #     same context lines, same hunk header -- so it supersedes cleanly on the next pin
 #     bump instead of conflicting in some hand-rolled variant form.
-#   Hunk 2: NOT fixed upstream, master included (master's copy of capabilities.c re-read
-#     2026-09-01: the HasQoeEvent line still reads `settings`). Filed upstream by this
-#     project on 2026-09-01 as PR #13313 (https://github.com/FreeRDP/FreeRDP/pull/13313,
-#     branch 4sh0u0:fix-hasqoe-apply-src, identical one-token fix); this hunk goes beyond
-#     upstream master until that merges. The PR link at the top of this file (README rule
-#     1) covers hunk 1; #13313 is hunk 2's own upstream record.
+#   Hunk 2: FIXED in upstream master by PR #13313
+#     (https://github.com/FreeRDP/FreeRDP/pull/13313, filed by this project on 2026-09-01,
+#     branch 4sh0u0:fix-hasqoe-apply-src), merged 2026-09-01 as commit
+#     74473823529bc8396d4ad57421d1cfbe1b9303ec. Like hunk 1, in no release yet (both
+#     merges postdate 3.31.0's 2026-08-26 cut). The hunk below is byte-identical to the
+#     PR's, so it too supersedes cleanly on the next pin bump. The PR link at the top of
+#     this file (README rule 1) covers hunk 1; #13313 is hunk 2's own upstream record.
 #
 # RETIREMENT CONDITION (per hunk -- both must be met before the file itself is deleted)
 #   Hunk 1: retire on the first FreeRDP release that contains PR #13287, i.e. the first
 #     release cut from master after 3.31.0. The pin bump replays this queue (README rule
 #     3) and `git apply` will fail hard on this hunk at that moment (README rule 2) --
 #     that failure is the intended, self-announcing retirement signal, not a regression.
-#   Hunk 2: retire when upstream PR #13313 is merged AND
-#     shipped in a release this project has pinned. Until then the hunk stays, and it is
-#     the item README rule 4's quarterly review exists for.
+#   Hunk 2: same condition and same mechanism as hunk 1 -- PR #13313 merged 2026-09-01,
+#     so the first release cut from master after 3.31.0 contains both hunks and the pin
+#     bump's `git apply` failure announces both retirements at once. (Before the merge
+#     this hunk was README rule 4's quarterly-review item; that watch is no longer
+#     needed.)
 #
 diff --git a/libfreerdp/core/capabilities.c b/libfreerdp/core/capabilities.c
 index ec9cfa8d0..13ee03941 100644
