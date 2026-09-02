@@ -1400,8 +1400,9 @@ enum WindowSmokeGateSelfTest {
                 && RailComparison.Borders.thickFrameMeasured == RailComparison.Borders(left: 5, top: 0, right: 5, bottom: 5)
                 // the two RAIL order-field bits the live wiring keys on (WindowOrderField in MacdowsCore/WindowModel.swift)
                 && RailComparison.OrderField.wndOffset == 0x0000_0800
+                && RailComparison.OrderField.wndSize == 0x0000_0400
                 && RailComparison.OrderField.style == 0x0000_0008,
-            "railComparisonBorderModelsAreTheTwoMeasuredOnes: About-calibrated (7,0,7,7) is the default (right/bottom 7 are a single-run reading, n=1); THICKFRAME (5,0,5,5) is the F-R1 measurement (n=8 independent runs, memo :101); the wiring's field bits are WND_OFFSET 0x800 and STYLE 0x8"
+            "railComparisonBorderModelsAreTheTwoMeasuredOnes: About-calibrated (7,0,7,7) is the default (right/bottom 7 are a single-run reading, n=1); THICKFRAME (5,0,5,5) is the F-R1 measurement (n=8 independent runs, memo :101); the wiring's field bits are WND_OFFSET 0x800, WND_SIZE 0x400 and STYLE 0x8"
         )
         // style bits from the RAIL WindowCreate (the `[style-dump] style=0x…` value): WS_THICKFRAME (0x00040000)
         // selects the measured THICKFRAME model -- Notepad 0x000F0000 and Realtek 0x800F0000 carry it, About
@@ -2058,8 +2059,8 @@ enum FinishGate {
 }
 
 /// adr/0015 §6.2's comparison object, as a pure seam: the server's RAIL-reported VISIBLE window rect
-/// (`offsetX/offsetY/windowWidth/windowHeight`, remote px -- the window as drawn, title bar included, which
-/// is why every border model has top = 0) against the window rect this client SENT in `ClientWindowMove`
+/// (`offsetX/offsetY/windowWidth/windowHeight`, remote px -- the window as drawn, title bar included; the
+/// invisible frame has no top edge on these styles, which is why every border model has top = 0) against the window rect this client SENT in `ClientWindowMove`
 /// (Windows coordinates, DWM's invisible resize frame included) minus that frame. The "borders" here are
 /// DWM's invisible frame, NOT the client-area insets. The two frame models are the two measured ones:
 /// About-calibrated (7,0,7,7) -- the left 7 is `measuredClientWindowMoveLeftBorder`, the right/bottom 7
@@ -2075,7 +2076,7 @@ enum RailComparison {
         let right: Int
         let bottom: Int
         /// The registry's calibration (`measuredClientWindowMoveLeftBorder = 7`; C-2 run 4 measured (7,0,7,7)).
-        static let aboutCalibrated = Borders(left: 7, top: 0, right: 7, bottom: 7)
+        static let aboutCalibrated = Borders(left: 7, top: 0, right: 7, bottom: 7) // right/bottom 7: single C-2 run 4 reading (n=1)
         /// F-R1: Notepad/THICKFRAME legs read (5,0,5,5) in eight independent runs.
         static let thickFrameMeasured = Borders(left: 5, top: 0, right: 5, bottom: 5)
         /// `WS_THICKFRAME` (== `WS_SIZEBOX`), the bit that distinguishes the two measured styles.
@@ -2090,6 +2091,7 @@ enum RailComparison {
     /// from MacdowsCore `WindowOrderField`, the same precedent the registry follows).
     enum OrderField {
         static let wndOffset: UInt32 = 0x0000_0800 // WINDOW_ORDER_FIELD_WND_OFFSET
+        static let wndSize: UInt32 = 0x0000_0400   // WINDOW_ORDER_FIELD_WND_SIZE
         static let style: UInt32 = 0x0000_0008     // WINDOW_ORDER_FIELD_STYLE
     }
 
@@ -2859,6 +2861,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// from orders that carried WINDOW_ORDER_FIELD_STYLE, 0x8). Sizes come from the registry's accumulated
     /// RAIL size at comparison time, the same state its own sizeCorrection uses.
     private var latestRailOffset: [UInt32: (x: Int, y: Int, elapsed: TimeInterval)] = [:]
+    /// When the last size-bearing RAIL order (WINDOW_ORDER_FIELD_WND_SIZE, 0x400) arrived, per window -- the
+    /// accumulated size itself carries no timestamp, so this is what dates it (review railcmp-r2 m-4).
+    private var latestRailSizeElapsed: [UInt32: TimeInterval] = [:]
     private var windowStyleBits: [UInt32: UInt32] = [:]
     private var lastClientWindowMoveSent: (left: Int32, top: Int32, right: Int32, bottom: Int32, at: Date)?
     /// Team-lead review round 4 (2026-08-23, no-false-red discipline): whether the real
@@ -3531,6 +3536,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 }
                 if event.fieldFlags & RailComparison.OrderField.wndOffset != 0 {
                     latestRailOffset[target] = (x: Int(event.offsetX), y: Int(event.offsetY), elapsed: elapsed)
+                }
+                if event.fieldFlags & RailComparison.OrderField.wndSize != 0 {
+                    latestRailSizeElapsed[target] = elapsed
                 }
                 print(
                     "[move-resize] raw RAIL geometry at elapsed=\(String(format: "%.3f", elapsed))s "
@@ -5474,8 +5482,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         let railText: String
         let sentElapsed = lastClientWindowMoveSentElapsed
         let tolerance = Int(MoveResizeGate.toleranceInRemotePixels)
+        let sizeElapsed = latestRailSizeElapsed[windowId]
         if let sent = lastClientWindowMoveSent, sent.at >= legSentAt, let sentElapsed,
-           let offset = latestRailOffset[windowId], offset.elapsed >= sentElapsed, let accumulated
+           let offset = latestRailOffset[windowId], offset.elapsed >= sentElapsed,
+           let accumulated, let sizeElapsed, sizeElapsed >= sentElapsed
         {
             let style = windowStyleBits[windowId]
             let borders = style.map { RailComparison.Borders.forStyleBits($0) } ?? RailComparison.Borders.aboutCalibrated
@@ -5488,24 +5498,30 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             )
             let delta = RailComparison.compare(expected: expected, reported: reported, toleranceRemotePx: tolerance)
             let frameMinusSizeCorrection = mapped.map {
-                "(\(borders.left + borders.right - (Int($0.width) - Int(accumulated.width))),"
-                    + "\(borders.top + borders.bottom - (Int($0.height) - Int(accumulated.height))))"
+                "(lr=\(borders.left + borders.right - (Int($0.width) - Int(accumulated.width))),"
+                    + "tb=\(borders.top + borders.bottom - (Int($0.height) - Int(accumulated.height))))"
             } ?? "n/a (no mapped size)"
             railText = "adr0015-6.2(MEASUREMENT ONLY; border-model half, sizeCorrection shown not deducted)="
                 + "sent(l=\(sent.left),t=\(sent.top),r=\(sent.right),b=\(sent.bottom) @\(String(format: "%.3f", sentElapsed))s) "
                 + "frame=(\(borders.left),\(borders.top),\(borders.right),\(borders.bottom)) "
                 + (style.map { String(format: "style=0x%08X", $0) } ?? "style=unknown(default frame)") + " "
                 + "expectedVisible=(\(expected.x),\(expected.y),\(expected.width)x\(expected.height)) "
-                + "reportedRAIL=(offset \(reported.x),\(reported.y) @\(String(format: "%.3f", offset.elapsed))s; accumulated size \(reported.width)x\(reported.height) at comparison) "
-                + "delta=(dx=\(delta.dx),dy=\(delta.dy),dw=\(delta.dw),dh=\(delta.dh)) tolerance=\(tolerance) within=\(delta.passed) "
+                + "reportedRAIL=(offset \(reported.x),\(reported.y) @\(String(format: "%.3f", offset.elapsed))s; accumulated size \(reported.width)x\(reported.height), last size-bearing order @\(String(format: "%.3f", sizeElapsed))s) "
+                + "delta=(dx=\(delta.dx),dy=\(delta.dy),dw=\(delta.dw),dh=\(delta.dh)) tolerance=\(tolerance) remote px (U6) within=\(delta.passed) "
                 + "frameMinusSizeCorrection=\(frameMinusSizeCorrection)"
         } else {
             let reason: String
-            if let sent = lastClientWindowMoveSent, sent.at >= legSentAt, sentElapsed != nil {
+            if let sent = lastClientWindowMoveSent, sent.at >= legSentAt, let sentElapsed {
                 if let offset = latestRailOffset[windowId] {
-                    reason = accumulated == nil
-                        ? "no accumulated RAIL size for this window"
-                        : "the last RAIL offset (@\(String(format: "%.3f", offset.elapsed))s) predates this leg's send -- the leg settled without a positioned RAIL order (remap-only)"
+                    if accumulated == nil {
+                        reason = "no accumulated RAIL size for this window"
+                    } else if offset.elapsed < sentElapsed {
+                        reason = "the last RAIL offset (@\(String(format: "%.3f", offset.elapsed))s) predates this leg's send -- the leg settled without a positioned RAIL order (remap-only)"
+                    } else if let sizeElapsed {
+                        reason = "the last size-bearing RAIL order (@\(String(format: "%.3f", sizeElapsed))s) predates this leg's send"
+                    } else {
+                        reason = "no size-bearing RAIL order was ever reported for this window"
+                    }
                 } else {
                     reason = "no RAIL offset was ever reported for this window"
                 }
