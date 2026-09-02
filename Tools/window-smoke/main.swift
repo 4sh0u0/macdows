@@ -1344,6 +1344,66 @@ enum WindowSmokeGateSelfTest {
             "finishGateWaitsForTheDeadlineOnlyWhileSomethingIsUnfinished: with every enabled scenario completed the run finishes at the base battery length; anything still running keeps the per-scenario deadline as the floor"
         )
 
+        // --- adr/0015 §6.2 comparison object: RAIL-reported client rect vs the sent window rect minus the
+        // style's borders (measurement only in this lane; the local content-rect verdict stays the gate) ---
+        // About-calibrated borders (7,0,7,7): C-2 run 4 sent left=195 top=180 right=717 bottom=696,
+        // RAIL reported offsetX=202 offsetY=180 windowWidth=508 windowHeight=509 -- an exact match.
+        let aboutExpected = RailComparison.expectedClientRect(
+            sentLeft: 195, sentTop: 180, sentRight: 717, sentBottom: 696, borders: RailComparison.Borders.aboutCalibrated
+        )
+        let aboutDelta = RailComparison.compare(
+            expected: aboutExpected,
+            reported: RailComparison.ClientRect(x: 202, y: 180, width: 508, height: 509), toleranceRemotePx: 0
+        )
+        // Notepad/THICKFRAME (C second step r1 :821/:822): sent left=738 top=352 right=2488 bottom=1326,
+        // RAIL reported offsetX=743 offsetY=352 windowWidth=1740 windowHeight=969. With the About-calibrated
+        // 7 px the residual is F-R1's (-2, 0, +4, +2); with the measured THICKFRAME borders (5,0,5,5) it is zero.
+        let notepadWith7 = RailComparison.compare(
+            expected: RailComparison.expectedClientRect(
+                sentLeft: 738, sentTop: 352, sentRight: 2488, sentBottom: 1326, borders: RailComparison.Borders.aboutCalibrated
+            ),
+            reported: RailComparison.ClientRect(x: 743, y: 352, width: 1740, height: 969), toleranceRemotePx: 0
+        )
+        let notepadWith5 = RailComparison.compare(
+            expected: RailComparison.expectedClientRect(
+                sentLeft: 738, sentTop: 352, sentRight: 2488, sentBottom: 1326, borders: RailComparison.Borders.thickFrameMeasured
+            ),
+            reported: RailComparison.ClientRect(x: 743, y: 352, width: 1740, height: 969), toleranceRemotePx: 0
+        )
+        expect(
+            aboutExpected == RailComparison.ClientRect(x: 202, y: 180, width: 508, height: 509)
+                && aboutDelta.passed && aboutDelta.dx == 0 && aboutDelta.dy == 0 && aboutDelta.dw == 0 && aboutDelta.dh == 0,
+            "railComparisonMatchesTheAboutCalibration: sent window rect minus (7,0,7,7) equals the RAIL-reported client rect of C-2 run 4 exactly (dx=dy=dw=dh=0, passed)"
+        )
+        expect(
+            !notepadWith7.passed && notepadWith7.dx == -2 && notepadWith7.dy == 0 && notepadWith7.dw == 4 && notepadWith7.dh == 2
+                && notepadWith5.passed && notepadWith5.dx == 0 && notepadWith5.dw == 0 && notepadWith5.dh == 0,
+            "railComparisonReadsFR1AsABorderModelDifference: the Notepad leg is (-2,0,+4,+2) under the About-calibrated 7 px and exactly zero under the measured THICKFRAME 5 px -- the server deducts the style's real border, the client compensates with the calibrated constant"
+        )
+        expect(
+            RailComparison.compare(
+                expected: RailComparison.ClientRect(x: 100, y: 100, width: 300, height: 200),
+                reported: RailComparison.ClientRect(x: 101, y: 100, width: 300, height: 200), toleranceRemotePx: 0
+            ).passed == false
+                && RailComparison.compare(
+                    expected: RailComparison.ClientRect(x: 100, y: 100, width: 300, height: 200),
+                    reported: RailComparison.ClientRect(x: 101, y: 100, width: 300, height: 200), toleranceRemotePx: 1
+                ).passed == true
+                && RailComparison.compare(
+                    expected: RailComparison.ClientRect(x: 100, y: 100, width: 300, height: 200),
+                    reported: RailComparison.ClientRect(x: 100, y: 100, width: 300, height: 198), toleranceRemotePx: 1
+                ).passed == false,
+            "railComparisonToleranceIsInclusiveOnEveryAxis: |delta| <= tolerance on all four of x/y/w/h passes; U6 pins the shipped tolerance at 0 remote px"
+        )
+        expect(
+            RailComparison.Borders.aboutCalibrated == RailComparison.Borders(left: 7, top: 0, right: 7, bottom: 7)
+                && RailComparison.Borders.thickFrameMeasured == RailComparison.Borders(left: 5, top: 0, right: 5, bottom: 5)
+                && RailComparison.Borders.forStyleLabel("about") == RailComparison.Borders.aboutCalibrated
+                && RailComparison.Borders.forStyleLabel("thickframe") == RailComparison.Borders.thickFrameMeasured
+                && RailComparison.Borders.forStyleLabel("something-else") == RailComparison.Borders.aboutCalibrated,
+            "railComparisonBorderModelsAreTheTwoMeasuredOnes: About-calibrated (7,0,7,7) is the default and the fallback for an unknown style; THICKFRAME (5,0,5,5) is the F-R1 measurement (n=8 independent runs, memo :101)"
+        )
+
         // --- the resize leg stays inside the desktop too (C second step r1, 2026-09-02: round 9's +100 pt
         // resize sent right=2576 on a 2560-wide desktop -- the move leg was bounded, the resize was not) ---
         expect(
@@ -1984,6 +2044,66 @@ let moveResizeTargetFilter = ProcessInfo.processInfo.environment["WINDOW_SMOKE_M
 enum FinishGate {
     static func minimumElapsed(base: TimeInterval, overall: TimeInterval, allScenariosCompleted: Bool) -> TimeInterval {
         allScenariosCompleted ? base : overall
+    }
+}
+
+/// adr/0015 §6.2's comparison object, as a pure seam: the server's RAIL-reported client rect
+/// (`offsetX/offsetY/windowWidth/windowHeight`, remote px) against the window rect this client SENT in
+/// `ClientWindowMove` (Windows coordinates, borders included) minus the window style's borders. The two
+/// border models are the two measured ones: About-calibrated (7,0,7,7) -- `measuredClientWindowMoveLeftBorder`
+/// -- and THICKFRAME/Notepad (5,0,5,5), F-R1's n=8 measurement (memo :101). The fixture's gate stays the
+/// local content-rect verdict (`MoveResizeGate.evaluate`); this seam is MEASUREMENT ONLY until the memo
+/// lane decides otherwise, so a failing §6.2 comparison never reds a run.
+enum RailComparison {
+    struct Borders: Equatable {
+        let left: Int
+        let top: Int
+        let right: Int
+        let bottom: Int
+        /// The registry's calibration (`measuredClientWindowMoveLeftBorder = 7`; C-2 run 4 measured (7,0,7,7)).
+        static let aboutCalibrated = Borders(left: 7, top: 0, right: 7, bottom: 7)
+        /// F-R1: Notepad/THICKFRAME legs read (5,0,5,5) in eight independent runs.
+        static let thickFrameMeasured = Borders(left: 5, top: 0, right: 5, bottom: 5)
+        /// A style label -> border model; anything unrecognised falls back to the calibrated default.
+        static func forStyleLabel(_ label: String) -> Borders {
+            label.lowercased() == "thickframe" ? thickFrameMeasured : aboutCalibrated
+        }
+    }
+
+    struct ClientRect: Equatable {
+        let x: Int
+        let y: Int
+        let width: Int
+        let height: Int
+    }
+
+    struct Delta: Equatable {
+        let dx: Int
+        let dy: Int
+        let dw: Int
+        let dh: Int
+        let passed: Bool
+    }
+
+    /// The client rect the server SHOULD report for a sent window rect: borders are inside the window rect,
+    /// so the client area starts `left`/`top` px in and is narrower by left+right, shorter by top+bottom.
+    static func expectedClientRect(sentLeft: Int, sentTop: Int, sentRight: Int, sentBottom: Int, borders: Borders) -> ClientRect {
+        ClientRect(
+            x: sentLeft + borders.left,
+            y: sentTop + borders.top,
+            width: (sentRight - sentLeft) - borders.left - borders.right,
+            height: (sentBottom - sentTop) - borders.top - borders.bottom
+        )
+    }
+
+    /// reported − expected on every axis; `passed` when all four |delta| <= tolerance (inclusive; U6 = 0).
+    static func compare(expected: ClientRect, reported: ClientRect, toleranceRemotePx: Int) -> Delta {
+        let dx = reported.x - expected.x
+        let dy = reported.y - expected.y
+        let dw = reported.width - expected.width
+        let dh = reported.height - expected.height
+        let passed = [dx, dy, dw, dh].allSatisfy { abs($0) <= toleranceRemotePx }
+        return Delta(dx: dx, dy: dy, dw: dw, dh: dh, passed: passed)
     }
 }
 
