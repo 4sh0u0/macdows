@@ -1364,7 +1364,9 @@ enum WindowSmokeGateSelfTest {
             GeometryRounds.parseRounds(nil) == 1 && GeometryRounds.parseRounds("") == 1 && GeometryRounds.parseRounds("0") == 1
                 && GeometryRounds.parseRounds("-3") == 1 && GeometryRounds.parseRounds("x") == 1 && GeometryRounds.parseRounds("10") == 10
                 && GeometryRounds.parseGap(nil) == 2.0 && GeometryRounds.parseGap("") == 2.0 && GeometryRounds.parseGap("x") == 2.0
-                && GeometryRounds.parseGap("0") == 0 && GeometryRounds.parseGap("-1") == 0 && GeometryRounds.parseGap("3.5") == 3.5,
+                && GeometryRounds.parseGap("0") == 0 && GeometryRounds.parseGap("-1") == 0 && GeometryRounds.parseGap("3.5") == 3.5
+                // surrounding whitespace (a launcher's `export X=" 5 "`) must not silently turn K into 1 (review georounds-r2 I-2)
+                && GeometryRounds.parseRounds(" 5 ") == 5 && GeometryRounds.parseGap(" 1.5\n") == 1.5,
             "geometryRoundsKnobsParseDefensively: WINDOW_SMOKE_GEOMETRY_ROUNDS unset/empty/non-numeric/<1 is 1 (today's single pass), WINDOW_SMOKE_GEOMETRY_ROUND_GAP unset/empty/non-numeric is 2.0 and never negative"
         )
         let roundsVerdictAll = GeometryRounds.verdict(perRound: [true, true])
@@ -1868,9 +1870,17 @@ let geometryRounds = GeometryRounds.parseRounds(ProcessInfo.processInfo.environm
 /// Seconds between rounds (after a round's restore / resize leg resolved, before the next SC_MAXIMIZE /
 /// move goes out). Default 2.0.
 let geometryRoundGap = GeometryRounds.parseGap(ProcessInfo.processInfo.environment["WINDOW_SMOKE_GEOMETRY_ROUND_GAP"])
-if geometryRounds > 1 {
-    print("[config] WINDOW_SMOKE_GEOMETRY_ROUNDS=\(geometryRounds) gap=\(geometryRoundGap)s -- the maximize and "
-        + "move/resize legs repeat on the same target; deadlines extend per round (GeometryRounds.deadline)")
+// Whenever the knob is SET (any value), say what it parsed to -- a mistyped value that falls back to
+// the default would otherwise produce a log byte-identical to a legitimate single-pass run (review
+// georounds-r2 I-2; same "never silently ignore" rule as DeclaredDesktopOverride).
+if let rawRounds = ProcessInfo.processInfo.environment["WINDOW_SMOKE_GEOMETRY_ROUNDS"] {
+    print("[config] WINDOW_SMOKE_GEOMETRY_ROUNDS=\"\(rawRounds)\" -> rounds=\(geometryRounds)"
+        + (geometryRounds == 1 ? " (single pass -- NOT repeating; a value < 2 or non-numeric parses to 1)" : "")
+        + " gap=\(geometryRoundGap)s"
+        + (geometryRounds > 1 ? " -- the maximize and move/resize legs repeat on the same target; deadlines extend per round (GeometryRounds.deadline)" : ""))
+}
+if let rawGap = ProcessInfo.processInfo.environment["WINDOW_SMOKE_GEOMETRY_ROUND_GAP"], ProcessInfo.processInfo.environment["WINDOW_SMOKE_GEOMETRY_ROUNDS"] == nil {
+    print("[config] WINDOW_SMOKE_GEOMETRY_ROUND_GAP=\"\(rawGap)\" -> gap=\(geometryRoundGap)s (no effect: WINDOW_SMOKE_GEOMETRY_ROUNDS is unset)")
 }
 
 /// adr/0012 follow-up diagnostic, harness-only (no product/FocusAuthority changes):
@@ -1949,12 +1959,12 @@ enum GeometryRounds {
 
     /// `WINDOW_SMOKE_GEOMETRY_ROUNDS`: unset, empty, non-numeric or < 1 all mean 1 -- today's single pass.
     static func parseRounds(_ raw: String?) -> Int {
-        max(1, Int(raw ?? "") ?? 1)
+        max(1, Int((raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)) ?? 1)
     }
 
     /// `WINDOW_SMOKE_GEOMETRY_ROUND_GAP` in seconds: unset, empty or non-numeric mean 2.0; never negative.
     static func parseGap(_ raw: String?) -> TimeInterval {
-        max(0, Double(raw ?? "") ?? 2.0)
+        max(0, Double((raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)) ?? 2.0)
     }
 
     /// After `completedRounds` full passes (1-based count of finished rounds), do we go again?
@@ -4241,7 +4251,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 maximizeRoundResults.append(false)
                 maximizeRoundsCompleted += 1
                 if geometryRounds > 1 {
-                    print("[maximize] round \(maximizeRoundsCompleted)/\(geometryRounds) FAILED (see the line above); remaining rounds skipped")
+                    print("[maximize] round \(maximizeRoundsCompleted)/\(geometryRounds) FAILED (see the line above); remaining rounds skipped surfaceMapEvents=\(gfxTargetHints.surfaceMapEventsSeen)")
                 }
                 // Still exercise the close leg (task item 5c) even after a maximize
                 // failure, skipping straight past the now-moot restore leg, rather than
@@ -4266,7 +4276,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 maximizeRoundsCompleted += 1
                 if GeometryRounds.next(completedRounds: maximizeRoundsCompleted, total: geometryRounds) == .again {
                     print("[maximize] round \(maximizeRoundsCompleted)/\(geometryRounds) done; next round after a \(geometryRoundGap)s gap "
-                        + "surfaceMapEvents=\(gfxTargetHints.surfaceMapEventsSeen)")
+                        + "surfaceMapEvents=\(gfxTargetHints.surfaceMapEventsSeen) (cumulative, all windows, all scenarios)")
                     maximizePhase = .awaitingNextRound(windowId: windowId, roundEndedAt: Date())
                 } else {
                     session.sendSysCommand(windowId, command: SC.close)
@@ -4281,7 +4291,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 maximizeRoundResults.append(false)
                 maximizeRoundsCompleted += 1
                 if geometryRounds > 1 {
-                    print("[maximize] round \(maximizeRoundsCompleted)/\(geometryRounds) FAILED at restore (see the line above); remaining rounds skipped")
+                    print("[maximize] round \(maximizeRoundsCompleted)/\(geometryRounds) FAILED at restore (see the line above); remaining rounds skipped surfaceMapEvents=\(gfxTargetHints.surfaceMapEventsSeen)")
                 }
                 session.sendSysCommand(windowId, command: SC.close)
                 print("[maximize] sent SC_CLOSE to windowId=\(windowId)")
@@ -4291,12 +4301,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
 
         case .awaitingNextRound(let windowId, let roundEndedAt):
             // Geometry rounds: wait the gap, then run maximize -> restore again on the same target.
-            guard Date().timeIntervalSince(roundEndedAt) >= geometryRoundGap else { return }
+            let sinceRoundEnd = Date().timeIntervalSince(roundEndedAt)
+            guard sinceRoundEnd >= geometryRoundGap else { return }
             guard registry.windowSnapshots().contains(where: { $0.windowId == windowId && $0.isVisible && $0.hasDisplayedContent }) else {
-                // The target vanished between rounds (this scenario's own close leg has not been sent
-                // yet) -- nothing left to drive. `finish()` reports the rounds that did complete against
-                // the configured count and reds the shortfall.
-                print("[maximize] round \(maximizeRoundsCompleted + 1)/\(geometryRounds) NOT started: windowId=\(windowId) is no longer visible with displayed content (the lock criterion)")
+                // Not (yet) back to the lock criterion. A restored window can be momentarily without
+                // displayed content, so keep polling for up to `maximizePollTimeout` past the gap (review
+                // georounds-r2 m-2) before concluding the target is gone -- then nothing is left to drive;
+                // `finish()` reports the completed rounds against the configured count and reds the shortfall.
+                guard sinceRoundEnd >= geometryRoundGap + Self.maximizePollTimeout else { return }
+                print("[maximize] round \(maximizeRoundsCompleted + 1)/\(geometryRounds) NOT started: windowId=\(windowId) was not visible with displayed "
+                    + "content (the lock criterion) within \(Self.maximizePollTimeout)s past the gap surfaceMapEvents=\(gfxTargetHints.surfaceMapEventsSeen)")
                 maximizePhase = .done
                 return
             }
@@ -4327,7 +4341,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// Shared by the first pass (target lock) and every later geometry round (`round` >= 2 re-arms the
     /// same target from wherever it settled, so `MoveResizeGate.moveOffset` may flip direction and the
     /// window walks back and forth instead of drifting off the desktop).
-    private func startMoveLeg(windowId: UInt32, window: NSWindow, title: String, round: Int, registry: RemoteWindowRegistry) {
+    private func startMoveLeg(session: CRSession, windowId: UInt32, window: NSWindow, title: String, round: Int, registry: RemoteWindowRegistry) {
         // Team-lead review round 6: baseline for the move leg's own "did the mapped
         // size change mid-leg" informational report -- see that report's own comment.
         moveResizeOriginalMappedSize = registry.debugMappedSize(forWindowId: windowId)
@@ -4379,8 +4393,13 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // round would repeat it from a new position with no bound -- K unchecked moves in one
             // direction can walk the window off the desktop, so the rounds stop here and `finish()`
             // reds the shortfall (review georounds-r1 m-1).
-            print("[move-resize] round \(round)/\(geometryRounds) NOT started: no bounded offset for this position (fits=false) -- repeating an unchecked default would drift; rounds stopped")
-            moveResizePhase = .done
+            print("[move-resize] round \(round)/\(geometryRounds) NOT started: no bounded offset for this position (fits=false) -- repeating an unchecked default would drift; rounds stopped "
+                + "surfaceMapEvents=\(gfxTargetHints.surfaceMapEventsSeen)")
+            // The window is still there: close it (Fix 2's cleanup promise) rather than leave a stale target.
+            session.sendSysCommand(windowId, command: SC.close)
+            print("[move-resize] sent SC_CLOSE to windowId=\(windowId) (rounds stopped)")
+            moveResizeCloseTargetId = windowId
+            moveResizePhase = .awaitingClose(windowId: windowId, sentAt: Date())
             return
         }
         let targetContent = originalContent.offsetBy(dx: offset.dx, dy: offset.dy)
@@ -4505,7 +4524,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             moveResizeWindowId = w.windowId
-            startMoveLeg(windowId: w.windowId, window: window, title: w.title, round: 1, registry: registry)
+            startMoveLeg(session: session, windowId: w.windowId, window: window, title: w.title, round: 1, registry: registry)
 
         case .awaitingMoveSettle(let windowId, let target, let sentAt):
             // Team-lead review round 6: position-only match -- see evaluateMoveResizeLeg's
@@ -4577,7 +4596,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             moveResizeRoundsCompleted += 1
             if GeometryRounds.next(completedRounds: moveResizeRoundsCompleted, total: geometryRounds) == .again {
                 print("[move-resize] round \(moveResizeRoundsCompleted)/\(geometryRounds) done; next round after a \(geometryRoundGap)s gap "
-                    + "surfaceMapEvents=\(gfxTargetHints.surfaceMapEventsSeen)")
+                    + "surfaceMapEvents=\(gfxTargetHints.surfaceMapEventsSeen) (cumulative, all windows, all scenarios)")
                 moveResizePhase = .awaitingNextRound(windowId: windowId, roundEndedAt: Date())
                 return
             }
@@ -4593,12 +4612,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         case .awaitingNextRound(let windowId, let roundEndedAt):
             // Geometry rounds: wait the gap, then re-arm the move leg from wherever the window settled.
             guard Date().timeIntervalSince(roundEndedAt) >= geometryRoundGap else { return }
+            // `registry.window(forWindowId:)` is nil only once the window is deleted -- the move leg needs the
+            // NSWindow itself (setFrame), not a visibility judgement, which is why this side does not use
+            // the maximize side's snapshot criterion.
             guard let window = registry.window(forWindowId: windowId) else {
-                print("[move-resize] round \(moveResizeRoundsCompleted + 1)/\(geometryRounds) NOT started: windowId=\(windowId) is gone")
+                print("[move-resize] round \(moveResizeRoundsCompleted + 1)/\(geometryRounds) NOT started: windowId=\(windowId) is gone "
+                    + "surfaceMapEvents=\(gfxTargetHints.surfaceMapEventsSeen)")
                 moveResizePhase = .done
                 return
             }
-            startMoveLeg(windowId: windowId, window: window, title: window.title, round: moveResizeRoundsCompleted + 1, registry: registry)
+            startMoveLeg(session: session, windowId: windowId, window: window, title: window.title, round: moveResizeRoundsCompleted + 1, registry: registry)
 
         case .awaitingClose(_, let sentAt):
             // moveResizeCloseWindowDeletedAt is set by drainNow()'s own windowDelete
@@ -6905,7 +6928,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
 
         // C second step (WINDOW_SMOKE_GEOMETRY_ROUNDS > 1): the rounds exist to enlarge the surface-map
         // trigger surface, so the gate is "every configured round RAN" (plus, for maximize, passed --
-        // that leg has no known-difference red). The move/resize legs' RECT/POINT verdicts stay gated by
+        // that assertion shares the `maximize scenario:` prefix memo §5 whitelist ① is keyed on, so a
+        // whitelisted maximize red does not invalidate the run twice). The move/resize legs' RECT/POINT verdicts stay gated by
         // the last round's assertions above (their F-R1 known difference is whitelisted there); earlier
         // rounds' verdicts are reported in the summary line, not gated twice under new strings.
         if geometryRounds > 1, maximizeScenarioEnabled || moveResizeScenarioEnabled {
