@@ -145,6 +145,26 @@ enum MoveResizeGate {
         let fits: Bool
     }
 
+    /// Nominal macOS menu-bar height in points, subtracted from the top of the bounds so a +60
+    /// flip does not aim the titlebar at the menu bar. A constant, not an `NSScreen` read: adr/0015
+    /// §5.A.5 confines every `NSScreen` read to the topology provider (review cm4-r1 B-2), and
+    /// AppKit's own clamp is asserted downstream against the ACTUAL frame anyway (round 5).
+    static let menuBarInsetPoints: CGFloat = 25
+
+    /// The frozen topology's desktop union is in WINDOWS-space axes (`y` = top edge, growing down,
+    /// `DesktopUnionBoundsInPoints`), while the move leg works in AppKit points (origin bottom-left).
+    /// Feeding the union straight into an `NSRect` mirrors the vertical axis whenever a display sits
+    /// above or below the primary (review cm4-r1 B-1: with a screen above, union `y = -1440` and a
+    /// window near the bottom would read as having 1440 pt of room). Flip through the primary's
+    /// height -- the same anchor `WindowGeometry` uses -- and take the menu-bar inset off the top.
+    /// Single display: numerically the identity.
+    static func appKitBounds(unionX: CGFloat, unionY: CGFloat, width: CGFloat, height: CGFloat,
+                             primaryHeightInPoints: CGFloat, topInset: CGFloat) -> NSRect {
+        let minY = primaryHeightInPoints - (unionY + height)
+        let maxY = primaryHeightInPoints - unionY
+        return NSRect(x: unionX, y: minY, width: width, height: (maxY - minY) - topInset)
+    }
+
     static func moveOffset(original: NSRect, within bounds: NSRect, leftBorder: CGFloat, margin: CGFloat) -> MoveOffset {
         var flipped = false
         var fits = true
@@ -761,9 +781,12 @@ enum SizeBand {
 ///    instead of the done flags, or not calling `FinishGate` at all.
 ///  * **the move offset** never flipping, flipping without checking that the opposite direction
 ///    fits, ignoring the margin or the left border, or reporting fits=true when neither direction
-///    fits => `moveOffsetKeepsTheTargetInsideTheDesktop`. **Not covered here** (live wiring): the
-///    lock site passing bounds other than the frozen union minus the menu-bar inset, or not
-///    applying the returned offset -- the next C run's "move offset" line is the live check.
+///    fits => `moveOffsetKeepsTheTargetInsideTheDesktop` (inclusive boundaries pinned: review
+///    cm4-r1 measured `<`->`<=` and `>`->`>=` surviving before). The union->AppKit flip using the
+///    union's y as a bottom edge, or dropping the menu-bar inset => `appKitBoundsFlipsTheWindowsSpaceUnion`.
+///    **Not covered here** (live wiring): the lock site passing a primary height other than the
+///    frozen `flipAnchor`'s, a left border other than 7 remote px / rasterScale, or not applying the
+///    returned offset -- the next C run's "move offset" line is the live check.
 ///  * **the remap observation** sampled outside the in-flight window, for a non-target window,
 ///    or with no target locked => `remapObservationAppliesOnlyToTheInFlightTarget`. **Not covered
 ///    here** (live wiring, no offline seam): the tap not calling it at all for `surfaceMapped`
@@ -1303,7 +1326,8 @@ enum WindowSmokeGateSelfTest {
         expect(
             FinishGate.minimumElapsed(base: 25, overall: 160, allScenariosCompleted: true) == 25
                 && FinishGate.minimumElapsed(base: 25, overall: 160, allScenariosCompleted: false) == 160
-                && FinishGate.minimumElapsed(base: 25, overall: 25, allScenariosCompleted: false) == 25,
+                // completed => base even when overall is SMALLER (kills a min/max mutant; review cm4-r1 I-6)
+                && FinishGate.minimumElapsed(base: 25, overall: 20, allScenariosCompleted: true) == 25,
             "finishGateWaitsForTheDeadlineOnlyWhileSomethingIsUnfinished: with every enabled scenario completed the run finishes at the base battery length; anything still running keeps the per-scenario deadline as the floor"
         )
 
@@ -1328,8 +1352,36 @@ enum WindowSmokeGateSelfTest {
                 // the left border counts: x-80 = 25 >= 20 but x-80-7 = 18 < 20, so -80 does NOT fit either
                 // (right edge overflows, so -80 is attempted) -> default kept with fits=false, not a flip
                 && MoveResizeGate.moveOffset(original: NSRect(x: 105, y: 300, width: 2400, height: 500), within: moveBounds, leftBorder: 7, margin: 20)
-                == Off(dx: 80, dy: -60, flipped: false, fits: false),
+                == Off(dx: 80, dy: -60, flipped: false, fits: false)
+                // inclusive boundaries (review cm4-r1 I-1): exactly the margin left below -> no flip
+                && MoveResizeGate.moveOffset(original: NSRect(x: 300, y: 80, width: 500, height: 500), within: moveBounds, leftBorder: 7, margin: 20)
+                == Off(dx: 80, dy: -60, flipped: false, fits: true)
+                // exactly the margin left on the left after -80 (x-80-7 = 20) -> the flip fits
+                && MoveResizeGate.moveOffset(original: NSRect(x: 107, y: 300, width: 2400, height: 500), within: moveBounds, leftBorder: 7, margin: 20)
+                == Off(dx: -80, dy: -60, flipped: true, fits: true)
+                // right edge landing exactly on maxX - margin (60+80+2400 = 2540) is NOT an overflow -> no flip
+                && MoveResizeGate.moveOffset(original: NSRect(x: 60, y: 300, width: 2400, height: 500), within: moveBounds, leftBorder: 7, margin: 20)
+                == Off(dx: 80, dy: -60, flipped: false, fits: true)
+                // +60 landing exactly on maxY - margin (10+1325+60 = 1395) fits -> flip up
+                && MoveResizeGate.moveOffset(original: NSRect(x: 300, y: 10, width: 500, height: 1325), within: moveBounds, leftBorder: 7, margin: 20)
+                == Off(dx: 80, dy: 60, flipped: true, fits: true),
             "moveOffsetKeepsTheTargetInsideTheDesktop: prefer (+80, -60); flip a component only when it would leave the bounds by less than the margin and the opposite direction fits; report fits=false when neither does"
+        )
+        // --- the union is Windows-space (y = top edge); the move leg's bounds must be AppKit (review cm4-r1 B-1) ---
+        expect(
+            // single display: identity (minus the menu-bar inset at the top)
+            MoveResizeGate.appKitBounds(unionX: 0, unionY: 0, width: 2560, height: 1440, primaryHeightInPoints: 1440, topInset: 25)
+                == NSRect(x: 0, y: 0, width: 2560, height: 1415)
+                // a display ABOVE the primary: union y = -1440 in Windows space -> AppKit room is above, not below
+                && MoveResizeGate.appKitBounds(unionX: 0, unionY: -1440, width: 2560, height: 2880, primaryHeightInPoints: 1440, topInset: 25)
+                == NSRect(x: 0, y: 0, width: 2560, height: 2855)
+                // a display BELOW the primary: union y = 0, height 2880 -> AppKit minY is negative
+                && MoveResizeGate.appKitBounds(unionX: 0, unionY: 0, width: 2560, height: 2880, primaryHeightInPoints: 1440, topInset: 25)
+                == NSRect(x: 0, y: -1440, width: 2560, height: 2855)
+                // a display LEFT of the primary keeps its negative x
+                && MoveResizeGate.appKitBounds(unionX: -1920, unionY: 0, width: 4480, height: 1440, primaryHeightInPoints: 1440, topInset: 25)
+                == NSRect(x: -1920, y: 0, width: 4480, height: 1415),
+            "appKitBoundsFlipsTheWindowsSpaceUnion: the frozen union's top-edge y is flipped through the primary's height into AppKit bottom-left bounds; single display is the identity"
         )
 
         // --- declared-desktop override (WINDOW_SMOKE_DECLARED_DESKTOP, scaled-map memo §4-1 F) ------
@@ -1810,7 +1862,10 @@ let moveResizeTargetFilter = ProcessInfo.processInfo.environment["WINDOW_SMOKE_M
 /// minimum session lengths: C r2 (2026-09-02) finished its 150 rotations at 59.2 s and then idled
 /// to 160 s = 10+N, adding nothing to the trigger surface and misreading as "160 s of activity"
 /// (C-m4). Now the deadlines are floors only while something is still running; once every enabled
-/// scenario has completed, the base battery length is the only floor.
+/// scenario has completed, the base battery length is the only floor. Consequence (review cm4-r1
+/// I-2): the passive denominators a run reports (surface-map events, f1 samples, FRAME_READY
+/// counts) now scale with the activity span, not with 10+N -- records must state session length
+/// AND activity span side by side before comparing them across runs.
 enum FinishGate {
     static func minimumElapsed(base: TimeInterval, overall: TimeInterval, allScenariosCompleted: Bool) -> TimeInterval {
         allScenariosCompleted ? base : overall
@@ -4220,22 +4275,32 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             let offset: MoveResizeGate.MoveOffset
             if let topology = displayTopology.sessionSnapshot {
                 let union = topology.unionBoundsInPoints
-                let topInset = NSScreen.main.map { $0.frame.maxY - $0.visibleFrame.maxY } ?? 25
-                let bounds = NSRect(
-                    x: union.x.inPoints, y: union.y.inPoints,
-                    width: union.width.inPoints, height: union.height.inPoints - topInset
+                // Windows-space union -> AppKit bounds through the primary's height (review cm4-r1 B-1),
+                // menu-bar inset as a constant (B-2), no NSScreen read here.
+                let bounds = MoveResizeGate.appKitBounds(
+                    unionX: union.x.inPoints, unionY: union.y.inPoints,
+                    width: union.width.inPoints, height: union.height.inPoints,
+                    primaryHeightInPoints: topology.flipAnchor.primaryHeightInPoints,
+                    topInset: MoveResizeGate.menuBarInsetPoints
                 )
-                offset = MoveResizeGate.moveOffset(original: originalContent, within: bounds, leftBorder: 7, margin: 20)
+                // The left border the send path deducts is 7 REMOTE PX (`RemoteWindowRegistry.
+                // measuredClientWindowMoveLeftBorder`, private there -- this is a second copy of the
+                // number, review cm4-r1 I-4); the bounds are in pt, so convert (I-3).
+                let leftBorderPt = 7 / topology.rasterScale
+                offset = MoveResizeGate.moveOffset(original: originalContent, within: bounds, leftBorder: leftBorderPt, margin: 20)
                 print("[move-resize] move offset (dx=\(Int(offset.dx)), dy=\(Int(offset.dy)))"
                     + (offset.flipped ? " FLIPPED from the default (+80,-60) to stay inside" : " (default)")
-                    + " bounds=\(bounds) margin=20pt original=\(originalContent)")
+                    + " bounds=\(bounds) (AppKit pt; union flipped through primary height \(topology.flipAnchor.primaryHeightInPoints), "
+                    + "menu-bar inset \(MoveResizeGate.menuBarInsetPoints)) margin=20pt leftBorder=\(leftBorderPt)pt original=\(originalContent)")
                 if !offset.fits {
                     print("[move-resize] WARNING: neither direction keeps the moved target inside the desktop by the "
                         + "margin -- keeping the default; the F0 'no boundary crossing' premise does NOT hold for this run")
                 }
             } else {
-                offset = MoveResizeGate.MoveOffset(dx: 80, dy: -60, flipped: false, fits: true)
-                print("[move-resize] move offset: default (+80,-60) -- no frozen topology to bound against")
+                // No frozen topology: nothing to bound against, so the default goes out UNCHECKED --
+                // said so, not reported as a fit (review cm4-r1 I-7).
+                offset = MoveResizeGate.MoveOffset(dx: 80, dy: -60, flipped: false, fits: false)
+                print("[move-resize] move offset: default (+80,-60) UNCHECKED -- no frozen topology to bound against")
             }
             let targetContent = originalContent.offsetBy(dx: offset.dx, dy: offset.dy)
             let targetFrame = window.frameRect(forContentRect: targetContent)
