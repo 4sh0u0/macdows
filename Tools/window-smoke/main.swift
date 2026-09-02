@@ -1348,30 +1348,30 @@ enum WindowSmokeGateSelfTest {
         // style's borders (measurement only in this lane; the local content-rect verdict stays the gate) ---
         // About-calibrated borders (7,0,7,7): C-2 run 4 sent left=195 top=180 right=717 bottom=696,
         // RAIL reported offsetX=202 offsetY=180 windowWidth=508 windowHeight=509 -- an exact match.
-        let aboutExpected = RailComparison.expectedClientRect(
+        let aboutExpected = RailComparison.expectedVisibleRect(
             sentLeft: 195, sentTop: 180, sentRight: 717, sentBottom: 696, borders: RailComparison.Borders.aboutCalibrated
         )
         let aboutDelta = RailComparison.compare(
             expected: aboutExpected,
-            reported: RailComparison.ClientRect(x: 202, y: 180, width: 508, height: 509), toleranceRemotePx: 0
+            reported: RailComparison.VisibleRect(x: 202, y: 180, width: 508, height: 509), toleranceRemotePx: 0
         )
         // Notepad/THICKFRAME (C second step r1 :821/:822): sent left=738 top=352 right=2488 bottom=1326,
         // RAIL reported offsetX=743 offsetY=352 windowWidth=1740 windowHeight=969. With the About-calibrated
         // 7 px the residual is F-R1's (-2, 0, +4, +2); with the measured THICKFRAME borders (5,0,5,5) it is zero.
         let notepadWith7 = RailComparison.compare(
-            expected: RailComparison.expectedClientRect(
+            expected: RailComparison.expectedVisibleRect(
                 sentLeft: 738, sentTop: 352, sentRight: 2488, sentBottom: 1326, borders: RailComparison.Borders.aboutCalibrated
             ),
-            reported: RailComparison.ClientRect(x: 743, y: 352, width: 1740, height: 969), toleranceRemotePx: 0
+            reported: RailComparison.VisibleRect(x: 743, y: 352, width: 1740, height: 969), toleranceRemotePx: 0
         )
         let notepadWith5 = RailComparison.compare(
-            expected: RailComparison.expectedClientRect(
+            expected: RailComparison.expectedVisibleRect(
                 sentLeft: 738, sentTop: 352, sentRight: 2488, sentBottom: 1326, borders: RailComparison.Borders.thickFrameMeasured
             ),
-            reported: RailComparison.ClientRect(x: 743, y: 352, width: 1740, height: 969), toleranceRemotePx: 0
+            reported: RailComparison.VisibleRect(x: 743, y: 352, width: 1740, height: 969), toleranceRemotePx: 0
         )
         expect(
-            aboutExpected == RailComparison.ClientRect(x: 202, y: 180, width: 508, height: 509)
+            aboutExpected == RailComparison.VisibleRect(x: 202, y: 180, width: 508, height: 509)
                 && aboutDelta.passed && aboutDelta.dx == 0 && aboutDelta.dy == 0 && aboutDelta.dw == 0 && aboutDelta.dh == 0,
             "railComparisonMatchesTheAboutCalibration: sent window rect minus (7,0,7,7) equals the RAIL-reported client rect of C-2 run 4 exactly (dx=dy=dw=dh=0, passed)"
         )
@@ -1382,26 +1382,26 @@ enum WindowSmokeGateSelfTest {
         )
         expect(
             RailComparison.compare(
-                expected: RailComparison.ClientRect(x: 100, y: 100, width: 300, height: 200),
-                reported: RailComparison.ClientRect(x: 101, y: 100, width: 300, height: 200), toleranceRemotePx: 0
+                expected: RailComparison.VisibleRect(x: 100, y: 100, width: 300, height: 200),
+                reported: RailComparison.VisibleRect(x: 101, y: 100, width: 300, height: 200), toleranceRemotePx: 0
             ).passed == false
                 && RailComparison.compare(
-                    expected: RailComparison.ClientRect(x: 100, y: 100, width: 300, height: 200),
-                    reported: RailComparison.ClientRect(x: 101, y: 100, width: 300, height: 200), toleranceRemotePx: 1
+                    expected: RailComparison.VisibleRect(x: 100, y: 100, width: 300, height: 200),
+                    reported: RailComparison.VisibleRect(x: 101, y: 100, width: 300, height: 200), toleranceRemotePx: 1
                 ).passed == true
                 && RailComparison.compare(
-                    expected: RailComparison.ClientRect(x: 100, y: 100, width: 300, height: 200),
-                    reported: RailComparison.ClientRect(x: 100, y: 100, width: 300, height: 198), toleranceRemotePx: 1
+                    expected: RailComparison.VisibleRect(x: 100, y: 100, width: 300, height: 200),
+                    reported: RailComparison.VisibleRect(x: 100, y: 100, width: 300, height: 198), toleranceRemotePx: 1
                 ).passed == false,
             "railComparisonToleranceIsInclusiveOnEveryAxis: |delta| <= tolerance on all four of x/y/w/h passes; U6 pins the shipped tolerance at 0 remote px"
         )
         expect(
             RailComparison.Borders.aboutCalibrated == RailComparison.Borders(left: 7, top: 0, right: 7, bottom: 7)
                 && RailComparison.Borders.thickFrameMeasured == RailComparison.Borders(left: 5, top: 0, right: 5, bottom: 5)
-                && RailComparison.Borders.forStyleLabel("about") == RailComparison.Borders.aboutCalibrated
-                && RailComparison.Borders.forStyleLabel("thickframe") == RailComparison.Borders.thickFrameMeasured
-                && RailComparison.Borders.forStyleLabel("something-else") == RailComparison.Borders.aboutCalibrated,
-            "railComparisonBorderModelsAreTheTwoMeasuredOnes: About-calibrated (7,0,7,7) is the default and the fallback for an unknown style; THICKFRAME (5,0,5,5) is the F-R1 measurement (n=8 independent runs, memo :101)"
+                // the two RAIL order-field bits the live wiring keys on (WindowOrderField in MacdowsCore/WindowModel.swift)
+                && RailComparison.OrderField.wndOffset == 0x0000_0800
+                && RailComparison.OrderField.style == 0x0000_0008,
+            "railComparisonBorderModelsAreTheTwoMeasuredOnes: About-calibrated (7,0,7,7) is the default (right/bottom 7 are a single-run reading, n=1); THICKFRAME (5,0,5,5) is the F-R1 measurement (n=8 independent runs, memo :101); the wiring's field bits are WND_OFFSET 0x800 and STYLE 0x8"
         )
         // style bits from the RAIL WindowCreate (the `[style-dump] style=0x…` value): WS_THICKFRAME (0x00040000)
         // selects the measured THICKFRAME model -- Notepad 0x000F0000 and Realtek 0x800F0000 carry it, About
@@ -2057,13 +2057,17 @@ enum FinishGate {
     }
 }
 
-/// adr/0015 §6.2's comparison object, as a pure seam: the server's RAIL-reported client rect
-/// (`offsetX/offsetY/windowWidth/windowHeight`, remote px) against the window rect this client SENT in
-/// `ClientWindowMove` (Windows coordinates, borders included) minus the window style's borders. The two
-/// border models are the two measured ones: About-calibrated (7,0,7,7) -- `measuredClientWindowMoveLeftBorder`
-/// -- and THICKFRAME/Notepad (5,0,5,5), F-R1's n=8 measurement (memo :101). The fixture's gate stays the
-/// local content-rect verdict (`MoveResizeGate.evaluate`); this seam is MEASUREMENT ONLY until the memo
-/// lane decides otherwise, so a failing §6.2 comparison never reds a run.
+/// adr/0015 §6.2's comparison object, as a pure seam: the server's RAIL-reported VISIBLE window rect
+/// (`offsetX/offsetY/windowWidth/windowHeight`, remote px -- the window as drawn, title bar included, which
+/// is why every border model has top = 0) against the window rect this client SENT in `ClientWindowMove`
+/// (Windows coordinates, DWM's invisible resize frame included) minus that frame. The "borders" here are
+/// DWM's invisible frame, NOT the client-area insets. The two frame models are the two measured ones:
+/// About-calibrated (7,0,7,7) -- the left 7 is `measuredClientWindowMoveLeftBorder`, the right/bottom 7
+/// are the single C-2 run 4 reading (n=1) -- and THICKFRAME/Notepad (5,0,5,5), F-R1's n=8 measurement
+/// (memo :101). Scope: this is the BORDER-MODEL half of §6.2's deductions; `sizeCorrection` (mapped −
+/// accumulated RAIL) is printed next to it, not deducted -- the measurement line says so. The fixture's
+/// gate stays the local content-rect verdict (`MoveResizeGate.evaluate`); this seam is MEASUREMENT ONLY,
+/// so a failing §6.2 comparison never reds a run.
 enum RailComparison {
     struct Borders: Equatable {
         let left: Int
@@ -2074,10 +2078,6 @@ enum RailComparison {
         static let aboutCalibrated = Borders(left: 7, top: 0, right: 7, bottom: 7)
         /// F-R1: Notepad/THICKFRAME legs read (5,0,5,5) in eight independent runs.
         static let thickFrameMeasured = Borders(left: 5, top: 0, right: 5, bottom: 5)
-        /// A style label -> border model; anything unrecognised falls back to the calibrated default.
-        static func forStyleLabel(_ label: String) -> Borders {
-            label.lowercased() == "thickframe" ? thickFrameMeasured : aboutCalibrated
-        }
         /// `WS_THICKFRAME` (== `WS_SIZEBOX`), the bit that distinguishes the two measured styles.
         static let wsThickFrame: UInt32 = 0x0004_0000
         /// Border model from the RAIL WindowCreate style bits (`[style-dump] style=0x…`).
@@ -2086,7 +2086,14 @@ enum RailComparison {
         }
     }
 
-    struct ClientRect: Equatable {
+    /// The RAIL window-order field-presence bits the live wiring gates its captures on (duplicated narrowly
+    /// from MacdowsCore `WindowOrderField`, the same precedent the registry follows).
+    enum OrderField {
+        static let wndOffset: UInt32 = 0x0000_0800 // WINDOW_ORDER_FIELD_WND_OFFSET
+        static let style: UInt32 = 0x0000_0008     // WINDOW_ORDER_FIELD_STYLE
+    }
+
+    struct VisibleRect: Equatable {
         let x: Int
         let y: Int
         let width: Int
@@ -2101,10 +2108,11 @@ enum RailComparison {
         let passed: Bool
     }
 
-    /// The client rect the server SHOULD report for a sent window rect: borders are inside the window rect,
-    /// so the client area starts `left`/`top` px in and is narrower by left+right, shorter by top+bottom.
-    static func expectedClientRect(sentLeft: Int, sentTop: Int, sentRight: Int, sentBottom: Int, borders: Borders) -> ClientRect {
-        ClientRect(
+    /// The visible rect the server SHOULD report for a sent window rect: the invisible frame is inside the
+    /// sent rect, so the visible window starts `left`/`top` px in and is narrower by left+right, shorter by
+    /// top+bottom.
+    static func expectedVisibleRect(sentLeft: Int, sentTop: Int, sentRight: Int, sentBottom: Int, borders: Borders) -> VisibleRect {
+        VisibleRect(
             x: sentLeft + borders.left,
             y: sentTop + borders.top,
             width: (sentRight - sentLeft) - borders.left - borders.right,
@@ -2113,7 +2121,7 @@ enum RailComparison {
     }
 
     /// reported − expected on every axis; `passed` when all four |delta| <= tolerance (inclusive; U6 = 0).
-    static func compare(expected: ClientRect, reported: ClientRect, toleranceRemotePx: Int) -> Delta {
+    static func compare(expected: VisibleRect, reported: VisibleRect, toleranceRemotePx: Int) -> Delta {
         let dx = reported.x - expected.x
         let dy = reported.y - expected.y
         let dw = reported.width - expected.width
@@ -3521,7 +3529,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 } else {
                     impliedSizeCorrection = "n/a"
                 }
-                if event.fieldFlags & 0x0000_0800 != 0 { // WINDOW_ORDER_FIELD_WND_OFFSET
+                if event.fieldFlags & RailComparison.OrderField.wndOffset != 0 {
                     latestRailOffset[target] = (x: Int(event.offsetX), y: Int(event.offsetY), elapsed: elapsed)
                 }
                 print(
@@ -3634,7 +3642,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // during the popup wait window stays self-diagnosing regardless of whether the
             // multiwin prereq still holds.
             if event.kind == .windowCreate, !extraApps.isEmpty || popupScenarioEnabled {
-                if event.fieldFlags & 0x0000_0008 != 0 { // WINDOW_ORDER_FIELD_STYLE -- feeds RailComparison.Borders.forStyleBits
+                if event.fieldFlags & RailComparison.OrderField.style != 0 { // feeds RailComparison.Borders.forStyleBits (WindowCreate orders carry it)
                     windowStyleBits[event.windowId] = event.style
                 }
                 print(Self.styleDumpLine(for: event))
@@ -5458,30 +5466,53 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             borderText = "n/a (no ClientWindowMove was observed for this window this run)"
         }
         // adr/0015 §6.2's comparison object, MEASUREMENT ONLY (the gate stays the local content-rect
-        // verdict above): the RAIL-reported client rect vs this leg's sent window rect minus the style's
-        // borders (`RailComparison`). Every input is named so the reader can recompute the delta by hand.
+        // verdict above): the RAIL-reported visible rect vs this leg's sent window rect minus the style's
+        // invisible frame (`RailComparison`). Scope and provenance are printed, not assumed: this is the
+        // border-model half of §6.2's deductions (sizeCorrection is shown beside it, not deducted); the RAIL
+        // offset must have arrived AFTER this leg's own send, or the field says why it is n/a (review
+        // railcmp-r1 I-2/I-3). Every input is named so the reader can recompute the delta by hand.
         let railText: String
-        if let sent = lastClientWindowMoveSent, sent.at >= legSentAt,
-           let offset = latestRailOffset[windowId], let accumulated
+        let sentElapsed = lastClientWindowMoveSentElapsed
+        let tolerance = Int(MoveResizeGate.toleranceInRemotePixels)
+        if let sent = lastClientWindowMoveSent, sent.at >= legSentAt, let sentElapsed,
+           let offset = latestRailOffset[windowId], offset.elapsed >= sentElapsed, let accumulated
         {
             let style = windowStyleBits[windowId]
             let borders = style.map { RailComparison.Borders.forStyleBits($0) } ?? RailComparison.Borders.aboutCalibrated
-            let expected = RailComparison.expectedClientRect(
+            let expected = RailComparison.expectedVisibleRect(
                 sentLeft: Int(sent.left), sentTop: Int(sent.top), sentRight: Int(sent.right), sentBottom: Int(sent.bottom),
                 borders: borders
             )
-            let reported = RailComparison.ClientRect(
+            let reported = RailComparison.VisibleRect(
                 x: offset.x, y: offset.y, width: Int(accumulated.width), height: Int(accumulated.height)
             )
-            let delta = RailComparison.compare(expected: expected, reported: reported, toleranceRemotePx: 0)
-            railText = "adr0015-6.2(MEASUREMENT ONLY)=sent(l=\(sent.left),t=\(sent.top),r=\(sent.right),b=\(sent.bottom)) "
-                + "borders=(\(borders.left),\(borders.top),\(borders.right),\(borders.bottom)) "
-                + (style.map { String(format: "style=0x%08X", $0) } ?? "style=unknown(default borders)") + " "
-                + "expectedClient=(\(expected.x),\(expected.y),\(expected.width)x\(expected.height)) "
-                + "reportedRAIL=(\(reported.x),\(reported.y),\(reported.width)x\(reported.height) @\(String(format: "%.3f", offset.elapsed))s) "
-                + "delta=(dx=\(delta.dx),dy=\(delta.dy),dw=\(delta.dw),dh=\(delta.dh)) withinU6=\(delta.passed)"
+            let delta = RailComparison.compare(expected: expected, reported: reported, toleranceRemotePx: tolerance)
+            let frameMinusSizeCorrection = mapped.map {
+                "(\(borders.left + borders.right - (Int($0.width) - Int(accumulated.width))),"
+                    + "\(borders.top + borders.bottom - (Int($0.height) - Int(accumulated.height))))"
+            } ?? "n/a (no mapped size)"
+            railText = "adr0015-6.2(MEASUREMENT ONLY; border-model half, sizeCorrection shown not deducted)="
+                + "sent(l=\(sent.left),t=\(sent.top),r=\(sent.right),b=\(sent.bottom) @\(String(format: "%.3f", sentElapsed))s) "
+                + "frame=(\(borders.left),\(borders.top),\(borders.right),\(borders.bottom)) "
+                + (style.map { String(format: "style=0x%08X", $0) } ?? "style=unknown(default frame)") + " "
+                + "expectedVisible=(\(expected.x),\(expected.y),\(expected.width)x\(expected.height)) "
+                + "reportedRAIL=(offset \(reported.x),\(reported.y) @\(String(format: "%.3f", offset.elapsed))s; accumulated size \(reported.width)x\(reported.height) at comparison) "
+                + "delta=(dx=\(delta.dx),dy=\(delta.dy),dw=\(delta.dw),dh=\(delta.dh)) tolerance=\(tolerance) within=\(delta.passed) "
+                + "frameMinusSizeCorrection=\(frameMinusSizeCorrection)"
         } else {
-            railText = "adr0015-6.2(MEASUREMENT ONLY)=n/a (no own send, no RAIL offset, or no accumulated RAIL size for this leg)"
+            let reason: String
+            if let sent = lastClientWindowMoveSent, sent.at >= legSentAt, sentElapsed != nil {
+                if let offset = latestRailOffset[windowId] {
+                    reason = accumulated == nil
+                        ? "no accumulated RAIL size for this window"
+                        : "the last RAIL offset (@\(String(format: "%.3f", offset.elapsed))s) predates this leg's send -- the leg settled without a positioned RAIL order (remap-only)"
+                } else {
+                    reason = "no RAIL offset was ever reported for this window"
+                }
+            } else {
+                reason = "this leg produced no ClientWindowMove of its own"
+            }
+            railText = "adr0015-6.2(MEASUREMENT ONLY)=n/a (\(reason))"
         }
         return "deductions@comparison(adr/0015 §6.2): mappedSize=\(mappedText) "
             + "accumulatedRAILSize=\(accumulated.map { "\($0.width)x\($0.height) remote px" } ?? "unknown") "
