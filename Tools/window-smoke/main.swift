@@ -1421,6 +1421,9 @@ enum WindowSmokeGateSelfTest {
                 == AboutTarget.Choice(windowId: 2, firstSeenElapsed: 5.0, tiedAtChosenTime: 2, runnerUpFirstSeen: 5.0)
                 && AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 7, firstSeenElapsed: 3.0)])
                 == AboutTarget.Choice(windowId: 7, firstSeenElapsed: 3.0, tiedAtChosenTime: 1, runnerUpFirstSeen: nil)
+                // three distinct stamps: the runner-up is the nearest loser (the maximum of the others under .newest)
+                && AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 5, firstSeenElapsed: 2.0), AboutTarget.Candidate(windowId: 9, firstSeenElapsed: 1.0), AboutTarget.Candidate(windowId: 3, firstSeenElapsed: 0.5)])
+                == AboutTarget.Choice(windowId: 5, firstSeenElapsed: 2.0, tiedAtChosenTime: 1, runnerUpFirstSeen: 1.0)
                 && AboutTarget.Choice(windowId: 7, firstSeenElapsed: 3.0, tiedAtChosenTime: 1, runnerUpFirstSeen: nil).decidedByFirstSeen
                 && !AboutTarget.Choice(windowId: 7, firstSeenElapsed: 3.0, tiedAtChosenTime: 2, runnerUpFirstSeen: 3.0).decidedByFirstSeen,
             "aboutTargetKnowsWhetherTimeDecided: a Choice carries how many candidates share the winner's first-seen time (1 = time decided) and the best loser's first-seen (nil for a lone candidate); a tie among losers leaves the winner decided"
@@ -1437,8 +1440,18 @@ enum WindowSmokeGateSelfTest {
                 && AboutTarget.describe(AboutTarget.Choice(windowId: 4, firstSeenElapsed: 1.0, tiedAtChosenTime: 2, runnerUpFirstSeen: 1.0), of: 2, prefer: .oldest)
                 == "lowest id of 2 candidates (all tied at first-seen @1.000s; oldest-wins did not decide)"
                 && AboutTarget.describe(AboutTarget.Choice(windowId: 2, firstSeenElapsed: 0.4, tiedAtChosenTime: 2, runnerUpFirstSeen: 0.4), of: 3, prefer: .oldest)
-                == "lowest id among the 2 candidates tied at the oldest first-seen @0.400s (of 3; oldest-wins eliminated 1)",
-            "aboutTargetCanPreferTheOldest: pick(prefer: .oldest) inverts the time order (earliest first-seen wins) while keeping the lowest-id tie-break and the same tie bookkeeping, and describe words every branch as oldest-wins"
+                == "lowest id among the 2 candidates tied at the oldest first-seen @0.400s (of 3; oldest-wins eliminated 1)"
+                // review about-target-r4 I-2 / m-5: three candidates with distinct stamps -- the runner-up is the NEAREST
+                // loser, i.e. the minimum of the others under .oldest (0.5 s behind, not 8.5 s)
+                && AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 1, firstSeenElapsed: 0.5), AboutTarget.Candidate(windowId: 2, firstSeenElapsed: 1.0), AboutTarget.Candidate(windowId: 3, firstSeenElapsed: 9.0)], prefer: .oldest)
+                == AboutTarget.Choice(windowId: 1, firstSeenElapsed: 0.5, tiedAtChosenTime: 1, runnerUpFirstSeen: 1.0)
+                // r4 I-1: under .oldest an unobserved minority IS pick-reachable in the partial-tie branch; describe
+                // must still name it rather than print -1.000s
+                && AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 1, firstSeenElapsed: -1), AboutTarget.Candidate(windowId: 2, firstSeenElapsed: -1), AboutTarget.Candidate(windowId: 3, firstSeenElapsed: 2.0)], prefer: .oldest)
+                == AboutTarget.Choice(windowId: 1, firstSeenElapsed: -1, tiedAtChosenTime: 2, runnerUpFirstSeen: -1)
+                && AboutTarget.describe(AboutTarget.Choice(windowId: 1, firstSeenElapsed: -1, tiedAtChosenTime: 2, runnerUpFirstSeen: -1), of: 3, prefer: .oldest)
+                == "lowest id among the 2 candidates tied at the oldest first-seen, none observed at a first WindowCreate (of 3; oldest-wins eliminated 1)",
+            "aboutTargetCanPreferTheOldest: pick(prefer: .oldest) inverts the time order (earliest first-seen wins) while keeping the lowest-id tie-break and the same tie bookkeeping; the runner-up is the nearest loser under either preference; describe words every branch as oldest-wins and never prints -1.000s"
         )
         // --- review about-target-r3 I-2: the selection body every lock site calls is a pure generic function, so
         // "returns the window pick chose (not the first in input order) and a reason over every candidate" is pinned ---
@@ -2459,14 +2472,15 @@ enum FocusRotationGate {
 /// About heuristic used to take the lowest id). Pure. Default `.newest`: the window first seen LATEST
 /// wins, because this run's winver is created AFTER connect while a leftover was enumerated at
 /// connect; equal first-seen keeps the historical lowest-id order. The rule can only prefer this run's
-/// window once that window IS a candidate, i.e. where the lock waits (the `extraAppsLaunched` gate at
-/// t >= 6 s; the input test's t >= 5 s). `.oldest` inverts the time order for the one selection that
+/// window once that window IS a candidate -- the maximize and popup locks wait for `extraAppsLaunched`
+/// (t >= 6 s), the input test for t >= 5 s, the cycle-close lock for a painted About, and the final
+/// size/paint anchor runs at t = 25 s. `.oldest` inverts the time order for the one selection that
 /// WANTS the stale window -- the W4b Activate experiment (`activateExperimentWindowId`'s doc; review
-/// about-target-r3 I-1). Every About-anchored selection in this file goes through `choose`: the
-/// maximize, popup, input-test and cycle-close locks and the final size/paint anchor (`.newest`), the
-/// Activate-experiment lock (`.oldest`, and it also feeds Registry-Editor-titled windows, so "About"
-/// here means "matched by the caller's title heuristic"), and `MoveResizeTarget.lock`'s About path
-/// through `pick` directly.
+/// about-target-r3 I-1). Every About-anchored selection in this file goes through `AboutTarget`: six
+/// through `choose` -- the maximize, popup, input-test and cycle-close locks and the final size/paint
+/// anchor (`.newest`), the Activate-experiment lock (`.oldest`, and it also feeds Registry-Editor-titled
+/// windows, so "About" here means "matched by the caller's title heuristic") -- and
+/// `MoveResizeTarget.lock`'s About path through `pick` directly.
 enum AboutTarget {
     struct Candidate: Equatable {
         let windowId: UInt32
@@ -2493,18 +2507,22 @@ enum AboutTarget {
             guard a.firstSeenElapsed != b.firstSeenElapsed else { return a.windowId < b.windowId }
             return prefer == .newest ? a.firstSeenElapsed > b.firstSeenElapsed : a.firstSeenElapsed < b.firstSeenElapsed
         }) else { return nil }
+        let others = candidates.filter { $0.windowId != best.windowId }.map(\.firstSeenElapsed)
         return Choice(
             windowId: best.windowId,
             firstSeenElapsed: best.firstSeenElapsed,
             tiedAtChosenTime: candidates.filter { $0.firstSeenElapsed == best.firstSeenElapsed }.count,
-            runnerUpFirstSeen: candidates.filter { $0.windowId != best.windowId }.map(\.firstSeenElapsed).max()
+            // the NEAREST loser: the latest of the others under .newest, the earliest under .oldest
+            // (review about-target-r4 I-2: an unconditional max reported the farthest loser on .oldest)
+            runnerUpFirstSeen: prefer == .newest ? others.max() : others.min()
         )
     }
 
     /// The reason half of a "target locked" log line: how many candidates competed, when the chosen
     /// one was first seen and how far behind the runner-up was; on a tie, which candidates tied and
     /// that the lowest id decided among them. Total over every `Choice`, not just `pick`'s: an
-    /// unobserved first-seen is named in every branch, never printed as -1.000s (review about-target-r3 m-5).
+    /// unobserved first-seen is named in every branch, never printed as -1.000s (review about-target-r3
+    /// m-5; r4 I-1 caught the partial-tie branch, which `.oldest` makes `pick`-reachable).
     static func describe(_ choice: Choice, of count: Int, prefer: Preference = .newest) -> String {
         let word = prefer == .newest ? "newest" : "oldest"
         let never = "first WindowCreate never observed"
@@ -2520,7 +2538,8 @@ enum AboutTarget {
                 ? "lowest id of \(count) candidates (none observed at a first WindowCreate; \(word)-wins did not decide)"
                 : "lowest id of \(count) candidates (all tied at first-seen @\(stamp); \(word)-wins did not decide)"
         }
-        return "lowest id among the \(choice.tiedAtChosenTime) candidates tied at the \(word) first-seen @\(stamp) (of \(count); \(word)-wins eliminated \(count - choice.tiedAtChosenTime))"
+        let tieStamp = choice.firstSeenElapsed < 0 ? ", none observed at a first WindowCreate" : " @\(stamp)"
+        return "lowest id among the \(choice.tiedAtChosenTime) candidates tied at the \(word) first-seen\(tieStamp) (of \(count); \(word)-wins eliminated \(count - choice.tiedAtChosenTime))"
     }
 
     /// The selection body every lock site calls (review about-target-r3 I-2: pure and pinned, so
@@ -2564,7 +2583,10 @@ struct FirstSeenClock {
     }
 
     /// `-1` for an id never recorded: sorts as oldest in `AboutTarget.pick`, i.e. loses to any
-    /// stamped candidate (fails safe).
+    /// stamped candidate under `.newest` and WINS over every stamped one under `.oldest` (review
+    /// about-target-r4 I-3). Reachable only for a window whose first order for its current incarnation
+    /// was a `WindowUpdate` (the registry constructs it; `observe` ignores updates by design) -- whether
+    /// the experiment should treat "never observed" as oldest or as unknown is an open owner call.
     func elapsed(of windowId: UInt32) -> TimeInterval { stamps[windowId] ?? -1 }
 
     func candidates(for windowIds: [UInt32]) -> [AboutTarget.Candidate] {
@@ -4776,7 +4798,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// anchor with `.newest`; the Activate experiment with `.oldest`; move/resize reaches the same
     /// `AboutTarget.pick` through `MoveResizeTarget.lock`), so two scenarios that lock in the same tick
     /// over the same predicate (maximize and popup) can never pick different windows (review
-    /// about-target-r1 I-2 / r2 I-1). The body is pure and pinned; only this wrapper is not.
+    /// about-target-r1 I-2 / r2 I-1). The body is pure and pinned; this wrapper is not, and it is where
+    /// this run's clock is injected -- substituting another `FirstSeenClock` here reverts every site at
+    /// once (review about-target-r4 m-6), which is why the live reason lines are the wiring's evidence.
     private func chooseTarget<S>(
         among matches: [S], id: (S) -> UInt32, prefer: AboutTarget.Preference = .newest
     ) -> (window: S, reason: String)? {
@@ -6040,10 +6064,12 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// (`moveResizeCloseTargetId`'s own doc comment). Unset keeps the original two-language
     /// title match, unchanged. Among several matches `chooseTarget(among:)` takes the newest
     /// first-seen -- WITHOUT the pre-existing exclusion `WINDOW_SMOKE_MOVE_TARGET` applies. The lock
-    /// re-evaluates every tick from t >= 5 s until something matches: with a leftover matching the
-    /// title present it fires at t = 5 s on the leftover and never re-locks (the run then tests the
-    /// leftover -- the case that bites); with none it waits and takes this run's own window when it
-    /// appears (an extra app's at t ~ 6.x s). The exclusion set `windowIdsBeforeExtraApps` does not
+    /// re-evaluates every tick from t >= 5 s until something matches: with ONLY a leftover matching the
+    /// title present (an explicit title naming an extra app) it fires at t = 5 s on the leftover and
+    /// never re-locks (the run then tests the leftover -- the case that bites); under the default About
+    /// predicate this run's own About is already a candidate at t = 5 s and newest-wins takes it; with
+    /// no match it waits and takes this run's own window when it appears (an extra app's at t ~ 6.x s).
+    /// The exclusion set `windowIdsBeforeExtraApps` does not
     /// exist at t = 5 s, so exclusion is neither possible there nor, in either case, what decides
     /// (review about-target-r2 m-8 / r3 m-1; pre-existing behaviour, made deterministic here).
     private static func matchesInputTestTarget(_ title: String) -> Bool {
