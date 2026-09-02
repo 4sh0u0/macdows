@@ -1344,6 +1344,56 @@ enum WindowSmokeGateSelfTest {
             "finishGateWaitsForTheDeadlineOnlyWhileSomethingIsUnfinished: with every enabled scenario completed the run finishes at the base battery length; anything still running keeps the per-scenario deadline as the floor"
         )
 
+        // --- MoveResizeTarget.lock, About path: newest About wins (same rule as AboutTarget.pick) ---
+        let leftoverAbout = MoveResizeTarget.Candidate(windowId: 5, title: "About Windows", firstSeenElapsed: 0.4)
+        let ownAbout = MoveResizeTarget.Candidate(windowId: 900, title: "关于 Windows", firstSeenElapsed: 2.1)
+        expect(
+            MoveResizeTarget.lock(candidates: [leftoverAbout, ownAbout], filter: nil, preExisting: [5, 900])?.windowId == 900
+                && MoveResizeTarget.lock(candidates: [ownAbout, leftoverAbout], filter: "", preExisting: [])?.windowId == 900
+                // an explicit filter keeps its own order -- lowest id among the non-pre-existing, first-seen ignored
+                && MoveResizeTarget.lock(
+                    candidates: [
+                        MoveResizeTarget.Candidate(windowId: 20, title: "无标题 - Notepad", firstSeenElapsed: 9),
+                        MoveResizeTarget.Candidate(windowId: 30, title: "Untitled - Notepad", firstSeenElapsed: 1)
+                    ], filter: "Notepad", preExisting: []
+                )?.windowId == 20,
+            "moveResizeLockAboutPathPrefersTheNewestAbout: with no filter the About first seen latest is locked even when a leftover About has the lower id; an explicit filter still takes the lowest non-pre-existing id"
+        )
+        // --- the About heuristic prefers THIS run's About over a leftover one (STATUS pool, lock-r1 I-4: the
+        // lowest-id About won, so an About left on the host by an earlier run beat the one this session's
+        // winver just created; memo :101 records such a leftover with a run-to-run constant id) ---
+        // Rule: newest by first WindowCreate wins; same first-seen time -> lowest id (the old order).
+        expect(
+            AboutTarget.pick(candidates: [
+                AboutTarget.Candidate(windowId: 328362, firstSeenElapsed: 0.4),   // leftover, enumerated at connect
+                AboutTarget.Candidate(windowId: 510198942, firstSeenElapsed: 2.1) // this run's winver
+            ]) == 510198942
+                && AboutTarget.pick(candidates: [
+                    AboutTarget.Candidate(windowId: 510198942, firstSeenElapsed: 2.1),
+                    AboutTarget.Candidate(windowId: 328362, firstSeenElapsed: 0.4)
+                ]) == 510198942
+                // a newer About with a LOWER id still wins (it is time, not id, that decides)
+                && AboutTarget.pick(candidates: [
+                    AboutTarget.Candidate(windowId: 900, firstSeenElapsed: 0.4),
+                    AboutTarget.Candidate(windowId: 100, firstSeenElapsed: 2.1)
+                ]) == 100
+                // ties fall back to the historical lowest-id order
+                && AboutTarget.pick(candidates: [
+                    AboutTarget.Candidate(windowId: 900, firstSeenElapsed: 1.0),
+                    AboutTarget.Candidate(windowId: 100, firstSeenElapsed: 1.0)
+                ]) == 100
+                && AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 7, firstSeenElapsed: 3.0)]) == 7
+                && AboutTarget.pick(candidates: []) == nil,
+            "aboutTargetPrefersTheNewestAbout: among About-titled candidates the one first seen latest wins (this run's winver), regardless of id; equal first-seen falls back to the lowest id; none -> nil"
+        )
+        expect(
+            AboutTarget.describe(chosen: AboutTarget.Candidate(windowId: 510198942, firstSeenElapsed: 2.1), of: 2)
+                == "newest of 2 candidates by first WindowCreate (windowId=510198942 first seen @2.100s)"
+                && AboutTarget.describe(chosen: AboutTarget.Candidate(windowId: 7, firstSeenElapsed: 3.0), of: 1)
+                == "the only candidate (windowId=7 first seen @3.000s)",
+            "aboutTargetSaysWhyItChose: the lock line names how many Abouts competed and when the chosen one was first seen, so a leftover-About host is visible in the log"
+        )
+
         // --- the W4b Activate experiment: each checkpoint (t=6 s pre, t=20 s post) reports EXACTLY ONCE
         // (C second step r3, 2026-09-02: the post-sample came back nil because the About target had already
         // been closed, and the `activatePostRatio == nil` re-arm printed "n/a" on every tick -- 779 lines;
@@ -2300,6 +2350,32 @@ enum FocusRotationGate {
     }
 }
 
+/// Which of several About-titled windows a scenario should take when the host still shows an
+/// About left over from an earlier run (the RemoteApp session keeps windows across our connects,
+/// and the About heuristic used to take the lowest id). Pure: the newest by first `WindowCreate`
+/// wins, because this run's winver is created AFTER connect while a leftover was enumerated at
+/// connect; equal first-seen keeps the historical lowest-id order. Used by `MoveResizeTarget.lock`
+/// (About path), the maximize target lock and the Activate-experiment target lock.
+enum AboutTarget {
+    struct Candidate: Equatable {
+        let windowId: UInt32
+        let firstSeenElapsed: TimeInterval
+    }
+
+    static func pick(candidates: [Candidate]) -> UInt32? {
+        candidates.min { a, b in
+            a.firstSeenElapsed != b.firstSeenElapsed ? a.firstSeenElapsed > b.firstSeenElapsed : a.windowId < b.windowId
+        }?.windowId
+    }
+
+    /// The reason half of a "target locked" log line: how many candidates competed and when the
+    /// chosen one was first seen, so a leftover-About host is visible in the log.
+    static func describe(chosen: Candidate, of count: Int) -> String {
+        let when = String(format: "windowId=%u first seen @%.3fs", chosen.windowId, chosen.firstSeenElapsed)
+        return count == 1 ? "the only candidate (\(when))" : "newest of \(count) candidates by first WindowCreate (\(when))"
+    }
+}
+
 enum MoveResizeTarget {
     /// `nil`/empty filter: the About-Windows heuristic every scenario in this file historically
     /// used (`about`, case-insensitive, or the CJK `关于`). Otherwise `|`-separated alternatives,
@@ -2323,6 +2399,9 @@ enum MoveResizeTarget {
     struct Candidate: Equatable {
         let windowId: UInt32
         let title: String
+        /// This run's elapsed-seconds clock at the window's first `WindowCreate`
+        /// (`windowFirstSeenElapsed`); `-1` = never observed, which sorts as oldest.
+        var firstSeenElapsed: TimeInterval = -1
     }
 
     /// Whether `filter` names a target explicitly (vs the nil/empty About heuristic).
@@ -2343,15 +2422,22 @@ enum MoveResizeTarget {
     /// no new one yet) and only exclusion, plus the per-tick retry, waits for it. Consequence: an
     /// explicit filter can never lock the first app's own window either (it pre-exists too). The About
     /// heuristic (nil/empty filter) deliberately does NOT exclude: About is the FIRST app's window,
-    /// itself pre-existing at that moment, and the target that path has always meant -- which also
-    /// means a leftover About from an earlier run is matched just the same and wins whenever its
-    /// id is the lower one. That weakness predates this change (the parent revision's lock was
-    /// behaviourally equivalent on that path: first match over the same ascending order) and is
-    /// left as is here.
+    /// itself pre-existing at that moment, and the target that path has always meant. It orders by
+    /// `AboutTarget.pick` instead -- the About first seen LATEST wins (this run's own winver; a
+    /// leftover About from an earlier run was enumerated at connect, so it is older), equal
+    /// first-seen falling back to the lowest id. Before this the About path took the lowest id
+    /// outright, so a leftover About with the lower id beat this run's own (STATUS pool item from
+    /// review movetarget-lock-r1 I-4; memo :101 names such a leftover with a run-to-run constant id).
     static func lock(candidates: [Candidate], filter: String?, preExisting: Set<UInt32>) -> Candidate? {
-        let explicit = isExplicit(filter)
+        guard isExplicit(filter) else {
+            let abouts = candidates.filter { matches(title: $0.title, filter: filter) }
+            guard let chosen = AboutTarget.pick(candidates: abouts.map {
+                AboutTarget.Candidate(windowId: $0.windowId, firstSeenElapsed: $0.firstSeenElapsed)
+            }) else { return nil }
+            return abouts.first { $0.windowId == chosen }
+        }
         return candidates.sorted(by: { $0.windowId < $1.windowId }).first { candidate in
-            matches(title: candidate.title, filter: filter) && (!explicit || !preExisting.contains(candidate.windowId))
+            matches(title: candidate.title, filter: filter) && !preExisting.contains(candidate.windowId)
         }
     }
 
@@ -2615,6 +2701,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// entry per window this run ever creates), and what `runPopupScenario`'s own
     /// WindowCreate→first-content latency measurement reads (adr/0010 §5's acceptance text).
     private var windowCreateTimestamps: [UInt32: TimeInterval] = [:]
+    /// windowId -> elapsed seconds at its FIRST `WindowCreate` (never overwritten, unlike
+    /// `windowCreateTimestamps`, which keeps the latest): what `AboutTarget.pick` orders by.
+    private var windowFirstSeenElapsed: [UInt32: TimeInterval] = [:]
     /// Classified (via `RemoteWindowRegistry.serverDesktopState()`, adr/0012 §3) running
     /// value used only to detect and log activeWindow transitions.
     private var flowLastActiveWindow: ServerActiveWindow = .unmonitored
@@ -3734,7 +3823,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // windowCreateTimestamps' own doc comment) -- every run, not just
             // WINDOW_SMOKE_POPUP.
             if event.kind == .windowCreate {
-                self.windowCreateTimestamps[event.windowId] = Date().timeIntervalSince(self.startTime)
+                let now = Date().timeIntervalSince(self.startTime)
+                self.windowCreateTimestamps[event.windowId] = now
+                if self.windowFirstSeenElapsed[event.windowId] == nil { self.windowFirstSeenElapsed[event.windowId] = now }
             }
             // adr/0010 §2/§4: per-MASKED-window shape diagnostic -- rect count + truncated
             // flag, read post `registry.handle(event)` (already applied above) so this
@@ -4471,13 +4562,19 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // scenario sharing the run.
         if cmdMapLiveActive || inputTestMode == .ime || unicodeDegradeScenarioEnabled { return }
         if activateExperimentWindowId == nil {
-            if let w = registry.windowSnapshots().first(where: { snap in
+            let matches = registry.windowSnapshots().filter { snap in
                 snap.isVisible
                     && (snap.title.localizedCaseInsensitiveContains("registry") || snap.title.contains("注册表")
                         || snap.title.localizedCaseInsensitiveContains("about") || snap.title.contains("关于"))
-            }) {
+            }
+            let matchCandidates = matches.map {
+                AboutTarget.Candidate(windowId: $0.windowId, firstSeenElapsed: windowFirstSeenElapsed[$0.windowId] ?? -1)
+            }
+            if let chosenId = AboutTarget.pick(candidates: matchCandidates),
+               let w = matches.first(where: { $0.windowId == chosenId }),
+               let chosen = matchCandidates.first(where: { $0.windowId == chosenId }) {
                 activateExperimentWindowId = w.windowId
-                print("[experiment] Activate-experiment target locked: windowId=\(w.windowId) title=\"\(w.title)\"")
+                print("[experiment] Activate-experiment target locked: windowId=\(w.windowId) title=\"\(w.title)\" -- \(AboutTarget.describe(chosen: chosen, of: matchCandidates.count))")
             }
         }
         guard let windowId = activateExperimentWindowId else { return }
@@ -4521,12 +4618,18 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         switch maximizePhase {
         case .waitingForTarget:
             guard extraAppsLaunched else { return } // multiwin prereq, per the task spec
-            guard let w = registry.windowSnapshots().first(where: { snap in
+            let abouts = registry.windowSnapshots().filter { snap in
                 snap.isVisible && snap.hasDisplayedContent
                     && (snap.title.localizedCaseInsensitiveContains("about") || snap.title.contains("关于"))
-            }) else { return }
+            }
+            let aboutCandidates = abouts.map {
+                AboutTarget.Candidate(windowId: $0.windowId, firstSeenElapsed: windowFirstSeenElapsed[$0.windowId] ?? -1)
+            }
+            guard let chosenId = AboutTarget.pick(candidates: aboutCandidates),
+                  let w = abouts.first(where: { $0.windowId == chosenId }),
+                  let chosen = aboutCandidates.first(where: { $0.windowId == chosenId }) else { return }
             maximizeTargetWindowId = w.windowId
-            print("[maximize] target locked: windowId=\(w.windowId) title=\"\(w.title)\"")
+            print("[maximize] target locked: windowId=\(w.windowId) title=\"\(w.title)\" -- \(AboutTarget.describe(chosen: chosen, of: aboutCandidates.count))")
             session.sendSysCommand(w.windowId, command: SC.maximize)
             print("[maximize] sent SC_MAXIMIZE to windowId=\(w.windowId)")
             maximizePhase = .awaitingMaximize(windowId: w.windowId, sentAt: Date())
@@ -4802,7 +4905,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // filter, windows that already existed when the extra apps were launched are skipped,
             // so a leftover from an earlier run can no longer be locked before this run's own
             // window appears (env-202609-14, review resize-live-r2 I-2 / r3 I-r3-1).
-            let lockCandidates = candidates.map { MoveResizeTarget.Candidate(windowId: $0.windowId, title: $0.title) }
+            let lockCandidates = candidates.map {
+                MoveResizeTarget.Candidate(windowId: $0.windowId, title: $0.title, firstSeenElapsed: windowFirstSeenElapsed[$0.windowId] ?? -1)
+            }
             guard let locked = MoveResizeTarget.lock(
                       candidates: lockCandidates, filter: moveResizeTargetFilter, preExisting: windowIdsBeforeExtraApps
                   ),
