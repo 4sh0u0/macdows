@@ -1851,6 +1851,19 @@ let cyclesTotal = max(1, Int(ProcessInfo.processInfo.environment["WINDOW_SMOKE_C
 /// 不写策略"); the >=99% convergence gate is W1's own exit criterion, not asserted here.
 let focusRotationTotal = max(0, Int(ProcessInfo.processInfo.environment["WINDOW_SMOKE_FOCUS_ROTATION"] ?? "") ?? 0)
 
+/// C second step "再来一轮" (docs/upgrade-gate/2026-09-scaledmap-next-step.md §4-2): repeat the maximize
+/// and move/resize leg sequences K times on the same target inside one session, `GeometryRounds`
+/// gating the transitions. 1 (the default) is today's single pass, byte-for-byte. Fixture-only: the
+/// point is the `[gfx] target=` surfaceMapEvents tally, read against C r2/r3's 23 for one pass.
+let geometryRounds = max(1, Int(ProcessInfo.processInfo.environment["WINDOW_SMOKE_GEOMETRY_ROUNDS"] ?? "") ?? 1)
+/// Seconds between rounds (after a round's restore / resize leg resolved, before the next SC_MAXIMIZE /
+/// move goes out). Default 2.0.
+let geometryRoundGap = max(0, Double(ProcessInfo.processInfo.environment["WINDOW_SMOKE_GEOMETRY_ROUND_GAP"] ?? "") ?? 2.0)
+if geometryRounds > 1 {
+    print("[config] WINDOW_SMOKE_GEOMETRY_ROUNDS=\(geometryRounds) gap=\(geometryRoundGap)s -- the maximize and "
+        + "move/resize legs repeat on the same target; deadlines extend per round (GeometryRounds.deadline)")
+}
+
 /// adr/0012 follow-up diagnostic, harness-only (no product/FocusAuthority changes):
 /// discriminates between two hypotheses for why cycle-mode close-legs were observed to fail
 /// 45.5% of the time against a real host after the FocusAuthority gate landed -- (A) server
@@ -2467,10 +2480,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         case waitingForTarget
         case awaitingMaximize(windowId: UInt32, sentAt: Date)
         case awaitingRestore(windowId: UInt32, sentAt: Date)
+        /// Geometry rounds: a maximize->restore pass finished and another is configured; waiting the gap.
+        case awaitingNextRound(windowId: UInt32, roundEndedAt: Date)
         case awaitingClose(windowId: UInt32, sentAt: Date)
         case done
     }
     private var maximizePhase: MaximizePhase = .waitingForTarget
+    /// Geometry rounds (WINDOW_SMOKE_GEOMETRY_ROUNDS): finished maximize->restore passes so far and each
+    /// pass's verdict (grew AND restored). A failed pass stops the rounds -- the close leg follows.
+    private var maximizeRoundsCompleted = 0
+    private var maximizeRoundResults: [Bool] = []
     private static let maximizePollTimeout: TimeInterval = 5.0
     /// `grew`: did a WindowUpdate report width >= 2000 remote px (`SizeBand.maximizedWidthFloor`,
     /// judged through the frozen topology) within 5s of SC_MAXIMIZE.
@@ -2504,16 +2523,23 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         case waitingForTarget
         case awaitingMoveSettle(windowId: UInt32, target: NSRect, sentAt: Date)
         case awaitingResizeSettle(windowId: UInt32, target: NSRect, sentAt: Date)
+        /// Geometry rounds: a move->resize pass finished and another is configured; waiting the gap.
+        case awaitingNextRound(windowId: UInt32, roundEndedAt: Date)
         case awaitingClose(windowId: UInt32, sentAt: Date)
         case done
     }
     private var moveResizePhase: MoveResizePhase = .waitingForTarget
+    /// Geometry rounds (WINDOW_SMOKE_GEOMETRY_ROUNDS): finished move->resize passes so far and each pass's
+    /// (move, resize) leg verdicts. Unlike the maximize rounds, a failed leg does not stop the rounds --
+    /// the window is still there to drive, and every pass adds remaps to the tally.
+    private var moveResizeRoundsCompleted = 0
+    private var moveResizeRoundResults: [(move: Bool, resize: Bool)] = []
     /// True while either leg is waiting for its round trip -- the window in which a surface remap
     /// on the target is an observation the leg must sample (F0-2).
     private var moveResizeLegAwaitingSettle: Bool {
         switch moveResizePhase {
         case .awaitingMoveSettle, .awaitingResizeSettle: return true
-        case .waitingForTarget, .awaitingClose, .done: return false
+        case .waitingForTarget, .awaitingNextRound, .awaitingClose, .done: return false
         }
     }
     /// When the in-flight leg locked its target (each awaiting phase's `sentAt` is that lock moment;
@@ -2524,7 +2550,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         switch moveResizePhase {
         case .awaitingMoveSettle(_, _, let lockedAt), .awaitingResizeSettle(_, _, let lockedAt):
             return lockedAt.timeIntervalSince(startTime)
-        case .waitingForTarget, .awaitingClose, .done:
+        case .waitingForTarget, .awaitingNextRound, .awaitingClose, .done:
             return nil
         }
     }
@@ -3599,14 +3625,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // 45s leaves comfortable slack. `maximizeStalled` is the same kind of hard failsafe
         // `rotationStalled` already is: normally `maximizePhase == .done` is what actually
         // gates the extra wait, not this fallback.
-        let maximizeDeadline: TimeInterval = maximizeScenarioEnabled ? 45 : baseDeadline
+        let maximizeDeadline: TimeInterval = maximizeScenarioEnabled
+            ? GeometryRounds.deadline(base: 45, rounds: geometryRounds, gap: geometryRoundGap) : baseDeadline
         let maximizeStalled = maximizeScenarioEnabled && maximizePhase != .done && elapsed >= maximizeDeadline + 10
         // Phase 2 W3: worst case is extraAppsLaunched (>=6s) + settle for the About target +
         // two back-to-back (move, resize) legs, each up to the 3s round-trip budget plus the
         // 200ms local settle debounce, + the close leg's own 5s WindowDelete wait (Fix 2) --
         // 40s leaves comfortable slack, same "gated by the phase reaching .done, this is
         // only the hard failsafe" shape `maximizeStalled` already establishes.
-        let moveResizeDeadline: TimeInterval = moveResizeScenarioEnabled ? 40 : baseDeadline
+        let moveResizeDeadline: TimeInterval = moveResizeScenarioEnabled
+            ? GeometryRounds.deadline(base: 40, rounds: geometryRounds, gap: geometryRoundGap) : baseDeadline
         let moveResizeStalled = moveResizeScenarioEnabled && moveResizePhase != .done && elapsed >= moveResizeDeadline + 10
         // adr/0010 W4 first slice: worst case is extraAppsLaunched (>=6s) + settle for the
         // About target + 0.3s activate settle + the popup-appear poll (5s) + a 0.3s
@@ -4189,6 +4217,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             } else if Date().timeIntervalSince(sentAt) >= Self.maximizePollTimeout {
                 let mappedWithContent = snap?.isVisible == true && snap?.hasDisplayedContent == true
                 maximizeResult = (grew: false, mappedWithContent: mappedWithContent)
+                maximizeRoundResults.append(false)
+                maximizeRoundsCompleted += 1
+                if geometryRounds > 1 {
+                    print("[maximize] round \(maximizeRoundsCompleted)/\(geometryRounds) FAILED; remaining rounds skipped")
+                }
                 print("[maximize] windowId=\(windowId) FAILED to reach >= \(Int(SizeBand.maximizedWidthFloor)) remote px width within 5s "
                     + "(got \(grown?.1 ?? (snap == nil ? "no snapshot" : "no frozen session topology to convert pt into remote px")))")
                 // Still exercise the close leg (task item 5c) even after a maximize
@@ -4209,12 +4242,24 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             if let restored, SizeBand.isRestoredWidth(restored.0) {
                 restoreResult = true
                 print("[maximize] windowId=\(windowId) restored to \(restored.1)")
-                session.sendSysCommand(windowId, command: SC.close)
-                print("[maximize] sent SC_CLOSE to windowId=\(windowId)")
-                maximizeCloseTargetId = windowId
-                maximizePhase = .awaitingClose(windowId: windowId, sentAt: Date())
+                maximizeRoundResults.append(maximizeResult?.grew == true)
+                maximizeRoundsCompleted += 1
+                if GeometryRounds.next(completedRounds: maximizeRoundsCompleted, total: geometryRounds) == .again {
+                    print("[maximize] round \(maximizeRoundsCompleted)/\(geometryRounds) done; next round after a \(geometryRoundGap)s gap")
+                    maximizePhase = .awaitingNextRound(windowId: windowId, roundEndedAt: Date())
+                } else {
+                    session.sendSysCommand(windowId, command: SC.close)
+                    print("[maximize] sent SC_CLOSE to windowId=\(windowId)")
+                    maximizeCloseTargetId = windowId
+                    maximizePhase = .awaitingClose(windowId: windowId, sentAt: Date())
+                }
             } else if Date().timeIntervalSince(sentAt) >= Self.maximizePollTimeout {
                 restoreResult = false
+                maximizeRoundResults.append(false)
+                maximizeRoundsCompleted += 1
+                if geometryRounds > 1 {
+                    print("[maximize] round \(maximizeRoundsCompleted)/\(geometryRounds) FAILED at restore; remaining rounds skipped")
+                }
                 print("[maximize] windowId=\(windowId) FAILED to restore below \(Int(SizeBand.restoredWidthCeiling)) remote px width within 5s "
                     + "(got \(restored?.1 ?? (snap == nil ? "no snapshot" : "no frozen session topology to convert pt into remote px")))")
                 session.sendSysCommand(windowId, command: SC.close)
@@ -4222,6 +4267,21 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 maximizeCloseTargetId = windowId
                 maximizePhase = .awaitingClose(windowId: windowId, sentAt: Date())
             }
+
+        case .awaitingNextRound(let windowId, let roundEndedAt):
+            // Geometry rounds: wait the gap, then run maximize -> restore again on the same target.
+            guard Date().timeIntervalSince(roundEndedAt) >= geometryRoundGap else { return }
+            guard registry.windowSnapshots().contains(where: { $0.windowId == windowId && $0.isVisible }) else {
+                // The target vanished between rounds (this scenario's own close leg has not been sent
+                // yet) -- nothing left to drive. `finish()` reports the rounds that did complete against
+                // the configured count and reds the shortfall.
+                print("[maximize] round \(maximizeRoundsCompleted + 1)/\(geometryRounds) NOT started: windowId=\(windowId) is no longer visible")
+                maximizePhase = .done
+                return
+            }
+            session.sendSysCommand(windowId, command: SC.maximize)
+            print("[maximize] round \(maximizeRoundsCompleted + 1)/\(geometryRounds): sent SC_MAXIMIZE to windowId=\(windowId)")
+            maximizePhase = .awaitingMaximize(windowId: windowId, sentAt: Date())
 
         case .awaitingClose(_, let sentAt):
             // maximizeCloseWindowDeletedAt is set by drainNow()'s own windowDelete
@@ -4294,6 +4354,81 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// server's prerogative to change out from under a move, and a future feature that
     /// assumes "size only changes on an explicit resize request" would be building on an
     /// assumption this run's own evidence already contradicts.
+    /// One move leg on `window`: compute the bounded offset, `setFrame`, and enter `.awaitingMoveSettle`.
+    /// Shared by the first pass (target lock) and every later geometry round (`round` >= 2 re-arms the
+    /// same target from wherever it settled, so `MoveResizeGate.moveOffset` may flip direction and the
+    /// window walks back and forth instead of drifting off the desktop).
+    private func startMoveLeg(windowId: UInt32, window: NSWindow, title: String, round: Int, registry: RemoteWindowRegistry) {
+        // Team-lead review round 6: baseline for the move leg's own "did the mapped
+        // size change mid-leg" informational report -- see that report's own comment.
+        moveResizeOriginalMappedSize = registry.debugMappedSize(forWindowId: windowId)
+        let originalContent = window.contentRect(forFrameRect: window.frame)
+        // Team-lead review round 5 (2026-08-23, real-host run): +60 in Y (moving the
+        // window's titlebar TOWARD the top of the screen) was observed to run the native
+        // titlebar off the top of the visible screen/menu-bar area, which AppKit itself
+        // clamps back down -- the settle path then HONESTLY reported the clamped (not
+        // requested) position, which briefly looked like a server-side "Y never moved"
+        // bug but was actually this harness asking for something AppKit would never
+        // grant. -60 (down, away from the screen's top edge) avoids that specific
+        // failure mode for a window that starts anywhere reasonably below the very top
+        // of the screen.
+        // C r2 §5-6: keep the moved target inside the real desktop (F0's "the move never leaves
+        // the desktop" premise; the F run's `bottom > declaredH` test). Bounds = the session's
+        // frozen desktop union in pt, minus the primary screen's menu-bar inset at the top.
+        let offset: MoveResizeGate.MoveOffset
+        if let topology = displayTopology.sessionSnapshot {
+            let union = topology.unionBoundsInPoints
+            // Windows-space union -> AppKit bounds through the primary's height (review cm4-r1 B-1),
+            // menu-bar inset as a constant (B-2), no NSScreen read here.
+            let bounds = MoveResizeGate.appKitBounds(
+                unionX: union.x.inPoints, unionY: union.y.inPoints,
+                width: union.width.inPoints, height: union.height.inPoints,
+                primaryHeightInPoints: topology.flipAnchor.primaryHeightInPoints,
+                topInset: MoveResizeGate.menuBarInsetPoints
+            )
+            // The left border the send path deducts is 7 REMOTE PX (`RemoteWindowRegistry.
+            // measuredClientWindowMoveLeftBorder`, private there -- this is a second copy of the
+            // number, review cm4-r1 I-4); the bounds are in pt, so convert (I-3).
+            let leftBorderPt = 7 / topology.rasterScale
+            offset = MoveResizeGate.moveOffset(original: originalContent, within: bounds, leftBorder: leftBorderPt, margin: 20)
+            print("[move-resize] move offset (dx=\(Int(offset.dx)), dy=\(Int(offset.dy)))"
+                + (offset.flipped ? " FLIPPED from the default (+80,-60) to stay inside" : " (default)")
+                + " bounds=\(bounds) (AppKit pt; union flipped through primary height \(topology.flipAnchor.primaryHeightInPoints), "
+                + "menu-bar inset \(MoveResizeGate.menuBarInsetPoints)) margin=20pt leftBorder=\(leftBorderPt)pt original=\(originalContent)")
+            if !offset.fits {
+                print("[move-resize] WARNING: neither direction keeps the moved target inside the desktop by the "
+                    + "margin -- keeping the default; the F0 'no boundary crossing' premise does NOT hold for this run")
+            }
+        } else {
+            // No frozen topology: nothing to bound against, so the default goes out UNCHECKED --
+            // said so, not reported as a fit (review cm4-r1 I-7).
+            offset = MoveResizeGate.MoveOffset(dx: 80, dy: -60, flipped: false, fits: false)
+            print("[move-resize] move offset: default (+80,-60) UNCHECKED -- no frozen topology to bound against")
+        }
+        let targetContent = originalContent.offsetBy(dx: offset.dx, dy: offset.dy)
+        let targetFrame = window.frameRect(forContentRect: targetContent)
+        if round == 1 {
+            print("[move-resize] target locked: windowId=\(windowId) title=\"\(title)\" originalContent=\(originalContent) -> move target content=\(targetContent)")
+        } else {
+            print("[move-resize] round \(round)/\(geometryRounds): move leg re-armed on windowId=\(windowId) originalContent=\(originalContent) -> move target content=\(targetContent)")
+        }
+        moveResizeObservedContentRects.removeAll()
+        window.setFrame(targetFrame, display: true)
+        // Team-lead review round 5: assert against the ACTUAL post-setFrame content
+        // rect, not the requested one -- more honest regardless of direction chosen
+        // (AppKit is free to clamp/adjust ANY requested frame for reasons beyond just
+        // the top-of-screen case above, e.g. screen width, Spaces, multi-monitor
+        // arrangement), and this is what the real settle path (`RemoteWindow.
+        // handleLocalGeometryChanged` -> `settleLocalMove`) itself reports too -- comparing
+        // against anything else risks this harness grading AppKit's own clamping as a
+        // server round-trip failure.
+        let actualSettledContent = window.contentRect(forFrameRect: window.frame)
+        if actualSettledContent != targetContent {
+            print("[move-resize] NOTE: AppKit did not grant the exact requested content rect -- requested=\(targetContent) actual=\(actualSettledContent) (asserting against actual, per team-lead review round 5)")
+        }
+        moveResizePhase = .awaitingMoveSettle(windowId: windowId, target: actualSettledContent, sentAt: Date())
+    }
+
     private func runMoveResizeScenario(session: CRSession, registry: RemoteWindowRegistry) {
         guard moveResizeScenarioEnabled else { return }
 
@@ -4340,70 +4475,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             moveResizeWindowId = w.windowId
-            // Team-lead review round 6: baseline for the move leg's own "did the mapped
-            // size change mid-leg" informational report -- see that report's own comment.
-            moveResizeOriginalMappedSize = registry.debugMappedSize(forWindowId: w.windowId)
-            let originalContent = window.contentRect(forFrameRect: window.frame)
-            // Team-lead review round 5 (2026-08-23, real-host run): +60 in Y (moving the
-            // window's titlebar TOWARD the top of the screen) was observed to run the native
-            // titlebar off the top of the visible screen/menu-bar area, which AppKit itself
-            // clamps back down -- the settle path then HONESTLY reported the clamped (not
-            // requested) position, which briefly looked like a server-side "Y never moved"
-            // bug but was actually this harness asking for something AppKit would never
-            // grant. -60 (down, away from the screen's top edge) avoids that specific
-            // failure mode for a window that starts anywhere reasonably below the very top
-            // of the screen.
-            // C r2 §5-6: keep the moved target inside the real desktop (F0's "the move never leaves
-            // the desktop" premise; the F run's `bottom > declaredH` test). Bounds = the session's
-            // frozen desktop union in pt, minus the primary screen's menu-bar inset at the top.
-            let offset: MoveResizeGate.MoveOffset
-            if let topology = displayTopology.sessionSnapshot {
-                let union = topology.unionBoundsInPoints
-                // Windows-space union -> AppKit bounds through the primary's height (review cm4-r1 B-1),
-                // menu-bar inset as a constant (B-2), no NSScreen read here.
-                let bounds = MoveResizeGate.appKitBounds(
-                    unionX: union.x.inPoints, unionY: union.y.inPoints,
-                    width: union.width.inPoints, height: union.height.inPoints,
-                    primaryHeightInPoints: topology.flipAnchor.primaryHeightInPoints,
-                    topInset: MoveResizeGate.menuBarInsetPoints
-                )
-                // The left border the send path deducts is 7 REMOTE PX (`RemoteWindowRegistry.
-                // measuredClientWindowMoveLeftBorder`, private there -- this is a second copy of the
-                // number, review cm4-r1 I-4); the bounds are in pt, so convert (I-3).
-                let leftBorderPt = 7 / topology.rasterScale
-                offset = MoveResizeGate.moveOffset(original: originalContent, within: bounds, leftBorder: leftBorderPt, margin: 20)
-                print("[move-resize] move offset (dx=\(Int(offset.dx)), dy=\(Int(offset.dy)))"
-                    + (offset.flipped ? " FLIPPED from the default (+80,-60) to stay inside" : " (default)")
-                    + " bounds=\(bounds) (AppKit pt; union flipped through primary height \(topology.flipAnchor.primaryHeightInPoints), "
-                    + "menu-bar inset \(MoveResizeGate.menuBarInsetPoints)) margin=20pt leftBorder=\(leftBorderPt)pt original=\(originalContent)")
-                if !offset.fits {
-                    print("[move-resize] WARNING: neither direction keeps the moved target inside the desktop by the "
-                        + "margin -- keeping the default; the F0 'no boundary crossing' premise does NOT hold for this run")
-                }
-            } else {
-                // No frozen topology: nothing to bound against, so the default goes out UNCHECKED --
-                // said so, not reported as a fit (review cm4-r1 I-7).
-                offset = MoveResizeGate.MoveOffset(dx: 80, dy: -60, flipped: false, fits: false)
-                print("[move-resize] move offset: default (+80,-60) UNCHECKED -- no frozen topology to bound against")
-            }
-            let targetContent = originalContent.offsetBy(dx: offset.dx, dy: offset.dy)
-            let targetFrame = window.frameRect(forContentRect: targetContent)
-            print("[move-resize] target locked: windowId=\(w.windowId) title=\"\(w.title)\" originalContent=\(originalContent) -> move target content=\(targetContent)")
-            moveResizeObservedContentRects.removeAll()
-            window.setFrame(targetFrame, display: true)
-            // Team-lead review round 5: assert against the ACTUAL post-setFrame content
-            // rect, not the requested one -- more honest regardless of direction chosen
-            // (AppKit is free to clamp/adjust ANY requested frame for reasons beyond just
-            // the top-of-screen case above, e.g. screen width, Spaces, multi-monitor
-            // arrangement), and this is what the real settle path (`RemoteWindow.
-            // handleLocalGeometryChanged` -> `settleLocalMove`) itself reports too -- comparing
-            // against anything else risks this harness grading AppKit's own clamping as a
-            // server round-trip failure.
-            let actualSettledContent = window.contentRect(forFrameRect: window.frame)
-            if actualSettledContent != targetContent {
-                print("[move-resize] NOTE: AppKit did not grant the exact requested content rect -- requested=\(targetContent) actual=\(actualSettledContent) (asserting against actual, per team-lead review round 5)")
-            }
-            moveResizePhase = .awaitingMoveSettle(windowId: w.windowId, target: actualSettledContent, sentAt: Date())
+            startMoveLeg(windowId: w.windowId, window: window, title: w.title, round: 1, registry: registry)
 
         case .awaitingMoveSettle(let windowId, let target, let sentAt):
             // Team-lead review round 6: position-only match -- see evaluateMoveResizeLeg's
@@ -4444,12 +4516,14 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             let currentContent = window.contentRect(forFrameRect: window.frame)
             let resizeTargetContent = NSRect(
                 x: currentContent.origin.x, y: currentContent.origin.y,
-                width: currentContent.width + 100, height: currentContent.height
+                width: currentContent.width + GeometryRounds.resizeDelta(round: moveResizeRoundsCompleted + 1), height: currentContent.height
             )
             let resizeTargetFrame = window.frameRect(forContentRect: resizeTargetContent)
             moveResizeObservedContentRects.removeAll()
             window.setFrame(resizeTargetFrame, display: true)
-            print("[move-resize] resize leg sent (content-rect space): \(currentContent) -> \(resizeTargetContent)")
+            print("[move-resize] resize leg sent (content-rect space"
+                + (geometryRounds > 1 ? ", round \(moveResizeRoundsCompleted + 1)/\(geometryRounds), delta \(Int(GeometryRounds.resizeDelta(round: moveResizeRoundsCompleted + 1)))pt" : "")
+                + "): \(currentContent) -> \(resizeTargetContent)")
             // Team-lead review round 5: same "assert against actual, not requested" fix as
             // the move leg above -- a +100pt-wider request could in principle also get
             // clamped (e.g. against screen width) even though this specific run's failure
@@ -4469,6 +4543,13 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             resizeResult = outcome
             print("[move-resize] resize leg resolved: legPassed=\(outcome.passed) "
                 + "oscillation=\(outcome.oscillation.text) \(outcome.detail)")
+            moveResizeRoundResults.append((move: moveResult?.passed == true, resize: outcome.passed))
+            moveResizeRoundsCompleted += 1
+            if GeometryRounds.next(completedRounds: moveResizeRoundsCompleted, total: geometryRounds) == .again {
+                print("[move-resize] round \(moveResizeRoundsCompleted)/\(geometryRounds) done; next round after a \(geometryRoundGap)s gap")
+                moveResizePhase = .awaitingNextRound(windowId: windowId, roundEndedAt: Date())
+                return
+            }
             // Fix 2 (team-lead review): always attempt the close leg here, matching the
             // maximize scenario's own "still exercise the close leg even after an earlier
             // leg's failure" precedent -- cleanup shouldn't depend on the round-trip
@@ -4477,6 +4558,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             print("[move-resize] sent SC_CLOSE to windowId=\(windowId)")
             moveResizeCloseTargetId = windowId
             moveResizePhase = .awaitingClose(windowId: windowId, sentAt: Date())
+
+        case .awaitingNextRound(let windowId, let roundEndedAt):
+            // Geometry rounds: wait the gap, then re-arm the move leg from wherever the window settled.
+            guard Date().timeIntervalSince(roundEndedAt) >= geometryRoundGap else { return }
+            guard let window = registry.window(forWindowId: windowId) else {
+                print("[move-resize] round \(moveResizeRoundsCompleted + 1)/\(geometryRounds) NOT started: windowId=\(windowId) is gone")
+                moveResizePhase = .done
+                return
+            }
+            startMoveLeg(windowId: windowId, window: window, title: window.title, round: moveResizeRoundsCompleted + 1, registry: registry)
 
         case .awaitingClose(_, let sentAt):
             // moveResizeCloseWindowDeletedAt is set by drainNow()'s own windowDelete
@@ -6778,6 +6869,33 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 } else {
                     check(false, "move-resize scenario: the close leg was sent before the run ended")
                 }
+            }
+        }
+
+        // C second step (WINDOW_SMOKE_GEOMETRY_ROUNDS > 1): the rounds exist to enlarge the surface-map
+        // trigger surface, so the gate is "every configured round RAN" (plus, for maximize, passed --
+        // that leg has no known-difference red). The move/resize legs' RECT/POINT verdicts stay gated by
+        // the last round's assertions above (their F-R1 known difference is whitelisted there); earlier
+        // rounds' verdicts are reported in the summary line, not gated twice under new strings.
+        if geometryRounds > 1 {
+            let maximizeVerdict = GeometryRounds.verdict(perRound: maximizeRoundResults)
+            let moveVerdict = GeometryRounds.verdict(perRound: moveResizeRoundResults.map(\.move))
+            let resizeVerdict = GeometryRounds.verdict(perRound: moveResizeRoundResults.map(\.resize))
+            print("[geometry-rounds] configured=\(geometryRounds) gap=\(geometryRoundGap)s "
+                + "maximize: \(maximizeVerdict.text) move: \(moveVerdict.text) resize: \(resizeVerdict.text) "
+                + "surfaceMapEvents=\(gfxTargetHints.surfaceMapEventsSeen)")
+            if maximizeScenarioEnabled {
+                check(
+                    maximizeVerdict.passed && maximizeRoundResults.count == geometryRounds,
+                    "geometry rounds: all \(geometryRounds) maximize->restore rounds ran and passed (\(maximizeVerdict.text))"
+                )
+            }
+            if moveResizeScenarioEnabled {
+                check(
+                    moveResizeRoundResults.count == geometryRounds,
+                    "geometry rounds: all \(geometryRounds) move->resize rounds ran (completed \(moveResizeRoundResults.count)/\(geometryRounds); "
+                        + "per-round leg verdicts move: \(moveVerdict.text) resize: \(resizeVerdict.text) -- reported, gated by the last round's assertions above)"
+                )
             }
         }
 
