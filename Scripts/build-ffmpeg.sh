@@ -170,7 +170,13 @@ FFMPEG_CONFIGURE_FLAGS=(
 	--disable-avdevice
 	--disable-avformat
 	--disable-avfilter
-	--disable-swscale
+	# --enable-swscale (was --disable-swscale up to the 3.30.0 pin): FreeRDP >= 3.31.0
+	# libfreerdp/codec/h264_ffmpeg.c includes libswscale/swscale.h and calls sws_getContext /
+	# sws_scale_frame unconditionally when WITH_FFMPEG (upstream b1e878a, "support more
+	# hardware decoders"), so the H264 decoder no longer links without it. libswscale is
+	# LGPL-2.1-or-later like the rest of this build; the --disable-gpl strings check below
+	# still governs.
+	--enable-swscale
 	--enable-decoder=h264
 	--enable-parser=h264
 	--enable-videotoolbox
@@ -262,7 +268,7 @@ log "  flags: ${FFMPEG_CONFIGURE_FLAGS[*]}"
 STAGED_PREFIX="$STAGING_ROOT$FFMPEG_PREFIX_PLACEHOLDER"
 [ -d "$STAGED_PREFIX/lib" ] || die "staged install is missing $STAGED_PREFIX/lib — 'make install' did not produce the expected layout"
 
-EXPECTED_COMPONENTS=(avcodec avutil swresample)
+EXPECTED_COMPONENTS=(avcodec avutil swresample swscale)
 for comp in "${EXPECTED_COMPONENTS[@]}"; do
 	find "$STAGED_PREFIX/lib" -maxdepth 1 -name "lib${comp}.*.dylib" -print -quit | grep -c . >/dev/null \
 		|| die "expected lib${comp} dylib not found under $STAGED_PREFIX/lib"
@@ -273,11 +279,11 @@ done
 # component it finds, so it would silently re-widen the link line.
 UNEXPECTED_LIBS="$(find "$STAGED_PREFIX/lib" -maxdepth 1 -name '*.dylib' -type f -exec basename {} \; \
 	| sed -E 's/\.[0-9].*$//' | sort -u \
-	| grep -vE '^lib(avcodec|avutil|swresample)$' || true)"
+	| grep -vE '^lib(avcodec|avutil|swresample|swscale)$' || true)"
 if [ -n "$UNEXPECTED_LIBS" ]; then
 	log "Unexpected libraries in the staged install:"
 	printf '%s\n' "$UNEXPECTED_LIBS" >&2
-	die "build produced ffmpeg components beyond avcodec/avutil/swresample — a --disable-* flag is not taking effect (nothing was promoted to $CRDP_FFMPEG_PREFIX)"
+	die "build produced ffmpeg components beyond avcodec/avutil/swresample/swscale — a --disable-* flag is not taking effect (nothing was promoted to $CRDP_FFMPEG_PREFIX)"
 fi
 
 # Relocatability guard, same rule Scripts/gen-notices.sh enforces on the finished bundle,

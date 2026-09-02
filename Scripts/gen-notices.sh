@@ -104,11 +104,12 @@ printf '%s\n' "${ALL_DEPS[@]}" | grep -c 'libfreerdp\|libwinpr' >/dev/null && DE
 printf '%s\n' "${ALL_DEPS[@]}" | grep -c '/usr/lib/libz\.' >/dev/null && DETECTED+=("zlib")
 
 # FFmpeg (adr/0007 H264 decode; Phase 2 W8). Unlike OpenSSL this is dynamically linked and
-# redistributed, so it is detectable straight from the load commands. All three components
+# redistributed, so it is detectable straight from the load commands. All four components
 # are checked because LGPL-2.1 §6 compliance is about what we *ship*: libavcodec carries
-# its own LC_LOAD_DYLIB on libswresample, so an app missing any one of the three is both
-# broken at load time and incompletely documented.
-FFMPEG_COMPONENTS=(avcodec avutil swresample)
+# its own LC_LOAD_DYLIB on libswresample, and libfreerdp3 (>= 3.31, h264_ffmpeg.c) links
+# libswscale directly, so an app missing any one of the four is both broken at load time
+# and incompletely documented.
+FFMPEG_COMPONENTS=(avcodec avutil swresample swscale)
 FFMPEG_LINKED=0
 for comp in "${FFMPEG_COMPONENTS[@]}"; do
 	if printf '%s\n' "${ALL_DEPS[@]}" | grep -c "lib${comp}\." >/dev/null; then

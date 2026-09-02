@@ -2,19 +2,10 @@
   "$schema_note": "Not a real JSON Schema — documents the fields this file is expected to carry. See adr/0006 §2/§3.",
   "component": "FreeRDP",
   "submodule_path": "ThirdParty/FreeRDP",
-  "tag": "3.30.0",
-  "commit": "6b107f0aadbabc47941c5a5b893b88c01792af6d",
+  "tag": "3.31.1",
+  "commit": "63b948ca5cb94307fd5444ee6e73927a41ccdab4",
   "upstream_url": "https://github.com/FreeRDP/FreeRDP.git",
-  "patches": [
-    {
-      "file": "0001-core-capabilities-apply-input-caps-from-src.patch",
-      "target": "libfreerdp/core/capabilities.c",
-      "summary": "rdp_apply_input_capability_set() reads FreeRDP_UnicodeInput (:1414) and FreeRDP_HasQoeEvent (:1423) back out of the destination `settings` instead of the parsed server answer `src`, making both assignments self-assignments that discard the server's Input Capability Set answer. One token per hunk; provenance in adr/0011 §7.",
-      "upstream": "https://github.com/FreeRDP/FreeRDP/pull/13287",
-      "upstream_status": "Both hunks are fixed in upstream master (hunk 1 via PR #13287, hunk 2 via this project's PR #13313), neither in a release yet. Dates, SHAs and compare figures live in the patch header — deliberately not duplicated here, so they cannot rot behind it.",
-      "retire_when": "Per hunk; the conditions and the mechanism that announces them (a pin bump replays the queue and `git apply` fails hard once upstream absorbs a hunk) are stated in the patch header."
-    }
-  ],
+  "patches": [],
   "_patches_note": "Inventory and rationale only — ThirdParty/patches/*.patch is the authoritative queue. Scripts/build-freerdp.sh discovers patches by globbing that directory (never from this field) and folds their file *contents* into the config hash, and Scripts/gen-notices.sh derives the SBOM's pedigree.patches from the same directory, so nothing mechanical reads this block and it cannot drift the build. It exists because this lock is the reviewable pin record: a reader must be able to see from here alone that the pinned checkout is not built verbatim. Per-hunk detail (defect, provenance, upstream status, retirement condition) lives in each patch file's own header; the queue's rules live in ThirdParty/patches/README.md.",
   "deployment_target": "14.0",
   "_deployment_target_note": "Single source for the minimum macOS version this repo targets. Scripts/build-openssl.sh reads this for -mmacosx-version-min; Scripts/build-freerdp.sh substitutes it into the -DCMAKE_OSX_DEPLOYMENT_TARGET flag below (the literal '14.0' in cmake_config.flags is a fallback/documentation value only — the running script always overrides it from this field, so the two can never drift silently).",
@@ -54,7 +45,7 @@
       "-DWITH_SWSCALE=OFF",
       "-DWITH_DSP_FFMPEG=OFF",
       "-DFFMPEG_INCLUDE_DIRS=<computed: .build/deps/ffmpeg-prefix/include>",
-      "-DFFMPEG_LIBRARIES=<computed: .build/deps/ffmpeg-prefix/lib/libavcodec.dylib;libavutil.dylib;libswresample.dylib>",
+      "-DFFMPEG_LIBRARIES=<computed: .build/deps/ffmpeg-prefix/lib/libavcodec.dylib;libavutil.dylib;libswresample.dylib;libswscale.dylib>",
       "-DAVCODEC_INCLUDE_DIRS=<computed: .build/deps/ffmpeg-prefix/include>",
       "-DAVCODEC_LIBRARIES=<computed: .build/deps/ffmpeg-prefix/lib/libavcodec.dylib>",
       "-DAVUTIL_INCLUDE_DIRS=<computed: .build/deps/ffmpeg-prefix/include>",
@@ -75,7 +66,7 @@
   "ffmpeg": {
     "_note": "Source-of-truth for the H264-decode ffmpeg dependency (adr/0007). Self-built and version-pinned by Scripts/build-ffmpeg.sh, exactly like .openssl below -- Phase 2 W8 replaced the Homebrew local-dev source this block used to describe. Located by FreeRDP's find_package(FFmpeg) (ThirdParty/FreeRDP/cmake/FindFFmpeg.cmake), which shells out to pkg-config; Scripts/build-freerdp.sh points PKG_CONFIG_LIBDIR at the self-built prefix so only these components can ever be found.",
     "version": "9.0.1",
-    "series": "9.0 (libavcodec major 63, libavutil major 61, libswresample major 7)",
+    "series": "9.0 (libavcodec major 63, libavutil major 61, libswresample major 7, libswscale major 10)",
     "tarball": "ffmpeg-9.0.1.tar.xz",
     "source_url": "https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz",
     "sha256": "cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635",
@@ -96,7 +87,7 @@
       "--disable-avdevice",
       "--disable-avformat",
       "--disable-avfilter",
-      "--disable-swscale",
+      "--enable-swscale",
       "--enable-decoder=h264",
       "--enable-parser=h264",
       "--enable-videotoolbox",
@@ -125,11 +116,20 @@
     "link_mode": "dynamic only -- LGPL §6 (adr/0007 decision; static linking is prohibited). --install-name-dir=@rpath gives every produced dylib an @rpath install name, so the app bundle's LD_RUNPATH_SEARCH_PATHS=@executable_path/../Frameworks resolves them with no install_name_tool rewriting (same treatment as the FreeRDP dylibs). Verify per-build with `otool -L` on the installed libfreerdp3 dylib -- Scripts/gen-notices.sh fails the release if any non-@rpath/non-system path appears.",
     "relink_instructions": "LGPL_RELINK.md (repository root) -- the LGPL-2.1 §6 obligation to let a user substitute their own modified FFmpeg build. Shipped inside the app at Contents/Resources/LGPL_RELINK.md, because the obligation attaches to the distributed copy rather than to this repository.",
     "license_text": "ThirdParty/licenses/LICENSE-FFmpeg-LGPL-2.1.txt -- byte-identical copy of COPYING.LGPLv2.1 from the pinned tarball, shipped at Contents/Resources/licenses/LICENSE-FFmpeg-LGPL-2.1.txt (LGPL-2.1 §1 requires the licence to accompany the binary). Scripts/gen-notices.sh fails the release if it is missing from the bundle or has drifted from the tracked copy.",
-    "components_produced": ["avcodec", "avutil", "swresample"],
-    "components_linked": ["avcodec", "avutil", "swresample"],
+    "components_produced": [
+      "avcodec",
+      "avutil",
+      "swresample"
+    ],
+    "components_linked": [
+      "avcodec",
+      "avutil",
+      "swresample"
+    ],
     "_components_note": "FindFFmpeg.cmake links every component it *finds*, so the minimal link line is self-enforced by the prefix containing only these three -- no upstream patch needed. Before W8 the Homebrew prefix caused libavdevice/libavformat/libavfilter/libswscale to be linked as well, despite libfreerdp3 referencing zero symbols from any of them (only av_*/avcodec_* are used, from libavcodec/avcodec.h + libavutil/opt.h + libavutil/hwcontext.h in h264_ffmpeg.c).",
     "hwaccel": "VideoToolbox via WITH_VIDEOTOOLBOX (ThirdParty/FreeRDP/libfreerdp/codec/h264_ffmpeg.c) -- software decode is ffmpeg's fallback path when VT hwaccel init fails at runtime, not a separate build config. The ffmpeg build enables --enable-videotoolbox plus the h264_videotoolbox hwaccel specifically.",
-    "toggle": "Scripts/build-freerdp.sh CRDP_WITH_FFMPEG env var, default 1 (ON). CRDP_WITH_FFMPEG=0 forces WITH_FFMPEG/WITH_VIDEO_FFMPEG/WITH_VIDEOTOOLBOX back to OFF at configure time (matching this repo's pre-AVC-flip config) without editing this lock or its committed flags, and skips the self-built-ffmpeg prerequisite check entirely -- see the script for how this folds into the config hash so the two toggle states get distinct build-cache dirs."
+    "toggle": "Scripts/build-freerdp.sh CRDP_WITH_FFMPEG env var, default 1 (ON). CRDP_WITH_FFMPEG=0 forces WITH_FFMPEG/WITH_VIDEO_FFMPEG/WITH_VIDEOTOOLBOX back to OFF at configure time (matching this repo's pre-AVC-flip config) without editing this lock or its committed flags, and skips the self-built-ffmpeg prerequisite check entirely -- see the script for how this folds into the config hash so the two toggle states get distinct build-cache dirs.",
+    "_swscale_note": "Enabled on the 3.31.1 pin bump (2026-09-02): FreeRDP >= 3.31.0 libfreerdp/codec/h264_ffmpeg.c includes libswscale/swscale.h and calls sws_* unconditionally under WITH_FFMPEG (upstream commit b1e878a45, in 3.31.0), so the H264 decode path does not build against an FFmpeg without libswscale. LGPL-2.1-or-later like the other components; the --disable-gpl check in Scripts/build-ffmpeg.sh is unchanged."
   },
   "openssl": {
     "version": "3.5.7",
@@ -138,9 +138,24 @@
     "source_url": "https://github.com/openssl/openssl/releases/download/openssl-3.5.7/openssl-3.5.7.tar.gz",
     "sha256": "a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8",
     "configure_target": "darwin64-arm64-cc",
-    "configure_flags": ["no-shared", "no-module"],
+    "configure_flags": [
+      "no-shared",
+      "no-module"
+    ],
     "corrections_applied": [
       "no-module added (W4a) — the legacy provider (needed for MD4; classic NTLM's NT-hash step, which NTLMv2 responses still depend on) was building as a separately loadable providers/legacy.dylib, discovered at runtime via a MODULESDIR baked into libcrypto at compile time from --prefix. --prefix here is a placeholder path (Scripts/build-openssl.sh's OPENSSL_PREFIX_PLACEHOLDER, deliberate per an earlier W1 fix that keeps $HOME out of compiled-in constants of a shipped binary) that gets relocated after the build, so the baked-in MODULESDIR never matched where the module file actually ended up, and OSSL_PROVIDER_load(NULL, \"legacy\") silently failed to find it at runtime. Concretely: real-host NLA/CredSSP authentication failed end to end with SEC_E_NO_CREDENTIALS, for the App target and any tool linking this build alike, discovered and root-caused while verifying W4a's CRBridge/CRSession real connection against a real host (root-caused in the project status log). `no-module` (with `legacy` left at its own default-enabled state — see providers/build.info's STATIC_LEGACY branch) makes OpenSSL compile the legacy provider's object files directly into libcrypto instead of a separate module; OSSL_PROVIDER_load then resolves it from an in-process built-in-provider table, never touching the filesystem, so the placeholder-prefix relocation can no longer break it. Side effect: .build/deps/prefix/lib/ossl-modules/ still exists as a directory (OpenSSL's `make install` creates it unconditionally) but is empty post-fix — legacy.dylib (and default.dylib, itself always built-in even before this change) never get written there — this also closes, by construction, a distribution-readiness gap that would otherwise have needed separate handling (the App target's Copy Files phase never embedded ossl-modules/*.dylib into the app bundle, so a genuinely shipped/distributed build would have hit this exact same failure on another machine; with the provider built directly into libcrypto, there is no module file that ever needed embedding)."
     ]
-  }
+  },
+  "retired_patches": [
+    {
+      "file": "0001-core-capabilities-apply-input-caps-from-src.patch",
+      "target": "libfreerdp/core/capabilities.c",
+      "upstream": "https://github.com/FreeRDP/FreeRDP/pull/13287",
+      "absorbed_in": "3.31.1 (63b948ca5cb94307fd5444ee6e73927a41ccdab4)",
+      "verification": "git apply --check against the 3.31.1 tree fails at libfreerdp/core/capabilities.c:1411 (both hunks already present upstream: :1414 and :1423 read `src`; hunk 1 via PR #13287 / 21cd3d6, hunk 2 via PR #13313 / 7447382). Verified 2026-09-02 in a temporary detached worktree of the submodule.",
+      "retired_on": "2026-09-02",
+      "summary_when_active": "rdp_apply_input_capability_set() reads FreeRDP_UnicodeInput (:1414) and FreeRDP_HasQoeEvent (:1423) back out of the destination `settings` instead of the parsed server answer `src`, making both assignments self-assignments that discard the server's Input Capability Set answer. One token per hunk; provenance in adr/0011 §7."
+    }
+  ],
+  "_retired_patches_note": "Retired patches stay listed here (not in ThirdParty/patches/, which is the live queue the build globs) so a reader can see which local deltas this project once carried and which upstream release absorbed them. Nothing mechanical reads this block."
 }

@@ -107,7 +107,7 @@ just keep `--enable-shared`, `--install-name-dir=@rpath`, and the same major ver
   --disable-avdevice \
   --disable-avformat \
   --disable-avfilter \
-  --disable-swscale \
+  --enable-swscale \
   --enable-decoder=h264 \
   --enable-parser=h264 \
   --enable-videotoolbox \

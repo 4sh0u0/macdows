@@ -235,12 +235,14 @@ while IFS= read -r flag; do
 	# See deps/freerdp.lock's matching corrections_applied entry for the full why; the
 	# short version is that the module links every component it *finds*, its find_library
 	# fallback reaches Homebrew's prefix on a brew-installed CMake, and it skips its entire
-	# discovery block when FFMPEG_LIBRARIES is already set. Seeding exactly the three
-	# components we build is what keeps libavformat/libavfilter/libavdevice/libswscale out
-	# of libfreerdp3's link line no matter what happens to be installed on the machine.
+	# discovery block when FFMPEG_LIBRARIES is already set. Seeding exactly the four
+	# components we build (avcodec, avutil, swresample, and -- since the 3.31.1 pin --
+	# swscale, which h264_ffmpeg.c calls unconditionally from 3.31.0 on) is what keeps
+	# libavformat/libavfilter/libavdevice out of libfreerdp3's link line no matter what
+	# happens to be installed on the machine.
 	-DFFMPEG_INCLUDE_DIRS=*) flag="-DFFMPEG_INCLUDE_DIRS=$CRDP_FFMPEG_PREFIX/include" ;;
 	-DFFMPEG_LIBRARIES=*)
-		flag="-DFFMPEG_LIBRARIES=$CRDP_FFMPEG_PREFIX/lib/libavcodec.dylib;$CRDP_FFMPEG_PREFIX/lib/libavutil.dylib;$CRDP_FFMPEG_PREFIX/lib/libswresample.dylib"
+		flag="-DFFMPEG_LIBRARIES=$CRDP_FFMPEG_PREFIX/lib/libavcodec.dylib;$CRDP_FFMPEG_PREFIX/lib/libavutil.dylib;$CRDP_FFMPEG_PREFIX/lib/libswresample.dylib;$CRDP_FFMPEG_PREFIX/lib/libswscale.dylib"
 		;;
 	-DAVCODEC_INCLUDE_DIRS=*) flag="-DAVCODEC_INCLUDE_DIRS=$CRDP_FFMPEG_PREFIX/include" ;;
 	-DAVCODEC_LIBRARIES=*) flag="-DAVCODEC_LIBRARIES=$CRDP_FFMPEG_PREFIX/lib/libavcodec.dylib" ;;

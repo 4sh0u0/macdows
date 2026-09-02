@@ -93,21 +93,23 @@ targets:
           copyFiles:
             destination: frameworks
             codeSignOnCopy: true
-      # W8: the three FFmpeg dylibs libfreerdp3 links for H264/AVC decode (adr/0007).
+      # W8: the four FFmpeg dylibs libfreerdp3 links for H264/AVC decode (adr/0007; the
+      # fourth, libswscale, since the FreeRDP 3.31.1 pin -- h264_ffmpeg.c calls sws_* from
+      # 3.31.0 on).
       # Same SONAME-symlink rule as the FreeRDP entries above — `libavcodec.63.dylib` is
       # the literal `@rpath/...` load command baked into libfreerdp3, and it is one hop to
       # the real `libavcodec.63.1.101.dylib`, which Xcode's Copy Files phase dereferences
       # into real bytes under the symlink's own name. So these need editing on an FFmpeg
       # *major* (SONAME) bump only, not on 9.0.1 -> 9.0.2.
       #
-      # All three are mandatory, not a menu: libavcodec carries its own LC_LOAD_DYLIB on
-      # libswresample (FreeRDP itself calls no swr_* symbol), so shipping two of the three
-      # produces an app that fails to load. Scripts/gen-notices.sh asserts all three are
-      # present rather than trusting this list.
+      # All four are mandatory, not a menu: libavcodec carries its own LC_LOAD_DYLIB on
+      # libswresample (FreeRDP itself calls no swr_* symbol) and libfreerdp3 links
+      # libswscale directly, so shipping a subset produces an app that fails to load.
+      # Scripts/gen-notices.sh asserts all four are present rather than trusting this list.
       #
       # Embedding rather than static-linking is also the LGPL-2.1 §6 obligation, not just a
       # packaging preference — see LGPL_RELINK.md, which tells users how to swap exactly
-      # these three files for their own build.
+      # these four files for their own build.
       - path: ../.build/deps/ffmpeg-prefix/lib/libavcodec.63.dylib
         optional: true
         buildPhase:
@@ -121,6 +123,12 @@ targets:
             destination: frameworks
             codeSignOnCopy: true
       - path: ../.build/deps/ffmpeg-prefix/lib/libswresample.7.dylib
+        optional: true
+        buildPhase:
+          copyFiles:
+            destination: frameworks
+            codeSignOnCopy: true
+      - path: ../.build/deps/ffmpeg-prefix/lib/libswscale.10.dylib
         optional: true
         buildPhase:
           copyFiles:
