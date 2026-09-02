@@ -138,8 +138,18 @@ enum MoveResizeGate {
     /// trivially (a false RECT/POINT PASS, and the server's real reply then read as "oscillation";
     /// C r1 :137 vs :139). Pure so the self-test can pin the ordering.
     static func observationCountsForLeg(observedAt: TimeInterval, legLockedAt: TimeInterval, lastSentAt: TimeInterval?) -> Bool {
-        guard let sent = lastSentAt, sent >= legLockedAt else { return false }
-        return observedAt >= sent
+        observationRejection(observedAt: observedAt, legLockedAt: legLockedAt, lastSentAt: lastSentAt) == nil
+    }
+
+    /// Why an observation does NOT count, or nil when it does -- one reason per branch so the
+    /// "NOT counted" log line says which (review c-fixture-r1 m-5: three causes shared one
+    /// sentence, and the update site prints for the closed/done target too).
+    static func observationRejection(observedAt: TimeInterval, legLockedAt: TimeInterval, lastSentAt: TimeInterval?) -> String? {
+        if legLockedAt == .infinity { return "no move/resize leg is in flight" }
+        guard let sent = lastSentAt else { return "no ClientWindowMove has been sent yet" }
+        if sent < legLockedAt { return "the last ClientWindowMove predates this leg's lock" }
+        if observedAt < sent { return "it predates this leg's ClientWindowMove" }
+        return nil
     }
 
     /// One leg's paired verdict (adr/0015 §6.3): a RECT comparison and the single-POINT reverse
@@ -686,10 +696,13 @@ enum SizeBand {
 ///  * **the post-send observation gate** counting an observation that predates this leg's
 ///    ClientWindowMove, accepting a send that predates the leg's lock (the previous leg's), or
 ///    counting with no send at all => `moveResizeObservationCountsOnlyAfterTheLegsOwnSend`.
-///    **Not covered here** (live wiring, no offline seam): either sampling site (update / remap)
-///    not calling it, passing a lock time other than the phase's, or a send time other than
-///    `lastClientWindowMoveSent` -- the next C run's move leg is the live check (its observation
-///    #1 must now print "NOT counted").
+///    The rejection reason naming the wrong branch, or not being nil when the observation counts
+///    => `moveResizeObservationRejectionNamesTheCause`. **Not covered here** (live wiring, no
+///    offline seam): either sampling site (update / remap) not calling it, passing a lock time other
+///    than the phase's, or a send time other than `lastClientWindowMoveSent`; the update site's
+///    `?? .infinity` bound (load-bearing there -- that site has no in-flight precondition; review
+///    c-fixture-r1 M-G measured `?? 0` surviving) -- the next C run's move leg is the live check
+///    (its observation #1 must now print "NOT counted").
 ///  * **the focus-rotation gates** picking a deleted member, picking from an empty live set, voiding
 ///    a pending rotation on another window's deletion, or deciding the pending outcome by anything
 ///    but the clock => `focusRotationNextTargetSkipsDeletedMembers` /
@@ -1168,8 +1181,21 @@ enum WindowSmokeGateSelfTest {
                 // a send that predates THIS leg's lock is the previous leg's send, not ours
                 && !MoveResizeGate.observationCountsForLeg(observedAt: 6.95, legLockedAt: 6.90, lastSentAt: 6.638)
                 // no send at all (resize r1's "the leg ran but never sent") -> nothing counts
-                && !MoveResizeGate.observationCountsForLeg(observedAt: 9.0, legLockedAt: 6.90, lastSentAt: nil),
+                && !MoveResizeGate.observationCountsForLeg(observedAt: 9.0, legLockedAt: 6.90, lastSentAt: nil)
+                // a send at the very lock instant is this leg's (review c-fixture-r1 m-3 / M-H)
+                && MoveResizeGate.observationCountsForLeg(observedAt: 6.90, legLockedAt: 6.90, lastSentAt: 6.90)
+                // no leg in flight (the sites pass .infinity) -> nothing counts, whatever was sent
+                && !MoveResizeGate.observationCountsForLeg(observedAt: 9.0, legLockedAt: .infinity, lastSentAt: 6.638),
             "moveResizeObservationCountsOnlyAfterTheLegsOwnSend: an observation counts for a leg only when a ClientWindowMove was sent at/after the leg's lock and the observation is at/after that send"
+        )
+        // the rejection reason names the branch (one per cause), and is nil exactly when it counts
+        expect(
+            MoveResizeGate.observationRejection(observedAt: 6.697, legLockedAt: 6.40, lastSentAt: 6.638) == nil
+                && MoveResizeGate.observationRejection(observedAt: 9.0, legLockedAt: .infinity, lastSentAt: 6.638) == "no move/resize leg is in flight"
+                && MoveResizeGate.observationRejection(observedAt: 9.0, legLockedAt: 6.90, lastSentAt: nil) == "no ClientWindowMove has been sent yet"
+                && MoveResizeGate.observationRejection(observedAt: 6.95, legLockedAt: 6.90, lastSentAt: 6.638) == "the last ClientWindowMove predates this leg's lock"
+                && MoveResizeGate.observationRejection(observedAt: 6.450, legLockedAt: 6.40, lastSentAt: 6.638) == "it predates this leg's ClientWindowMove",
+            "moveResizeObservationRejectionNamesTheCause: nil when the observation counts; otherwise one of four distinct reasons (no leg / no send / stale send / too early)"
         )
 
         // --- focus rotation skips deleted members and never picks from an empty set --------------
@@ -1188,7 +1214,9 @@ enum WindowSmokeGateSelfTest {
         expect(
             FocusRotationGate.pendingIsVoided(byDeletedWindowId: 144835106, pendingTargetId: 144835106)
                 && !FocusRotationGate.pendingIsVoided(byDeletedWindowId: 263232, pendingTargetId: 144835106)
-                && !FocusRotationGate.pendingIsVoided(byDeletedWindowId: 144835106, pendingTargetId: nil),
+                && !FocusRotationGate.pendingIsVoided(byDeletedWindowId: 144835106, pendingTargetId: nil)
+                // windowId 0 vs nothing pending: `deleted == (pending ?? 0)` must not sneak through (r1 m-4 / M-E)
+                && !FocusRotationGate.pendingIsVoided(byDeletedWindowId: 0, pendingTargetId: nil),
             "focusRotationPendingIsVoidedOnlyByItsOwnTargetsDeletion: deleting the in-flight target voids the rotation; deleting any other window, or with nothing in flight, does not"
         )
 
@@ -2071,6 +2099,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private var focusRotationsIssued = 0
     /// Rotations dropped because their target was deleted before converging (C-H1a); not misses.
     private var focusRotationsVoided = 0
+    /// Set when the rotation ended because no live member was left (every member deleted) -- a
+    /// fixture-population outcome, printed into the "ran all N rotations" verdict so it can never
+    /// read as a server stall (review c-fixture-r1 I-2).
+    private var focusRotationEndedNoLiveMember = false
     /// Every windowId whose WindowDelete the drain has seen -- the focus rotation skips these.
     private var deletedWindowIds: Set<UInt32> = []
     private var focusRotationPendingTargetId: UInt32?
@@ -2888,6 +2920,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 self.deletedWindowIds.insert(event.windowId)
                 // C-H1a: a rotation whose target vanished can never converge; void it (not a miss
                 // -- the fixture activated a window that no longer existed) so the next can go out.
+                // Settle anything already due first (a hit or a timeout that landed in this same
+                // batch must be recorded, not voided -- review c-fixture-r1 m-1), then void.
+                self.pollFocusRotationPending(registry: registry)
                 if FocusRotationGate.pendingIsVoided(byDeletedWindowId: event.windowId, pendingTargetId: self.focusRotationPendingTargetId) {
                     self.focusRotationsVoided += 1
                     print("[focus-rotation] pending target windowId=\(event.windowId) was deleted before convergence; "
@@ -3003,14 +3038,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 )
                 let contentRect = window.contentRect(forFrameRect: window.frame)
                 let observedAt = self.startTime.map { Date().timeIntervalSince($0) } ?? -1
-                if MoveResizeGate.observationCountsForLeg(
+                // `?? .infinity` = no leg in flight => nothing counts. This bound is load-bearing HERE
+                // (the update site has no in-flight precondition of its own; review c-fixture-r1 M-G).
+                if let rejection = MoveResizeGate.observationRejection(
                     observedAt: observedAt, legLockedAt: self.moveResizeLegLockedAtElapsed ?? .infinity,
                     lastSentAt: self.lastClientWindowMoveSentElapsed
                 ) {
-                    self.moveResizeObservedContentRects.append((contentRect: contentRect, at: observedAt, source: "update"))
-                } else {
                     print("[move-resize] update at elapsed=\(String(format: "%.3f", observedAt))s for windowId=\(target) "
-                        + "NOT counted as an observation: it predates this leg's ClientWindowMove (C-H2)")
+                        + "NOT counted as an observation: \(rejection) (C-H2)")
+                } else {
+                    self.moveResizeObservedContentRects.append((contentRect: contentRect, at: observedAt, source: "update"))
                 }
             }
             // F0-2 (2026-09-02): the surface remap's frame re-apply is the SECOND state the local
@@ -3026,14 +3063,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             {
                 let contentRect = window.contentRect(forFrameRect: window.frame)
                 let elapsed = self.startTime.map { Date().timeIntervalSince($0) } ?? -1
-                let counts = MoveResizeGate.observationCountsForLeg(
+                // `remapObservationApplies` above already requires a leg in flight, so the
+                // `?? .infinity` bound here is unreachable (review c-fixture-r1 M-F, equivalent).
+                let rejection = MoveResizeGate.observationRejection(
                     observedAt: elapsed, legLockedAt: self.moveResizeLegLockedAtElapsed ?? .infinity,
                     lastSentAt: self.lastClientWindowMoveSentElapsed
                 )
                 print("[move-resize] surface remap at elapsed=\(String(format: "%.3f", elapsed))s for windowId=\(target): "
                     + "mapped=\(event.mappedWidth)x\(event.mappedHeight) -> content rect now \(contentRect) "
-                    + (counts ? "(observation source=remap)" : "(NOT counted as an observation: it predates this leg's ClientWindowMove, C-H2)"))
-                if counts {
+                    + (rejection.map { "(NOT counted as an observation: \($0), C-H2)" } ?? "(observation source=remap)"))
+                if rejection == nil {
                     self.moveResizeObservedContentRects.append((contentRect: contentRect, at: elapsed, source: "remap"))
                 }
             }
@@ -5284,6 +5323,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         ) else {
             print("[focus-rotation] no live member left to rotate (members=\(focusRotationWindowIds) "
                 + "deleted=\(deletedWindowIds.sorted())); scenario ends at issued=\(focusRotationsIssued)")
+            focusRotationEndedNoLiveMember = true
             focusRotationDone = true
             return
         }
@@ -5294,7 +5334,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         focusRotationPendingSentAt = sentAt
         focusRotationPendingSoftDeadline = sentAt.addingTimeInterval(FocusAuthority.softDeadlineInterval)
         focusRotationPendingEventualDeadline = sentAt.addingTimeInterval(FocusAuthority.hardDeadlineInterval)
-        print("[focus-rotation] rotation \(focusRotationsIssued)/\(focusRotationTotal): activating windowId=\(targetId)")
+        print("[focus-rotation] rotation \(focusRotationsIssued)/\(focusRotationTotal) at elapsed=\(String(format: "%.3f", elapsed))s: activating windowId=\(targetId)")
     }
 
     /// The round-robin candidate pool for `runFocusRotation` -- visible windows with real
@@ -6282,9 +6322,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             for miss in eventualMisses {
                 print("[focus-rotation] eventual miss detail: target=\(miss.targetId) observedActiveWindow=\(Self.describe(miss.observedActiveWindow))")
             }
+            if focusRotationsVoided > 0 {
+                print("[focus-rotation] \(focusRotationsVoided) of the \(focusRotationsIssued) issued rotation(s) were voided -- their target "
+                    + "was deleted before convergence -- and are not in results (not misses); results = hits + misses = \(focusRotationResults.count)")
+            }
             check(
                 focusRotationsIssued == focusRotationTotal,
-                "focus rotation ran all \(focusRotationTotal) rotations (issued \(focusRotationsIssued))"
+                "focus rotation ran all \(focusRotationTotal) rotations (issued \(focusRotationsIssued)"
+                    + (focusRotationEndedNoLiveMember
+                        ? "; ended early: no live member left -- every rotation member was deleted (fixture population), NOT a convergence stall)"
+                        : ")")
             )
         }
 
