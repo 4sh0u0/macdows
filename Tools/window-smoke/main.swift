@@ -632,6 +632,13 @@ enum SizeBand {
 ///    **Not covered here**: `runMoveResizeScenario`'s target lock calling something other than
 ///    `MoveResizeTarget.lock`, passing it a set other than `windowIdsBeforeExtraApps`, or choosing
 ///    the wrong one of its two one-shot log lines -- live wiring, no offline seam.
+///  * **the multi-window gate** counting a window that merely flashed after the exec, counting a
+///    close target that never showed content, or re-adding pre-existing ids =>
+///    `multiWindowGateCountsVisibleOrHarnessClosedNewWindows`. **Not covered here** (live wiring,
+///    no offline seam): `finish()` passing an empty `closedByHarness`, or only one of its two
+///    halves (the F0-H1 defect itself; review multiwindow-gate-r2 MF); the per-tick accumulator
+///    dropping `hasDisplayedContent` or the band floor (a weaker accumulator survives every pin,
+///    as review multiwindow-gate-r1 M2 measured); the F0 rerun is the live check for the first.
 ///  * **the oscillation verdict** collapsing back to two states (an unmatched leg reported as
 ///    "none"), counting pre-match failures as oscillation, dropping the post-match scan, or
 ///    `isOscillated` going constant (the unfailable green reborn through the accessor
@@ -1049,6 +1056,25 @@ enum WindowSmokeGateSelfTest {
             "oscillationVerdictIsUnjudgeableUntilTheRectMatches: no match => unjudgeable(n); failures BEFORE the first match are not oscillation; any later divergence is; isOscillated is true for exactly the oscillated case and text names each state"
         )
 
+        // --- multi-window gate: a new window that was later closed still counts ---------------
+        // (F0 对照 r1, 2026-09-02: once the move/resize target lock picked the run-launched window,
+        // its close leg closed that window before finish(), and the assertion -- which counted
+        // only windows still VISIBLE at finish -- reported 0 new windows by construction.)
+        expect(
+            // the run-launched target the close leg closed still counts
+            MultiWindowGate.newContentWindowIds(visibleAtFinish: [5, 10], closedByHarness: [709], everSeenContent: [5, 10, 709], before: [5, 10]) == [709]
+                // still-visible new window counts
+                && MultiWindowGate.newContentWindowIds(visibleAtFinish: [5, 10, 800], closedByHarness: [], everSeenContent: [5, 10, 800], before: [5, 10]) == [800]
+                // a window that merely flashed (seen, neither visible now nor closed by us) does NOT count
+                && MultiWindowGate.newContentWindowIds(visibleAtFinish: [5], closedByHarness: [], everSeenContent: [5, 900], before: [5]).isEmpty
+                // a close target that never showed content does NOT count
+                && MultiWindowGate.newContentWindowIds(visibleAtFinish: [5], closedByHarness: [901], everSeenContent: [5], before: [5]).isEmpty
+                // pre-existing ids never count, even when we closed them (resize r1's leftover case)
+                && MultiWindowGate.newContentWindowIds(visibleAtFinish: [10], closedByHarness: [10], everSeenContent: [10], before: [10]).isEmpty
+                && MultiWindowGate.newContentWindowIds(visibleAtFinish: [], closedByHarness: [], everSeenContent: [], before: [5]).isEmpty,
+            "multiWindowGateCountsVisibleOrHarnessClosedNewWindows: a new window counts if still visible at finish or closed by this run's own close leg (and it showed content); a mere flash does not; pre-existing ids never do"
+        )
+
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
         // rev-L9 M-4: `Scripts/run-window-smoke.command:159` records `DONE exit=$?` and its callers
         // read that line as the whole verdict. A `WINDOW_SMOKE_SELFTEST=1` leaked into the
@@ -1430,6 +1456,27 @@ enum MoveResizeTarget {
     }
 }
 
+/// The multi-window scenario's acceptance, as a pure function: which windows count as "new
+/// content windows that appeared after the extra apps were launched". Inputs: the qualifying
+/// windows visible at finish(), the ids this run's own close legs closed, and the ids EVER seen
+/// visible-with-content after the exec (accumulated per tick): on the 2026-09-02 F0 control run the move/resize target lock picked the
+/// run-launched Notepad (as designed since 1f05aa4) and its close leg closed it before finish(),
+/// so a visible-at-finish count reported 0 new windows by construction (F0-H1,
+/// docs/upgrade-gate/2026-09-f0-control-live.md §3 item 1). `before` is `windowIdsBeforeExtraApps`.
+enum MultiWindowGate {
+    /// Counts a new window only if it is still a qualifying visible window at finish() OR this
+    /// run's own close legs closed it (review multiwindow-gate-r1 I-1: "ever seen" alone would let
+    /// any window that merely flashed after the exec -- a popup, a transient dialog -- satisfy the
+    /// count; binding it to our own SC_CLOSE targets keeps the causal link to the extra apps).
+    /// `everSeenContent` still gates `closedByHarness`: a close target that never showed content
+    /// does not count either. `before` = `windowIdsBeforeExtraApps`, subtracted last.
+    static func newContentWindowIds(
+        visibleAtFinish: Set<UInt32>, closedByHarness: Set<UInt32>, everSeenContent: Set<UInt32>, before: Set<UInt32>
+    ) -> Set<UInt32> {
+        visibleAtFinish.union(closedByHarness.intersection(everSeenContent)).subtracting(before)
+    }
+}
+
 /// adr/0010 W4 first slice: menu-popup end-to-end acceptance -- activates the About window
 /// (via the real, gated `FocusAuthority` click path, same as `activateForClose`), sends
 /// Alt+Space (About's system menu shortcut on Windows), and asserts a NEW child window
@@ -1570,6 +1617,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// windows from a long-lived session could satisfy a bare count with zero extra apps
     /// actually launching).
     private var windowIdsBeforeExtraApps: Set<UInt32> = []
+    /// Every window id seen visible-with-content (and inside the plausible-content band) on any
+    /// tick after the extra apps were launched, with the last title seen for it -- the
+    /// multi-window assertion's input (`MultiWindowGate`), so a window this run launched and later
+    /// closed (the move/resize target since 1f05aa4) still counts as having appeared.
+    private var contentWindowsSeenAfterExtraApps: [UInt32: String] = [:]
     /// Every ExecResult with a nonzero (failed) result observed this run.
     private var failedExecResults: [String] = []
     private var cycleIndex = 0
@@ -2747,7 +2799,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        checkFirstFrameGate(registry.windowSnapshots())
+        let tickSnapshots = registry.windowSnapshots()
+        checkFirstFrameGate(tickSnapshots)
+        if extraAppsLaunched {
+            for snap in tickSnapshots
+            where snap.isVisible && snap.hasDisplayedContent && isInPlausibleContentBand(snap)
+                && !windowIdsBeforeExtraApps.contains(snap.windowId)
+            {
+                contentWindowsSeenAfterExtraApps[snap.windowId] = snap.title
+            }
+        }
         runActivateExperiment(elapsed: elapsed, session: session, registry: registry)
         runInputTest(elapsed: elapsed, registry: registry)
         // adr/0011 §5 items 5/6/7: the degradation scenario locks its own target (it is not
@@ -5221,22 +5282,38 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             print("[info] tray scenario with zero visible windows -- a windowless tray driver is legitimate; skipping the generic visible-RemoteWindow check")
         } else if inputTestMode == nil {
             check(!visibleWindows.isEmpty, "at least one visible RemoteWindow (got \(visibleWindows.count))")
-            // Phase 1 acceptance: with extra apps launched into the same session, N NEW
-            // visible content windows (windowIds not present at exec time) must have
-            // appeared, and no ClientExecute may have failed -- a bare total count could
-            // be satisfied by leftover windows from an earlier session with zero extra
-            // apps actually launching (2026-08-22 review HIGH).
+            // Phase 1 acceptance: with extra apps launched into the same session, N NEW content
+            // windows (windowIds not present at exec time) must have appeared -- still visible
+            // at finish, or closed by this run's own close legs -- and no ClientExecute may have
+            // failed. A bare total count could be satisfied by leftover windows from an earlier
+            // session with zero extra apps actually launching (2026-08-22 review HIGH).
             if !extraApps.isEmpty {
-                let newContentWindows = visibleWindows.filter {
-                    // Same 150x80 remote-px floor as the per-window band assert below.
+                // F0-H1 (2026-09-02): the move/resize scenario's close leg legitimately closes the
+                // run-launched target before we get here, so "visible at finish" alone reported 0
+                // by construction. A closed target counts only if it was seen visible-with-content
+                // inside the band on some tick after the exec (`contentWindowsSeenAfterExtraApps`);
+                // a window that merely flashed and was not closed by us does not count (review
+                // multiwindow-gate-r1 I-1). `before` is subtracted inside the gate too -- that is
+                // the defence for an accumulator populated outside the `extraAppsLaunched` window,
+                // not dead code.
+                let visibleNewContent = Set(visibleWindows.filter {
                     isInPlausibleContentBand($0) && $0.hasDisplayedContent
                         && !windowIdsBeforeExtraApps.contains($0.windowId)
-                }
+                }.map(\.windowId))
+                // Both halves are the SC_CLOSE-time ids (set on the same line the close is sent),
+                // never the lock-time target: a window merely aimed at and gone on its own must
+                // not read as "closed by us" (review multiwindow-gate-r2 I-1).
+                let closedByHarness = Set([moveResizeCloseTargetId, maximizeCloseTargetId].compactMap { $0 })
+                let newContentIds = MultiWindowGate.newContentWindowIds(
+                    visibleAtFinish: visibleNewContent, closedByHarness: closedByHarness,
+                    everSeenContent: Set(contentWindowsSeenAfterExtraApps.keys), before: windowIdsBeforeExtraApps
+                )
                 check(
-                    newContentWindows.count >= extraApps.count,
-                    "multi-window scenario: >=\(extraApps.count) NEW visible content windows appeared after the "
-                        + "extra execs (got \(newContentWindows.count): "
-                        + "\(newContentWindows.map(\.title).joined(separator: " | ")))"
+                    newContentIds.count >= extraApps.count,
+                    "multi-window scenario: >=\(extraApps.count) NEW content windows appeared after the extra "
+                        + "execs (still visible at finish, or closed by this run's own close leg) (got "
+                        + "\(newContentIds.count), \(visibleNewContent.count) still visible: "
+                        + "\(newContentIds.sorted().map { "\($0)=\"\(contentWindowsSeenAfterExtraApps[$0] ?? "")\"" }.joined(separator: " | ")))"
                 )
                 check(
                     failedExecResults.isEmpty,
