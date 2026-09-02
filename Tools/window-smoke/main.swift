@@ -130,6 +130,45 @@ enum MoveResizeGate {
         return eventWindowId == targetWindowId
     }
 
+    /// The move leg's offset. Default (+80, -60) -- +80 right, -60 down in AppKit coordinates (a
+    /// titlebar moved TOWARD the top of the screen gets clamped by AppKit, review round 5). C r2
+    /// (2026-09-02, docs/upgrade-gate/2026-09-c-existing-form-r2-live.md §5-6) locked a Notepad
+    /// at y=74 pt and the default left 14 remote px above the desktop bottom: one more run with a
+    /// lower start and the F0 premise "the move never leaves the real desktop" would silently break
+    /// (and the F run's `bottom > declaredH` test would fire without any mis-declaration). A
+    /// component is flipped only when the default would leave less than `margin` and the opposite
+    /// direction fits; `fits == false` means neither does and the caller must warn.
+    struct MoveOffset: Equatable {
+        let dx: CGFloat
+        let dy: CGFloat
+        let flipped: Bool
+        let fits: Bool
+    }
+
+    static func moveOffset(original: NSRect, within bounds: NSRect, leftBorder: CGFloat, margin: CGFloat) -> MoveOffset {
+        var flipped = false
+        var fits = true
+        // vertical: prefer down (-60); the sent rect's bottom in Windows terms is the AppKit minY
+        var dy: CGFloat = -60
+        if original.minY + dy < bounds.minY + margin {
+            if original.maxY + 60 <= bounds.maxY - margin {
+                dy = 60; flipped = true
+            } else {
+                fits = false
+            }
+        }
+        // horizontal: prefer right (+80); the sent left edge is x - leftBorder
+        var dx: CGFloat = 80
+        if original.maxX + dx > bounds.maxX - margin {
+            if original.minX - 80 - leftBorder >= bounds.minX + margin {
+                dx = -80; flipped = true
+            } else {
+                fits = false
+            }
+        }
+        return MoveOffset(dx: dx, dy: dy, flipped: flipped, fits: fits)
+    }
+
     /// C-H2 (C r1, 2026-09-02, docs/upgrade-gate/2026-09-c-existing-form-r1-live.md §3-3): an
     /// observation counts for a leg only when a ClientWindowMove was sent AT OR AFTER the leg
     /// locked (a send that predates the lock is the previous leg's) and the observation is at or
@@ -716,6 +755,15 @@ enum SizeBand {
 ///    collapses to ONE member is a silent degeneration (the rotation re-activates the active
 ///    window); the per-rotation `live=` and the summary's `liveMembersAtFinish=` make it readable,
 ///    not red (review c-fixture-r2 I-1).
+///  * **the finish gate** waiting out the scenario deadline after everything completed, or not
+///    waiting it while something still runs => `finishGateWaitsForTheDeadlineOnlyWhileSomethingIsUnfinished`.
+///    **Not covered here** (live wiring): `tick()` computing `allScenariosCompleted` from `*Stalled`
+///    instead of the done flags, or not calling `FinishGate` at all.
+///  * **the move offset** never flipping, flipping without checking that the opposite direction
+///    fits, ignoring the margin or the left border, or reporting fits=true when neither direction
+///    fits => `moveOffsetKeepsTheTargetInsideTheDesktop`. **Not covered here** (live wiring): the
+///    lock site passing bounds other than the frozen union minus the menu-bar inset, or not
+///    applying the returned offset -- the next C run's "move offset" line is the live check.
 ///  * **the remap observation** sampled outside the in-flight window, for a non-target window,
 ///    or with no target locked => `remapObservationAppliesOnlyToTheInFlightTarget`. **Not covered
 ///    here** (live wiring, no offline seam): the tap not calling it at all for `surfaceMapped`
@@ -1249,6 +1297,41 @@ enum WindowSmokeGateSelfTest {
             "focusRotationPendingOutcomeIsTimeBased: a match is a hit (soft iff at/before the soft deadline); no match is pending until the eventual deadline and a miss from then on -- regardless of whether any event arrived"
         )
 
+        // --- finish gate: a run whose scenarios all completed does not idle out the rotation deadline ---
+        // (C r2, 2026-09-02: the 150 rotations finished at 59.2 s and the run sat until 160 s = 10+N,
+        // because the per-scenario deadlines doubled as minimum session lengths -- C-m4.)
+        expect(
+            FinishGate.minimumElapsed(base: 25, overall: 160, allScenariosCompleted: true) == 25
+                && FinishGate.minimumElapsed(base: 25, overall: 160, allScenariosCompleted: false) == 160
+                && FinishGate.minimumElapsed(base: 25, overall: 25, allScenariosCompleted: false) == 25,
+            "finishGateWaitsForTheDeadlineOnlyWhileSomethingIsUnfinished: with every enabled scenario completed the run finishes at the base battery length; anything still running keeps the per-scenario deadline as the floor"
+        )
+
+        // --- the move leg's offset keeps the target inside the desktop (C r2 §5-6: (+80, -60) left 14 px) ---
+        let moveBounds = NSRect(x: 0, y: 0, width: 2560, height: 1440 - 25)   // pt; the top inset is the menu bar
+        typealias Off = MoveResizeGate.MoveOffset
+        expect(
+            // C r1's target (265, 128, 1906, 1052): the default fits (bottom margin 68 >= 20)
+            MoveResizeGate.moveOffset(original: NSRect(x: 265, y: 128, width: 1906, height: 1052), within: moveBounds, leftBorder: 7, margin: 20)
+                == Off(dx: 80, dy: -60, flipped: false, fits: true)
+                // C r2's target (317, 74, 1910, 1054): -60 would leave 14 < 20 -> up instead (74+1054+60 <= 1415-20)
+                && MoveResizeGate.moveOffset(original: NSRect(x: 317, y: 74, width: 1910, height: 1054), within: moveBounds, leftBorder: 7, margin: 20)
+                == Off(dx: 80, dy: 60, flipped: true, fits: true)
+                // right edge: x+80+w would leave the desktop -> dx flips to -80 (room on the left, border included)
+                && MoveResizeGate.moveOffset(original: NSRect(x: 600, y: 300, width: 1900, height: 500), within: moveBounds, leftBorder: 7, margin: 20)
+                == Off(dx: -80, dy: -60, flipped: true, fits: true)
+                // hugging the left edge: +80 still fits, so no flip even though -80 would not
+                && MoveResizeGate.moveOffset(original: NSRect(x: 10, y: 300, width: 500, height: 500), within: moveBounds, leftBorder: 7, margin: 20)
+                == Off(dx: 80, dy: -60, flipped: false, fits: true)
+                // neither vertical direction fits (a very tall window): default kept, fits=false so the caller warns
+                && MoveResizeGate.moveOffset(original: NSRect(x: 300, y: 10, width: 500, height: 1400), within: moveBounds, leftBorder: 7, margin: 20).fits == false
+                // the left border counts: x-80 = 25 >= 20 but x-80-7 = 18 < 20, so -80 does NOT fit either
+                // (right edge overflows, so -80 is attempted) -> default kept with fits=false, not a flip
+                && MoveResizeGate.moveOffset(original: NSRect(x: 105, y: 300, width: 2400, height: 500), within: moveBounds, leftBorder: 7, margin: 20)
+                == Off(dx: 80, dy: -60, flipped: false, fits: false),
+            "moveOffsetKeepsTheTargetInsideTheDesktop: prefer (+80, -60); flip a component only when it would leave the bounds by less than the margin and the opposite direction fits; report fits=false when neither does"
+        )
+
         // --- declared-desktop override (WINDOW_SMOKE_DECLARED_DESKTOP, scaled-map memo §4-1 F) ------
         // Fixture-only: what is DECLARED to the server may differ from the real frozen desktop, but
         // the gate anchor (Y-flip, size bands) must stay the real one -- otherwise T5's "declared
@@ -1723,6 +1806,17 @@ let moveResizeScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOK
 let moveResizeTargetFilter = ProcessInfo.processInfo.environment["WINDOW_SMOKE_MOVE_TARGET"]
 
 /// Title matching for the move/resize scenario's target lock (see `moveResizeTargetFilter`).
+/// When the per-tick driver may call `finish()`. The per-scenario deadlines used to double as
+/// minimum session lengths: C r2 (2026-09-02) finished its 150 rotations at 59.2 s and then idled
+/// to 160 s = 10+N, adding nothing to the trigger surface and misreading as "160 s of activity"
+/// (C-m4). Now the deadlines are floors only while something is still running; once every enabled
+/// scenario has completed, the base battery length is the only floor.
+enum FinishGate {
+    static func minimumElapsed(base: TimeInterval, overall: TimeInterval, allScenariosCompleted: Bool) -> TimeInterval {
+        allScenariosCompleted ? base : overall
+    }
+}
+
 /// Pure gates for the focus-rotation scenario (C r1, 2026-09-02, docs/upgrade-gate/
 /// 2026-09-c-existing-form-r1-live.md §3-2): the member set was frozen at `ready` with the MOVE
 /// target in it, the close leg deleted that window, rotation 11 activated the deleted id, and the
@@ -3423,9 +3517,26 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         let popupReady = !popupScenarioEnabled || popupPhase == .done || popupStalled
         let inputScriptReady = !inputScriptScenarioActive || inputScriptComplete || inputScriptStalled
         let trayClickReady = !trayClickScenarioEnabled || trayClickDone || trayClickStalled
-        if elapsed >= overallDeadline, rotationReady, maximizeReady, moveResizeReady, popupReady,
+        // C-m4 (C r2, 2026-09-02): once every enabled scenario has actually COMPLETED (not merely
+        // stalled), the per-scenario deadlines stop being a floor -- the run finishes at the base
+        // battery length instead of idling to 10+N. A stalled scenario still waits its deadline
+        // so the failsafe verdicts fire at the documented times.
+        let allScenariosCompleted = (focusRotationTotal == 0 || focusRotationDone)
+            && (!maximizeScenarioEnabled || maximizePhase == .done)
+            && (!moveResizeScenarioEnabled || moveResizePhase == .done)
+            && (!popupScenarioEnabled || popupPhase == .done)
+            && (!inputScriptScenarioActive || inputScriptComplete)
+            && (!trayClickScenarioEnabled || trayClickDone)
+        let minimumElapsed = FinishGate.minimumElapsed(
+            base: baseDeadline, overall: overallDeadline, allScenariosCompleted: allScenariosCompleted
+        )
+        if elapsed >= minimumElapsed, rotationReady, maximizeReady, moveResizeReady, popupReady,
            inputScriptReady, trayClickReady
         {
+            if allScenariosCompleted, elapsed < overallDeadline {
+                print("[run] all enabled scenarios completed at elapsed=\(String(format: "%.1f", elapsed))s; "
+                    + "finishing now instead of idling to the \(Int(overallDeadline))s scenario deadline (C-m4)")
+            }
             finish()
         }
     }
@@ -4103,7 +4214,30 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // grant. -60 (down, away from the screen's top edge) avoids that specific
             // failure mode for a window that starts anywhere reasonably below the very top
             // of the screen.
-            let targetContent = originalContent.offsetBy(dx: 80, dy: -60)
+            // C r2 §5-6: keep the moved target inside the real desktop (F0's "the move never leaves
+            // the desktop" premise; the F run's `bottom > declaredH` test). Bounds = the session's
+            // frozen desktop union in pt, minus the primary screen's menu-bar inset at the top.
+            let offset: MoveResizeGate.MoveOffset
+            if let topology = displayTopology.sessionSnapshot {
+                let union = topology.unionBoundsInPoints
+                let topInset = NSScreen.main.map { $0.frame.maxY - $0.visibleFrame.maxY } ?? 25
+                let bounds = NSRect(
+                    x: union.x.inPoints, y: union.y.inPoints,
+                    width: union.width.inPoints, height: union.height.inPoints - topInset
+                )
+                offset = MoveResizeGate.moveOffset(original: originalContent, within: bounds, leftBorder: 7, margin: 20)
+                print("[move-resize] move offset (dx=\(Int(offset.dx)), dy=\(Int(offset.dy)))"
+                    + (offset.flipped ? " FLIPPED from the default (+80,-60) to stay inside" : " (default)")
+                    + " bounds=\(bounds) margin=20pt original=\(originalContent)")
+                if !offset.fits {
+                    print("[move-resize] WARNING: neither direction keeps the moved target inside the desktop by the "
+                        + "margin -- keeping the default; the F0 'no boundary crossing' premise does NOT hold for this run")
+                }
+            } else {
+                offset = MoveResizeGate.MoveOffset(dx: 80, dy: -60, flipped: false, fits: true)
+                print("[move-resize] move offset: default (+80,-60) -- no frozen topology to bound against")
+            }
+            let targetContent = originalContent.offsetBy(dx: offset.dx, dy: offset.dy)
             let targetFrame = window.frameRect(forContentRect: targetContent)
             print("[move-resize] target locked: windowId=\(w.windowId) title=\"\(w.title)\" originalContent=\(originalContent) -> move target content=\(targetContent)")
             moveResizeObservedContentRects.removeAll()
