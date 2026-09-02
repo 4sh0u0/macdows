@@ -1331,6 +1331,43 @@ enum WindowSmokeGateSelfTest {
             "finishGateWaitsForTheDeadlineOnlyWhileSomethingIsUnfinished: with every enabled scenario completed the run finishes at the base battery length; anything still running keeps the per-scenario deadline as the floor"
         )
 
+        // --- geometry rounds (C second step, "再来一轮"): repeat the maximize and move/resize legs K times ---
+        // (C r1/r2/r3, 2026-09-02: 11/150/450 focus rotations left surfaceMapEvents at 24/23/23 -- the
+        // aggregate did not grow with rotations; only geometry changes remap surfaces, so the way to
+        // enlarge the trigger surface inside one session is to repeat the geometry legs, not rotations.)
+        expect(
+            GeometryRounds.next(completedRounds: 1, total: 1) == .close
+                && GeometryRounds.next(completedRounds: 1, total: 2) == .again
+                && GeometryRounds.next(completedRounds: 2, total: 2) == .close
+                // over-run guard: more rounds completed than configured never asks for another
+                && GeometryRounds.next(completedRounds: 3, total: 2) == .close
+                // total < 1 is clamped to 1 (the knob's default), not "run forever"
+                && GeometryRounds.next(completedRounds: 1, total: 0) == .close
+                && GeometryRounds.next(completedRounds: 0, total: 1) == .again,
+            "geometryRoundsStopAfterTheConfiguredCount: K=1 is today's single pass; completed rounds r < K ask for another; r >= K closes"
+        )
+        expect(
+            GeometryRounds.resizeDelta(round: 1) == 100 && GeometryRounds.resizeDelta(round: 2) == -100
+                && GeometryRounds.resizeDelta(round: 3) == 100 && GeometryRounds.resizeDelta(round: 4) == -100,
+            "geometryRoundsAlternateTheResizeDirection: odd rounds +100 pt, even rounds -100 pt, so the width returns to its original value every two rounds instead of drifting"
+        )
+        expect(
+            GeometryRounds.deadline(base: 45, rounds: 1, gap: 2) == 45
+                && GeometryRounds.deadline(base: 45, rounds: 3, gap: 2) == 69
+                && GeometryRounds.deadline(base: 40, rounds: 2, gap: 0) == 50
+                && GeometryRounds.deadline(base: 40, rounds: 0, gap: 2) == 40,
+            "geometryRoundsExtendTheScenarioDeadlinePerExtraRound: base + (K-1) x (gap + 10 s of leg budget); K <= 1 leaves the base untouched"
+        )
+        let roundsVerdictAll = GeometryRounds.verdict(perRound: [true, true])
+        let roundsVerdictOne = GeometryRounds.verdict(perRound: [true, false, true])
+        let roundsVerdictNone = GeometryRounds.verdict(perRound: [])
+        expect(
+            roundsVerdictAll.passed && roundsVerdictAll.text == "rounds=2 passed=2/2"
+                && !roundsVerdictOne.passed && roundsVerdictOne.text == "rounds=3 passed=2/3 failed=[2]"
+                && !roundsVerdictNone.passed && roundsVerdictNone.text == "rounds=0 passed=0/0",
+            "geometryRoundsVerdictNamesTheFailingRounds: every round must pass; the text carries K, the pass count and the 1-based failing round numbers; zero rounds is not a pass"
+        )
+
         // --- the move leg's offset keeps the target inside the desktop (C r2 §5-6: (+80, -60) left 14 px) ---
         let moveBounds = NSRect(x: 0, y: 0, width: 2560, height: 1440 - 25)   // pt; the top inset is the menu bar
         typealias Off = MoveResizeGate.MoveOffset
@@ -1871,6 +1908,51 @@ let moveResizeTargetFilter = ProcessInfo.processInfo.environment["WINDOW_SMOKE_M
 enum FinishGate {
     static func minimumElapsed(base: TimeInterval, overall: TimeInterval, allScenariosCompleted: Bool) -> TimeInterval {
         allScenariosCompleted ? base : overall
+    }
+}
+
+/// Pure gates for the geometry-rounds knob (C second step "再来一轮", `WINDOW_SMOKE_GEOMETRY_ROUNDS=K`,
+/// docs/upgrade-gate/2026-09-scaledmap-next-step.md §4-2): C r1/r2/r3 (2026-09-02) ran 11/150/450
+/// focus rotations and `surfaceMapEvents` stayed at 24/23/23 -- the aggregate does not grow with
+/// rotations, only geometry changes remap surfaces. Repeating the maximize and move/resize legs K
+/// times inside one session is the fixture's way to enlarge that trigger surface. K=1 (the default)
+/// is today's single pass, byte-for-byte: the legs run once and close.
+enum GeometryRounds {
+    enum Step: Equatable {
+        /// Wait the round gap, then run the leg sequence again on the same target.
+        case again
+        /// The configured rounds are done: send the close leg.
+        case close
+    }
+
+    /// After `completedRounds` full passes (1-based count of finished rounds), do we go again?
+    /// `total` below 1 is clamped to 1, mirroring the knob's `max(1, …)` parse.
+    static func next(completedRounds: Int, total: Int) -> Step {
+        completedRounds < max(1, total) ? .again : .close
+    }
+
+    /// The resize leg's width delta for `round` (1-based): odd rounds widen by 100 pt, even rounds
+    /// narrow by 100 pt, so the window returns to its original width every two rounds instead of
+    /// drifting off the desktop.
+    static func resizeDelta(round: Int) -> CGFloat {
+        round % 2 == 1 ? 100 : -100
+    }
+
+    /// The scenario's hard-failsafe deadline for K rounds: the single-pass `base` plus, per extra
+    /// round, the round gap and 10 s of leg budget (the same per-round extension shape the popup
+    /// scenario uses). K <= 1 leaves the base untouched.
+    static func deadline(base: TimeInterval, rounds: Int, gap: TimeInterval) -> TimeInterval {
+        base + Double(max(1, rounds) - 1) * (gap + 10)
+    }
+
+    /// Aggregate verdict over per-round leg results: every round must pass, and zero rounds is not
+    /// a pass. `text` carries K, the pass count and the 1-based numbers of the failing rounds.
+    static func verdict(perRound: [Bool]) -> (passed: Bool, text: String) {
+        let passedCount = perRound.filter { $0 }.count
+        let failed = perRound.enumerated().filter { !$0.element }.map { $0.offset + 1 }
+        var text = "rounds=\(perRound.count) passed=\(passedCount)/\(perRound.count)"
+        if !failed.isEmpty { text += " failed=\(failed)" }
+        return (passed: !perRound.isEmpty && failed.isEmpty, text: text)
     }
 }
 
