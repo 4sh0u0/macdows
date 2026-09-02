@@ -1361,7 +1361,7 @@ enum WindowSmokeGateSelfTest {
                 // other desktops and margins are not baked in (review resize-bound-r1 M7/M8: 1920-wide, margin 10)
                 && MoveResizeGate.boundedResizeDelta(preferred: 100, contentMaxX: 1810, boundsMaxX: 1920, margin: 10) == 100
                 && MoveResizeGate.boundedResizeDelta(preferred: 100, contentMaxX: 1811, boundsMaxX: 1920, margin: 10) == -100
-                // the shipped margin is the shared constant, and it is 20 (2541 + 100 crosses 2540; with a 0 margin it would not)
+                // the shipped margin is the shared constant, and it is 20 (2441 + 100 = 2541 crosses 2540; with a 0 margin it would not)
                 && MoveResizeGate.boundedResizeDelta(preferred: 100, contentMaxX: 2441, boundsMaxX: 2560, margin: MoveResizeGate.desktopMarginPoints) == -100
                 && MoveResizeGate.boundedResizeDelta(preferred: 100, contentMaxX: 2440, boundsMaxX: 2560, margin: MoveResizeGate.desktopMarginPoints) == 100,
             "resizeLegDeltaFlipsToNarrowWhenWideningWouldCrossTheRightEdge: +delta is kept only while contentMaxX + delta <= boundsMaxX - margin (inclusive); otherwise the leg narrows by the same amount; a negative delta is never changed"
@@ -1387,7 +1387,7 @@ enum WindowSmokeGateSelfTest {
         expect(
             GeometryRounds.resizeDelta(round: 1) == 100 && GeometryRounds.resizeDelta(round: 2) == -100
                 && GeometryRounds.resizeDelta(round: 3) == 100 && GeometryRounds.resizeDelta(round: 4) == -100,
-            "geometryRoundsAlternateTheResizeDirection: odd rounds +100 pt, even rounds -100 pt as the PREFERRED sequence (the width returns every two rounds); MoveResizeGate.boundedResizeDelta may turn an odd round into -100 at the desktop's right edge"
+            "geometryRoundsAlternateTheResizeDirection: odd rounds +100 pt, even rounds -100 pt as the PREFERRED sequence (the width returns every two rounds); MoveResizeGate.boundedResizeDelta may turn an odd round into -100 at the desktop's right edge, lowering the base by 200 before the alternation resumes"
         )
         expect(
             GeometryRounds.deadline(base: 45, rounds: 1, gap: 2) == 45
@@ -2020,7 +2020,7 @@ enum GeometryRounds {
     /// The resize leg's width delta for `round` (1-based): odd rounds widen by 100 pt, even rounds
     /// narrow by 100 pt, so the width returns to its original value every two rounds -- unless
     /// `MoveResizeGate.boundedResizeDelta` turns an odd round's widening into narrowing because it would
-    /// cross the desktop's right edge; then the width steps down and stays there (it never crosses).
+    /// cross the desktop's right edge; the flipped pair then lowers the base by 200 pt and the ±100 alternation resumes from there (the right edge is never crossed).
     static func resizeDelta(round: Int) -> CGFloat {
         round % 2 == 1 ? 100 : -100
     }
@@ -4439,7 +4439,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             print("[move-resize] move offset (dx=\(Int(offset.dx)), dy=\(Int(offset.dy)))"
                 + (offset.flipped ? " FLIPPED from the default (+80,-60) to stay inside" : " (default)")
                 + " bounds=\(bounds) (AppKit pt; union flipped through primary height \(topology.flipAnchor.primaryHeightInPoints), "
-                + "menu-bar inset \(MoveResizeGate.menuBarInsetPoints)) margin=\(MoveResizeGate.desktopMarginPoints)pt leftBorder=\(leftBorderPt)pt original=\(originalContent)")
+                + "menu-bar inset \(MoveResizeGate.menuBarInsetPoints)) margin=\(Int(MoveResizeGate.desktopMarginPoints))pt leftBorder=\(leftBorderPt)pt original=\(originalContent)")
             if !offset.fits {
                 print("[move-resize] WARNING: neither direction keeps the moved target inside the desktop by the "
                     + "margin -- keeping the default; the F0 'no boundary crossing' premise does NOT hold for this run")
@@ -4644,9 +4644,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 if resizeDelta != preferredResizeDelta {
                     print("[move-resize] resize delta \(Int(preferredResizeDelta)) -> \(Int(resizeDelta))pt BOUNDED: widening would put the "
                         + "right edge past \(bounds.maxX - MoveResizeGate.desktopMarginPoints) (content maxX \(currentContent.maxX), bounds maxX \(bounds.maxX), "
-                        + "margin \(MoveResizeGate.desktopMarginPoints)pt)")
+                        + "margin \(Int(MoveResizeGate.desktopMarginPoints))pt)")
                 }
-                resizeBoundLabel = resizeDelta != preferredResizeDelta ? "flipped" : "kept"
+                // "kept" only when a WIDENING was checked and allowed; a narrowing delta is passed through by the
+                // gate without a check and says so (review resize-bound-r2 m-3).
+                resizeBoundLabel = preferredResizeDelta <= 0 ? "narrow" : (resizeDelta != preferredResizeDelta ? "flipped" : "kept")
             } else {
                 resizeDelta = preferredResizeDelta
                 resizeBoundLabel = "unchecked"
