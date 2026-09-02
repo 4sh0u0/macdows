@@ -150,6 +150,9 @@ enum MoveResizeGate {
     /// §5.A.5 confines every `NSScreen` read to the topology provider (review cm4-r1 B-2), and
     /// AppKit's own clamp is asserted downstream against the ACTUAL frame anyway (round 5).
     static let menuBarInsetPoints: CGFloat = 25
+    /// The margin (AppKit pt) the move offset and the resize delta keep from the desktop bounds -- one
+    /// constant for the two legs (review resize-bound-r1 m: it used to be three literal copies of 20).
+    static let desktopMarginPoints: CGFloat = 20
 
     /// The frozen topology's desktop union is in WINDOWS-space axes (`y` = top edge, growing down,
     /// `DesktopUnionBoundsInPoints`), while the move leg works in AppKit points (origin bottom-left).
@@ -1354,7 +1357,13 @@ enum WindowSmokeGateSelfTest {
                 // narrowing never crosses the right edge and is passed through unchanged -- also when widening
                 // WOULD have fit (kills the mutant that runs |delta| through the bound and re-signs it)
                 && MoveResizeGate.boundedResizeDelta(preferred: -100, contentMaxX: 2460, boundsMaxX: 2560, margin: 20) == -100
-                && MoveResizeGate.boundedResizeDelta(preferred: -100, contentMaxX: 2400, boundsMaxX: 2560, margin: 20) == -100,
+                && MoveResizeGate.boundedResizeDelta(preferred: -100, contentMaxX: 2400, boundsMaxX: 2560, margin: 20) == -100
+                // other desktops and margins are not baked in (review resize-bound-r1 M7/M8: 1920-wide, margin 10)
+                && MoveResizeGate.boundedResizeDelta(preferred: 100, contentMaxX: 1810, boundsMaxX: 1920, margin: 10) == 100
+                && MoveResizeGate.boundedResizeDelta(preferred: 100, contentMaxX: 1811, boundsMaxX: 1920, margin: 10) == -100
+                // the shipped margin is the shared constant, and it is 20 (2541 + 100 crosses 2540; with a 0 margin it would not)
+                && MoveResizeGate.boundedResizeDelta(preferred: 100, contentMaxX: 2441, boundsMaxX: 2560, margin: MoveResizeGate.desktopMarginPoints) == -100
+                && MoveResizeGate.boundedResizeDelta(preferred: 100, contentMaxX: 2440, boundsMaxX: 2560, margin: MoveResizeGate.desktopMarginPoints) == 100,
             "resizeLegDeltaFlipsToNarrowWhenWideningWouldCrossTheRightEdge: +delta is kept only while contentMaxX + delta <= boundsMaxX - margin (inclusive); otherwise the leg narrows by the same amount; a negative delta is never changed"
         )
 
@@ -1378,7 +1387,7 @@ enum WindowSmokeGateSelfTest {
         expect(
             GeometryRounds.resizeDelta(round: 1) == 100 && GeometryRounds.resizeDelta(round: 2) == -100
                 && GeometryRounds.resizeDelta(round: 3) == 100 && GeometryRounds.resizeDelta(round: 4) == -100,
-            "geometryRoundsAlternateTheResizeDirection: odd rounds +100 pt, even rounds -100 pt, so the width returns to its original value every two rounds instead of drifting"
+            "geometryRoundsAlternateTheResizeDirection: odd rounds +100 pt, even rounds -100 pt as the PREFERRED sequence (the width returns every two rounds); MoveResizeGate.boundedResizeDelta may turn an odd round into -100 at the desktop's right edge"
         )
         expect(
             GeometryRounds.deadline(base: 45, rounds: 1, gap: 2) == 45
@@ -2009,8 +2018,9 @@ enum GeometryRounds {
     }
 
     /// The resize leg's width delta for `round` (1-based): odd rounds widen by 100 pt, even rounds
-    /// narrow by 100 pt, so the window returns to its original width every two rounds instead of
-    /// drifting off the desktop.
+    /// narrow by 100 pt, so the width returns to its original value every two rounds -- unless
+    /// `MoveResizeGate.boundedResizeDelta` turns an odd round's widening into narrowing because it would
+    /// cross the desktop's right edge; then the width steps down and stays there (it never crosses).
     static func resizeDelta(round: Int) -> CGFloat {
         round % 2 == 1 ? 100 : -100
     }
@@ -4425,11 +4435,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // number, review cm4-r1 I-4); the bounds are in pt, so convert (I-3).
             let leftBorderPt = 7 / topology.rasterScale
             moveResizeBoundsInPoints = bounds
-            offset = MoveResizeGate.moveOffset(original: originalContent, within: bounds, leftBorder: leftBorderPt, margin: 20)
+            offset = MoveResizeGate.moveOffset(original: originalContent, within: bounds, leftBorder: leftBorderPt, margin: MoveResizeGate.desktopMarginPoints)
             print("[move-resize] move offset (dx=\(Int(offset.dx)), dy=\(Int(offset.dy)))"
                 + (offset.flipped ? " FLIPPED from the default (+80,-60) to stay inside" : " (default)")
                 + " bounds=\(bounds) (AppKit pt; union flipped through primary height \(topology.flipAnchor.primaryHeightInPoints), "
-                + "menu-bar inset \(MoveResizeGate.menuBarInsetPoints)) margin=20pt leftBorder=\(leftBorderPt)pt original=\(originalContent)")
+                + "menu-bar inset \(MoveResizeGate.menuBarInsetPoints)) margin=\(MoveResizeGate.desktopMarginPoints)pt leftBorder=\(leftBorderPt)pt original=\(originalContent)")
             if !offset.fits {
                 print("[move-resize] WARNING: neither direction keeps the moved target inside the desktop by the "
                     + "margin -- keeping the default; the F0 'no boundary crossing' premise does NOT hold for this run")
@@ -4624,16 +4634,22 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // the move leg was bounded, the resize was not. Bound it against the same right edge: widen only
             // while the margin holds, otherwise narrow by the same amount (MoveResizeGate.boundedResizeDelta).
             let resizeDelta: CGFloat
+            // Printed on the "resize leg sent" line so a bound that did NOT flip still leaves a trace (review
+            // resize-bound-r1 m), the way every move leg prints its offset line.
+            let resizeBoundLabel: String
             if let bounds = moveResizeBoundsInPoints {
                 resizeDelta = MoveResizeGate.boundedResizeDelta(
-                    preferred: preferredResizeDelta, contentMaxX: currentContent.maxX, boundsMaxX: bounds.maxX, margin: 20
+                    preferred: preferredResizeDelta, contentMaxX: currentContent.maxX, boundsMaxX: bounds.maxX, margin: MoveResizeGate.desktopMarginPoints
                 )
                 if resizeDelta != preferredResizeDelta {
                     print("[move-resize] resize delta \(Int(preferredResizeDelta)) -> \(Int(resizeDelta))pt BOUNDED: widening would put the "
-                        + "right edge past \(bounds.maxX - 20) (content maxX \(currentContent.maxX), bounds maxX \(bounds.maxX), margin 20pt)")
+                        + "right edge past \(bounds.maxX - MoveResizeGate.desktopMarginPoints) (content maxX \(currentContent.maxX), bounds maxX \(bounds.maxX), "
+                        + "margin \(MoveResizeGate.desktopMarginPoints)pt)")
                 }
+                resizeBoundLabel = resizeDelta != preferredResizeDelta ? "flipped" : "kept"
             } else {
                 resizeDelta = preferredResizeDelta
+                resizeBoundLabel = "unchecked"
                 print("[move-resize] resize delta \(Int(resizeDelta))pt UNCHECKED -- no frozen topology to bound against")
             }
             let resizeTargetContent = NSRect(
@@ -4644,7 +4660,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             moveResizeObservedContentRects.removeAll()
             window.setFrame(resizeTargetFrame, display: true)
             print("[move-resize] resize leg sent (content-rect space"
-                + (geometryRounds > 1 ? ", round \(moveResizeRoundsCompleted + 1)/\(geometryRounds)" : "") + ", delta \(Int(resizeDelta))pt"
+                + (geometryRounds > 1 ? ", round \(moveResizeRoundsCompleted + 1)/\(geometryRounds)" : "") + ", delta \(Int(resizeDelta))pt bound=\(resizeBoundLabel)"
                 + "): \(currentContent) -> \(resizeTargetContent)")
             // Team-lead review round 5: same "assert against actual, not requested" fix as
             // the move leg above -- a +100pt-wider request could in principle also get
