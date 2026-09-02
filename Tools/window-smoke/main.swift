@@ -1344,6 +1344,24 @@ enum WindowSmokeGateSelfTest {
             "finishGateWaitsForTheDeadlineOnlyWhileSomethingIsUnfinished: with every enabled scenario completed the run finishes at the base battery length; anything still running keeps the per-scenario deadline as the floor"
         )
 
+        // --- the W4b Activate experiment samples ONCE per checkpoint (C second step r3, 2026-09-02: the
+        // t=20 s post-sample came back nil because the About target had already been closed, and the
+        // `activatePostRatio == nil` re-arm printed "n/a" on every tick -- 779 lines) ---
+        expect(
+            ActivateExperimentGate.sampleDue(elapsed: 20, threshold: 20, sampled: false)
+                && !ActivateExperimentGate.sampleDue(elapsed: 19.999, threshold: 20, sampled: false)
+                && !ActivateExperimentGate.sampleDue(elapsed: 25, threshold: 20, sampled: true)
+                && ActivateExperimentGate.sampleDue(elapsed: 6, threshold: 6, sampled: false)
+                && !ActivateExperimentGate.sampleDue(elapsed: 100, threshold: 6, sampled: true),
+            "activateExperimentSamplesOncePerCheckpoint: a checkpoint is due at its threshold (inclusive) and never again once sampled, whether or not the sample produced a value"
+        )
+        expect(
+            ActivateExperimentGate.ratioText(0.98, windowVisible: true) == "98.0%"
+                && ActivateExperimentGate.ratioText(nil, windowVisible: false).hasPrefix("n/a (target no longer visible")
+                && ActivateExperimentGate.ratioText(nil, windowVisible: true).hasPrefix("n/a (no pixel sample"),
+            "activateExperimentSaysWhyASampleIsAbsent: a nil ratio is printed once with its reason -- the target is gone, or it is visible but had no sampleable backing"
+        )
+
         // --- adr/0015 §6.2 comparison object: RAIL-reported client rect vs the sent window rect minus the
         // style's borders (measurement only in this lane; the local content-rect verdict stays the gate) ---
         // About-calibrated borders (7,0,7,7): C-2 run 4 sent left=195 top=180 right=717 bottom=696,
@@ -2055,6 +2073,24 @@ let moveResizeTargetFilter = ProcessInfo.processInfo.environment["WINDOW_SMOKE_M
 enum FinishGate {
     static func minimumElapsed(base: TimeInterval, overall: TimeInterval, allScenariosCompleted: Bool) -> TimeInterval {
         allScenariosCompleted ? base : overall
+    }
+}
+
+/// Pure gates for the W4b Activate experiment's two pixel-sample checkpoints (t=6 s pre, t=20 s post).
+/// C second step r3 (2026-09-02): the post-sample returned nil because the About target had already been
+/// closed by the maximize scenario's close leg, and the old `activatePostRatio == nil` re-arm printed
+/// "n/a" on every tick until finish (779 lines). A checkpoint is sampled ONCE, value or not, and a
+/// missing value says why.
+enum ActivateExperimentGate {
+    static func sampleDue(elapsed: TimeInterval, threshold: TimeInterval, sampled: Bool) -> Bool {
+        elapsed >= threshold && !sampled
+    }
+
+    static func ratioText(_ ratio: Double?, windowVisible: Bool) -> String {
+        if let ratio { return String(format: "%.1f%%", ratio * 100) }
+        return windowVisible
+            ? "n/a (no pixel sample -- target visible but no sampleable backing at this tick)"
+            : "n/a (target no longer visible -- closed or unmapped before this checkpoint)"
     }
 }
 
@@ -3055,6 +3091,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private var activateExperimentWindowId: UInt32?
     private var activatePreRatio: Double?
     private var activatePostRatio: Double?
+    /// Sampled-once flags for the two checkpoints (value or nil) -- see `ActivateExperimentGate`.
+    private var activatePreSampled = false
+    private var activatePostSampled = false
     private var didSendActivate = false
 
     init(host: String, user: String, pass: String, screenshotPath: String, launchedProgram: String,
@@ -4407,20 +4446,24 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         }
         guard let windowId = activateExperimentWindowId else { return }
 
-        if elapsed >= 6, activatePreRatio == nil {
+        if ActivateExperimentGate.sampleDue(elapsed: elapsed, threshold: 6, sampled: activatePreSampled) {
+            activatePreSampled = true
             activatePreRatio = registry.nonWhitePixelRatio(windowId: windowId, inBottomFraction: 0.2, sampleCount: 100)
+            let visible = registry.windowSnapshots().contains { $0.windowId == windowId && $0.isVisible }
             print("[experiment] pre-Activate bottom-20% non-white ratio for windowId=\(windowId): "
-                + "\(activatePreRatio.map { String(format: "%.1f%%", $0 * 100) } ?? "n/a")")
+                + ActivateExperimentGate.ratioText(activatePreRatio, windowVisible: visible))
         }
         if elapsed >= 8, !didSendActivate {
             didSendActivate = true
             session.activateWindow(windowId)
             print("[experiment] sent ClientActivate for windowId=\(windowId)")
         }
-        if elapsed >= 20, activatePostRatio == nil {
+        if ActivateExperimentGate.sampleDue(elapsed: elapsed, threshold: 20, sampled: activatePostSampled) {
+            activatePostSampled = true
             activatePostRatio = registry.nonWhitePixelRatio(windowId: windowId, inBottomFraction: 0.2, sampleCount: 100)
+            let visible = registry.windowSnapshots().contains { $0.windowId == windowId && $0.isVisible }
             print("[experiment] post-Activate bottom-20% non-white ratio for windowId=\(windowId): "
-                + "\(activatePostRatio.map { String(format: "%.1f%%", $0 * 100) } ?? "n/a")")
+                + ActivateExperimentGate.ratioText(activatePostRatio, windowVisible: visible))
         }
     }
 
