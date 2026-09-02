@@ -82,6 +82,43 @@ enum MoveResizeGate {
     /// separate claim.
     static let toleranceInRemotePixels: Double = 0
 
+    /// Whether a leg "reached its target and stayed there". Three states, because the old
+    /// `Bool` had only two and lied in the third: on the 2026-09-02 real-host run
+    /// (env-202609-14) both red legs printed "settled without oscillation" as PASS although the
+    /// rect never matched -- the unmatched branches hard-coded `false`, so the assertion could
+    /// not fail (review resize-live-r1 I1, r2). `unjudgeable` is what those legs actually were.
+    enum OscillationVerdict: Equatable {
+        /// The leg could not be judged: no frozen topology to judge in, no geometry-carrying
+        /// observation at all, or observations that never matched inside the budget -- in each
+        /// case "did it stay there" has no referent. `observations` = how many geometry-carrying
+        /// updates were seen for the leg (0 = none); WHICH of the three causes applies is in the
+        /// leg's own detail text, not here (review oscillation-verdict-r1 I-1).
+        case unjudgeable(observations: Int)
+        /// Matched, and every later observation still matched.
+        case none
+        /// Matched, then at least one later observation diverged again.
+        case oscillated
+
+        var isOscillated: Bool { self == .oscillated }
+        var text: String {
+            switch self {
+            case .unjudgeable(let n): return "unjudgeable (\(n) observation(s); cause in the leg's detail)"
+            case .none: return "none"
+            case .oscillated: return "oscillated"
+            }
+        }
+    }
+
+    /// Pure form of the leg's oscillation scan: `rectPassedPerObservation[i]` is whether the
+    /// i-th observed rect passed the RECT half. Failures BEFORE the first match are the leg
+    /// still travelling and are not oscillation; only a later divergence is.
+    static func oscillationVerdict(rectPassedPerObservation: [Bool]) -> OscillationVerdict {
+        guard let firstMatch = rectPassedPerObservation.firstIndex(of: true) else {
+            return .unjudgeable(observations: rectPassedPerObservation.count)
+        }
+        return rectPassedPerObservation[(firstMatch + 1)...].contains(false) ? .oscillated : .none
+    }
+
     /// One leg's paired verdict (adr/0015 §6.3): a RECT comparison and the single-POINT reverse
     /// mapping of the same target's top-left corner, kept as two separately-named results.
     ///
@@ -595,6 +632,12 @@ enum SizeBand {
 ///    **Not covered here**: `runMoveResizeScenario`'s target lock calling something other than
 ///    `MoveResizeTarget.lock`, passing it a set other than `windowIdsBeforeExtraApps`, or choosing
 ///    the wrong one of its two one-shot log lines -- live wiring, no offline seam.
+///  * **the oscillation verdict** collapsing back to two states (an unmatched leg reported as
+///    "none"), counting pre-match failures as oscillation, dropping the post-match scan, or
+///    `isOscillated` going constant (the unfailable green reborn through the accessor
+///    `check(!oscillated)` reads), or `text` naming the wrong state =>
+///    `oscillationVerdictIsUnjudgeableUntilTheRectMatches`. **Not covered here**: `finish()`
+///    printing PASS instead of N/A for `.unjudgeable` -- live wiring, no offline seam.
 ///
 /// **Known blind spot, stated rather than papered over** (rev-L9 I-2, R6): replacing the two
 /// `WindowGeometry.windowsPoint` calls with a copy of the rect conversion's own origin is an
@@ -983,6 +1026,27 @@ enum WindowSmokeGateSelfTest {
                 && MoveResizeTarget.matchedOnlyPreExisting(candidates: [about, oldNotepad, newNotepad], filter: "Notepad", preExisting: preExisting).isEmpty
                 && MoveResizeTarget.matchedOnlyPreExisting(candidates: [about], filter: nil, preExisting: preExisting).isEmpty,
             "moveResizeTargetLockExcludesPreExistingOnlyWhenFiltered: About heuristic accepts the (pre-existing) first app; a filter skips ids seen before the extra apps launched, picks the lowest new id, and reports the pre-existing-only ids in ascending order"
+        )
+
+        // --- oscillation verdict: unjudgeable when the rect never matched -----------------------
+        // (review resize-live-r1 I1 / r2: the two red legs of env-202609-14 printed "settled without
+        // oscillation" PASS because the unmatched branches hard-coded `oscillated: false` -- a
+        // structurally unfailable green. The verdict now has a third state and finish() reports it
+        // as N/A, never as PASS.)
+        expect(
+            MoveResizeGate.oscillationVerdict(rectPassedPerObservation: []) == .unjudgeable(observations: 0)
+                && MoveResizeGate.oscillationVerdict(rectPassedPerObservation: [false, false]) == .unjudgeable(observations: 2)
+                && MoveResizeGate.oscillationVerdict(rectPassedPerObservation: [true]) == .none
+                && MoveResizeGate.oscillationVerdict(rectPassedPerObservation: [false, true, true]) == .none
+                && MoveResizeGate.oscillationVerdict(rectPassedPerObservation: [true, false]) == .oscillated
+                && MoveResizeGate.oscillationVerdict(rectPassedPerObservation: [false, true, false, true]) == .oscillated
+                && MoveResizeGate.OscillationVerdict.oscillated.isOscillated
+                && !MoveResizeGate.OscillationVerdict.none.isOscillated
+                && !MoveResizeGate.OscillationVerdict.unjudgeable(observations: 3).isOscillated
+                && MoveResizeGate.OscillationVerdict.unjudgeable(observations: 3).text.contains("3 observation")
+                && MoveResizeGate.OscillationVerdict.none.text == "none"
+                && MoveResizeGate.OscillationVerdict.oscillated.text == "oscillated",
+            "oscillationVerdictIsUnjudgeableUntilTheRectMatches: no match => unjudgeable(n); failures BEFORE the first match are not oscillation; any later divergence is; isOscillated is true for exactly the oscillated case and text names each state"
         )
 
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
@@ -1803,9 +1867,14 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         /// the leg never matched, on the same last rect the rect half was judged against) -- the
         /// pairing is only meaningful if both halves speak about one observation.
         let pointCheckPassed: Bool
-        let oscillated: Bool
+        /// `MoveResizeGate.oscillationVerdict` over this leg's observations -- `unjudgeable` when the
+        /// leg could not be judged (no frozen topology, no observation, or no match; the cause is in
+        /// `detail`), which `finish()` reports as N/A rather than as a PASS.
+        let oscillation: MoveResizeGate.OscillationVerdict
         /// Human-readable paired verdict + measured deltas + the deductions in force (§6.2).
         let detail: String
+
+        var oscillated: Bool { oscillation.isOscillated }
 
         /// The leg's own verdict: both halves, per §6.3.
         var passed: Bool { rectCheckPassed && pointCheckPassed }
@@ -3078,6 +3147,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private func finishCycles() {
         drainTimer?.invalidate()
         drainTimer = nil
+        printRunElapsed()
 
         var ok = true
         func check(_ cond: Bool, _ message: String) {
@@ -3493,7 +3563,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             ) else { return }
             moveResult = outcome
             print("[move-resize] move leg resolved (position-only): legPassed=\(outcome.passed) "
-                + "oscillated=\(outcome.oscillated) \(outcome.detail)")
+                + "oscillation=\(outcome.oscillation.text) \(outcome.detail)")
             if let mapped = registry.debugMappedSize(forWindowId: windowId), let originalMapped = moveResizeOriginalMappedSize,
                mapped != originalMapped
             {
@@ -3548,7 +3618,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             ) else { return }
             resizeResult = outcome
             print("[move-resize] resize leg resolved: legPassed=\(outcome.passed) "
-                + "oscillated=\(outcome.oscillated) \(outcome.detail)")
+                + "oscillation=\(outcome.oscillation.text) \(outcome.detail)")
             // Fix 2 (team-lead review): always attempt the close leg here, matching the
             // maximize scenario's own "still exercise the close leg even after an earlier
             // leg's failure" precedent -- cleanup shouldn't depend on the round-trip
@@ -4019,7 +4089,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // decline and say so, never fabricate a coordinate from a substituted height.
         guard let topology = displayTopology.sessionSnapshot else {
             return MoveResizeLegOutcome(
-                rectCheckPassed: false, pointCheckPassed: false, oscillated: false,
+                rectCheckPassed: false, pointCheckPassed: false,
+                oscillation: .unjudgeable(observations: moveResizeObservedContentRects.count),
                 detail: "no frozen session topology (adr/0015 §5.A.6) -- the leg cannot be judged in "
                     + "remote px at all, so it is reported failed rather than compared against a "
                     + "substituted primary height"
@@ -4051,7 +4122,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 // the rect half did not reach, which is itself a finding worth printing.
                 guard let last = contentRects.last else {
                     return MoveResizeLegOutcome(
-                        rectCheckPassed: false, pointCheckPassed: false, oscillated: false,
+                        rectCheckPassed: false, pointCheckPassed: false, oscillation: .unjudgeable(observations: 0),
                         detail: "no geometry-carrying WindowUpdate/WindowCreate was observed for this leg at all "
                             + "-- neither half of the paired assertion had an observation to judge; "
                             + deductionsText(windowId: windowId, target: targetMacRect, in: topology, legSentAt: sentAt)
@@ -4060,7 +4131,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 let failed = verdict(last)
                 return MoveResizeLegOutcome(
                     rectCheckPassed: failed.rectCheckPassed, pointCheckPassed: failed.pointCheckPassed,
-                    oscillated: false,
+                    oscillation: .unjudgeable(observations: contentRects.count),
                     detail: "\(failed.pairedVerdictText) \(failed.deltaText) (judged against the LAST of "
                         + "\(contentRects.count) observed rect(s)); "
                         + deductionsText(windowId: windowId, target: targetMacRect, in: topology, legSentAt: sentAt)
@@ -4069,7 +4140,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             return nil
         }
         let matchedVerdict = verdict(contentRects[firstMatchIndex])
-        let oscillated = contentRects[(firstMatchIndex + 1)...].contains { !verdict($0).rectCheckPassed }
+        let oscillation = MoveResizeGate.oscillationVerdict(
+            rectPassedPerObservation: contentRects.map { verdict($0).rectCheckPassed }
+        )
+        let oscillated = oscillation.isOscillated
         // A brief settle window after the first match, so a late-arriving divergent
         // WindowUpdate still has a chance to be observed as oscillation before this leg
         // resolves -- unless oscillation has already been directly observed, in which case
@@ -4079,7 +4153,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         }
         return MoveResizeLegOutcome(
             rectCheckPassed: matchedVerdict.rectCheckPassed, pointCheckPassed: matchedVerdict.pointCheckPassed,
-            oscillated: oscillated,
+            oscillation: oscillation,
             detail: "\(matchedVerdict.pairedVerdictText) \(matchedVerdict.deltaText); "
                 + deductionsText(windowId: windowId, target: targetMacRect, in: topology, legSentAt: sentAt)
         )
@@ -4908,9 +4982,25 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         return topology
     }
 
+    /// One run-level line, on both exits: the interval from `startTime` -- set just BEFORE
+    /// `newSession.start()` is called, so it includes connection setup -- to the entry of
+    /// `finish()`/`finishCycles()`, i.e. before the assertion battery and the shutdown. Until now the only duration on record came from the wrapper's own
+    /// start/stop stamps outside this log (docs/upgrade-gate/2026-09-scaledmap-next-step.md §5
+    /// needs a duration the run's own evidence carries; review scaledmap-memo-r2 I-2); the two
+    /// differ by the wrapper's own pre-launch work, so records name which one they quote.
+    /// Informational, never gated; a missing `startTime` (start was never requested) prints as such.
+    private func printRunElapsed() {
+        if let startTime {
+            print("[run] elapsed since start: \(String(format: "%.1f", Date().timeIntervalSince(startTime)))s")
+        } else {
+            print("[run] elapsed since start: n/a (start was never requested)")
+        }
+    }
+
     private func finish() {
         drainTimer?.invalidate()
         drainTimer = nil
+        printRunElapsed()
 
         let snapshots = registry.windowSnapshots()
         let visibleWindows = snapshots.filter(\.isVisible)
@@ -5716,11 +5806,22 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                         + "WindowGeometry.windowsPoint (adr/0015 §6.3's paired assertion; no `- height` term, "
                         + "so its sign/anchor errors are invisible to the rect check above). \(moveResult.detail)"
                 )
-                check(
-                    !moveResult.oscillated,
-                    "move-resize scenario: move leg settled without POSITION oscillation (no later WindowUpdate "
-                        + "diverged from the matched target's x/y)"
-                )
+                // Three-way, not a Bool: when the leg is unjudgeable (no topology, no observation,
+                // or no match -- `detail` says which) there is nothing to have "settled", and
+                // printing PASS there was the unfailable green review resize-live-r1 I1 caught on
+                // env-202609-14's two red legs.
+                switch moveResult.oscillation {
+                case .unjudgeable(let n):
+                    print("[assert] N/A: move-resize scenario: move leg POSITION oscillation is not judgeable "
+                        + "(\(n) observation(s); no match, no observation, or no frozen topology -- see the "
+                        + "leg-resolved line); not counted as PASS")
+                case .none, .oscillated:
+                    check(
+                        !moveResult.oscillated,
+                        "move-resize scenario: move leg settled without POSITION oscillation (no later WindowUpdate "
+                            + "diverged from the matched target's x/y)"
+                    )
+                }
             } else {
                 check(false, "move-resize scenario: a target window was locked and the move leg was sent before the run ended")
             }
@@ -5744,7 +5845,14 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                         "move-resize scenario: resize leg POINT check -- the same target's top-left through "
                             + "WindowGeometry.windowsPoint (adr/0015 §6.3's paired assertion). \(resizeResult.detail)"
                     )
-                    check(!resizeResult.oscillated, "move-resize scenario: resize leg settled without oscillation")
+                    switch resizeResult.oscillation {
+                    case .unjudgeable(let n):
+                        print("[assert] N/A: move-resize scenario: resize leg oscillation is not judgeable "
+                            + "(\(n) observation(s); no match, no observation, or no frozen topology -- see the "
+                            + "leg-resolved line); not counted as PASS")
+                    case .none, .oscillated:
+                        check(!resizeResult.oscillated, "move-resize scenario: resize leg settled without oscillation")
+                    }
                 } else {
                     // Ungated, but still PAIRED and still fully reported -- adr/0015 §6.3 is about
                     // what a leg's verdict must SAY, and that does not change with whether the
@@ -5753,7 +5861,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                         "[info] move-resize scenario: resize leg's target window was NOT resizable at send time "
                             + "(the default About target never is -- StyleTranslatorTests' aboutWindowsDialogShape; "
                             + "WINDOW_SMOKE_MOVE_TARGET picks a resizable one) -- "
-                            + "legPassed=\(resizeResult.passed) oscillated=\(resizeResult.oscillated) "
+                            + "legPassed=\(resizeResult.passed) oscillation=\(resizeResult.oscillation.text) "
                             + "rectCheck=\(resizeResult.rectCheckPassed ? "PASS" : "FAIL") "
                             + "pointCheck=\(resizeResult.pointCheckPassed ? "PASS" : "FAIL") "
                             + "\(resizeResult.detail), reported informationally, not gated"
