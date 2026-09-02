@@ -130,6 +130,18 @@ enum MoveResizeGate {
         return eventWindowId == targetWindowId
     }
 
+    /// C-H2 (C r1, 2026-09-02, docs/upgrade-gate/2026-09-c-existing-form-r1-live.md §3-3): an
+    /// observation counts for a leg only when a ClientWindowMove was sent AT OR AFTER the leg
+    /// locked (a send that predates the lock is the previous leg's) and the observation is at or
+    /// after that send. Without this, a surface remap of the target landing between the local
+    /// `setFrame` and the debounced send re-applied the harness's own target frame and matched it
+    /// trivially (a false RECT/POINT PASS, and the server's real reply then read as "oscillation";
+    /// C r1 :137 vs :139). Pure so the self-test can pin the ordering.
+    static func observationCountsForLeg(observedAt: TimeInterval, legLockedAt: TimeInterval, lastSentAt: TimeInterval?) -> Bool {
+        guard let sent = lastSentAt, sent >= legLockedAt else { return false }
+        return observedAt >= sent
+    }
+
     /// One leg's paired verdict (adr/0015 §6.3): a RECT comparison and the single-POINT reverse
     /// mapping of the same target's top-left corner, kept as two separately-named results.
     ///
@@ -668,6 +680,20 @@ enum SizeBand {
 ///    would make `finishCycles()`'s summary claim the previous cycle's declaration -- review r2 R1);
 ///    and the anchor assignment reading `desktop` instead of `declared.gateAnchor` (equivalent, the
 ///    pins do not distinguish it -- review r2 C2).
+///  * **the post-send observation gate** counting an observation that predates this leg's
+///    ClientWindowMove, accepting a send that predates the leg's lock (the previous leg's), or
+///    counting with no send at all => `moveResizeObservationCountsOnlyAfterTheLegsOwnSend`.
+///    **Not covered here** (live wiring, no offline seam): either sampling site (update / remap)
+///    not calling it, passing a lock time other than the phase's, or a send time other than
+///    `lastClientWindowMoveSent` -- the next C run's move leg is the live check (its observation
+///    #1 must now print "NOT counted").
+///  * **the focus-rotation gates** picking a deleted member, picking from an empty live set, voiding
+///    a pending rotation on another window's deletion, or deciding the pending outcome by anything
+///    but the clock => `focusRotationNextTargetSkipsDeletedMembers` /
+///    `focusRotationPendingIsVoidedOnlyByItsOwnTargetsDeletion` / `focusRotationPendingOutcomeIsTimeBased`.
+///    **Not covered here** (live wiring, the C-H1b defect itself): `tick()` not calling
+///    `pollFocusRotationPending` (with only the drain calling it an idle session never times out),
+///    or `deletedWindowIds` not fed from the drain's windowDelete branch.
 ///  * **the remap observation** sampled outside the in-flight window, for a non-target window,
 ///    or with no target locked => `remapObservationAppliesOnlyToTheInFlightTarget`. **Not covered
 ///    here** (live wiring, no offline seam): the tap not calling it at all for `surfaceMapped`
@@ -1123,6 +1149,67 @@ enum WindowSmokeGateSelfTest {
                 && !MoveResizeGate.remapObservationApplies(eventWindowId: 5, targetWindowId: 709, legAwaitingSettle: true)
                 && !MoveResizeGate.remapObservationApplies(eventWindowId: 709, targetWindowId: nil, legAwaitingSettle: true),
             "remapObservationAppliesOnlyToTheInFlightTarget: a surface remap is an observation only for the locked target while a leg awaits settle"
+        )
+
+        // --- move/resize observations count only after the leg's OWN send ------------------------
+        // (C r1, 2026-09-02: the move leg locked and set its local frame; a surface REMAP of the
+        // target (mapped 1906x1052 -> 1910x1054) landed 190 ms BEFORE `sent ClientWindowMove`; it
+        // re-applied the harness's own target frame, was recorded as observation #1, matched
+        // trivially -> a false RECT/POINT PASS, and the server's real reply then read as
+        // "oscillation" (C-H2). The F0 runs could not show this: their binaries predate dd53a27
+        // and sampled no remaps at all.)
+        expect(
+            !MoveResizeGate.observationCountsForLeg(observedAt: 6.450, legLockedAt: 6.40, lastSentAt: 6.638)
+                && MoveResizeGate.observationCountsForLeg(observedAt: 6.697, legLockedAt: 6.40, lastSentAt: 6.638)
+                && MoveResizeGate.observationCountsForLeg(observedAt: 6.638, legLockedAt: 6.40, lastSentAt: 6.638)
+                // a send that predates THIS leg's lock is the previous leg's send, not ours
+                && !MoveResizeGate.observationCountsForLeg(observedAt: 6.95, legLockedAt: 6.90, lastSentAt: 6.638)
+                // no send at all (resize r1's "the leg ran but never sent") -> nothing counts
+                && !MoveResizeGate.observationCountsForLeg(observedAt: 9.0, legLockedAt: 6.90, lastSentAt: nil),
+            "moveResizeObservationCountsOnlyAfterTheLegsOwnSend: an observation counts for a leg only when a ClientWindowMove was sent at/after the leg's lock and the observation is at/after that send"
+        )
+
+        // --- focus rotation skips deleted members and never picks from an empty set --------------
+        // (C r1: the rotation set was frozen at `ready` with the MOVE target in it; the close leg
+        // deleted that window, rotation 11 activated the deleted id, nothing ever converged -- C-H1a.)
+        expect(
+            FocusRotationGate.nextTarget(members: [263232, 144835106, 545129032], deleted: [], issued: 1) == 144835106
+                && FocusRotationGate.nextTarget(members: [263232, 144835106, 545129032], deleted: [144835106], issued: 1) == 545129032
+                && FocusRotationGate.nextTarget(members: [263232, 144835106, 545129032], deleted: [144835106], issued: 3) == 545129032
+                && FocusRotationGate.nextTarget(members: [263232, 144835106, 545129032], deleted: [144835106], issued: 4) == 263232
+                && FocusRotationGate.nextTarget(members: [7], deleted: [7], issued: 0) == nil
+                && FocusRotationGate.nextTarget(members: [], deleted: [], issued: 0) == nil,
+            "focusRotationNextTargetSkipsDeletedMembers: deleted windows drop out of the rotation and it keeps cycling the live ones; an empty live set yields no target"
+        )
+        // a pending rotation is voided only by ITS OWN target's deletion (not counted as a miss)
+        expect(
+            FocusRotationGate.pendingIsVoided(byDeletedWindowId: 144835106, pendingTargetId: 144835106)
+                && !FocusRotationGate.pendingIsVoided(byDeletedWindowId: 263232, pendingTargetId: 144835106)
+                && !FocusRotationGate.pendingIsVoided(byDeletedWindowId: 144835106, pendingTargetId: nil),
+            "focusRotationPendingIsVoidedOnlyByItsOwnTargetsDeletion: deleting the in-flight target voids the rotation; deleting any other window, or with nothing in flight, does not"
+        )
+
+        // --- focus rotation pending outcome is time-based, not event-based --------------------------
+        // (C r1: the convergence/timeout poll ran only in drainNow(), which runs only when the
+        // session pushes events; an idle session therefore never timed rotation 11 out -- 10
+        // results for 11 issued, eventualMisses=0 -- and the scenario stalled to the failsafe (C-H1b).)
+        let rotationSentAt = Date(timeIntervalSince1970: 1_000)
+        let softDeadline = rotationSentAt.addingTimeInterval(0.5)
+        let eventualDeadline = rotationSentAt.addingTimeInterval(5.0)
+        func pending(_ dt: TimeInterval, matches: Bool) -> FocusRotationGate.PendingOutcome {
+            FocusRotationGate.pendingOutcome(
+                now: rotationSentAt.addingTimeInterval(dt), softDeadline: softDeadline,
+                eventualDeadline: eventualDeadline, activeMatchesTarget: matches
+            )
+        }
+        expect(
+            pending(0.1, matches: true) == .hit(soft: true)
+                && pending(0.5, matches: true) == .hit(soft: true)
+                && pending(2.0, matches: true) == .hit(soft: false)
+                && pending(4.9, matches: false) == .pending
+                && pending(5.0, matches: false) == .miss
+                && pending(60, matches: false) == .miss,
+            "focusRotationPendingOutcomeIsTimeBased: a match is a hit (soft iff at/before the soft deadline); no match is pending until the eventual deadline and a miss from then on -- regardless of whether any event arrived"
         )
 
         // --- declared-desktop override (WINDOW_SMOKE_DECLARED_DESKTOP, scaled-map memo §4-1 F) ------
@@ -1599,6 +1686,45 @@ let moveResizeScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOK
 let moveResizeTargetFilter = ProcessInfo.processInfo.environment["WINDOW_SMOKE_MOVE_TARGET"]
 
 /// Title matching for the move/resize scenario's target lock (see `moveResizeTargetFilter`).
+/// Pure gates for the focus-rotation scenario (C r1, 2026-09-02, docs/upgrade-gate/
+/// 2026-09-c-existing-form-r1-live.md §3-2): the member set was frozen at `ready` with the MOVE
+/// target in it, the close leg deleted that window, rotation 11 activated the deleted id, and the
+/// convergence/timeout poll -- living only in the event-driven drain -- never ran again in the
+/// idle session, so the scenario sat until the deadline failsafe (11 issued, 10 results).
+enum FocusRotationGate {
+    /// The next window to activate: members deleted since `ready` drop out, the rotation keeps
+    /// cycling the live ones in their original order, and an empty live set yields nothing (the
+    /// caller ends the scenario rather than activating a ghost).
+    static func nextTarget(members: [UInt32], deleted: Set<UInt32>, issued: Int) -> UInt32? {
+        let live = members.filter { !deleted.contains($0) }
+        guard !live.isEmpty else { return nil }
+        return live[issued % live.count]
+    }
+
+    /// A pending rotation is voided (dropped without a result -- the fixture activated a window
+    /// that no longer exists, which says nothing about convergence) only when ITS OWN target is
+    /// the window being deleted.
+    static func pendingIsVoided(byDeletedWindowId deleted: UInt32, pendingTargetId: UInt32?) -> Bool {
+        guard let pendingTargetId else { return false }
+        return deleted == pendingTargetId
+    }
+
+    enum PendingOutcome: Equatable {
+        case pending
+        case hit(soft: Bool)
+        case miss
+    }
+
+    /// adr/0012 §4.2's two tiers, decided by the CLOCK, not by event arrival: a match is a hit
+    /// (soft iff at/before the soft deadline); no match stays pending until the eventual deadline
+    /// and is a miss from then on. The caller polls this from the per-tick timer as well as the
+    /// drain, so an idle session still resolves.
+    static func pendingOutcome(now: Date, softDeadline: Date, eventualDeadline: Date, activeMatchesTarget: Bool) -> PendingOutcome {
+        if activeMatchesTarget { return .hit(soft: now <= softDeadline) }
+        return now >= eventualDeadline ? .miss : .pending
+    }
+}
+
 enum MoveResizeTarget {
     /// `nil`/empty filter: the About-Windows heuristic every scenario in this file historically
     /// used (`about`, case-insensitive, or the CJK `关于`). Otherwise `|`-separated alternatives,
@@ -1940,6 +2066,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private var focusRotationReady = false
     private var focusRotationWindowIds: [UInt32] = []
     private var focusRotationsIssued = 0
+    /// Rotations dropped because their target was deleted before converging (C-H1a); not misses.
+    private var focusRotationsVoided = 0
+    /// Every windowId whose WindowDelete the drain has seen -- the focus rotation skips these.
+    private var deletedWindowIds: Set<UInt32> = []
     private var focusRotationPendingTargetId: UInt32?
     private var focusRotationPendingSentAt: Date?
     /// The 500ms soft-deadline mark (adr/0012 §1) -- convergence observed at or before this
@@ -2111,6 +2241,24 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         case .awaitingMoveSettle, .awaitingResizeSettle: return true
         case .waitingForTarget, .awaitingClose, .done: return false
         }
+    }
+    /// When the in-flight leg locked its target (each awaiting phase's `sentAt` is that lock moment;
+    /// the ClientWindowMove goes out later, after the local debounce), as run elapsed seconds --
+    /// nil when no leg is awaiting settle. Feeds `MoveResizeGate.observationCountsForLeg` (C-H2).
+    private var moveResizeLegLockedAtElapsed: TimeInterval? {
+        guard let startTime else { return nil }
+        switch moveResizePhase {
+        case .awaitingMoveSettle(_, _, let lockedAt), .awaitingResizeSettle(_, _, let lockedAt):
+            return lockedAt.timeIntervalSince(startTime)
+        case .waitingForTarget, .awaitingClose, .done:
+            return nil
+        }
+    }
+    /// `lastClientWindowMoveSent.at` as run elapsed seconds (the one send-time source, recorded
+    /// where the PDU is actually posted); nil before any send.
+    private var lastClientWindowMoveSentElapsed: TimeInterval? {
+        guard let startTime, let sent = lastClientWindowMoveSent else { return nil }
+        return sent.at.timeIntervalSince(startTime)
     }
     private static let moveResizePollTimeout: TimeInterval = 3.0
     /// Team-lead review (2026-08-23 real-host run): mirrors `maximizePollTimeout`'s own 5s
@@ -2731,6 +2879,17 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // W4c deliverable 5: registry.handle(event) above already removed this
             // windowId from its own tracking for a windowDelete -- this just separately
             // records the fact and the timing for the input-test assertion in finish().
+            if event.kind == .windowDelete {
+                self.deletedWindowIds.insert(event.windowId)
+                // C-H1a: a rotation whose target vanished can never converge; void it (not a miss
+                // -- the fixture activated a window that no longer existed) so the next can go out.
+                if FocusRotationGate.pendingIsVoided(byDeletedWindowId: event.windowId, pendingTargetId: self.focusRotationPendingTargetId) {
+                    self.focusRotationsVoided += 1
+                    print("[focus-rotation] pending target windowId=\(event.windowId) was deleted before convergence; "
+                        + "rotation voided (not counted as a miss)")
+                    self.resolveFocusRotationPending()
+                }
+            }
             if event.kind == .windowDelete, let target = self.inputTestWindowId, event.windowId == target,
                !self.inputTestWindowDeleted
             {
@@ -2838,7 +2997,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                         + "impliedSizeCorrection(mapped-accumulatedRAIL,w,h)=\(impliedSizeCorrection)"
                 )
                 let contentRect = window.contentRect(forFrameRect: window.frame)
-                self.moveResizeObservedContentRects.append((contentRect: contentRect, at: Date().timeIntervalSince(self.startTime), source: "update"))
+                let observedAt = self.startTime.map { Date().timeIntervalSince($0) } ?? -1
+                if MoveResizeGate.observationCountsForLeg(
+                    observedAt: observedAt, legLockedAt: self.moveResizeLegLockedAtElapsed ?? .infinity,
+                    lastSentAt: self.lastClientWindowMoveSentElapsed
+                ) {
+                    self.moveResizeObservedContentRects.append((contentRect: contentRect, at: observedAt, source: "update"))
+                } else {
+                    print("[move-resize] update at elapsed=\(String(format: "%.3f", observedAt))s for windowId=\(target) "
+                        + "NOT counted as an observation: it predates this leg's ClientWindowMove (C-H2)")
+                }
             }
             // F0-2 (2026-09-02): the surface remap's frame re-apply is the SECOND state the local
             // window reaches after a resize (RAIL update first, remap a beat later), and it is
@@ -2853,9 +3021,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             {
                 let contentRect = window.contentRect(forFrameRect: window.frame)
                 let elapsed = self.startTime.map { Date().timeIntervalSince($0) } ?? -1
+                let counts = MoveResizeGate.observationCountsForLeg(
+                    observedAt: elapsed, legLockedAt: self.moveResizeLegLockedAtElapsed ?? .infinity,
+                    lastSentAt: self.lastClientWindowMoveSentElapsed
+                )
                 print("[move-resize] surface remap at elapsed=\(String(format: "%.3f", elapsed))s for windowId=\(target): "
-                    + "mapped=\(event.mappedWidth)x\(event.mappedHeight) -> content rect now \(contentRect) (observation source=remap)")
-                self.moveResizeObservedContentRects.append((contentRect: contentRect, at: elapsed, source: "remap"))
+                    + "mapped=\(event.mappedWidth)x\(event.mappedHeight) -> content rect now \(contentRect) "
+                    + (counts ? "(observation source=remap)" : "(NOT counted as an observation: it predates this leg's ClientWindowMove, C-H2)"))
+                if counts {
+                    self.moveResizeObservedContentRects.append((contentRect: contentRect, at: elapsed, source: "remap"))
+                }
             }
             // Team-lead review (2026-08-23, maximize-scenario real-host regression
             // investigation): reuses the move-resize scenario's own raw-RAIL-geometry trace
@@ -3022,24 +3197,38 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // `FocusAuthority.hardDeadlineInterval`) is the "did convergence eventually happen"
         // observation tier adr/0012 §0's own real-capture data showed never actually fails
         // in steady state ("收敛从未彻底失败，只是有时很慢").
-        if let targetId = focusRotationPendingTargetId, let sentAt = focusRotationPendingSentAt,
-           let softDeadline = focusRotationPendingSoftDeadline,
-           let eventualDeadline = focusRotationPendingEventualDeadline
-        {
-            let currentActive = registry.serverDesktopState().activeWindow
-            if case .window(let active) = currentActive, active == targetId {
-                let now = Date()
-                let latencyMs = now.timeIntervalSince(sentAt) * 1000
-                focusRotationResults.append(FocusRotationResult(
-                    targetId: targetId, softHit: now <= softDeadline, eventualHit: true,
-                    latencyMs: latencyMs, observedActiveWindow: currentActive))
-                resolveFocusRotationPending()
-            } else if Date() >= eventualDeadline {
-                focusRotationResults.append(FocusRotationResult(
-                    targetId: targetId, softHit: false, eventualHit: false, latencyMs: nil,
-                    observedActiveWindow: currentActive))
-                resolveFocusRotationPending()
-            }
+        pollFocusRotationPending(registry: registry)
+    }
+
+    /// C-H1b (C r1, 2026-09-02): polled from BOTH `drainNow()` and `tick()`. It used to live only
+    /// in the drain, which runs only when the session pushes events -- an idle session therefore
+    /// never timed a pending rotation out (rotation 11 targeted a deleted window: 10 results for
+    /// 11 issued, `eventualMisses=0`, and the scenario sat until the deadline failsafe). The
+    /// outcome itself is `FocusRotationGate.pendingOutcome` -- decided by the clock.
+    private func pollFocusRotationPending(registry: RemoteWindowRegistry) {
+        guard let targetId = focusRotationPendingTargetId, let sentAt = focusRotationPendingSentAt,
+              let softDeadline = focusRotationPendingSoftDeadline,
+              let eventualDeadline = focusRotationPendingEventualDeadline
+        else { return }
+        let currentActive = registry.serverDesktopState().activeWindow
+        var matches = false
+        if case .window(let active) = currentActive, active == targetId { matches = true }
+        let now = Date()
+        switch FocusRotationGate.pendingOutcome(
+            now: now, softDeadline: softDeadline, eventualDeadline: eventualDeadline, activeMatchesTarget: matches
+        ) {
+        case .pending:
+            return
+        case .hit(let soft):
+            focusRotationResults.append(FocusRotationResult(
+                targetId: targetId, softHit: soft, eventualHit: true,
+                latencyMs: now.timeIntervalSince(sentAt) * 1000, observedActiveWindow: currentActive))
+            resolveFocusRotationPending()
+        case .miss:
+            focusRotationResults.append(FocusRotationResult(
+                targetId: targetId, softHit: false, eventualHit: false, latencyMs: nil,
+                observedActiveWindow: currentActive))
+            resolveFocusRotationPending()
         }
     }
 
@@ -3081,6 +3270,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // step per tick, gated on each step's own gap.
         runUnicodeDegradeScenario(elapsed: elapsed, registry: registry)
         runInputScript(registry: registry)
+        // C-H1b: time-based, so a pending rotation resolves even when no event arrives.
+        pollFocusRotationPending(registry: registry)
         runFocusRotation(elapsed: elapsed, session: session, registry: registry)
         runMaximizeScenario(session: session, registry: registry)
         runMoveResizeScenario(session: session, registry: registry)
@@ -5081,9 +5272,16 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // 300ms inter-rotation settle (nil before the very first rotation -- that one
         // fires as soon as the scenario becomes ready, no wait needed).
         if let nextAllowedAt = focusRotationNextAllowedAt, Date() < nextAllowedAt { return }
-        guard !focusRotationWindowIds.isEmpty else { return }
-
-        let targetId = focusRotationWindowIds[focusRotationsIssued % focusRotationWindowIds.count]
+        // C-H1a (C r1, 2026-09-02): members deleted since `ready` (the MOVE target, closed by
+        // its own close leg) drop out -- activating a deleted window never converges.
+        guard let targetId = FocusRotationGate.nextTarget(
+            members: focusRotationWindowIds, deleted: deletedWindowIds, issued: focusRotationsIssued
+        ) else {
+            print("[focus-rotation] no live member left to rotate (members=\(focusRotationWindowIds) "
+                + "deleted=\(deletedWindowIds.sorted())); scenario ends at issued=\(focusRotationsIssued)")
+            focusRotationDone = true
+            return
+        }
         focusRotationsIssued += 1
         session.activateWindow(targetId)
         let sentAt = Date()
@@ -6071,8 +6269,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 return latencies[rank]
             }
             print(String(
-                format: "[focus-rotation] n=%d softHits=%d eventualHits=%d eventualMisses=%d p50=%.1fms p95=%.1fms maxMs=%.1fms",
-                focusRotationTotal, softHits.count, eventualHits.count, eventualMisses.count,
+                format: "[focus-rotation] configured=%d issued=%d results=%d voided=%d softHits=%d eventualHits=%d eventualMisses=%d p50=%.1fms p95=%.1fms maxMs=%.1fms",
+                focusRotationTotal, focusRotationsIssued, focusRotationResults.count, focusRotationsVoided,
+                softHits.count, eventualHits.count, eventualMisses.count,
                 percentileMs(0.5), percentileMs(0.95), latencies.last ?? 0
             ))
             for miss in eventualMisses {
