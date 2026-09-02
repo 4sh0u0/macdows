@@ -152,9 +152,9 @@ public struct KnownDifferenceTable: Sendable, Equatable {
     /// "Phase 2 W0(2) AVC caps flip" entry of `cmake_config.corrections_applied`)
     /// **falsified that** on two independent grounds:
     ///
-    /// - *Caps*: `rdpgfx_main.c:373-387` sets `RDPGFX_CAPS_FLAG_AVC_DISABLED` in **both**
+    /// - *Caps*: `rdpgfx_main.c:386-389 (3.31.1; 373-387 at 3.30.0)` sets `RDPGFX_CAPS_FLAG_AVC_DISABLED` in **both**
     ///   arms of the `WITH_GFX_H264` `#ifdef`; the H264 arm is additionally gated on runtime
-    ///   `!GfxAVC444`, which defaults `FALSE` (`settings.c:1231-1232`) and is set nowhere in
+    ///   `!GfxAVC444`, which defaults `FALSE` (`core/settings.c:1234 (3.31.1; 1231-1232 at 3.30.0)`) and is set nowhere in
     ///   this repo. So the flip does not change the caps we advertise. The flag whose *name*
     ///   matches the scaled map — `RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE`, 10.7+ — is gated on
     ///   `WITH_CAIRO`/`WITH_SWSCALE`, both OFF before and after.

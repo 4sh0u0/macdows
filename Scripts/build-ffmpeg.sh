@@ -145,7 +145,7 @@ STAGING_ROOT="$CRDP_BUILD_DIR/deps/ffmpeg-stage"
 #     libavcodec that cannot load. It is a transitively required component, not an
 #     optional one — hence a transitively required dylib in the shipped set (four with swscale, see below).
 #   * --enable-parser=h264 IS passed (not in the original W8 sketch): --disable-everything
-#     also drops parsers, and FreeRDP's h264_ffmpeg.c:796 calls
+#     also drops parsers, and FreeRDP's h264_ffmpeg.c:1177 (3.31.1; :796 at 3.30.0) calls
 #     av_parser_init(AV_CODEC_ID_H264) and treats NULL as a hard failure
 #     ("Failed to initialize libav parser" -> goto EXCEPTION). Without this flag H.264
 #     decode does not initialise at all.
