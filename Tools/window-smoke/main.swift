@@ -1387,24 +1387,40 @@ enum WindowSmokeGateSelfTest {
             "aboutTargetPrefersTheNewestAbout: among About-titled candidates the one first seen latest wins (this run's winver), regardless of id; equal first-seen falls back to the lowest id; none -> nil"
         )
         expect(
-            AboutTarget.describe(AboutTarget.Choice(windowId: 510198942, firstSeenElapsed: 2.1, decidedByFirstSeen: true), of: 2)
-                == "newest of 2 candidates by first WindowCreate (windowId=510198942 first seen @2.100s)"
-                && AboutTarget.describe(AboutTarget.Choice(windowId: 7, firstSeenElapsed: 3.0, decidedByFirstSeen: true), of: 1)
+            AboutTarget.describe(AboutTarget.Choice(windowId: 510198942, firstSeenElapsed: 2.1, tiedAtNewest: 1, runnerUpFirstSeen: 0.4), of: 2)
+                == "newest of 2 candidates by first WindowCreate (windowId=510198942 first seen @2.100s; runner-up @0.400s)"
+                // review about-target-r2 m-7: the margin is readable -- an unobserved runner-up says so
+                && AboutTarget.describe(AboutTarget.Choice(windowId: 3, firstSeenElapsed: 2.1, tiedAtNewest: 1, runnerUpFirstSeen: -1), of: 3)
+                == "newest of 3 candidates by first WindowCreate (windowId=3 first seen @2.100s; runner-up never observed)"
+                && AboutTarget.describe(AboutTarget.Choice(windowId: 7, firstSeenElapsed: 3.0, tiedAtNewest: 1, runnerUpFirstSeen: nil), of: 1)
                 == "the only candidate (windowId=7 first seen @3.000s)"
-                // review about-target-r1 m-4: when time did NOT decide, the line must not claim it did
-                && AboutTarget.describe(AboutTarget.Choice(windowId: 100, firstSeenElapsed: 1.0, decidedByFirstSeen: false), of: 2)
-                == "lowest id of 2 candidates (windowId=100; first-seen tie @1.000s, newest-wins did not decide)"
-                && AboutTarget.describe(AboutTarget.Choice(windowId: 100, firstSeenElapsed: -1, decidedByFirstSeen: false), of: 3)
-                == "lowest id of 3 candidates (windowId=100; first-seen tie @-1.000s, newest-wins did not decide)",
-            "aboutTargetSaysWhyItChose: the lock line names how many windows competed and when the chosen one was first seen; a tie (or all-unobserved -1) says the lowest id decided, not the newest-wins rule"
+                && AboutTarget.describe(AboutTarget.Choice(windowId: 7, firstSeenElapsed: -1, tiedAtNewest: 1, runnerUpFirstSeen: nil), of: 1)
+                == "the only candidate (windowId=7; first WindowCreate never observed)"
+                // review about-target-r1 m-4 / r2 m-1: when time did NOT decide, say exactly what did
+                && AboutTarget.describe(AboutTarget.Choice(windowId: 100, firstSeenElapsed: 1.0, tiedAtNewest: 2, runnerUpFirstSeen: 1.0), of: 2)
+                == "lowest id of 2 candidates (all tied at first-seen @1.000s; newest-wins did not decide)"
+                && AboutTarget.describe(AboutTarget.Choice(windowId: 100, firstSeenElapsed: -1, tiedAtNewest: 3, runnerUpFirstSeen: -1), of: 3)
+                == "lowest id of 3 candidates (none observed at a first WindowCreate; newest-wins did not decide)"
+                && AboutTarget.describe(AboutTarget.Choice(windowId: 2, firstSeenElapsed: 5.0, tiedAtNewest: 2, runnerUpFirstSeen: 5.0), of: 3)
+                == "lowest id among the 2 candidates tied at the newest first-seen @5.000s (of 3; newest-wins eliminated 1)",
+            "aboutTargetSaysWhyItChose: the lock line names how many windows competed, when the chosen one was first seen and how far behind the runner-up was; a tie says which candidates tied and what the lowest id decided among, and an unobserved first-seen is named, never printed as -1.000s"
         )
         expect(
-            AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 900, firstSeenElapsed: 0.4), AboutTarget.Candidate(windowId: 100, firstSeenElapsed: 2.1)])?.decidedByFirstSeen == true
-                && AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 900, firstSeenElapsed: 1.0), AboutTarget.Candidate(windowId: 100, firstSeenElapsed: 1.0)])?.decidedByFirstSeen == false
-                // a tie among the LOSERS is not a tie: the winner is alone at its time
-                && AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 1, firstSeenElapsed: -1), AboutTarget.Candidate(windowId: 2, firstSeenElapsed: -1), AboutTarget.Candidate(windowId: 3, firstSeenElapsed: 2.1)])?.decidedByFirstSeen == true
-                && AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 7, firstSeenElapsed: 3.0)])?.decidedByFirstSeen == true,
-            "aboutTargetKnowsWhetherTimeDecided: decidedByFirstSeen is false exactly when another candidate shares the winner's first-seen time (the lowest id then decided); a lone candidate counts as decided"
+            AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 900, firstSeenElapsed: 0.4), AboutTarget.Candidate(windowId: 100, firstSeenElapsed: 2.1)])
+                == AboutTarget.Choice(windowId: 100, firstSeenElapsed: 2.1, tiedAtNewest: 1, runnerUpFirstSeen: 0.4)
+                && AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 900, firstSeenElapsed: 1.0), AboutTarget.Candidate(windowId: 100, firstSeenElapsed: 1.0)])
+                == AboutTarget.Choice(windowId: 100, firstSeenElapsed: 1.0, tiedAtNewest: 2, runnerUpFirstSeen: 1.0)
+                // a tie among the LOSERS is not a tie: the winner is alone at its time; the runner-up is the best loser
+                && AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 1, firstSeenElapsed: -1), AboutTarget.Candidate(windowId: 2, firstSeenElapsed: -1), AboutTarget.Candidate(windowId: 3, firstSeenElapsed: 2.1)])
+                == AboutTarget.Choice(windowId: 3, firstSeenElapsed: 2.1, tiedAtNewest: 1, runnerUpFirstSeen: -1)
+                // review about-target-r2 m-1: a tie among the NEWEST only counts those tied, not everyone
+                && AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 1, firstSeenElapsed: -1), AboutTarget.Candidate(windowId: 3, firstSeenElapsed: 5.0), AboutTarget.Candidate(windowId: 2, firstSeenElapsed: 5.0)])
+                == AboutTarget.Choice(windowId: 2, firstSeenElapsed: 5.0, tiedAtNewest: 2, runnerUpFirstSeen: 5.0)
+                && AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 7, firstSeenElapsed: 3.0)])
+                == AboutTarget.Choice(windowId: 7, firstSeenElapsed: 3.0, tiedAtNewest: 1, runnerUpFirstSeen: nil)
+                && AboutTarget.Choice(windowId: 7, firstSeenElapsed: 3.0, tiedAtNewest: 1, runnerUpFirstSeen: nil).decidedByFirstSeen
+                && !AboutTarget.Choice(windowId: 7, firstSeenElapsed: 3.0, tiedAtNewest: 2, runnerUpFirstSeen: 3.0).decidedByFirstSeen,
+            "aboutTargetKnowsWhetherTimeDecided: a Choice carries how many candidates share the winner's first-seen time (1 = time decided) and the best loser's first-seen (nil for a lone candidate); a tie among losers leaves the winner decided"
         )
         // --- review about-target-r1 I-1: the first-seen bookkeeping is a value type, so "first WindowCreate
         // only" and "unobserved = -1" are pinned here instead of living in three call sites ---
@@ -1422,19 +1438,44 @@ enum WindowSmokeGateSelfTest {
                 && AboutTarget.pick(candidates: clock.candidates(for: [7, 510198942, 328362]))?.windowId == 510198942,
             "firstSeenClockKeepsTheFirstStamp: recording an id again leaves its first-seen time alone (a re-sent WindowCreate cannot make a leftover look new), an unrecorded id reads -1, and candidates(for:) hands AboutTarget exactly those values in id order"
         )
+        // --- review about-target-r2 I-2 / m-4: the drain feeds the clock through ONE observe(kind:) step, so
+        // "only a WindowCreate records, a WindowDelete forgets (a recycled id starts fresh)" is pinned ---
+        var observed = FirstSeenClock()
+        observed.observe(kind: .windowUpdate, windowId: 5, at: 0.5)   // an update alone records nothing
+        observed.observe(kind: .windowCreate, windowId: 5, at: 1.0)
+        observed.observe(kind: .windowCreate, windowId: 5, at: 2.0)   // re-sent create: first stamp kept
+        let afterCreates = observed.elapsed(of: 5)
+        observed.observe(kind: .windowDelete, windowId: 5, at: 3.0)
+        let afterDelete = observed.elapsed(of: 5)
+        observed.observe(kind: .windowCreate, windowId: 5, at: 4.0)   // the id comes back: a new incarnation
+        expect(
+            afterCreates == 1.0 && afterDelete == -1 && observed.elapsed(of: 5) == 4.0,
+            "firstSeenClockObservesCreatesAndDeletes: through observe(kind:) only a WindowCreate records (first one wins), a WindowUpdate alone records nothing, and a WindowDelete forgets the id so a recycled id is stamped by its own create"
+        )
+        // --- review about-target-r2 I-3: the experiment's target freezes on the CLOCK at the pre-sample
+        // threshold, not on `settled` (which the 2 s grace can hold open to t = 8 s, the interval in which
+        // the extra apps' windows appear and a Registry-Editor window would win the target) ---
+        let freezeProbe = ActivateExperimentCheckpoint(threshold: 6)
+        expect(
+            !freezeProbe.freezesTarget(at: 5.99) && freezeProbe.freezesTarget(at: 6) && freezeProbe.freezesTarget(at: 7.5)
+                && !freezeProbe.settled,
+            "activateExperimentFreezesOnTheClock: the target is frozen from the threshold instant on, whether or not the checkpoint has settled -- the grace window never re-opens the lock"
+        )
         // --- review about-target-r1 I-3: the Activate experiment may re-lock until its pre-sample is taken ---
         expect(
             AboutTarget.relock(current: nil, chosen: 5, frozen: false) == 5
                 && AboutTarget.relock(current: 5, chosen: 9, frozen: false) == 9
                 && AboutTarget.relock(current: 5, chosen: 5, frozen: false) == nil
                 && AboutTarget.relock(current: 5, chosen: 9, frozen: true) == nil
-                && AboutTarget.relock(current: nil, chosen: nil, frozen: false) == nil,
-            "activateExperimentRelocksUntilFrozen: a newer target replaces the current one only while the pre-sample has not been taken; the same id, no candidate, or a frozen target yields no change"
+                && AboutTarget.relock(current: nil, chosen: nil, frozen: false) == nil
+                // a FIRST lock is never refused by the freeze: an About that appears after t = 6 s still gets the experiment
+                && AboutTarget.relock(current: nil, chosen: 9, frozen: true) == 9,
+            "activateExperimentRelocksUntilFrozen: a newer target replaces the current one only while the target is not frozen; the same id or no candidate yields no change; a frozen target keeps its window, but a first lock is never refused"
         )
         // --- review about-target-r1 m-4: the move-resize lock line carries the reason on the About path ---
         expect(
             MoveResizeTarget.reason(candidates: [leftoverAbout, ownAbout], filter: nil)
-                == "newest of 2 candidates by first WindowCreate (windowId=900 first seen @2.100s)"
+                == "newest of 2 candidates by first WindowCreate (windowId=900 first seen @2.100s; runner-up @0.400s)"
                 // a candidate that DOES match the explicit filter still yields no reason (mutant R5: an
                 // empty match set made the explicit case pass vacuously)
                 && MoveResizeTarget.reason(candidates: [leftoverAbout, ownAbout, newNotepad], filter: "Notepad") == nil
@@ -2207,6 +2248,13 @@ struct ActivateExperimentCheckpoint {
 
     init(threshold: TimeInterval) { self.threshold = threshold }
 
+    /// Whether the Activate experiment's target is frozen at `elapsed`: from the threshold instant on,
+    /// by the clock, whether or not this checkpoint has settled. `settled` can stay false through the
+    /// grace (t = 6..8 s for the pre-sample) -- the very interval in which the extra apps' windows
+    /// appear -- and a lock still open then would let a Registry-Editor window take the target and the
+    /// t = 8 s ClientActivate with it (review about-target-r2 I-3).
+    func freezesTarget(at elapsed: TimeInterval) -> Bool { elapsed >= threshold }
+
     /// Call once per tick. Returns the line to print when the checkpoint settles (exactly once), else nil.
     /// `sample` is only invoked at or after the threshold and never after settling.
     mutating func run(elapsed: TimeInterval, sample: () -> Double?, targetVisible: () -> Bool) -> String? {
@@ -2415,48 +2463,83 @@ enum AboutTarget {
         let firstSeenElapsed: TimeInterval
     }
 
-    /// The winner, plus whether first-seen time actually decided: `false` when another candidate
-    /// shares the winner's time (every candidate unobserved at -1, say) and the lowest id broke the
-    /// tie -- `describe` then must not claim the newest-wins rule chose (review about-target-r1 m-4).
+    /// The winner, how many candidates share its first-seen time (`tiedAtNewest`, 1 = time decided,
+    /// otherwise the lowest id broke the tie among exactly those -- review about-target-r1 m-4 / r2
+    /// m-1), and the best loser's first-seen (`runnerUpFirstSeen`, nil for a lone candidate; -1 =
+    /// never observed) so a log reader can tell a 1.7 s margin from noise (r2 m-7).
     struct Choice: Equatable {
         let windowId: UInt32
         let firstSeenElapsed: TimeInterval
-        let decidedByFirstSeen: Bool
+        let tiedAtNewest: Int
+        let runnerUpFirstSeen: TimeInterval?
+        var decidedByFirstSeen: Bool { tiedAtNewest == 1 }
     }
 
     static func pick(candidates: [Candidate]) -> Choice? {
         guard let best = candidates.min(by: { a, b in
             a.firstSeenElapsed != b.firstSeenElapsed ? a.firstSeenElapsed > b.firstSeenElapsed : a.windowId < b.windowId
         }) else { return nil }
-        let shared = candidates.contains { $0.windowId != best.windowId && $0.firstSeenElapsed == best.firstSeenElapsed }
-        return Choice(windowId: best.windowId, firstSeenElapsed: best.firstSeenElapsed, decidedByFirstSeen: !shared)
+        return Choice(
+            windowId: best.windowId,
+            firstSeenElapsed: best.firstSeenElapsed,
+            tiedAtNewest: candidates.filter { $0.firstSeenElapsed == best.firstSeenElapsed }.count,
+            runnerUpFirstSeen: candidates.filter { $0.windowId != best.windowId }.map(\.firstSeenElapsed).max()
+        )
     }
 
     /// The reason half of a "target locked" log line: how many candidates competed, when the chosen
-    /// one was first seen, and -- on a tie -- that the lowest id decided rather than the rule.
+    /// one was first seen and how far behind the runner-up was; on a tie, which candidates tied and
+    /// that the lowest id decided among them. An unobserved first-seen is named, never printed as -1.
     static func describe(_ choice: Choice, of count: Int) -> String {
-        let when = String(format: "windowId=%u first seen @%.3fs", choice.windowId, choice.firstSeenElapsed)
-        if count == 1 { return "the only candidate (\(when))" }
-        if choice.decidedByFirstSeen { return "newest of \(count) candidates by first WindowCreate (\(when))" }
-        return "lowest id of \(count) candidates (" + String(format: "windowId=%u; first-seen tie @%.3fs", choice.windowId, choice.firstSeenElapsed)
-            + ", newest-wins did not decide)"
+        let never = "first WindowCreate never observed"
+        let stamp = String(format: "%.3fs", choice.firstSeenElapsed)
+        if count == 1 {
+            return choice.firstSeenElapsed < 0
+                ? "the only candidate (windowId=\(choice.windowId); \(never))"
+                : "the only candidate (windowId=\(choice.windowId) first seen @\(stamp))"
+        }
+        if choice.decidedByFirstSeen {
+            let runnerUp = choice.runnerUpFirstSeen.map { $0 < 0 ? "; runner-up never observed" : String(format: "; runner-up @%.3fs", $0) } ?? ""
+            return "newest of \(count) candidates by first WindowCreate (windowId=\(choice.windowId) first seen @\(stamp)\(runnerUp))"
+        }
+        if choice.tiedAtNewest >= count {
+            return choice.firstSeenElapsed < 0
+                ? "lowest id of \(count) candidates (none observed at a first WindowCreate; newest-wins did not decide)"
+                : "lowest id of \(count) candidates (all tied at first-seen @\(stamp); newest-wins did not decide)"
+        }
+        return "lowest id among the \(choice.tiedAtNewest) candidates tied at the newest first-seen @\(stamp) (of \(count); newest-wins eliminated \(count - choice.tiedAtNewest))"
     }
 
-    /// The Activate experiment's re-lock rule: adopt `chosen` while the target is not yet frozen
-    /// (its pre-sample not taken) and it differs from `current`; `nil` = keep what we have.
+    /// The Activate experiment's re-lock rule: adopt `chosen` when it differs from `current`, unless
+    /// the target is frozen (`ActivateExperimentCheckpoint.freezesTarget(at:)`, the pre-sample
+    /// threshold by the clock) AND a target already exists -- a FIRST lock is never refused, so an
+    /// About that only appears after t = 6 s still gets the experiment (the parent locked at any time).
+    /// `nil` = keep what we have.
     static func relock(current: UInt32?, chosen: UInt32?, frozen: Bool) -> UInt32? {
-        guard !frozen, let chosen, chosen != current else { return nil }
+        guard let chosen, chosen != current, current == nil || !frozen else { return nil }
         return chosen
     }
 }
 
-/// windowId -> this run's elapsed-seconds clock at the FIRST `WindowCreate` drained for it, never
-/// overwritten (`windowCreateTimestamps` keeps the LATEST, for adr/0010 §5's popup latency). "First"
-/// means first in this process: entries are not pruned on WindowDelete or between `WINDOW_SMOKE_CYCLES`
-/// cycles, so a recycled id keeps its earliest stamp -- which still orders a cycle-1 window as older
-/// than a cycle-2 one, the direction `AboutTarget.pick` needs (review about-target-r1 m-7).
+/// windowId -> this run's elapsed-seconds clock at the FIRST `WindowCreate` drained for the window's
+/// current incarnation: a re-sent create never overwrites (`windowCreateTimestamps` keeps the LATEST,
+/// for adr/0010 §5's popup latency), a `WindowDelete` forgets the id so a recycled id is stamped by
+/// its own create (review about-target-r2 m-4). Entries are not reset between `WINDOW_SMOKE_CYCLES`
+/// cycles -- the registry is reused too -- so a window that survives a cycle keeps its stamp and is
+/// rightly the older one when the next cycle's About appears beside it. Fed from `drainNow()` through
+/// `observe(kind:windowId:at:)` only.
 struct FirstSeenClock {
     private(set) var stamps: [UInt32: TimeInterval] = [:]
+
+    /// The drain's one call: a `WindowCreate` records (first stamp wins), a `WindowDelete` forgets,
+    /// every other event kind is ignored.
+    mutating func observe(kind: CRDPEventKind, windowId: UInt32, at elapsed: TimeInterval) {
+        switch kind {
+        case .windowCreate: record(windowId, at: elapsed)
+        case .windowDelete: stamps[windowId] = nil
+        default: break
+        }
+    }
 
     mutating func record(_ windowId: UInt32, at elapsed: TimeInterval) {
         if stamps[windowId] == nil { stamps[windowId] = elapsed }
@@ -2496,8 +2579,9 @@ enum MoveResizeTarget {
         let title: String
         /// This run's elapsed-seconds clock at the window's first `WindowCreate` (`FirstSeenClock`);
         /// `-1` = never observed, which sorts as oldest. A `var` only so the default stays in the
-        /// memberwise initializer (a `let` with a default is dropped from it, SE-0242) -- the older
-        /// pins construct candidates without it; nothing mutates the field.
+        /// memberwise initializer (a `let` with a default is dropped from it, SE-0242): the sites and
+        /// pins that PASS `firstSeenElapsed:` need that parameter, while the older pins omit it and
+        /// take the default; nothing mutates the field.
         var firstSeenElapsed: TimeInterval = -1
     }
 
@@ -3936,11 +4020,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // adr/0010 §5: unconditional WindowCreate timestamp bookkeeping (see
             // windowCreateTimestamps' own doc comment) -- every run, not just
             // WINDOW_SMOKE_POPUP.
+            let now = Date().timeIntervalSince(self.startTime)
             if event.kind == .windowCreate {
-                let now = Date().timeIntervalSince(self.startTime)
                 self.windowCreateTimestamps[event.windowId] = now
-                self.firstSeen.record(event.windowId, at: now)
             }
+            self.firstSeen.observe(kind: event.kind, windowId: event.windowId, at: now)
             // adr/0010 §2/§4: per-MASKED-window shape diagnostic -- rect count + truncated
             // flag, read post `registry.handle(event)` (already applied above) so this
             // reflects whatever PendingWindowState/RemoteWindow actually settled on for this
@@ -4334,9 +4418,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 snap.isVisible
                     && (snap.title.localizedCaseInsensitiveContains("about") || snap.title.contains("关于"))
             }
-            if let target = aboutWindows.first(where: \.hasDisplayedContent) {
+            if let picked = chooseTarget(among: aboutWindows.filter(\.hasDisplayedContent), id: \.windowId) {
+                let target = picked.window
                 cycleCloseTargetId = target.windowId
                 cycleAboutCountAtLock = aboutWindows.count
+                print("[cycles] cycle \(cycleIndex)/\(cyclesTotal) close target locked: windowId=\(target.windowId) -- \(picked.reason)")
                 // adr/0012 follow-up diagnostic: a fresh lock starts a fresh close-leg --
                 // any convergence observed for a PRIOR cycle's target must not leak into
                 // this one's probe-eligibility check.
@@ -4664,12 +4750,13 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Experiment 1 (W4b review round 2): t=6s sample, t=8s ClientActivate, t=20s sample --
-    /// see `activateExperimentWindowId`'s own doc comment.
-    /// The one selection every About-anchored lock in this file goes through, so two scenarios that
-    /// lock in the same tick over the same predicate (maximize and popup) can never pick different
-    /// windows (review about-target-r1 I-2). `matches` = the caller's own predicate already applied;
-    /// the choice is `AboutTarget.pick` over `firstSeen`, the reason is `AboutTarget.describe`.
+    /// The one selection every About-anchored choice in this file goes through -- the maximize,
+    /// popup, input-test, Activate-experiment and cycle-close locks and the final size/paint anchor
+    /// (move/resize reaches the same `AboutTarget.pick` through `MoveResizeTarget.lock`) -- so two
+    /// scenarios that lock in the same tick over the same predicate (maximize and popup) can never
+    /// pick different windows (review about-target-r1 I-2 / r2 I-1). `matches` = the caller's own
+    /// predicate already applied; the choice is `AboutTarget.pick` over `firstSeen`, the reason is
+    /// `AboutTarget.describe`.
     private func chooseTarget<S>(among matches: [S], id: (S) -> UInt32) -> (window: S, reason: String)? {
         let candidates = firstSeen.candidates(for: matches.map(id))
         guard let choice = AboutTarget.pick(candidates: candidates),
@@ -4677,6 +4764,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         return (window, AboutTarget.describe(choice, of: candidates.count))
     }
 
+    /// Experiment 1 (W4b review round 2): t=6s sample, t=8s ClientActivate, t=20s sample --
+    /// see `activateExperimentWindowId`'s own doc comment.
     private func runActivateExperiment(elapsed: TimeInterval, session: CRSession, registry: RemoteWindowRegistry) {
         // Scripted-input scenarios suppress this legacy W4b experiment outright: its t=20s
         // ClientActivate moves SERVER focus, and keyboard input is focus-addressed on the
@@ -4688,18 +4777,22 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         if cmdMapLiveActive || inputTestMode == .ime || unicodeDegradeScenarioEnabled { return }
         // No wait gate here (the first tick with any match locks), so on a host carrying a leftover
         // About the leftover is the only candidate at first -- the lock therefore stays open to a
-        // newer candidate until the pre-sample (t = 6 s) freezes it: pre and post must read one window.
-        let matches = registry.windowSnapshots().filter { snap in
-            snap.isVisible
-                && (snap.title.localizedCaseInsensitiveContains("registry") || snap.title.contains("注册表")
-                    || snap.title.localizedCaseInsensitiveContains("about") || snap.title.contains("关于"))
-        }
-        let picked = chooseTarget(among: matches, id: \.windowId)
-        if let picked, let newId = AboutTarget.relock(
-            current: activateExperimentWindowId, chosen: picked.window.windowId, frozen: activatePre.settled
-        ) {
-            activateExperimentWindowId = newId
-            print("[experiment] Activate-experiment target locked: windowId=\(newId) title=\"\(picked.window.title)\" -- \(picked.reason)")
+        // newer candidate until the pre-sample threshold (t = 6 s, by the clock: `freezesTarget(at:)`,
+        // not `settled`, whose grace could hold the lock open while the extra apps' windows appear)
+        // freezes it: pre and post must read one window. A first lock is never refused (`relock`).
+        // Once locked and frozen the scan is skipped (review about-target-r2 m-6).
+        let frozen = activatePre.freezesTarget(at: elapsed)
+        if activateExperimentWindowId == nil || !frozen {
+            let matches = registry.windowSnapshots().filter { snap in
+                snap.isVisible
+                    && (snap.title.localizedCaseInsensitiveContains("registry") || snap.title.contains("注册表")
+                        || snap.title.localizedCaseInsensitiveContains("about") || snap.title.contains("关于"))
+            }
+            if let picked = chooseTarget(among: matches, id: \.windowId),
+               let newId = AboutTarget.relock(current: activateExperimentWindowId, chosen: picked.window.windowId, frozen: frozen) {
+                activateExperimentWindowId = newId
+                print("[experiment] Activate-experiment target locked: windowId=\(newId) title=\"\(picked.window.title)\" -- \(picked.reason)")
+            }
         }
         guard let windowId = activateExperimentWindowId else { return }
 
@@ -4730,9 +4823,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// wire-level test of the SC_* lane and the server's own response, independent of
     /// whatever local UI affordance the About window's own chrome happens to grant it
     /// (which should have no enabled zoom button at all, per the acceptance text this task
-    /// separately targets). Target-locking uses `runInputTest`'s own "visible +
-    /// hasDisplayedContent + About-titled" predicate and, like it, the shared `chooseTarget(among:)`
-    /// selection (newest first-seen wins; review about-target-r1 I-2).
+    /// separately targets). Target-locking uses the "visible + hasDisplayedContent + About-titled"
+    /// predicate `runInputTest` uses for its default target (WINDOW_SMOKE_INPUT_TARGET_TITLE unset)
+    /// and, like it, the shared `chooseTarget(among:)` selection (newest first-seen wins; review
+    /// about-target-r1 I-2).
     ///
     /// Advances at most one phase transition per call (mirrors `tickCycles`' own per-tick
     /// state machine shape) -- called every `tick()` once the multiwin setup
@@ -5925,7 +6019,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// About window that happens to be lying around from an earlier run is exactly the
     /// stale-window contamination class this file has already paid for three times
     /// (`moveResizeCloseTargetId`'s own doc comment). Unset keeps the original two-language
-    /// title match, unchanged.
+    /// title match, unchanged. Among several matches `chooseTarget(among:)` takes the newest
+    /// first-seen -- WITHOUT the pre-existing exclusion `WINDOW_SMOKE_MOVE_TARGET` applies: this lock
+    /// fires at t >= 5 s, before the extra apps launch at t >= 6 s, so `windowIdsBeforeExtraApps` does
+    /// not exist yet and a title naming an extra app can only ever see a leftover at lock time
+    /// (review about-target-r2 m-8; pre-existing behaviour, made deterministic here).
     private static func matchesInputTestTarget(_ title: String) -> Bool {
         if let inputTargetTitleSubstring {
             return title.localizedCaseInsensitiveContains(inputTargetTitleSubstring)
@@ -6965,9 +7063,12 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // Gating (counts toward pass/fail) only when this run actually launched winver --
         // round 2's WINDOW_SMOKE_APP parameterization means a run can launch something
         // else entirely, in which case there is no About Windows dialog to find at all.
-        let aboutWindow = visibleWindows.first { w in
+        // Selection shared with every other About-anchored choice (`chooseTarget`): on a host that
+        // still shows an About from an earlier run, the size/paint gate judges THIS run's About --
+        // the same window the Activate experiment targets (review about-target-r2 I-1).
+        let aboutWindow = chooseTarget(among: visibleWindows.filter { w in
             w.title.localizedCaseInsensitiveContains("about") || w.title.contains("关于")
-        }
+        }, id: \.windowId)?.window
         // W4c: when an input test is active, a *successful* click/Enter closes this exact
         // window by design partway through the run -- gating the paint/size checks below on
         // it still being open at t=25s would make a passing input test look like a failure.
