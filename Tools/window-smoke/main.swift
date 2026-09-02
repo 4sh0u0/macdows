@@ -588,9 +588,13 @@ enum SizeBand {
 ///    the live wiring has no offline seam; `grep 'frame.width >= 2000'` zero-hit is the only guard.
 ///  * **the move/resize target filter** losing case-insensitivity, an empty filter no longer
 ///    meaning "the About heuristic", the `|` alternatives no longer split, or their surrounding
-///    whitespace no longer trimmed => `moveResizeTargetFilterSemantics`. **Not covered here**:
-///    `runMoveResizeScenario`'s target
-///    lock calling something other than `MoveResizeTarget.matches` -- live wiring, no offline seam.
+///    whitespace no longer trimmed => `moveResizeTargetFilterSemantics`; the lock no longer
+///    skipping pre-existing ids under a filter, skipping them under the About heuristic too, an
+///    empty filter counted as explicit, losing its lowest-id ordering, or the pre-existing-only
+///    report losing its ascending order => `moveResizeTargetLockExcludesPreExistingOnlyWhenFiltered`.
+///    **Not covered here**: `runMoveResizeScenario`'s target lock calling something other than
+///    `MoveResizeTarget.lock`, passing it a set other than `windowIdsBeforeExtraApps`, or choosing
+///    the wrong one of its two one-shot log lines -- live wiring, no offline seam.
 ///
 /// **Known blind spot, stated rather than papered over** (rev-L9 I-2, R6): replacing the two
 /// `WindowGeometry.windowsPoint` calls with a copy of the rect conversion's own origin is an
@@ -955,6 +959,32 @@ enum WindowSmokeGateSelfTest {
             "moveResizeTargetFilterSemantics: nil/empty = About heuristic (incl. 关于); a filter is |-separated, whitespace-trimmed, case-insensitive substrings and excludes About"
         )
 
+        // --- move/resize target LOCK: pre-existing windows are excluded only under a filter ---
+        // (review resize-live-r2 I-2 / r3: with WINDOW_SMOKE_MOVE_TARGET the lock ran before the
+        // run's own window appeared and took a leftover window from an earlier run; the About
+        // heuristic must keep accepting the first app's window, which is itself pre-existing.)
+        let about = MoveResizeTarget.Candidate(windowId: 5, title: "About Windows")
+        let oldNotepad = MoveResizeTarget.Candidate(windowId: 10, title: "无标题 - Notepad")
+        let newNotepad = MoveResizeTarget.Candidate(windowId: 20, title: "无标题 - Notepad")
+        let laterNotepad = MoveResizeTarget.Candidate(windowId: 30, title: "Untitled - Notepad")
+        let preExisting: Set<UInt32> = [5, 10]
+        expect(
+            MoveResizeTarget.lock(candidates: [about, oldNotepad], filter: nil, preExisting: preExisting)?.windowId == 5
+                && MoveResizeTarget.lock(candidates: [about, oldNotepad], filter: "", preExisting: preExisting)?.windowId == 5
+                && MoveResizeTarget.lock(candidates: [about, oldNotepad, newNotepad], filter: "Notepad", preExisting: preExisting)?.windowId == 20
+                && MoveResizeTarget.lock(candidates: [about, oldNotepad], filter: "Notepad", preExisting: preExisting) == nil
+                && MoveResizeTarget.lock(candidates: [laterNotepad, newNotepad], filter: "Notepad", preExisting: preExisting)?.windowId == 20
+                && MoveResizeTarget.lock(candidates: [about, oldNotepad], filter: "Notepad", preExisting: [])?.windowId == 10
+                && MoveResizeTarget.matchedOnlyPreExisting(candidates: [about, oldNotepad], filter: "Notepad", preExisting: preExisting) == [10]
+                && MoveResizeTarget.matchedOnlyPreExisting(
+                    candidates: [oldNotepad, MoveResizeTarget.Candidate(windowId: 8, title: "Untitled - Notepad")],
+                    filter: "Notepad", preExisting: [8, 10]
+                ) == [8, 10]
+                && MoveResizeTarget.matchedOnlyPreExisting(candidates: [about, oldNotepad, newNotepad], filter: "Notepad", preExisting: preExisting).isEmpty
+                && MoveResizeTarget.matchedOnlyPreExisting(candidates: [about], filter: nil, preExisting: preExisting).isEmpty,
+            "moveResizeTargetLockExcludesPreExistingOnlyWhenFiltered: About heuristic accepts the (pre-existing) first app; a filter skips ids seen before the extra apps launched, picks the lowest new id, and reports the pre-existing-only ids in ascending order"
+        )
+
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
         // rev-L9 M-4: `Scripts/run-window-smoke.command:159` records `DONE exit=$?` and its callers
         // read that line as the whole verdict. A `WINDOW_SMOKE_SELFTEST=1` leaked into the
@@ -1257,8 +1287,12 @@ let moveResizeScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOK
 /// e.g. `Notepad|记事本` together with `WINDOW_SMOKE_EXTRA_APPS=notepad` to drive the legs against a
 /// window that is actually RESIZABLE -- the About dialog never is (StyleTranslatorTests'
 /// `aboutWindowsDialogShape`), which is why the 0-remote-px resize half of adr/0015 §6.3 has had
-/// no real-host data point (C-2 record, coverage gap). Pure matching logic lives in
-/// `MoveResizeTarget` so the self-test can pin it; the lock itself is live-only.
+/// no real-host data point (C-2 record, coverage gap). An explicit filter only ever locks a window
+/// that appeared AFTER the extra apps were launched (`MoveResizeTarget.lock`): windows already
+/// present at that moment -- leftovers from an earlier run, AND the first app's own window
+/// (`WINDOW_SMOKE_APP`) -- are skipped, so a filter cannot target the first app; launch that
+/// program as an extra app instead. Pure matching/lock logic lives in `MoveResizeTarget` so the
+/// self-test can pin it; the wiring itself is live-only.
 let moveResizeTargetFilter = ProcessInfo.processInfo.environment["WINDOW_SMOKE_MOVE_TARGET"]
 
 /// Title matching for the move/resize scenario's target lock (see `moveResizeTargetFilter`).
@@ -1278,6 +1312,57 @@ enum MoveResizeTarget {
         return filter.split(separator: "|").map { $0.trimmingCharacters(in: .whitespaces) }.contains { alternative in
             !alternative.isEmpty && title.localizedCaseInsensitiveContains(alternative)
         }
+    }
+
+    /// The two fields the lock decision needs, lifted off `RemoteWindowRegistry`'s snapshot so
+    /// the decision itself is a pure function the self-test can drive.
+    struct Candidate: Equatable {
+        let windowId: UInt32
+        let title: String
+    }
+
+    /// Whether `filter` names a target explicitly (vs the nil/empty About heuristic).
+    private static func isExplicit(_ filter: String?) -> Bool {
+        guard let filter else { return false }
+        return !filter.isEmpty
+    }
+
+    /// The window `runMoveResizeScenario` locks onto, or `nil` to keep waiting (the caller retries
+    /// every tick). Lowest `windowId` first, so a filter matching several windows does not depend
+    /// on `windowSnapshots()`' dictionary order between runs.
+    ///
+    /// `preExisting` is the id set captured the moment the extra apps were launched
+    /// (`windowIdsBeforeExtraApps`). Under an EXPLICIT filter those ids are skipped: the 2026-09-02
+    /// real-host run (env-202609-14, review resize-live-r2 I-2) locked a Notepad left over from an
+    /// earlier run because the lock fires as soon as `extraAppsLaunched` is set -- before this
+    /// run's own window has appeared -- so "prefer the new one" would have been a no-op (there was
+    /// no new one yet) and only exclusion, plus the per-tick retry, waits for it. Consequence: an
+    /// explicit filter can never lock the first app's own window either (it pre-exists too). The About
+    /// heuristic (nil/empty filter) deliberately does NOT exclude: About is the FIRST app's window,
+    /// itself pre-existing at that moment, and the target that path has always meant -- which also
+    /// means a leftover About from an earlier run is matched just the same and wins whenever its
+    /// id is the lower one. That weakness predates this change (the parent revision's lock was
+    /// behaviourally equivalent on that path: first match over the same ascending order) and is
+    /// left as is here.
+    static func lock(candidates: [Candidate], filter: String?, preExisting: Set<UInt32>) -> Candidate? {
+        let explicit = isExplicit(filter)
+        return candidates.sorted(by: { $0.windowId < $1.windowId }).first { candidate in
+            matches(title: candidate.title, filter: filter) && (!explicit || !preExisting.contains(candidate.windowId))
+        }
+    }
+
+    /// The ids an explicit filter matched but `lock` skipped as pre-existing -- non-empty exactly
+    /// when the filter matches SOMETHING yet nothing this run launched, which is the case the
+    /// one-shot "waiting for a window launched by this run" log line names. Empty whenever a new
+    /// match exists, and always empty for the About heuristic: it never skips, so its `lock` is
+    /// `nil` only when nothing matches at all. Given `lock == nil`, every match IS pre-existing
+    /// (an explicit filter would otherwise have locked it), so no `preExisting` test is repeated
+    /// here -- an explicit-filter guard was tried in the author's own mutation pass and the
+    /// `preExisting` predicate by review movetarget-lock-r1 (its N3); both proved equivalent
+    /// mutants and were removed.
+    static func matchedOnlyPreExisting(candidates: [Candidate], filter: String?, preExisting: Set<UInt32>) -> [UInt32] {
+        guard lock(candidates: candidates, filter: filter, preExisting: preExisting) == nil else { return [] }
+        return candidates.filter { matches(title: $0.title, filter: filter) }.map(\.windowId).sorted()
     }
 }
 
@@ -1728,6 +1813,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private var moveResult: MoveResizeLegOutcome?
     /// Throttle for the "filter matched no window" line in the target lock (printed once).
     private var moveResizeTargetMissLogged = false
+    /// Its sibling for the other one-shot line: the filter matched only windows that pre-date the
+    /// extra-app launch. Separate flags so each message can appear once, in whichever order the
+    /// live run produces them (review movetarget-lock-r1 I-2: a shared flag let the first printer
+    /// swallow the other line for the rest of the run).
+    private var moveResizeTargetPreExistingOnlyLogged = false
     private var resizeResult: MoveResizeLegOutcome?
     /// The most recent `ClientWindowMove` this run actually put on the wire for the move/resize
     /// target, verbatim (adr/0015 §6.2's deduction record): the harness knows what Windows-space
@@ -3324,20 +3414,41 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         case .waitingForTarget:
             guard extraAppsLaunched else { return } // multiwin prereq, per the task spec
             // Sorted by windowId (as `focusRotationCandidateWindows` does): `windowSnapshots()` is
-            // dictionary-ordered, and with a filter that can match several windows the lock must
-            // not depend on hash order between runs.
+            // dictionary-ordered. `MoveResizeTarget.lock` sorts again on its own, so this order now
+            // only fixes the "titles seen" wording of the miss line below between runs.
             let candidates = registry.windowSnapshots().sorted(by: { $0.windowId < $1.windowId })
                 .filter { $0.isVisible && $0.hasDisplayedContent }
-            guard let w = candidates.first(where: { MoveResizeTarget.matches(title: $0.title, filter: moveResizeTargetFilter) }),
+            // The decision is `MoveResizeTarget.lock`'s (pure, self-tested): under an explicit
+            // filter, windows that already existed when the extra apps were launched are skipped,
+            // so a leftover from an earlier run can no longer be locked before this run's own
+            // window appears (env-202609-14, review resize-live-r2 I-2 / r3 I-r3-1).
+            let lockCandidates = candidates.map { MoveResizeTarget.Candidate(windowId: $0.windowId, title: $0.title) }
+            guard let locked = MoveResizeTarget.lock(
+                      candidates: lockCandidates, filter: moveResizeTargetFilter, preExisting: windowIdsBeforeExtraApps
+                  ),
+                  let w = candidates.first(where: { $0.windowId == locked.windowId }),
                   let window = registry.window(forWindowId: w.windowId)
             else {
                 // A filter that matches nothing would otherwise stall silently for the whole
                 // scenario deadline and surface as a generic "no target locked" red (review
-                // movetarget-r2 m-2). Say so once, with the titles that WERE visible.
-                if let moveResizeTargetFilter, !candidates.isEmpty, !moveResizeTargetMissLogged {
-                    moveResizeTargetMissLogged = true
-                    print("[move-resize] no visible content window matched WINDOW_SMOKE_MOVE_TARGET=\"\(moveResizeTargetFilter)\" "
-                        + "(titles seen: \(candidates.map { "\"\($0.title)\"" }.joined(separator: ", ")))")
+                // movetarget-r2 m-2). Say so once, with the titles that WERE visible -- and, when
+                // it matched only pre-existing windows, say THAT (the wait is expected). Each line
+                // has its own one-shot flag: a run can legitimately show both, in either order.
+                if let moveResizeTargetFilter, !candidates.isEmpty,
+                   !moveResizeTargetPreExistingOnlyLogged || !moveResizeTargetMissLogged
+                {
+                    let skipped = MoveResizeTarget.matchedOnlyPreExisting(
+                        candidates: lockCandidates, filter: moveResizeTargetFilter, preExisting: windowIdsBeforeExtraApps
+                    )
+                    if !skipped.isEmpty, !moveResizeTargetPreExistingOnlyLogged {
+                        moveResizeTargetPreExistingOnlyLogged = true
+                        print("[move-resize] WINDOW_SMOKE_MOVE_TARGET=\"\(moveResizeTargetFilter)\" matched only window(s) that "
+                            + "existed before the extra apps were launched (ids \(skipped)); waiting for a window launched by this run")
+                    } else if skipped.isEmpty, !moveResizeTargetMissLogged {
+                        moveResizeTargetMissLogged = true
+                        print("[move-resize] no visible content window matched WINDOW_SMOKE_MOVE_TARGET=\"\(moveResizeTargetFilter)\" "
+                            + "(titles seen: \(candidates.map { "\"\($0.title)\"" }.joined(separator: ", ")))")
+                    }
                 }
                 return
             }
