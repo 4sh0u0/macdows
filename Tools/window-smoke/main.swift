@@ -650,12 +650,19 @@ enum SizeBand {
 ///    halves (the F0-H1 defect itself; review multiwindow-gate-r2 MF); the per-tick accumulator
 ///    dropping `hasDisplayedContent` or the band floor (a weaker accumulator survives every pin,
 ///    as review multiwindow-gate-r1 M2 measured); the F0 rerun is the live check for the first.
-///  * **the declared-desktop override** accepting 0/negative/non-`<w>x<h>` values, not trimming,
-///    or letting the override replace the gate anchor => `declaredDesktopOverrideParsesOnlyPositiveWxH`
-///    / `declaredDesktopKeepsTheGateAnchorReal`. **Not covered here**: `freezeAndApplyDesktopSize`
-///    assigning the anchor instead of `toServer` to `session.desktopWidth/Height`, or the two
-///    `[topology]` lines not printing the declared value -- live wiring, no offline seam; the F
-///    run's `[topology] connect:` line ("DECLARED TO SERVER as …") is the live check.
+///  * **the declared-desktop override** accepting 0/negative/non-`<w>x<h>` values, a trailing or
+///    doubled `x` (`omittingEmptySubsequences` flipped -- review declared-desktop-r1 M3 measured that
+///    mutant surviving before the pin), whitespace-only as unset, an extent past the wire ceiling,
+///    not trimming newlines, or letting the override replace the gate anchor =>
+///    `declaredDesktopOverrideParsesOnlyPositiveWxH` / `declaredDesktopKeepsTheGateAnchorReal`; the
+///    evidence suffix printing when nothing was assigned, or not printing the assigned value =>
+///    `declaredDesktopEvidenceSuffixSaysOnlyWhatWasAssigned`. The anchor assignment itself is typed:
+///    `declaration` returns the real instance or nil as `gateAnchor` and `freezeAndApplyDesktopSize`
+///    assigns THAT, so "anchor takes the override" does not compile. **Not covered here** (live
+///    wiring, no offline seam): the two `session.desktopWidth/Height` assignments taking the anchor
+///    instead of `toServer` -- the connect line prints the value READ BACK from the session, so that
+///    slip shows up as the real size on the F run's `[topology] connect:` line (scaled-map memo §5
+///    branch ①), which is the live check.
 ///  * **the remap observation** sampled outside the in-flight window, for a non-target window,
 ///    or with no target locked => `remapObservationAppliesOnlyToTheInFlightTarget`. **Not covered
 ///    here** (live wiring, no offline seam): the tap not calling it at all for `surfaceMapped`
@@ -1126,19 +1133,47 @@ enum WindowSmokeGateSelfTest {
                 && DeclaredDesktopOverride.parse("1280") == .invalid("1280")
                 && DeclaredDesktopOverride.parse("axb") == .invalid("axb")
                 && DeclaredDesktopOverride.parse("1280x720x1") == .invalid("1280x720x1")
-                && DeclaredDesktopOverride.parse("-1x5") == .invalid("-1x5"),
-            "declaredDesktopOverrideParsesOnlyPositiveWxH: unset/empty = no override; <w>x<h> of positive integers (whitespace trimmed) = override; anything else = invalid, never silently ignored"
+                && DeclaredDesktopOverride.parse("-1x5") == .invalid("-1x5")
+                // review declared-desktop-r1 I-2: a trailing or doubled separator is the ONLY input
+                // class that tells `omittingEmptySubsequences: false` from `true` (the 3-part sample
+                // above is 3 parts under both) -- that flag is load-bearing, so pin it
+                && DeclaredDesktopOverride.parse("1024x768x") == .invalid("1024x768x")
+                && DeclaredDesktopOverride.parse("1024xx768") == .invalid("1024xx768")
+                // review declared-desktop-r1 I-3: the override bypasses DisplayTopology's clamp, so
+                // parse owns the wire ceiling -- at the ceiling accepted, one past it refused
+                && DeclaredDesktopOverride.parse("65535x65535") == .size(width: 65535, height: 65535)
+                && DeclaredDesktopOverride.parse("65536x768") == .invalid("65536x768")
+                && DeclaredDesktopOverride.parse("1024x65536") == .invalid("1024x65536")
+                && DeclaredDesktopOverride.parse("4294967296x768") == .invalid("4294967296x768")
+                // review declared-desktop-r1 m-3/m-12: whitespace-only is a set-but-malformed value
+                // (invalid, never a silent unset), and `.invalid` carries the RAW text
+                && DeclaredDesktopOverride.parse(" ") == .invalid(" ")
+                && DeclaredDesktopOverride.parse(" 0x720 ") == .invalid(" 0x720 ")
+                // review declared-desktop-r1 m-2: trailing newline/CR trimmed like other whitespace
+                && DeclaredDesktopOverride.parse("1024x768\n") == .size(width: 1024, height: 768)
+                && DeclaredDesktopOverride.parse("1024x768\r\n") == .size(width: 1024, height: 768),
+            "declaredDesktopOverrideParsesOnlyPositiveWxH: unset/empty = no override; <w>x<h> of positive integers (whitespace/newlines trimmed, each <= 65535) = override; anything else -- including a trailing/doubled x, whitespace-only, an out-of-range extent -- is invalid, never silently ignored"
         )
         let realDesk = DeclaredDesktopOverride.Size(width: 2560, height: 1440)
         let smallDesk = DeclaredDesktopOverride.Size(width: 1280, height: 720)
         let withOverride = DeclaredDesktopOverride.declaration(real: realDesk, override: smallDesk)
         let withoutOverride = DeclaredDesktopOverride.declaration(real: realDesk, override: nil)
-        let noDisplay = DeclaredDesktopOverride.declaration(real: nil, override: smallDesk)
+        let noDisplay = DeclaredDesktopOverride.declaration(real: nil as DeclaredDesktopOverride.Size?, override: smallDesk)
         expect(
             withOverride.toServer == smallDesk && withOverride.gateAnchor == realDesk
                 && withoutOverride.toServer == realDesk && withoutOverride.gateAnchor == realDesk
                 && noDisplay.toServer == nil && noDisplay.gateAnchor == nil,
             "declaredDesktopKeepsTheGateAnchorReal: the override changes only what is declared to the server; the frozen real desktop stays the gate anchor; no usable display declares nothing even with an override"
+        )
+        // review declared-desktop-r1 B-1/I-1/m-9: the evidence suffix says what was ASSIGNED, or
+        // nothing -- never the knob's request, never a declaration that did not happen
+        let assignedSuffix = DeclaredDesktopOverride.evidenceSuffix(overrideSet: true, assigned: smallDesk)
+        expect(
+            DeclaredDesktopOverride.evidenceSuffix(overrideSet: false, assigned: realDesk) == ""
+                && DeclaredDesktopOverride.evidenceSuffix(overrideSet: true, assigned: nil) == ""
+                && assignedSuffix == " -- DECLARED TO SERVER as 1280x720 remote px (WINDOW_SMOKE_DECLARED_DESKTOP, fixture-only; gate anchor unchanged)"
+                && DeclaredDesktopOverride.evidenceSuffix(overrideSet: true, assigned: realDesk).contains("DECLARED TO SERVER as 2560x1440 remote px"),
+            "declaredDesktopEvidenceSuffixSaysOnlyWhatWasAssigned: no override or nothing assigned = no suffix; otherwise the assigned WxH in the one DECLARED TO SERVER form all three [topology] lines share"
         )
 
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
@@ -1161,18 +1196,37 @@ if ProcessInfo.processInfo.environment["WINDOW_SMOKE_SELFTEST"] == "1" {
     exit(WindowSmokeGateSelfTest.run() ? 0 : 1)
 }
 
+/// The two extents every desktop-size shape here exposes. `DesktopSizeInRemotePixels` (the real
+/// frozen desktop) conforms retroactively so `DeclaredDesktopOverride.declaration` can hand the
+/// SAME real instance back as the gate anchor: the anchor is typed as the real value or nothing and
+/// cannot be built from the override at all (review declared-desktop-r1 I-4 -- the anchor invariant
+/// is enforced by the type, and the production path consumes `gateAnchor`, so the pins on it bear
+/// weight).
+protocol DeclaredDesktopExtent {
+    var width: Int { get }
+    var height: Int { get }
+}
+
+extension DesktopSizeInRemotePixels: DeclaredDesktopExtent {}
+
 /// WINDOW_SMOKE_DECLARED_DESKTOP=<w>x<h> (scaled-map memo §4-1, path F; fixture-only, the App
 /// target never reads it): declare a desktop OTHER than the real frozen one to the server, to
 /// re-create the 2026-08-21 mis-declaration condition (T5) on purpose. The pure part lives here so
-/// the self-test can pin two things the memo's §3-F makes load-bearing: (1) parsing never silently
+/// the self-test can pin the things the memo's §3-F makes load-bearing: (1) parsing never silently
 /// ignores a malformed value -- a run that thinks it mis-declared but did not is the false
-/// negative §5 guards against, so `.invalid` is fatal at startup; (2) the override changes ONLY
-/// what is sent (`session.desktopWidth/Height`), never `sessionDesktopSizeInRemotePixels`, the
-/// Y-flip anchor and size-band base -- otherwise T5's "declared small, rendered at real pixels"
-/// would cancel itself. The App-side consequence (RemoteWindowRegistry's adr/0015 §5.A.4
-/// divergence warning) is expected and recorded, not a defect.
+/// negative §5 guards against, so `.invalid` (including whitespace-only, a trailing/doubled `x`,
+/// or an extent past the wire ceiling) is fatal at startup; (2) the override changes ONLY what is
+/// sent (`session.desktopWidth/Height`), never `sessionDesktopSizeInRemotePixels`, the Y-flip
+/// anchor and size-band base -- otherwise T5's "declared small, rendered at real pixels" would
+/// cancel itself; (3) the evidence suffix the three `[topology]` lines print says what was
+/// ASSIGNED (read back from the session), never what the knob asked for. Accepted-and-normalised
+/// spellings, documented rather than refused (review r1 m-5/m-6): leading zeros (`01024x0768`) and
+/// an explicit plus sign (`+1024x+768`) parse as the plain integers -- the `[topology]` lines print
+/// the normalised value, so env/row transcription copies those, not the knob's spelling. The
+/// App-side consequence (RemoteWindowRegistry's adr/0015 §5.A.4 divergence warning) is expected and
+/// recorded, not a defect.
 enum DeclaredDesktopOverride {
-    struct Size: Equatable {
+    struct Size: Equatable, DeclaredDesktopExtent {
         let width: Int
         let height: Int
     }
@@ -1183,14 +1237,22 @@ enum DeclaredDesktopOverride {
         case size(width: Int, height: Int)
     }
 
-    /// `nil`/empty = unset. Otherwise `<w>x<h>`, both positive integers, surrounding whitespace
-    /// trimmed; anything else is `.invalid` carrying the raw text for the fatal config line.
+    /// The wire ceiling the real path inherits from `DisplayTopology` (adr/0015 §3 rule 3). The
+    /// override bypasses that clamp entirely, so parse owns the same bound: past it the value
+    /// would be silently clamped by `UInt32(clamping:)` at the assignment and the evidence line
+    /// would disagree with what was sent (review declared-desktop-r1 I-3).
+    static let maxExtent = DesktopSizeInRemotePixels.maxExtentInRemotePixels
+
+    /// `nil`/empty = unset. Otherwise `<w>x<h>`, both positive integers `<= maxExtent`, joined by
+    /// a lowercase `x`, surrounding whitespace/newlines trimmed; anything else -- whitespace-only
+    /// included -- is `.invalid` carrying the RAW text for the fatal config line.
     static func parse(_ raw: String?) -> Parsed {
-        guard let raw else { return .unset }
-        let trimmed = raw.trimmingCharacters(in: .whitespaces)
-        if trimmed.isEmpty { return .unset }
+        guard let raw, !raw.isEmpty else { return .unset }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = trimmed.split(separator: "x", omittingEmptySubsequences: false)
-        guard parts.count == 2, let width = Int(parts[0]), let height = Int(parts[1]), width > 0, height > 0 else {
+        guard parts.count == 2, let width = Int(parts[0]), let height = Int(parts[1]),
+              width > 0, height > 0, width <= maxExtent, height <= maxExtent
+        else {
             return .invalid(raw)
         }
         return .size(width: width, height: height)
@@ -1198,17 +1260,32 @@ enum DeclaredDesktopOverride {
 
     /// What goes to the server vs what stays the gate anchor. With no usable display nothing is
     /// declared even when an override is set (adr/0015 §5.A.6's fallback rule is not the knob's to
-    /// change), and the anchor is the real desktop or nothing.
-    static func declaration(real: Size?, override: Size?) -> (toServer: Size?, gateAnchor: Size?) {
+    /// change), and the anchor is the real desktop instance itself or nothing.
+    static func declaration<Real: DeclaredDesktopExtent>(real: Real?, override: Size?) -> (toServer: Size?, gateAnchor: Real?) {
         guard let real else { return (nil, nil) }
-        return (override ?? real, real)
+        return (override ?? Size(width: real.width, height: real.height), real)
+    }
+
+    /// The one evidence suffix all three `[topology]` lines append (connect line, `finish()` and
+    /// `finishCycles()` summaries -- one regex, `DECLARED TO SERVER as (\d+)x(\d+)`, reads all
+    /// three; review r1 m-9). Derived from what was actually ASSIGNED, never from the knob: no
+    /// override => nothing; override set but nothing assigned (no usable display, §5.A.6) =>
+    /// nothing (review r1 I-1 -- the line must not claim a declaration that never happened);
+    /// otherwise the assigned value (review r1 B-1 -- a wiring slip that assigned the anchor
+    /// prints the anchor, which is exactly what makes this line the F run's live check under the
+    /// scaled-map memo §5 branch ①).
+    static func evidenceSuffix(overrideSet: Bool, assigned: Size?) -> String {
+        guard overrideSet, let assigned else { return "" }
+        return " -- DECLARED TO SERVER as \(assigned.width)x\(assigned.height) remote px "
+            + "(WINDOW_SMOKE_DECLARED_DESKTOP, fixture-only; gate anchor unchanged)"
     }
 }
 
 /// See `DeclaredDesktopOverride`. Fatal on a malformed value: a mis-declaration run whose knob was
 /// silently ignored would read as a clean negative (scaled-map memo §5, "有效性前置"). Evaluated
 /// HERE, before the boundary gate and before anything touches host.env or a socket: a bad knob
-/// must fail the run before it can connect anywhere.
+/// must fail the run before it can connect anywhere. Exit code 3 is this refusal's own (2 = missing
+/// credentials, 78 = boundary gate) so `DONE exit=<rc>` keeps one meaning per code (review r1 m-1).
 let declaredDesktopOverride: DeclaredDesktopOverride.Size? = {
     switch DeclaredDesktopOverride.parse(ProcessInfo.processInfo.environment["WINDOW_SMOKE_DECLARED_DESKTOP"]) {
     case .unset:
@@ -1216,12 +1293,15 @@ let declaredDesktopOverride: DeclaredDesktopOverride.Size? = {
     case .size(let width, let height):
         return DeclaredDesktopOverride.Size(width: width, height: height)
     case .invalid(let raw):
-        print("[config] FAIL: WINDOW_SMOKE_DECLARED_DESKTOP=\"\(raw)\" must be <w>x<h> with positive integers "
-            + "(e.g. 1024x768); refusing to run rather than silently declaring the real desktop")
-        exit(2)
+        // Printed escaped: this line is tee'd into the run log, and a raw newline in the value
+        // would otherwise inject a line of its own (review r1 m-7).
+        let shown = raw.replacingOccurrences(of: "\r", with: "\\r").replacingOccurrences(of: "\n", with: "\\n")
+        print("[config] FAIL: WINDOW_SMOKE_DECLARED_DESKTOP=\"\(shown)\" must be <w>x<h> -- two positive integers, "
+            + "each <= \(DeclaredDesktopOverride.maxExtent), joined by a lowercase x (e.g. 1024x768); "
+            + "refusing to run rather than silently declaring the real desktop")
+        exit(3)
     }
 }()
-
 
 // Three MacdowsCore rules and no local copy of any of them: MacdowsPaths says WHERE host.env
 // is, EnvFile.parse says HOW it is read, EnvFile.value says WHICH of the environment variable
@@ -1728,6 +1808,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// The desktop size (remote px) this run last froze and handed to `CRSession`, or `nil` if a
     /// freeze ever found no usable display (adr/0015 §5.A.6: in that state nothing is sent).
     private var sessionDesktopSizeInRemotePixels: DesktopSizeInRemotePixels?
+    /// What `freezeAndApplyDesktopSize` last READ BACK from `session.desktopWidth/Height` after
+    /// assigning under WINDOW_SMOKE_DECLARED_DESKTOP; nil when no override is set or nothing was
+    /// assigned (no usable display). Feeds `DeclaredDesktopOverride.evidenceSuffix` for all three
+    /// `[topology]` lines (review declared-desktop-r1 B-1/I-1).
+    private var declaredDesktopAssigned: DeclaredDesktopOverride.Size?
 
     /// F2's measurement (`docs/plans/phase3.md:132`): every SURFACE_MAPPED event's target hint,
     /// aggregated for the one `[gfx] target=` line every run prints at summary time.
@@ -2490,28 +2575,33 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     @discardableResult
     private func freezeAndApplyDesktopSize(to session: CRSession, reason: String) -> DesktopSizeInRemotePixels? {
         let desktop = displayTopology.freezeSessionSnapshot()
-        sessionDesktopSizeInRemotePixels = desktop
-        // WINDOW_SMOKE_DECLARED_DESKTOP (fixture-only): the override changes only what is sent;
-        // `sessionDesktopSizeInRemotePixels` above stays the real frozen desktop (the gate anchor).
-        let declared = DeclaredDesktopOverride.declaration(
-            real: desktop.map { DeclaredDesktopOverride.Size(width: $0.width, height: $0.height) },
-            override: declaredDesktopOverride
-        )
+        // WINDOW_SMOKE_DECLARED_DESKTOP (fixture-only): the override changes only what is sent.
+        // The gate anchor is taken FROM `declaration` -- typed as the real frozen instance or nil,
+        // it cannot be the override by construction, so the self-test's `gateAnchor` pins cover
+        // this very assignment (review declared-desktop-r1 I-4).
+        let declared = DeclaredDesktopOverride.declaration(real: desktop, override: declaredDesktopOverride)
+        sessionDesktopSizeInRemotePixels = declared.gateAnchor
         if let desktop, let toServer = declared.toServer {
-            // `UInt32(clamping:)` cannot actually clamp -- `DisplayTopology` guarantees
-            // `0 < value <= maxExtentInRemotePixels` -- and is written this way so that if that
-            // guarantee is ever relaxed the connect path degrades instead of trapping. Same shape
-            // as `AppDelegate.swift:264-265`, deliberately.
+            // Neither path can clamp here: the real value is bounded by `DisplayTopology`
+            // (`0 < value <= maxExtentInRemotePixels`), the override by `DeclaredDesktopOverride.parse`'s
+            // identical ceiling (review r1 I-3). `UInt32(clamping:)` stays so that if either bound is
+            // ever relaxed the connect path degrades instead of trapping. Same shape as
+            // `AppDelegate.swift:264-265`, deliberately.
             session.desktopWidth = UInt32(clamping: toServer.width)
             session.desktopHeight = UInt32(clamping: toServer.height)
-            let declaredNote = declaredDesktopOverride.map {
-                "; DECLARED TO SERVER as \($0.width)x\($0.height) remote px (WINDOW_SMOKE_DECLARED_DESKTOP, fixture-only; gate anchor unchanged)"
-            } ?? ""
+            // Evidence is READ BACK from the session, not copied from the knob: had the two lines
+            // above assigned the anchor instead, this would print the anchor -- the wiring slip the
+            // scaled-map memo §5 branch ① exists to catch (review r1 B-1).
+            declaredDesktopAssigned = declaredDesktopOverride == nil
+                ? nil
+                : DeclaredDesktopOverride.Size(width: Int(session.desktopWidth), height: Int(session.desktopHeight))
             print(
                 "[topology] \(reason): desktop size frozen at \(desktop.width)x\(desktop.height) remote px "
-                    + "(adr/0015 §3 rule 3, union of the local screens; anchor and size from one read, §5.A.4)\(declaredNote)"
+                    + "(adr/0015 §3 rule 3, union of the local screens; anchor and size from one read, §5.A.4)"
+                    + DeclaredDesktopOverride.evidenceSuffix(overrideSet: declaredDesktopOverride != nil, assigned: declaredDesktopAssigned)
             )
         } else {
+            declaredDesktopAssigned = nil
             print(
                 "[topology] \(reason): no usable display -- desktopWidth/Height deliberately NOT set "
                     + "(adr/0015 §5.A.6: 0x0 falls back to FreeRDP's 1024x768 desktop, CRSession.h:285-286). "
@@ -3387,7 +3477,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         print("[topology] session desktop size after \(cycleResults.count) cycle(s): "
             + (sessionDesktopSizeInRemotePixels.map { "\($0.width)x\($0.height) remote px" }
                 ?? "<not set -- no usable display at the last freeze, adr/0015 §5.A.6>")
-            + (declaredDesktopOverride.map { " (declared to server: \($0.width)x\($0.height) remote px, WINDOW_SMOKE_DECLARED_DESKTOP)" } ?? ""))
+            + DeclaredDesktopOverride.evidenceSuffix(overrideSet: declaredDesktopOverride != nil, assigned: declaredDesktopAssigned))
         // adr/0015 §5's reconnect re-take, pinned against the soak that actually ran: one freeze
         // at connect plus one per finished cycle (`finishCycle` calls `freezeAndApplyDesktopSize`
         // then `prepareForReconnect()`). This is the assertion the registry's own doc comment
@@ -5267,7 +5357,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         print("[topology] session desktop size: "
             + (sessionDesktopSizeInRemotePixels.map { "\($0.width)x\($0.height) remote px" }
                 ?? "<never set -- no usable display at connect, adr/0015 §5.A.6>")
-            + (declaredDesktopOverride.map { " (declared to server: \($0.width)x\($0.height) remote px, WINDOW_SMOKE_DECLARED_DESKTOP)" } ?? ""))
+            + DeclaredDesktopOverride.evidenceSuffix(overrideSet: declaredDesktopOverride != nil, assigned: declaredDesktopAssigned))
         let freezePin = topologyFreezeCountCheck(expectedReconnects: 0)
         check(freezePin.passed, freezePin.message)
 
