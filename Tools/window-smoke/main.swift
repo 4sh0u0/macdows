@@ -1873,14 +1873,22 @@ let geometryRoundGap = GeometryRounds.parseGap(ProcessInfo.processInfo.environme
 // Whenever the knob is SET (any value), say what it parsed to -- a mistyped value that falls back to
 // the default would otherwise produce a log byte-identical to a legitimate single-pass run (review
 // georounds-r2 I-2; same "never silently ignore" rule as DeclaredDesktopOverride).
-if let rawRounds = ProcessInfo.processInfo.environment["WINDOW_SMOKE_GEOMETRY_ROUNDS"] {
-    print("[config] WINDOW_SMOKE_GEOMETRY_ROUNDS=\"\(rawRounds)\" -> rounds=\(geometryRounds)"
-        + (geometryRounds == 1 ? " (single pass -- NOT repeating; a value < 2 or non-numeric parses to 1)" : "")
-        + " gap=\(geometryRoundGap)s"
-        + (geometryRounds > 1 ? " -- the maximize and move/resize legs repeat on the same target; deadlines extend per round (GeometryRounds.deadline)" : ""))
+// Echo, not exit: unlike WINDOW_SMOKE_DECLARED_DESKTOP (whose mis-parse would change what the SERVER is
+// told, hence the exit(3) before the boundary gate), a mis-parsed rounds knob only shortens a client-side
+// fixture loop -- the run stays valid as a single pass, it just is not the run that was intended, and the
+// echo is what makes that visible in the log. Values are printed escaped (\r / \n) for the same reason
+// the DECLARED_DESKTOP line is: this goes into a tee'd log and a raw newline would inject a line.
+func escapedForLog(_ raw: String) -> String {
+    raw.replacingOccurrences(of: "\r", with: "\\r").replacingOccurrences(of: "\n", with: "\\n")
 }
-if let rawGap = ProcessInfo.processInfo.environment["WINDOW_SMOKE_GEOMETRY_ROUND_GAP"], ProcessInfo.processInfo.environment["WINDOW_SMOKE_GEOMETRY_ROUNDS"] == nil {
-    print("[config] WINDOW_SMOKE_GEOMETRY_ROUND_GAP=\"\(rawGap)\" -> gap=\(geometryRoundGap)s (no effect: WINDOW_SMOKE_GEOMETRY_ROUNDS is unset)")
+let rawGeometryGap = ProcessInfo.processInfo.environment["WINDOW_SMOKE_GEOMETRY_ROUND_GAP"]
+if let rawRounds = ProcessInfo.processInfo.environment["WINDOW_SMOKE_GEOMETRY_ROUNDS"] {
+    print("[config] WINDOW_SMOKE_GEOMETRY_ROUNDS=\"\(escapedForLog(rawRounds))\" -> rounds=\(geometryRounds)"
+        + (geometryRounds == 1 ? " (single pass -- NOT repeating; a value < 2 or non-numeric parses to 1)" : "")
+        + " gap=\(geometryRoundGap)s" + (rawGeometryGap.map { " (WINDOW_SMOKE_GEOMETRY_ROUND_GAP=\"\(escapedForLog($0))\")" } ?? " (default)")
+        + (geometryRounds > 1 ? " -- the maximize and move/resize legs repeat on the same target; deadlines extend per round (GeometryRounds.deadline)" : ""))
+} else if let rawGap = rawGeometryGap {
+    print("[config] WINDOW_SMOKE_GEOMETRY_ROUND_GAP=\"\(escapedForLog(rawGap))\" -> gap=\(geometryRoundGap)s (no effect: WINDOW_SMOKE_GEOMETRY_ROUNDS is unset)")
 }
 
 /// adr/0012 follow-up diagnostic, harness-only (no product/FocusAuthority changes):
@@ -2515,6 +2523,13 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         case done
     }
     private var maximizePhase: MaximizePhase = .waitingForTarget
+    /// Geometry rounds: how long past the round gap the next maximize round waits for the target to be
+    /// back at the lock criterion before declaring it gone. 3 s, not the 5 s poll timeout: a round that
+    /// uses the whole grace and then succeeds is a successful round (it does not stop the rounds), so the
+    /// per-round budget GeometryRounds.deadline grants (gap + 10 s) is exceeded by exactly this grace in
+    /// the worst case -- with 3 s that is K <= 3 rounds inside the base-45 slack (review georounds-r3 m-2;
+    /// memo §4-2: raise the budget before K >= 5).
+    private static let betweenRoundsGrace: TimeInterval = 3.0
     /// Geometry rounds (WINDOW_SMOKE_GEOMETRY_ROUNDS): finished maximize->restore passes so far and each
     /// pass's verdict (grew AND restored). A failed pass stops the rounds -- the close leg follows.
     private var maximizeRoundsCompleted = 0
@@ -2559,7 +2574,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     }
     private var moveResizePhase: MoveResizePhase = .waitingForTarget
     /// Geometry rounds (WINDOW_SMOKE_GEOMETRY_ROUNDS): finished move->resize passes so far and each pass's
-    /// (move, resize) leg verdicts. Unlike the maximize rounds, a failed leg does not stop the rounds --
+    /// (move, resize) leg verdicts. Reading the per-round `surfaceMapEvents=` on the "round N/K done" lines:
+    /// the tally is one global counter, so a round's delta is the difference between CONSECUTIVE done lines
+    /// OF THE SAME SCENARIO, and it includes whatever the other scenario, the extra apps and the focus
+    /// rotation remapped in that interval; events arriving in the gap or late count toward the next round. Unlike the maximize rounds, a failed leg does not stop the rounds --
     /// the window is still there to drive, and every pass adds remaps to the tally.
     private var moveResizeRoundsCompleted = 0
     private var moveResizeRoundResults: [(move: Bool, resize: Bool)] = []
@@ -3650,7 +3668,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             : baseDeadline
         let rotationStalled = focusRotationTotal > 0 && !focusRotationDone && elapsed >= rotationDeadline + 10
         // Phase 2 W2 task item 5b/5c: worst case is extraAppsLaunched (>=6s) + settle for
-        // the About target + three back-to-back 5s SC_* polls (maximize/restore/close) --
+        // the About target + three back-to-back 5s SC_* polls (maximize/restore/close); with
+        // WINDOW_SMOKE_GEOMETRY_ROUNDS > 1 GeometryRounds.deadline adds (gap + 10 s) per extra round,
+        // which the between-rounds grace (3 s) can exceed -- see `betweenRoundsGrace` --
         // 45s leaves comfortable slack. `maximizeStalled` is the same kind of hard failsafe
         // `rotationStalled` already is: normally `maximizePhase == .done` is what actually
         // gates the extra wait, not this fallback.
@@ -4305,12 +4325,13 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             guard sinceRoundEnd >= geometryRoundGap else { return }
             guard registry.windowSnapshots().contains(where: { $0.windowId == windowId && $0.isVisible && $0.hasDisplayedContent }) else {
                 // Not (yet) back to the lock criterion. A restored window can be momentarily without
-                // displayed content, so keep polling for up to `maximizePollTimeout` past the gap (review
-                // georounds-r2 m-2) before concluding the target is gone -- then nothing is left to drive;
-                // `finish()` reports the completed rounds against the configured count and reds the shortfall.
-                guard sinceRoundEnd >= geometryRoundGap + Self.maximizePollTimeout else { return }
+                // displayed content, so keep polling for `betweenRoundsGrace` past the gap (review
+                // georounds-r2 m-2 / r3 m-2) before concluding the target is gone -- then nothing is left
+                // to drive; `finish()` reports the completed rounds against the configured count and reds
+                // the shortfall.
+                guard sinceRoundEnd >= geometryRoundGap + Self.betweenRoundsGrace else { return }
                 print("[maximize] round \(maximizeRoundsCompleted + 1)/\(geometryRounds) NOT started: windowId=\(windowId) was not visible with displayed "
-                    + "content (the lock criterion) within \(Self.maximizePollTimeout)s past the gap surfaceMapEvents=\(gfxTargetHints.surfaceMapEventsSeen)")
+                    + "content (the lock criterion) within \(Self.betweenRoundsGrace)s past the gap surfaceMapEvents=\(gfxTargetHints.surfaceMapEventsSeen)")
                 maximizePhase = .done
                 return
             }
@@ -4396,6 +4417,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             print("[move-resize] round \(round)/\(geometryRounds) NOT started: no bounded offset for this position (fits=false) -- repeating an unchecked default would drift; rounds stopped "
                 + "surfaceMapEvents=\(gfxTargetHints.surfaceMapEventsSeen)")
             // The window is still there: close it (Fix 2's cleanup promise) rather than leave a stale target.
+            // Caveat (review georounds-r3 m-3): without WINDOW_SMOKE_MOVE_TARGET the move target is the same
+            // About window the maximize scenario drives, so this close also ends its remaining rounds -- a
+            // K > 1 run should set WINDOW_SMOKE_MOVE_TARGET (the C-form wrappers do).
             session.sendSysCommand(windowId, command: SC.close)
             print("[move-resize] sent SC_CLOSE to windowId=\(windowId) (rounds stopped)")
             moveResizeCloseTargetId = windowId
