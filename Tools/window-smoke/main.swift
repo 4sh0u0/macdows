@@ -119,6 +119,17 @@ enum MoveResizeGate {
         return rectPassedPerObservation[(firstMatch + 1)...].contains(false) ? .oscillated : .none
     }
 
+    /// Whether a `surfaceMapped` event is an observation for the move/resize leg in flight: the
+    /// registry re-applies the target's frame when its surface remap lands ("mapped is
+    /// canonical", `RemoteWindowRegistry.surfaceMapped` handling), and the leg must sample that
+    /// re-applied content rect too -- on the 2026-09-02 F0 runs the only sample was taken at the
+    /// WindowUpdate, still carrying the old mapped size (F0-2, docs/upgrade-gate/
+    /// 2026-09-f0-control-live.md §3 item 3). Pure so the self-test can pin the gating.
+    static func remapObservationApplies(eventWindowId: UInt32, targetWindowId: UInt32?, legAwaitingSettle: Bool) -> Bool {
+        guard legAwaitingSettle, let targetWindowId else { return false }
+        return eventWindowId == targetWindowId
+    }
+
     /// One leg's paired verdict (adr/0015 §6.3): a RECT comparison and the single-POINT reverse
     /// mapping of the same target's top-left corner, kept as two separately-named results.
     ///
@@ -639,6 +650,14 @@ enum SizeBand {
 ///    halves (the F0-H1 defect itself; review multiwindow-gate-r2 MF); the per-tick accumulator
 ///    dropping `hasDisplayedContent` or the band floor (a weaker accumulator survives every pin,
 ///    as review multiwindow-gate-r1 M2 measured); the F0 rerun is the live check for the first.
+///  * **the remap observation** sampled outside the in-flight window, for a non-target window,
+///    or with no target locked => `remapObservationAppliesOnlyToTheInFlightTarget`. **Not covered
+///    here** (live wiring, no offline seam): the tap not calling it at all for `surfaceMapped`
+///    (the F0-2 defect itself), or passing `event.windowId` instead of `event.mappedWindowId`
+///    (a `surfaceMapped` event carries the window in `mappedWindowId`; `windowId` is 0 there --
+///    `CRSession.mm` `payload.surfaceMapped.windowId` -> `mappedWindowId`; review
+///    remap-observation-r1 M5 measured that mutant surviving). The next F/F0 run's
+///    "sources in order: update,remap" text is the live check for both.
 ///  * **the oscillation verdict** collapsing back to two states (an unmatched leg reported as
 ///    "none"), counting pre-match failures as oscillation, dropping the post-match scan, or
 ///    `isOscillated` going constant (the unfailable green reborn through the accessor
@@ -1073,6 +1092,19 @@ enum WindowSmokeGateSelfTest {
                 && MultiWindowGate.newContentWindowIds(visibleAtFinish: [10], closedByHarness: [10], everSeenContent: [10], before: [10]).isEmpty
                 && MultiWindowGate.newContentWindowIds(visibleAtFinish: [], closedByHarness: [], everSeenContent: [], before: [5]).isEmpty,
             "multiWindowGateCountsVisibleOrHarnessClosedNewWindows: a new window counts if still visible at finish or closed by this run's own close leg (and it showed content); a mere flash does not; pre-existing ids never do"
+        )
+
+        // --- move/resize legs also observe the post-remap content rect -------------------------
+        // (F0-2, 2026-09-02 F0 r1/r2: the resize leg's only observation was taken at the
+        // WindowUpdate, when the local content rect still carried the OLD GFX-mapped size; the
+        // registry re-applies the frame when the surface remap lands, and that re-apply was never
+        // sampled, so dw read as -100 against a server that had actually applied +90.)
+        expect(
+            MoveResizeGate.remapObservationApplies(eventWindowId: 709, targetWindowId: 709, legAwaitingSettle: true)
+                && !MoveResizeGate.remapObservationApplies(eventWindowId: 709, targetWindowId: 709, legAwaitingSettle: false)
+                && !MoveResizeGate.remapObservationApplies(eventWindowId: 5, targetWindowId: 709, legAwaitingSettle: true)
+                && !MoveResizeGate.remapObservationApplies(eventWindowId: 709, targetWindowId: nil, legAwaitingSettle: true),
+            "remapObservationAppliesOnlyToTheInFlightTarget: a surface remap is an observation only for the locked target while a leg awaits settle"
         )
 
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
@@ -1886,6 +1918,14 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         case done
     }
     private var moveResizePhase: MoveResizePhase = .waitingForTarget
+    /// True while either leg is waiting for its round trip -- the window in which a surface remap
+    /// on the target is an observation the leg must sample (F0-2).
+    private var moveResizeLegAwaitingSettle: Bool {
+        switch moveResizePhase {
+        case .awaitingMoveSettle, .awaitingResizeSettle: return true
+        case .waitingForTarget, .awaitingClose, .done: return false
+        }
+    }
     private static let moveResizePollTimeout: TimeInterval = 3.0
     /// Team-lead review (2026-08-23 real-host run): mirrors `maximizePollTimeout`'s own 5s
     /// budget for the close leg specifically -- WindowDelete round trips are a full RAIL
@@ -1976,7 +2016,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// Content rects (NOT raw `NSWindow.frame` -- team-lead review, 2026-08-23 real-host
     /// run: RAIL geometry maps to a window's CONTENT rect once it has native chrome,
     /// `RemoteWindow.updateFrame`'s own doc comment has the full finding) observed via a
-    /// geometry-carrying WindowUpdate/WindowCreate for `moveResizeWindowId`, recorded by
+    /// geometry-carrying WindowUpdate/WindowCreate (or, since F0-2, surface remap) for `moveResizeWindowId`, recorded by
     /// `drainNow()`'s own event-kind switch, timestamped against `startTime` -- reset at the
     /// start of each leg so a leg's own oscillation check never sees the PRIOR leg's settle
     /// history. Each entry is `window.contentRect(forFrameRect: window.frame)` at the moment
@@ -1986,7 +2026,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// space `RemoteWindow`/`RemoteWindowRegistry` actually round-trip through the wire,
     /// rather than the raw outer frame (which differs from content rect by this window's
     /// chrome insets once it's titled).
-    private var moveResizeObservedContentRects: [(contentRect: NSRect, at: TimeInterval)] = []
+    /// `source`: "update" for a geometry-carrying WindowCreate/WindowUpdate, "remap" for the frame
+    /// re-apply a surface remap triggers (F0-2) -- both are real states the local window went
+    /// through and both count for the round-trip match and the oscillation scan.
+    private var moveResizeObservedContentRects: [(contentRect: NSRect, at: TimeInterval, source: String)] = []
 
     // adr/0010 W4 first slice (WINDOW_SMOKE_POPUP): menu-popup e2e state machine -- see
     // `runPopupScenario`'s own doc comment for the full sequence.
@@ -2591,7 +2634,24 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                         + "impliedSizeCorrection(mapped-accumulatedRAIL,w,h)=\(impliedSizeCorrection)"
                 )
                 let contentRect = window.contentRect(forFrameRect: window.frame)
-                self.moveResizeObservedContentRects.append((contentRect: contentRect, at: Date().timeIntervalSince(self.startTime)))
+                self.moveResizeObservedContentRects.append((contentRect: contentRect, at: Date().timeIntervalSince(self.startTime), source: "update"))
+            }
+            // F0-2 (2026-09-02): the surface remap's frame re-apply is the SECOND state the local
+            // window reaches after a resize (RAIL update first, remap a beat later), and it is
+            // the one whose size the registry treats as canonical. Sample it too, post
+            // `registry.handle(event)`, for the locked target while a leg awaits settle.
+            if moveResizeScenarioEnabled, event.kind == .surfaceMapped,
+               MoveResizeGate.remapObservationApplies(
+                   eventWindowId: UInt32(truncatingIfNeeded: event.mappedWindowId), targetWindowId: self.moveResizeWindowId,
+                   legAwaitingSettle: self.moveResizeLegAwaitingSettle
+               ),
+               let target = self.moveResizeWindowId, let window = registry.window(forWindowId: target)
+            {
+                let contentRect = window.contentRect(forFrameRect: window.frame)
+                let elapsed = self.startTime.map { Date().timeIntervalSince($0) } ?? -1
+                print("[move-resize] surface remap at elapsed=\(String(format: "%.3f", elapsed))s for windowId=\(target): "
+                    + "mapped=\(event.mappedWidth)x\(event.mappedHeight) -> content rect now \(contentRect) (observation source=remap)")
+                self.moveResizeObservedContentRects.append((contentRect: contentRect, at: elapsed, source: "remap"))
             }
             // Team-lead review (2026-08-23, maximize-scenario real-host regression
             // investigation): reuses the move-resize scenario's own raw-RAIL-geometry trace
@@ -4080,7 +4140,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Shared by both legs: within `Self.moveResizePollTimeout` (3s) of `sentAt`, has any
-    /// WindowUpdate-applied content rect recorded in `moveResizeObservedContentRects`
+    /// WindowUpdate- or remap-applied content rect recorded in `moveResizeObservedContentRects`
     /// matched `target` -- and, once matched, did any LATER recorded content rect in the same
     /// leg diverge from `target` again (ping-pong)? Returns `nil` while the leg is still within
     /// budget and not yet resolved either way (neither matched-and-settled nor timed out) -- the
@@ -4184,7 +4244,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 guard let last = contentRects.last else {
                     return MoveResizeLegOutcome(
                         rectCheckPassed: false, pointCheckPassed: false, oscillation: .unjudgeable(observations: 0),
-                        detail: "no geometry-carrying WindowUpdate/WindowCreate was observed for this leg at all "
+                        detail: "no geometry-carrying WindowUpdate/WindowCreate (nor a surface remap) was observed for this leg at all "
                             + "-- neither half of the paired assertion had an observation to judge; "
                             + deductionsText(windowId: windowId, target: targetMacRect, in: topology, legSentAt: sentAt)
                     )
@@ -4194,7 +4254,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                     rectCheckPassed: failed.rectCheckPassed, pointCheckPassed: failed.pointCheckPassed,
                     oscillation: .unjudgeable(observations: contentRects.count),
                     detail: "\(failed.pairedVerdictText) \(failed.deltaText) (judged against the LAST of "
-                        + "\(contentRects.count) observed rect(s)); "
+                        + "\(contentRects.count) observed rect(s), sources in order: \(moveResizeObservedContentRects.map(\.source).joined(separator: ",")) "
+                        + "-- the last is a \(moveResizeObservedContentRects.last?.source ?? "?") observation); "
                         + deductionsText(windowId: windowId, target: targetMacRect, in: topology, legSentAt: sentAt)
                 )
             }
@@ -4215,7 +4276,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         return MoveResizeLegOutcome(
             rectCheckPassed: matchedVerdict.rectCheckPassed, pointCheckPassed: matchedVerdict.pointCheckPassed,
             oscillation: oscillation,
-            detail: "\(matchedVerdict.pairedVerdictText) \(matchedVerdict.deltaText); "
+            detail: "\(matchedVerdict.pairedVerdictText) \(matchedVerdict.deltaText) (matched on observation "
+                + "#\(firstMatchIndex + 1) of \(contentRects.count), a \(moveResizeObservedContentRects[firstMatchIndex].source) observation; "
+                + "sources in order: \(moveResizeObservedContentRects.map(\.source).joined(separator: ","))); "
                 + deductionsText(windowId: windowId, target: targetMacRect, in: topology, legSentAt: sentAt)
         )
     }
@@ -5895,7 +5958,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 case .none, .oscillated:
                     check(
                         !moveResult.oscillated,
-                        "move-resize scenario: move leg settled without POSITION oscillation (no later WindowUpdate "
+                        "move-resize scenario: move leg settled without POSITION oscillation (no later WindowUpdate or remap "
                             + "diverged from the matched target's x/y)"
                     )
                 }
