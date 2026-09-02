@@ -1108,7 +1108,7 @@ enum WindowSmokeGateSelfTest {
         )
 
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
-        // rev-L9 M-4: `Scripts/run-window-smoke.command:159` records `DONE exit=$?` and its callers
+        // rev-L9 M-4: `Scripts/run-window-smoke.command:192-193` records `DONE exit=<rc>` via `launcher_done` and its callers
         // read that line as the whole verdict. A `WINDOW_SMOKE_SELFTEST=1` leaked into the
         // launcher's environment would therefore print `DONE exit=0` for a run that connected to
         // nothing -- and both modes end in a line matching `overall: PASS`. The banner is the
@@ -1144,7 +1144,7 @@ if ProcessInfo.processInfo.environment["WINDOW_SMOKE_SELFTEST"] == "1" {
 // `NSHomeDirectory() + "/.config/macdows/host.env"` while LabBoundary located ITS file through
 // $HOME, so a redirected HOME sent the two halves of one gate decision to two different homes
 // (MacdowsPaths' doc comment has the measurement and the four reasons the reconciled order is
-// the $HOME-preferring one -- which is also what run-window-smoke.command:99 and lib.sh:57 use,
+// the $HOME-preferring one -- which is also what run-window-smoke.command:125 and lib.sh:57 use,
 // so the launcher and this binary now read one file by construction). The precedence had been a
 // four-line local function duplicated verbatim in Tools/bridge-smoke/GateShim.swift. Neither
 // resolved path nor any credential changes in the default environment; what changes is that

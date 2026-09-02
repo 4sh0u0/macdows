@@ -475,7 +475,7 @@ final class RemoteWindowRegistry {
     /// `Tools/window-smoke/main.swift:1667`), **`sessionTopologyFreezeCount == N + 1`**. A value
     /// of 1 means the re-take never fired, which is exactly the defect r1 caught. Handed to L9 in
     /// `task-L7-report.md` as a wave-3 harness item; the registry cannot print it itself, and a
-    /// `Logger` line would not do — `Scripts/run-window-smoke.command:158` tees stdout/stderr,
+    /// `Logger` line would not do — `Scripts/run-window-smoke.command:191` tees stdout/stderr,
     /// while `os_log` goes to the unified log and never reaches that file.
     private(set) var sessionTopologyFreezeCount = 0
 

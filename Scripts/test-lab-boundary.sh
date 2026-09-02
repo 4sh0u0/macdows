@@ -259,7 +259,9 @@ MINIMAL_BIN="$TEST_DIR/minimal-bin"
 mkdir -p "$MINIMAL_BIN"
 MINIMAL_BIN_READY=1
 MINIMAL_BIN_MISSING=""
-for tool in bash dirname basename mkdir python3; do
+# `date` joined the list with the launcher's wrapper-side start/end stamps (F0 记录 §5.6):
+# a coreutil on every runner; the launcher itself degrades to "unknown" without it.
+for tool in bash dirname basename mkdir date python3; do
 	TOOL_PATH="$(command -v "$tool" 2>/dev/null)" || TOOL_PATH=""
 	if [ "$tool" = "python3" ]; then
 		# python3 on a developer machine is routinely a version-manager shim (pyenv, asdf,
@@ -527,6 +529,54 @@ else
 		LAUNCHER_ASSERT=1
 	fi
 	check "$LAUNCHER_ASSERT" "the DONE contract is still written" "DONE exit=78 in the log" "$LAUNCHER_LOG"
+
+	# F0 记录 §5.6 (2026-09-02): the launcher's own start/end stamps are the only wrapper-side
+	# duration a run's evidence can carry (window-smoke's [run] elapsed stops at finish(), and
+	# the stdout log has no clock of its own). Both stamps must be written even on a gate
+	# refusal, and DONE must stay the LAST line -- every caller reads it with `tail -1`.
+	LAUNCHER_ASSERT=0
+	if [ -f "$LAUNCHER_LOG" ]; then
+		# No `head | grep -q` pipe here (this file's own pipefail rule above): the first line is
+		# read into a variable and matched with bash's =~ instead.
+		FIRST_LINE="$(head -1 "$LAUNCHER_LOG")"
+		STAMP_RE='^\[launcher\] start [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{4}$'
+		[[ "$FIRST_LINE" =~ $STAMP_RE ]] || LAUNCHER_ASSERT=1
+		grep -Eq -- '^\[launcher\] end [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{4} elapsed=[0-9]+s$' "$LAUNCHER_LOG" || LAUNCHER_ASSERT=1
+		[ "$(tail -1 "$LAUNCHER_LOG")" = "DONE exit=78" ] || LAUNCHER_ASSERT=1
+	else
+		LAUNCHER_ASSERT=1
+	fi
+	check "$LAUNCHER_ASSERT" "launcher stamps start/end and keeps DONE last" "[launcher] start first, [launcher] end … elapsed=Ns before a final DONE exit=78" "$LAUNCHER_LOG"
+
+	# The other way round (review launcher-stamps-r1 I1): WITHOUT `date` on the reduced PATH the
+	# stamps must degrade to "unknown" and the refusal must still end in exit 78 with DONE last --
+	# a missing clock is not allowed to turn a gate refusal into a shell fatal.
+	MINIMAL_BIN_NODATE="$TEST_DIR/minimal-bin-nodate"
+	mkdir -p "$MINIMAL_BIN_NODATE"
+	for tool in bash dirname basename mkdir python3; do
+		ln -sf "$MINIMAL_BIN/$tool" "$MINIMAL_BIN_NODATE/$tool"
+	done
+	LAUNCHER_NODATE_LOG="$TEST_DIR/launcher-nodate.log"
+	LAUNCHER_NODATE_OUT="$TEST_DIR/launcher-nodate.out"
+	LAUNCHER_NODATE_RC=0
+	(
+		unset HOME
+		unset WIN_HOST
+		PATH="$MINIMAL_BIN_NODATE" WINDOW_SMOKE_LOG="$LAUNCHER_NODATE_LOG" \
+			MACDOWS_LAB_BOUNDARY_FILE="$BOUNDARY_OK" "$SCRIPT_DIR/run-window-smoke.command"
+	) >"$LAUNCHER_NODATE_OUT" 2>&1 || LAUNCHER_NODATE_RC=$?
+	cat "$LAUNCHER_NODATE_OUT" >>"$TRANSCRIPT"
+	LAUNCHER_ASSERT=0
+	[ "$LAUNCHER_NODATE_RC" -eq 78 ] || LAUNCHER_ASSERT=1
+	if [ -f "$LAUNCHER_NODATE_LOG" ]; then
+		cat "$LAUNCHER_NODATE_LOG" >>"$TRANSCRIPT"
+		[ "$(head -1 "$LAUNCHER_NODATE_LOG")" = "[launcher] start unknown" ] || LAUNCHER_ASSERT=1
+		grep -Fqx -- '[launcher] end unknown elapsed=unknown' "$LAUNCHER_NODATE_LOG" || LAUNCHER_ASSERT=1
+		[ "$(tail -1 "$LAUNCHER_NODATE_LOG")" = "DONE exit=78" ] || LAUNCHER_ASSERT=1
+	else
+		LAUNCHER_ASSERT=1
+	fi
+	check "$LAUNCHER_ASSERT" "launcher survives a PATH without date" "stamps degrade to unknown, exit 78, DONE still last" "$LAUNCHER_NODATE_LOG"
 
 	# Nothing may have been built on the way to that refusal. The launcher names xcodegen and
 	# xcodebuild only inside its build branch, so their absence says that branch was never

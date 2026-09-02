@@ -58,6 +58,33 @@ set +e
 LOG="${WINDOW_SMOKE_LOG:-$REPO_ROOT/.build/evidence/window-smoke-run.log}"
 mkdir -p "$(dirname "$LOG")"
 : > "$LOG"
+# Wrapper-side clock (F0 记录 §5.6, 2026-09-02): window-smoke's own `[run] elapsed since start`
+# stops at finish() and its stdout carries no wall-clock, so the start/end stamps below are the
+# only wrapper-origin duration a run's evidence can hold. `launcher_done` writes the end stamp
+# and then DONE -- DONE stays the LAST line, which is the contract every caller reads.
+# `date` may be absent under a deliberately reduced PATH; the stamps are informational, so a
+# missing clock must never turn a refusal into a shell fatal -- it degrades to "unknown".
+# Scripts/test-lab-boundary.sh drives this launcher both ways: with `date` on the reduced PATH
+# (real stamps pinned) and without it (the "unknown" degradation pinned, DONE still last).
+launcher_stamp() {
+    if command -v date >/dev/null 2>&1; then date '+%Y-%m-%dT%H:%M:%S%z'; else echo unknown; fi
+}
+launcher_epoch() {
+    if command -v date >/dev/null 2>&1; then date +%s; else echo 0; fi
+}
+LAUNCH_START_EPOCH=$(launcher_epoch)
+echo "[launcher] start $(launcher_stamp)" >>"$LOG"
+launcher_done() {
+    local end_epoch elapsed
+    end_epoch=$(launcher_epoch)
+    if [ "$LAUNCH_START_EPOCH" -gt 0 ] && [ "$end_epoch" -gt 0 ]; then
+        elapsed="$(( end_epoch - LAUNCH_START_EPOCH ))s"
+    else
+        elapsed="unknown"
+    fi
+    echo "[launcher] end $(launcher_stamp) elapsed=$elapsed" >>"$LOG"
+    echo "DONE exit=$1" >>"$LOG"
+}
 
 # WIN_HOST from the environment wins here, as it does in window-smoke. Otherwise pull just
 # that one key out of host.env textually -- sourcing the file would drag WIN_USER/WIN_PASS
@@ -103,7 +130,7 @@ if [ -z "$SMOKE_HOST" ] && [ -f "$HOST_ENV_FILE" ]; then
 fi
 if ! crdp_assert_lab_boundary "$SMOKE_HOST"; then
     echo "[launcher] live-host boundary gate refused this target -- nothing was built, nothing was connected" >&2
-    echo "DONE exit=78" >>"$LOG"
+    launcher_done 78
     exit 78
 fi
 # Hand window-smoke the exact string the gate just cleared, instead of letting it re-derive
@@ -145,25 +172,26 @@ if [[ ! -d "$APP_DIR/Macdows.xcodeproj" ]]; then
     echo "[launcher] $APP_DIR/Macdows.xcodeproj not found -- generating project..." >&2
     if ! command -v xcodegen >/dev/null 2>&1; then
         echo "[launcher] xcodegen not found on PATH -- install it (e.g. 'brew install xcodegen') and retry" >&2
-        echo "DONE exit=1" >>"$LOG"
+        launcher_done 1
         exit 1
     fi
     if ! (
         cd "$APP_DIR" || exit 1
         xcodegen generate
     ); then
-        echo "DONE exit=1" >>"$LOG"
+        launcher_done 1
         exit 1
     fi
 fi
 if ! xcodebuild -project "$APP_DIR/Macdows.xcodeproj" -scheme window-smoke -configuration Debug \
     build -derivedDataPath "$APP_DIR/build"; then
-    echo "DONE exit=1" >>"$LOG"
+    launcher_done 1
     exit 1
 fi
 
 "$BIN" >>"$LOG" 2>&1
-echo "DONE exit=$?" >>"$LOG"
+BIN_RC=$?
+launcher_done "$BIN_RC"
 
 # Self-close this Terminal window on clean completion; keep it open on failure
 # so the scrollback stays inspectable. tty-matched so only this window closes.
