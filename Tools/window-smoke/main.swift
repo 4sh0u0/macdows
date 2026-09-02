@@ -650,6 +650,12 @@ enum SizeBand {
 ///    halves (the F0-H1 defect itself; review multiwindow-gate-r2 MF); the per-tick accumulator
 ///    dropping `hasDisplayedContent` or the band floor (a weaker accumulator survives every pin,
 ///    as review multiwindow-gate-r1 M2 measured); the F0 rerun is the live check for the first.
+///  * **the declared-desktop override** accepting 0/negative/non-`<w>x<h>` values, not trimming,
+///    or letting the override replace the gate anchor => `declaredDesktopOverrideParsesOnlyPositiveWxH`
+///    / `declaredDesktopKeepsTheGateAnchorReal`. **Not covered here**: `freezeAndApplyDesktopSize`
+///    assigning the anchor instead of `toServer` to `session.desktopWidth/Height`, or the two
+///    `[topology]` lines not printing the declared value -- live wiring, no offline seam; the F
+///    run's `[topology] connect:` line ("DECLARED TO SERVER as …") is the live check.
 ///  * **the remap observation** sampled outside the in-flight window, for a non-target window,
 ///    or with no target locked => `remapObservationAppliesOnlyToTheInFlightTarget`. **Not covered
 ///    here** (live wiring, no offline seam): the tap not calling it at all for `surfaceMapped`
@@ -1107,6 +1113,34 @@ enum WindowSmokeGateSelfTest {
             "remapObservationAppliesOnlyToTheInFlightTarget: a surface remap is an observation only for the locked target while a leg awaits settle"
         )
 
+        // --- declared-desktop override (WINDOW_SMOKE_DECLARED_DESKTOP, scaled-map memo §4-1 F) ------
+        // Fixture-only: what is DECLARED to the server may differ from the real frozen desktop, but
+        // the gate anchor (Y-flip, size bands) must stay the real one -- otherwise T5's "declared
+        // small, rendered at real pixels" condition cancels itself.
+        expect(
+            DeclaredDesktopOverride.parse(nil) == .unset
+                && DeclaredDesktopOverride.parse("") == .unset
+                && DeclaredDesktopOverride.parse("1280x720") == .size(width: 1280, height: 720)
+                && DeclaredDesktopOverride.parse(" 1024x768 ") == .size(width: 1024, height: 768)
+                && DeclaredDesktopOverride.parse("0x720") == .invalid("0x720")
+                && DeclaredDesktopOverride.parse("1280") == .invalid("1280")
+                && DeclaredDesktopOverride.parse("axb") == .invalid("axb")
+                && DeclaredDesktopOverride.parse("1280x720x1") == .invalid("1280x720x1")
+                && DeclaredDesktopOverride.parse("-1x5") == .invalid("-1x5"),
+            "declaredDesktopOverrideParsesOnlyPositiveWxH: unset/empty = no override; <w>x<h> of positive integers (whitespace trimmed) = override; anything else = invalid, never silently ignored"
+        )
+        let realDesk = DeclaredDesktopOverride.Size(width: 2560, height: 1440)
+        let smallDesk = DeclaredDesktopOverride.Size(width: 1280, height: 720)
+        let withOverride = DeclaredDesktopOverride.declaration(real: realDesk, override: smallDesk)
+        let withoutOverride = DeclaredDesktopOverride.declaration(real: realDesk, override: nil)
+        let noDisplay = DeclaredDesktopOverride.declaration(real: nil, override: smallDesk)
+        expect(
+            withOverride.toServer == smallDesk && withOverride.gateAnchor == realDesk
+                && withoutOverride.toServer == realDesk && withoutOverride.gateAnchor == realDesk
+                && noDisplay.toServer == nil && noDisplay.gateAnchor == nil,
+            "declaredDesktopKeepsTheGateAnchorReal: the override changes only what is declared to the server; the frozen real desktop stays the gate anchor; no usable display declares nothing even with an override"
+        )
+
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
         // rev-L9 M-4: `Scripts/run-window-smoke.command:192-193` records `DONE exit=<rc>` via `launcher_done` and its callers
         // read that line as the whole verdict. A `WINDOW_SMOKE_SELFTEST=1` leaked into the
@@ -1126,6 +1160,68 @@ enum WindowSmokeGateSelfTest {
 if ProcessInfo.processInfo.environment["WINDOW_SMOKE_SELFTEST"] == "1" {
     exit(WindowSmokeGateSelfTest.run() ? 0 : 1)
 }
+
+/// WINDOW_SMOKE_DECLARED_DESKTOP=<w>x<h> (scaled-map memo §4-1, path F; fixture-only, the App
+/// target never reads it): declare a desktop OTHER than the real frozen one to the server, to
+/// re-create the 2026-08-21 mis-declaration condition (T5) on purpose. The pure part lives here so
+/// the self-test can pin two things the memo's §3-F makes load-bearing: (1) parsing never silently
+/// ignores a malformed value -- a run that thinks it mis-declared but did not is the false
+/// negative §5 guards against, so `.invalid` is fatal at startup; (2) the override changes ONLY
+/// what is sent (`session.desktopWidth/Height`), never `sessionDesktopSizeInRemotePixels`, the
+/// Y-flip anchor and size-band base -- otherwise T5's "declared small, rendered at real pixels"
+/// would cancel itself. The App-side consequence (RemoteWindowRegistry's adr/0015 §5.A.4
+/// divergence warning) is expected and recorded, not a defect.
+enum DeclaredDesktopOverride {
+    struct Size: Equatable {
+        let width: Int
+        let height: Int
+    }
+
+    enum Parsed: Equatable {
+        case unset
+        case invalid(String)
+        case size(width: Int, height: Int)
+    }
+
+    /// `nil`/empty = unset. Otherwise `<w>x<h>`, both positive integers, surrounding whitespace
+    /// trimmed; anything else is `.invalid` carrying the raw text for the fatal config line.
+    static func parse(_ raw: String?) -> Parsed {
+        guard let raw else { return .unset }
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return .unset }
+        let parts = trimmed.split(separator: "x", omittingEmptySubsequences: false)
+        guard parts.count == 2, let width = Int(parts[0]), let height = Int(parts[1]), width > 0, height > 0 else {
+            return .invalid(raw)
+        }
+        return .size(width: width, height: height)
+    }
+
+    /// What goes to the server vs what stays the gate anchor. With no usable display nothing is
+    /// declared even when an override is set (adr/0015 §5.A.6's fallback rule is not the knob's to
+    /// change), and the anchor is the real desktop or nothing.
+    static func declaration(real: Size?, override: Size?) -> (toServer: Size?, gateAnchor: Size?) {
+        guard let real else { return (nil, nil) }
+        return (override ?? real, real)
+    }
+}
+
+/// See `DeclaredDesktopOverride`. Fatal on a malformed value: a mis-declaration run whose knob was
+/// silently ignored would read as a clean negative (scaled-map memo §5, "有效性前置"). Evaluated
+/// HERE, before the boundary gate and before anything touches host.env or a socket: a bad knob
+/// must fail the run before it can connect anywhere.
+let declaredDesktopOverride: DeclaredDesktopOverride.Size? = {
+    switch DeclaredDesktopOverride.parse(ProcessInfo.processInfo.environment["WINDOW_SMOKE_DECLARED_DESKTOP"]) {
+    case .unset:
+        return nil
+    case .size(let width, let height):
+        return DeclaredDesktopOverride.Size(width: width, height: height)
+    case .invalid(let raw):
+        print("[config] FAIL: WINDOW_SMOKE_DECLARED_DESKTOP=\"\(raw)\" must be <w>x<h> with positive integers "
+            + "(e.g. 1024x768); refusing to run rather than silently declaring the real desktop")
+        exit(2)
+    }
+}()
+
 
 // Three MacdowsCore rules and no local copy of any of them: MacdowsPaths says WHERE host.env
 // is, EnvFile.parse says HOW it is read, EnvFile.value says WHICH of the environment variable
@@ -2395,16 +2491,25 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private func freezeAndApplyDesktopSize(to session: CRSession, reason: String) -> DesktopSizeInRemotePixels? {
         let desktop = displayTopology.freezeSessionSnapshot()
         sessionDesktopSizeInRemotePixels = desktop
-        if let desktop {
+        // WINDOW_SMOKE_DECLARED_DESKTOP (fixture-only): the override changes only what is sent;
+        // `sessionDesktopSizeInRemotePixels` above stays the real frozen desktop (the gate anchor).
+        let declared = DeclaredDesktopOverride.declaration(
+            real: desktop.map { DeclaredDesktopOverride.Size(width: $0.width, height: $0.height) },
+            override: declaredDesktopOverride
+        )
+        if let desktop, let toServer = declared.toServer {
             // `UInt32(clamping:)` cannot actually clamp -- `DisplayTopology` guarantees
             // `0 < value <= maxExtentInRemotePixels` -- and is written this way so that if that
             // guarantee is ever relaxed the connect path degrades instead of trapping. Same shape
             // as `AppDelegate.swift:264-265`, deliberately.
-            session.desktopWidth = UInt32(clamping: desktop.width)
-            session.desktopHeight = UInt32(clamping: desktop.height)
+            session.desktopWidth = UInt32(clamping: toServer.width)
+            session.desktopHeight = UInt32(clamping: toServer.height)
+            let declaredNote = declaredDesktopOverride.map {
+                "; DECLARED TO SERVER as \($0.width)x\($0.height) remote px (WINDOW_SMOKE_DECLARED_DESKTOP, fixture-only; gate anchor unchanged)"
+            } ?? ""
             print(
                 "[topology] \(reason): desktop size frozen at \(desktop.width)x\(desktop.height) remote px "
-                    + "(adr/0015 §3 rule 3, union of the local screens; anchor and size from one read, §5.A.4)"
+                    + "(adr/0015 §3 rule 3, union of the local screens; anchor and size from one read, §5.A.4)\(declaredNote)"
             )
         } else {
             print(
@@ -3281,7 +3386,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         printMeasurementSummaries()
         print("[topology] session desktop size after \(cycleResults.count) cycle(s): "
             + (sessionDesktopSizeInRemotePixels.map { "\($0.width)x\($0.height) remote px" }
-                ?? "<not set -- no usable display at the last freeze, adr/0015 §5.A.6>"))
+                ?? "<not set -- no usable display at the last freeze, adr/0015 §5.A.6>")
+            + (declaredDesktopOverride.map { " (declared to server: \($0.width)x\($0.height) remote px, WINDOW_SMOKE_DECLARED_DESKTOP)" } ?? ""))
         // adr/0015 §5's reconnect re-take, pinned against the soak that actually ran: one freeze
         // at connect plus one per finished cycle (`finishCycle` calls `freezeAndApplyDesktopSize`
         // then `prepareForReconnect()`). This is the assertion the registry's own doc comment
@@ -5160,7 +5266,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // this method's own note on why it never resets the registry).
         print("[topology] session desktop size: "
             + (sessionDesktopSizeInRemotePixels.map { "\($0.width)x\($0.height) remote px" }
-                ?? "<never set -- no usable display at connect, adr/0015 §5.A.6>"))
+                ?? "<never set -- no usable display at connect, adr/0015 §5.A.6>")
+            + (declaredDesktopOverride.map { " (declared to server: \($0.width)x\($0.height) remote px, WINDOW_SMOKE_DECLARED_DESKTOP)" } ?? ""))
         let freezePin = topologyFreezeCountCheck(expectedReconnects: 0)
         check(freezePin.passed, freezePin.message)
 
