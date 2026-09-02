@@ -709,7 +709,13 @@ enum SizeBand {
 ///    `focusRotationPendingIsVoidedOnlyByItsOwnTargetsDeletion` / `focusRotationPendingOutcomeIsTimeBased`.
 ///    **Not covered here** (live wiring, the C-H1b defect itself): `tick()` not calling
 ///    `pollFocusRotationPending` (with only the drain calling it an idle session never times out),
-///    or `deletedWindowIds` not fed from the drain's windowDelete branch.
+///    `deletedWindowIds` not fed from the drain's windowDelete branch, the empty-live-set exit not
+///    setting `focusRotationEndedNoLiveMember` (the verdict would then read like a stall -- review
+///    c-fixture-r2 M-N2 measured it surviving), or the windowDelete branch voiding before polling
+///    (a same-batch timeout would be voided instead of recorded -- M-N3 surviving). A live set that
+///    collapses to ONE member is a silent degeneration (the rotation re-activates the active
+///    window); the per-rotation `live=` and the summary's `liveMembersAtFinish=` make it readable,
+///    not red (review c-fixture-r2 I-1).
 ///  * **the remap observation** sampled outside the in-flight window, for a non-target window,
 ///    or with no target locked => `remapObservationAppliesOnlyToTheInFlightTarget`. **Not covered
 ///    here** (live wiring, no offline seam): the tap not calling it at all for `surfaceMapped`
@@ -5334,7 +5340,12 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         focusRotationPendingSentAt = sentAt
         focusRotationPendingSoftDeadline = sentAt.addingTimeInterval(FocusAuthority.softDeadlineInterval)
         focusRotationPendingEventualDeadline = sentAt.addingTimeInterval(FocusAuthority.hardDeadlineInterval)
-        print("[focus-rotation] rotation \(focusRotationsIssued)/\(focusRotationTotal) at elapsed=\(String(format: "%.3f", elapsed))s: activating windowId=\(targetId)")
+        // `live=` is printed on every rotation so a soft-hit rate is never read without the member
+        // count it was measured against: with one live member the rotation re-activates the window
+        // that is already active and converges trivially (review c-fixture-r2 I-1).
+        let liveMembers = focusRotationWindowIds.filter { !deletedWindowIds.contains($0) }.count
+        print("[focus-rotation] rotation \(focusRotationsIssued)/\(focusRotationTotal) at elapsed=\(String(format: "%.3f", elapsed))s: "
+            + "activating windowId=\(targetId) (live=\(liveMembers) of \(focusRotationWindowIds.count) members)")
     }
 
     /// The round-robin candidate pool for `runFocusRotation` -- visible windows with real
@@ -6314,8 +6325,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 return latencies[rank]
             }
             print(String(
-                format: "[focus-rotation] configured=%d issued=%d results=%d voided=%d softHits=%d eventualHits=%d eventualMisses=%d p50=%.1fms p95=%.1fms maxMs=%.1fms",
+                format: "[focus-rotation] configured=%d issued=%d results=%d voided=%d liveMembersAtFinish=%d/%d softHits=%d eventualHits=%d eventualMisses=%d p50=%.1fms p95=%.1fms maxMs=%.1fms",
                 focusRotationTotal, focusRotationsIssued, focusRotationResults.count, focusRotationsVoided,
+                focusRotationWindowIds.filter { !deletedWindowIds.contains($0) }.count, focusRotationWindowIds.count,
                 softHits.count, eventualHits.count, eventualMisses.count,
                 percentileMs(0.5), percentileMs(0.95), latencies.last ?? 0
             ))
