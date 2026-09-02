@@ -1403,6 +1403,16 @@ enum WindowSmokeGateSelfTest {
                 && RailComparison.Borders.forStyleLabel("something-else") == RailComparison.Borders.aboutCalibrated,
             "railComparisonBorderModelsAreTheTwoMeasuredOnes: About-calibrated (7,0,7,7) is the default and the fallback for an unknown style; THICKFRAME (5,0,5,5) is the F-R1 measurement (n=8 independent runs, memo :101)"
         )
+        // style bits from the RAIL WindowCreate (the `[style-dump] style=0x…` value): WS_THICKFRAME (0x00040000)
+        // selects the measured THICKFRAME model -- Notepad 0x000F0000 and Realtek 0x800F0000 carry it, About
+        // 0x80080000 does not.
+        expect(
+            RailComparison.Borders.forStyleBits(0x000F_0000) == RailComparison.Borders.thickFrameMeasured
+                && RailComparison.Borders.forStyleBits(0x800F_0000) == RailComparison.Borders.thickFrameMeasured
+                && RailComparison.Borders.forStyleBits(0x8008_0000) == RailComparison.Borders.aboutCalibrated
+                && RailComparison.Borders.forStyleBits(0) == RailComparison.Borders.aboutCalibrated,
+            "railComparisonPicksTheBorderModelFromWS_THICKFRAME: style bit 0x00040000 set -> THICKFRAME (5,0,5,5), otherwise the About-calibrated default -- the two real styles this project has measured"
+        )
 
         // --- the resize leg stays inside the desktop too (C second step r1, 2026-09-02: round 9's +100 pt
         // resize sent right=2576 on a 2560-wide desktop -- the move leg was bounded, the resize was not) ---
@@ -2067,6 +2077,12 @@ enum RailComparison {
         /// A style label -> border model; anything unrecognised falls back to the calibrated default.
         static func forStyleLabel(_ label: String) -> Borders {
             label.lowercased() == "thickframe" ? thickFrameMeasured : aboutCalibrated
+        }
+        /// `WS_THICKFRAME` (== `WS_SIZEBOX`), the bit that distinguishes the two measured styles.
+        static let wsThickFrame: UInt32 = 0x0004_0000
+        /// Border model from the RAIL WindowCreate style bits (`[style-dump] style=0x…`).
+        static func forStyleBits(_ style: UInt32) -> Borders {
+            style & wsThickFrame != 0 ? thickFrameMeasured : aboutCalibrated
         }
     }
 
@@ -2830,6 +2846,12 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// Timestamped so a verdict can say whether the send it is quoting belongs to the leg being
     /// judged or to an earlier one -- an unlabelled "the deduction was N" taken from the previous
     /// leg's send is exactly the silent absorption §6.2 forbids.
+    /// adr/0015 §6.2 measurement inputs, per window: the last RAIL-reported client-area OFFSET (only from
+    /// orders that carried WINDOW_ORDER_FIELD_WND_OFFSET, 0x800) and the WindowCreate/Update style bits (only
+    /// from orders that carried WINDOW_ORDER_FIELD_STYLE, 0x8). Sizes come from the registry's accumulated
+    /// RAIL size at comparison time, the same state its own sizeCorrection uses.
+    private var latestRailOffset: [UInt32: (x: Int, y: Int, elapsed: TimeInterval)] = [:]
+    private var windowStyleBits: [UInt32: UInt32] = [:]
     private var lastClientWindowMoveSent: (left: Int32, top: Int32, right: Int32, bottom: Int32, at: Date)?
     /// Team-lead review round 4 (2026-08-23, no-false-red discipline): whether the real
     /// target window's `NSWindow.styleMask` actually included `.resizable` at the moment
@@ -3499,6 +3521,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 } else {
                     impliedSizeCorrection = "n/a"
                 }
+                if event.fieldFlags & 0x0000_0800 != 0 { // WINDOW_ORDER_FIELD_WND_OFFSET
+                    latestRailOffset[target] = (x: Int(event.offsetX), y: Int(event.offsetY), elapsed: elapsed)
+                }
                 print(
                     "[move-resize] raw RAIL geometry at elapsed=\(String(format: "%.3f", elapsed))s "
                         + "for windowId=\(target) kind=\(event.kind): "
@@ -3609,6 +3634,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // during the popup wait window stays self-diagnosing regardless of whether the
             // multiwin prereq still holds.
             if event.kind == .windowCreate, !extraApps.isEmpty || popupScenarioEnabled {
+                if event.fieldFlags & 0x0000_0008 != 0 { // WINDOW_ORDER_FIELD_STYLE -- feeds RailComparison.Borders.forStyleBits
+                    windowStyleBits[event.windowId] = event.style
+                }
                 print(Self.styleDumpLine(for: event))
             }
             // adr/0010 §5: unconditional WindowCreate timestamp bookkeeping (see
@@ -5429,9 +5457,35 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         } else {
             borderText = "n/a (no ClientWindowMove was observed for this window this run)"
         }
+        // adr/0015 §6.2's comparison object, MEASUREMENT ONLY (the gate stays the local content-rect
+        // verdict above): the RAIL-reported client rect vs this leg's sent window rect minus the style's
+        // borders (`RailComparison`). Every input is named so the reader can recompute the delta by hand.
+        let railText: String
+        if let sent = lastClientWindowMoveSent, sent.at >= legSentAt,
+           let offset = latestRailOffset[windowId], let accumulated
+        {
+            let style = windowStyleBits[windowId]
+            let borders = style.map { RailComparison.Borders.forStyleBits($0) } ?? RailComparison.Borders.aboutCalibrated
+            let expected = RailComparison.expectedClientRect(
+                sentLeft: Int(sent.left), sentTop: Int(sent.top), sentRight: Int(sent.right), sentBottom: Int(sent.bottom),
+                borders: borders
+            )
+            let reported = RailComparison.ClientRect(
+                x: offset.x, y: offset.y, width: Int(accumulated.width), height: Int(accumulated.height)
+            )
+            let delta = RailComparison.compare(expected: expected, reported: reported, toleranceRemotePx: 0)
+            railText = "adr0015-6.2(MEASUREMENT ONLY)=sent(l=\(sent.left),t=\(sent.top),r=\(sent.right),b=\(sent.bottom)) "
+                + "borders=(\(borders.left),\(borders.top),\(borders.right),\(borders.bottom)) "
+                + (style.map { String(format: "style=0x%08X", $0) } ?? "style=unknown(default borders)") + " "
+                + "expectedClient=(\(expected.x),\(expected.y),\(expected.width)x\(expected.height)) "
+                + "reportedRAIL=(\(reported.x),\(reported.y),\(reported.width)x\(reported.height) @\(String(format: "%.3f", offset.elapsed))s) "
+                + "delta=(dx=\(delta.dx),dy=\(delta.dy),dw=\(delta.dw),dh=\(delta.dh)) withinU6=\(delta.passed)"
+        } else {
+            railText = "adr0015-6.2(MEASUREMENT ONLY)=n/a (no own send, no RAIL offset, or no accumulated RAIL size for this leg)"
+        }
         return "deductions@comparison(adr/0015 §6.2): mappedSize=\(mappedText) "
             + "accumulatedRAILSize=\(accumulated.map { "\($0.width)x\($0.height) remote px" } ?? "unknown") "
-            + "sizeCorrection=\(sizeCorrectionText) outboundLeftBorder=\(borderText)"
+            + "sizeCorrection=\(sizeCorrectionText) outboundLeftBorder=\(borderText) " + railText
     }
 
     /// W4c deliverable 5: locates this run's own launched-app window once it's visible and
