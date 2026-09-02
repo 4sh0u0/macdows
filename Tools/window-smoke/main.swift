@@ -1370,7 +1370,10 @@ enum WindowSmokeGateSelfTest {
         )
         expect(
             cpBlankLines == [nil, nil, nil, "n/a (no pixel sample within 2.0 s of the checkpoint -- target visible but no sampleable backing)", nil]
-                && blankSamples == 4,
+                && blankSamples == 4
+                // the pre-sample's whole grace window must end before the t=8 s ClientActivate goes out, or a
+                // late pre-sample would measure the post-activate state (review actonce-r2 m-4)
+                && ActivateExperimentCheckpoint(threshold: 6).threshold + ActivateExperimentCheckpoint(threshold: 6).grace <= 8,
             "activateCheckpointRetriesANilSampleOnlyWithinTheGrace: a visible target with no backing is re-sampled each tick for 2.0 s past the threshold (four samples here), then settles once with that reason and never runs again"
         )
 
@@ -2097,7 +2100,9 @@ enum FinishGate {
 /// arm it (review actonce-r1 I-1).
 struct ActivateExperimentCheckpoint {
     let threshold: TimeInterval
-    /// How long past the threshold a visible target with a nil sample is re-sampled before giving up.
+    /// How long past the threshold a visible target with a nil sample is re-sampled before giving up. Bounded
+    /// by the experiment's own timeline: pre (t=6) + grace must not reach the t=8 s ClientActivate, or a late
+    /// pre-sample would read the post-activate state -- pinned in the self-test (review actonce-r2 m-4).
     let grace: TimeInterval = 2.0
     private(set) var settled = false
     private(set) var ratio: Double?
