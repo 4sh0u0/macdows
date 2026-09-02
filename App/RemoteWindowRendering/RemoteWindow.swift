@@ -345,11 +345,12 @@ final class RemoteWindow {
     /// `didEndLiveResizeNotification` -- AppKit's own clean begin/end pair for an
     /// *interactive* resize (never posted for a programmatic `-setFrame:display:`, which is
     /// why the move-settle debounce below exists at all: move has no equivalent pair).
-    /// Guards `handleLocalDidMove` from double-counting a resize's own incidental origin
+    /// Guards `handleLocalGeometryChanged` from double-counting a resize's own incidental origin
     /// changes (dragging a top-left resize handle moves the origin too) against the
-    /// suppression counter a second time.
+    /// suppression counter a second time -- and, since F-R2, the per-step `didResize`
+    /// notifications the same gesture posts, which would otherwise start a competing debounce.
     private var isInLiveResize = false
-    /// Debounce work item for settling a native titlebar drag (see `handleLocalDidMove`'s
+    /// Debounce work item for settling a native titlebar drag (see `handleLocalGeometryChanged`'s
     /// own doc comment for why a trailing-edge debounce, not a clean "did end move"
     /// callback, is the only way to detect drag-end for a *move* -- AppKit has no
     /// `windowDidEndLiveMove` counterpart to `didEndLiveResizeNotification`). Mirrors
@@ -359,6 +360,7 @@ final class RemoteWindow {
     private static let moveSettleDebounce: TimeInterval = 0.2
 
     private var didMoveObserver: NSObjectProtocol?
+    private var didResizeObserver: NSObjectProtocol?
     private var willStartLiveResizeObserver: NSObjectProtocol?
     private var didEndLiveResizeObserver: NSObjectProtocol?
 
@@ -369,12 +371,19 @@ final class RemoteWindow {
     /// with no way to distinguish "the server just told us to move" from "the user is
     /// dragging" at the notification level itself. Without this flag, `updateFrame`
     /// applying an ordinary server-driven `WindowUpdate` would trigger
-    /// `handleLocalDidMove` exactly like a real drag, and -- after the 200ms debounce --
+    /// `handleLocalGeometryChanged` exactly like a real drag, and -- after the 200ms debounce --
     /// echo that same geometry straight back to the server as a spurious
-    /// `ClientWindowMove`, on every single server-initiated move. `willStartLiveResizeNotification`/
-    /// `didEndLiveResizeNotification` need no equivalent guard: AppKit only ever posts that
-    /// pair for a genuine interactive (mouse-tracked) resize loop, never as a side effect of
-    /// a programmatic `-setFrame:`/`.styleMask` change.
+    /// `ClientWindowMove`, on every single server-initiated move. The same applies to
+    /// `NSWindow.didResizeNotification` (F-R2, 2026-09-02): a server-driven `WindowUpdate`
+    /// that changes the SIZE posts `didResize` exactly like a local programmatic resize, so
+    /// the shared handler checks this flag before either notification can claim a gesture.
+    /// `willStartLiveResizeNotification`/`didEndLiveResizeNotification` need no equivalent
+    /// guard: AppKit only ever posts that pair for a genuine interactive (mouse-tracked)
+    /// resize loop, never as a side effect of a programmatic `-setFrame:`/`.styleMask` change.
+    /// The set/clear bracket around `setFrame` only works because the block observers above are
+    /// delivered INLINE on the posting (main) thread -- measured (review fr2-r1 probe Q1);
+    /// `RemoteWindowLocalGeometrySyncTests.serverDrivenFrameApplyIsNotEchoedBackAsALocalSettle`
+    /// is the guard against that premise ever changing (a different queue, or an async apply).
     private var isApplyingProgrammaticFrame = false
 
     /// `contentRect` is already in macOS screen space (post `WindowGeometry.macRect`) — this
@@ -484,18 +493,45 @@ final class RemoteWindow {
             }
         }
 
-        // Phase 2 W3: native titlebar drag/resize -> server sync (see
-        // `geometryAuthoritySuppressionCount`'s own doc comment for why this needs three
-        // separate observers, not one). Uses `NSNotification.Name` constants rather than
-        // `NSWindowDelegate` for the exact same reason `didResignKeyObserver` above does --
-        // this class isn't an `NSObject` subclass, and AppKit exposes these three specific
-        // transitions as public notifications, sidestepping the need for delegate
-        // conformance entirely. [weak self]: none of these must be what keeps a closed
-        // RemoteWindow alive.
+        // Phase 2 W3: native titlebar drag/resize -> server sync (see `isInLiveResize`'s and
+        // `moveSettleWorkItem`'s own doc comments for why this needs four separate observers, not
+        // one: a move has no end signal and is debounced, an interactive resize has AppKit's
+        // begin/end pair, and a programmatic resize posts only `didResize`). Uses
+        // `NSNotification.Name` constants rather than `NSWindowDelegate` for the exact same reason
+        // `didResignKeyObserver` above does -- this class isn't an `NSObject` subclass, and AppKit
+        // exposes these four specific transitions as public notifications, sidestepping the need
+        // for delegate conformance entirely. [weak self]: none of these must be what keeps a
+        // closed RemoteWindow alive.
         didMoveObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didMoveNotification, object: win, queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.handleLocalDidMove() }
+            MainActor.assumeIsolated { self?.handleLocalGeometryChanged() }
+        }
+        // F-R2 (docs/upgrade-gate/2026-09-resize-leg-live.md §3.2, real-host run 2026-09-02;
+        // measured on this machine: six scenarios in the controller's .titled/.resizable probe,
+        // corroborated by an independent five-scenario probe and two borderless re-runs in review
+        // -- fr2-r1's own probe was borderless too -- and `RemoteWindowLocalGeometrySyncTests`
+        // re-pins it on the borderless styleMask this class actually uses): a programmatic
+        // `-setFrame:display:` that changes the SIZE posts ONLY `didResizeNotification` -- not
+        // `didMoveNotification`, even when the origin changes in the same call, and never the
+        // live-resize pair (interactive-only). Without this observer a non-interactive local size
+        // change (window-smoke's resize leg, a display reconfiguration (unmeasured, plausible), or
+        // any other non-interactive frame change AppKit applies on the window's behalf -- min/max
+        // constraints were measured NOT to be one: setting them neither moves an existing frame
+        // nor posts anything, review fr2-r1) had no sync exit at all and never became a
+        // `ClientWindowMove`. It feeds the SAME trailing-edge debounce as `didMove` -- one gesture,
+        // one settle, whichever notifications AppKit chooses to post for it -- and is skipped
+        // during an interactive resize (`isInLiveResize`), whose own clean end signal settles it.
+        // `RemoteWindowLocalGeometrySyncTests` pins this. UNMEASURED (registered, review fr2-r1
+        // I-2): whether AppKit can post a trailing `didResize` AFTER `didEndLiveResizeNotification`;
+        // if it does, the same rect settles a second time 200ms later as a duplicate,
+        // geometry-identical `ClientWindowMove` (the registry does not dedupe) and holds
+        // `geometryAuthoritySuppressionCount` for that extra 200ms, during which inbound server
+        // `WindowUpdate`s are refused. One hand-driven resize on a live host decides it.
+        didResizeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResizeNotification, object: win, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleLocalGeometryChanged() }
         }
         willStartLiveResizeObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.willStartLiveResizeNotification, object: win, queue: .main
@@ -660,15 +696,17 @@ final class RemoteWindow {
 
     // MARK: - Phase 2 W3: local move/resize -> server sync
 
-    /// Native titlebar drag: fires on every intermediate position during the drag, not just
-    /// once at the end (AppKit has no `windowDidEndLiveMove` counterpart to
-    /// `didEndLiveResizeNotification` -- this is the "standard workaround" the task spec
-    /// itself calls for: debounce on the trailing edge of repeated `didMove` notifications).
-    /// Ignored during a live *resize* (`isInLiveResize`) -- a resize's own incidental origin
-    /// changes (e.g. dragging a top-left handle) are settled by
-    /// `handleLocalDidEndLiveResize` instead, which has AppKit's own clean end signal and
-    /// doesn't need a debounce at all.
-    private func handleLocalDidMove() {
+    /// Native titlebar drag (`didMove`) or a non-interactive frame change (`didResize`, F-R2):
+    /// `didMove` fires on every intermediate position during a drag, not just once at the end
+    /// (AppKit has no `windowDidEndLiveMove` counterpart to `didEndLiveResizeNotification` --
+    /// this is the "standard workaround" the task spec itself calls for: debounce on the
+    /// trailing edge of repeated notifications), and `didResize` rides the same debounce so a
+    /// burst of programmatic frame changes settles once, reporting the last frame. Ignored
+    /// during a live *resize* (`isInLiveResize`) -- both a resize's own incidental origin
+    /// changes (e.g. dragging a top-left handle) and its per-step `didResize` notifications are
+    /// settled by `handleLocalDidEndLiveResize` instead, which has AppKit's own clean end
+    /// signal and doesn't need a debounce at all.
+    private func handleLocalGeometryChanged() {
         guard !isApplyingProgrammaticFrame else { return }
         guard !isInLiveResize else { return }
         if moveSettleWorkItem == nil {
@@ -684,10 +722,11 @@ final class RemoteWindow {
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.moveSettleDebounce, execute: workItem)
     }
 
-    /// Fires `Self.moveSettleDebounce` after the last observed `didMove` -- the drag is
-    /// presumed over (no clean end signal exists for a move, see `handleLocalDidMove`'s own
-    /// doc comment), so this releases suppression and reports the final frame upward for
-    /// `RemoteWindowRegistry` to sync to the server.
+    /// Fires `Self.moveSettleDebounce` after the last observed `didMove`/`didResize` -- the
+    /// gesture is presumed over (no clean end signal exists for a move or a programmatic
+    /// resize, see `handleLocalGeometryChanged`'s own doc comment), so this releases
+    /// suppression and reports the final frame upward for `RemoteWindowRegistry` to sync to
+    /// the server.
     private func settleLocalMove() {
         moveSettleWorkItem = nil
         geometryAuthoritySuppressionCount = max(0, geometryAuthoritySuppressionCount - 1)
@@ -750,6 +789,11 @@ final class RemoteWindow {
     /// AppKit's own "unconstrained" sentinel here -- `.zero` for min, `.greatestFiniteMagnitude`
     /// for max -- rather than in the pure `MacdowsCore` translator, which stays free of the
     /// AppKit boundary (adr/0006 §2).
+    ///
+    /// Deliberately outside the `isApplyingProgrammaticFrame` guard: assigning `minSize`/`maxSize`
+    /// neither moves an existing frame nor posts `didResize`/`didMove` (measured, review fr2-r1:
+    /// AppKit does not retroactively clamp, and a later programmatic `setFrame` is not clamped by
+    /// them either), so there is no frame change here for the guard to hide.
     func applyTrackSizeConstraints(_ constraints: WindowTrackSizeConstraints) {
         window.minSize = NSSize(width: constraints.minWidth ?? 0, height: constraints.minHeight ?? 0)
         window.maxSize = NSSize(
@@ -1244,11 +1288,15 @@ final class RemoteWindow {
             self.didResignKeyObserver = nil
         }
         // Phase 2 W3: same "block observers keep firing until explicitly removed" reasoning
-        // as didResignKeyObserver above, times three. moveSettleWorkItem is cancelled too --
+        // as didResignKeyObserver above, times four. moveSettleWorkItem is cancelled too --
         // nothing left to settle once this window is closing.
         if let didMoveObserver {
             NotificationCenter.default.removeObserver(didMoveObserver)
             self.didMoveObserver = nil
+        }
+        if let didResizeObserver {
+            NotificationCenter.default.removeObserver(didResizeObserver)
+            self.didResizeObserver = nil
         }
         if let willStartLiveResizeObserver {
             NotificationCenter.default.removeObserver(willStartLiveResizeObserver)

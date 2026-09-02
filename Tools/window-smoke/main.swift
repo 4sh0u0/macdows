@@ -1245,7 +1245,8 @@ let maximizeScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_
 
 /// Phase 2 W3 (docs/plans/phase2.md §2 W3): automatable local move/resize -> server sync
 /// acceptance -- no human drag is available to this harness, so this programmatically
-/// moves (then resizes) the About window's real `NSWindow` via `-setFrame:display:` and
+/// moves (then resizes) the target window's real `NSWindow` (About by default -- see
+/// `WINDOW_SMOKE_MOVE_TARGET`) via `-setFrame:display:` and
 /// asserts the settle path this fires round-trips through `CRSession.sendWindowMove` and
 /// back via a real `WindowUpdate`. See `runMoveResizeScenario`'s own doc comment for the
 /// acknowledged honesty gap against a genuine mouse-driven drag. Requires
@@ -3265,27 +3266,38 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Phase 2 W3 (docs/plans/phase2.md §2 W3): drives a move-then-resize sequence against
-    /// the About window's real `NSWindow`, purely programmatically -- no human drag is
+    /// the target window's real `NSWindow` (About by default -- see `WINDOW_SMOKE_MOVE_TARGET`),
+    /// purely programmatically -- no human drag is
     /// available to an automated harness. Uses `-setFrame:display:`, which AppKit confirms
     /// posts `NSWindow.didMoveNotification` for a programmatic origin change exactly as it
     /// would for an interactive one, so this exercises the REAL production settle path
-    /// (`RemoteWindow.handleLocalDidMove` -> 200ms debounce -> `onLocalGeometrySettled` ->
+    /// (`RemoteWindow.handleLocalGeometryChanged` -> 200ms debounce -> `onLocalGeometrySettled` ->
     /// `RemoteWindowRegistry.handleLocalGeometrySettled` -> `CRSession.sendWindowMove`) end
     /// to end, not a bypass or a direct call into any of those methods.
     ///
-    /// HONESTY GAP (acknowledged, per the task spec's own wording): `-setFrame:display:`
-    /// does NOT post `NSWindow.willStartLiveResizeNotification`/`didEndLiveResizeNotification`
-    /// -- those fire ONLY for a genuine interactive (mouse-driven) resize, which nothing in
-    /// this headless harness can produce. Both legs below therefore exercise the SAME
-    /// didMove-debounce settle path `RemoteWindow` uses for a move, never the live-resize
-    /// begin/end path it separately implements for an interactive resize -- that path has
-    /// no automated coverage at all in this harness. The About window is additionally not
-    /// resizable (StyleTranslatorTests' `aboutWindowsDialogShape`), so even a real
-    /// interactive resize could never be driven against it regardless; `-setFrame:display:`
-    /// still changes its frame at the wire/model level regardless of `styleMask`, which is
-    /// what the resize leg actually verifies (does a programmatic geometry change round-trip
-    /// through `ClientWindowMove` and back) -- at the acknowledged cost of the live-resize
-    /// notification pair having zero coverage from any window in this run.
+    /// HONESTY GAP (acknowledged, per the task spec's own wording; re-measured 2026-09-02,
+    /// F-R2): `-setFrame:display:` does NOT post `NSWindow.willStartLiveResizeNotification`/
+    /// `didEndLiveResizeNotification` -- those fire ONLY for a genuine interactive
+    /// (mouse-driven) resize, which nothing in this headless harness can produce -- so the
+    /// live-resize begin/end path `RemoteWindow` implements for an interactive resize has no
+    /// automated coverage at all in this harness. What the two legs DO exercise differs, and
+    /// the paragraph this replaces had it wrong: a programmatic frame change that alters the
+    /// SIZE posts only `didResizeNotification` (never `didMove`, even when the origin changes
+    /// in the same call -- measured on this machine: six scenarios in the controller's probe,
+    /// corroborated by an independent five-scenario probe and two borderless re-runs in review;
+    /// docs/upgrade-gate/2026-09-resize-leg-live.md §3.2), so the move leg travels the
+    /// `didMove` observer and the resize leg the `didResize` observer, both into
+    /// `RemoteWindow.handleLocalGeometryChanged`'s shared 200ms debounce. Until that second
+    /// observer existed the resize leg had NO sync exit at all -- the 2026-09-02 real-host run
+    /// (`env-202609-14`) sent no `ClientWindowMove` for it, which is what surfaced the
+    /// production gap (`RemoteWindowLocalGeometrySyncTests` pins the fix). The DEFAULT target,
+    /// About, is additionally not resizable (StyleTranslatorTests' `aboutWindowsDialogShape`),
+    /// so against it even a real interactive resize could never be driven; with
+    /// `WINDOW_SMOKE_MOVE_TARGET` pointing at a resizable window (env-202609-14's notepad) that
+    /// half no longer applies, but the live-resize pair still cannot be produced headless.
+    /// `-setFrame:display:` changes the frame at the wire/model level regardless of
+    /// `styleMask`, which is what the resize leg actually verifies (does a programmatic
+    /// geometry change round-trip through `ClientWindowMove` and back).
     ///
     /// Team-lead review (2026-08-23 real-host run): all target/comparison math below is in
     /// CONTENT-RECT space (`window.contentRect(forFrameRect:)`/`window.frameRect(forContentRect:)`),
@@ -3353,7 +3365,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // (AppKit is free to clamp/adjust ANY requested frame for reasons beyond just
             // the top-of-screen case above, e.g. screen width, Spaces, multi-monitor
             // arrangement), and this is what the real settle path (`RemoteWindow.
-            // handleLocalDidMove` -> `settleLocalMove`) itself reports too -- comparing
+            // handleLocalGeometryChanged` -> `settleLocalMove`) itself reports too -- comparing
             // against anything else risks this harness grading AppKit's own clamping as a
             // server round-trip failure.
             let actualSettledContent = window.contentRect(forFrameRect: window.frame)
@@ -5565,7 +5577,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // automated acceptance -- gating only when WINDOW_SMOKE_MOVE was actually set for
         // this run. See runMoveResizeScenario's own doc comment for the acknowledged
         // honesty gap (programmatic setFrame, not a live-resize-notification-driving real
-        // drag) and why the resize leg still runs against the (non-resizable) About window
+        // drag) and why the resize leg is programmatic even when `WINDOW_SMOKE_MOVE_TARGET` points it at a resizable window
         // anyway.
         if moveResizeScenarioEnabled {
             if let moveResult {
