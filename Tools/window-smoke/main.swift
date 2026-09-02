@@ -670,9 +670,12 @@ enum SizeBand {
 ///    evidence suffix printing when nothing was assigned, or not printing the assigned value =>
 ///    `declaredDesktopEvidenceSuffixSaysOnlyWhatWasAssigned`. The anchor is guarded by the TYPE, not
 ///    by a pin: `declaration` returns `Real?` as `gateAnchor` and `DesktopSizeInRemotePixels.init` is
-///    internal to MacdowsCore, so "anchor takes the override" does not compile anywhere in this
-///    target (review declared-desktop-r2 C1/C3). **Not covered here** (live wiring, no offline
-///    seam -- review r2 measured each surviving): the two `session.desktopWidth/Height` assignments
+///    internal to MacdowsCore, so "anchor takes the override" does not compile at either obvious site
+///    (review declared-desktop-r2 C1/C3). One indirect route remains and is a live-wiring blind spot:
+///    an anchor synthesised from the override's numbers through the public
+///    `DisplayTopology.single(...)?.desktopSizeInRemotePixels` chain (review r3 I-1). **Not covered
+///    here** (live wiring, no offline seam; review r2 measured R1 and C2 below surviving, the first
+///    item was argued from the assignment shape, not built): the two `session.desktopWidth/Height` assignments
 ///    taking the anchor instead of `toServer` (the connect line prints the value READ BACK from the
 ///    session, so that slip shows up as the real size on the F run's `[topology] connect:` line,
 ///    scaled-map memo §5 branch ① -- the live check); `freezeAndApplyDesktopSize`'s else branch not
@@ -2732,8 +2735,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // The gate anchor is taken FROM `declaration`, and the guarantee that it can never be the
         // override is the TYPE, not the pins: `gateAnchor` is `Real?` (here `DesktopSizeInRemotePixels?`)
         // and that type's initialiser is internal to MacdowsCore, so neither `declaration` nor this
-        // call site can build an anchor from the override at all (review declared-desktop-r2 I-b;
-        // both mutants fail to compile). The self-test's `gateAnchor` pins guard `declaration`'s
+        // call site can build an anchor from the override by a direct init (review declared-desktop-r2
+        // I-b; both mutants fail to compile). A topology synthesised from the override's numbers
+        // (`DisplayTopology.single(...)` is public) could -- registered in the mutation list as a
+        // live-wiring blind spot (review r3 I-1). The self-test's `gateAnchor` pins guard `declaration`'s
         // return contract, which this line consumes; they do not distinguish this line from
         // assigning `desktop` directly (an equivalent write -- review r2 C2).
         let declared = DeclaredDesktopOverride.declaration(real: desktop, override: declaredDesktopOverride)
