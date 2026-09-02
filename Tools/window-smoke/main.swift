@@ -1369,8 +1369,10 @@ enum WindowSmokeGateSelfTest {
         )
         // --- the union is Windows-space (y = top edge); the move leg's bounds must be AppKit (review cm4-r1 B-1) ---
         expect(
-            // single display: identity (minus the menu-bar inset at the top)
-            MoveResizeGate.appKitBounds(unionX: 0, unionY: 0, width: 2560, height: 1440, primaryHeightInPoints: 1440, topInset: 25)
+            // single display: identity (minus the menu-bar inset at the top). Passes the CONSTANT, not
+            // a literal, so a change to `menuBarInsetPoints` itself is caught (review cm4-r2 N-1: with
+            // all four pins on the literal 25, `menuBarInsetPoints = 0` survived).
+            MoveResizeGate.appKitBounds(unionX: 0, unionY: 0, width: 2560, height: 1440, primaryHeightInPoints: 1440, topInset: MoveResizeGate.menuBarInsetPoints)
                 == NSRect(x: 0, y: 0, width: 2560, height: 1415)
                 // a display ABOVE the primary: union y = -1440 in Windows space -> AppKit room is above, not below
                 && MoveResizeGate.appKitBounds(unionX: 0, unionY: -1440, width: 2560, height: 2880, primaryHeightInPoints: 1440, topInset: 25)
