@@ -165,6 +165,16 @@ enum MoveResizeGate {
         return NSRect(x: unionX, y: minY, width: width, height: (maxY - minY) - topInset)
     }
 
+    /// The resize leg's width delta, bounded on the right the way `moveOffset` bounds the move: a positive
+    /// (widening) delta is kept only while `contentMaxX + delta <= boundsMaxX - margin` (inclusive);
+    /// otherwise the leg narrows by the same amount. A negative delta never crosses the right edge and is
+    /// returned unchanged. (C second step r1, 2026-09-02: round 9's +100 pt resize sent right=2576 on the
+    /// 2560-wide desktop -- the move leg was bounded, the resize was not.)
+    static func boundedResizeDelta(preferred: CGFloat, contentMaxX: CGFloat, boundsMaxX: CGFloat, margin: CGFloat) -> CGFloat {
+        guard preferred > 0 else { return preferred }
+        return contentMaxX + preferred <= boundsMaxX - margin ? preferred : -preferred
+    }
+
     static func moveOffset(original: NSRect, within bounds: NSRect, leftBorder: CGFloat, margin: CGFloat) -> MoveOffset {
         var flipped = false
         var fits = true
@@ -295,7 +305,7 @@ enum MoveResizeGate {
                 + (positionOnly ? "" : ",dw=\(Self.fmt(dw)),dh=\(Self.fmt(dh))")
                 + ") pointDelta=(dx=\(Self.fmt(pdx)),dy=\(Self.fmt(pdy))) remote px"
                 + " tolerance=\(Self.fmt(MoveResizeGate.toleranceInRemotePixels)) remote px (U6)"
-                + (positionOnly ? " [position-only leg: size is the server's prerogative, round 6]" : "")
+                + (positionOnly ? " [position-only leg: size is the server's prerogative, team-lead review round 6]" : "")
         }
 
         private static func fmt(_ value: Double) -> String { String(format: "%.3f", value) }
@@ -1329,6 +1339,23 @@ enum WindowSmokeGateSelfTest {
                 // completed => base even when overall is SMALLER (kills a min/max mutant; review cm4-r1 I-6)
                 && FinishGate.minimumElapsed(base: 25, overall: 20, allScenariosCompleted: true) == 25,
             "finishGateWaitsForTheDeadlineOnlyWhileSomethingIsUnfinished: with every enabled scenario completed the run finishes at the base battery length; anything still running keeps the per-scenario deadline as the floor"
+        )
+
+        // --- the resize leg stays inside the desktop too (C second step r1, 2026-09-02: round 9's +100 pt
+        // resize sent right=2576 on a 2560-wide desktop -- the move leg was bounded, the resize was not) ---
+        expect(
+            MoveResizeGate.boundedResizeDelta(preferred: 100, contentMaxX: 2400, boundsMaxX: 2560, margin: 20) == 100
+                // would end at 2560 > 2540: widen becomes narrow
+                && MoveResizeGate.boundedResizeDelta(preferred: 100, contentMaxX: 2460, boundsMaxX: 2560, margin: 20) == -100
+                // exactly on the margin line is allowed (inclusive)
+                && MoveResizeGate.boundedResizeDelta(preferred: 100, contentMaxX: 2440, boundsMaxX: 2560, margin: 20) == 100
+                // one point past it is not (kills a margin-ignoring mutant: 2441+100 = 2541 <= 2560)
+                && MoveResizeGate.boundedResizeDelta(preferred: 100, contentMaxX: 2441, boundsMaxX: 2560, margin: 20) == -100
+                // narrowing never crosses the right edge and is passed through unchanged -- also when widening
+                // WOULD have fit (kills the mutant that runs |delta| through the bound and re-signs it)
+                && MoveResizeGate.boundedResizeDelta(preferred: -100, contentMaxX: 2460, boundsMaxX: 2560, margin: 20) == -100
+                && MoveResizeGate.boundedResizeDelta(preferred: -100, contentMaxX: 2400, boundsMaxX: 2560, margin: 20) == -100,
+            "resizeLegDeltaFlipsToNarrowWhenWideningWouldCrossTheRightEdge: +delta is kept only while contentMaxX + delta <= boundsMaxX - margin (inclusive); otherwise the leg narrows by the same amount; a negative delta is never changed"
         )
 
         // --- geometry rounds (C second step, "再来一轮"): repeat the maximize and move/resize legs K times ---
@@ -2581,6 +2608,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// the window is still there to drive, and every pass adds remaps to the tally.
     private var moveResizeRoundsCompleted = 0
     private var moveResizeRoundResults: [(move: Bool, resize: Bool)] = []
+    /// The AppKit-pt desktop bounds the move leg was bounded against (nil when no frozen topology) -- kept
+    /// so the resize leg can bound its width delta against the same right edge.
+    private var moveResizeBoundsInPoints: NSRect?
     /// True while either leg is waiting for its round trip -- the window in which a surface remap
     /// on the target is an observation the leg must sample (F0-2).
     private var moveResizeLegAwaitingSettle: Bool {
@@ -4394,6 +4424,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // measuredClientWindowMoveLeftBorder`, private there -- this is a second copy of the
             // number, review cm4-r1 I-4); the bounds are in pt, so convert (I-3).
             let leftBorderPt = 7 / topology.rasterScale
+            moveResizeBoundsInPoints = bounds
             offset = MoveResizeGate.moveOffset(original: originalContent, within: bounds, leftBorder: leftBorderPt, margin: 20)
             print("[move-resize] move offset (dx=\(Int(offset.dx)), dy=\(Int(offset.dy)))"
                 + (offset.flipped ? " FLIPPED from the default (+80,-60) to stay inside" : " (default)")
@@ -4407,6 +4438,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // No frozen topology: nothing to bound against, so the default goes out UNCHECKED --
             // said so, not reported as a fit (review cm4-r1 I-7).
             offset = MoveResizeGate.MoveOffset(dx: 80, dy: -60, flipped: false, fits: false)
+            moveResizeBoundsInPoints = nil
             print("[move-resize] move offset: default (+80,-60) UNCHECKED -- no frozen topology to bound against")
         }
         if round > 1, !offset.fits {
@@ -4587,15 +4619,32 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // AppKit whether the real target actually supports interactive resize at all.
             moveResizeTargetIsResizable = window.styleMask.contains(.resizable)
             let currentContent = window.contentRect(forFrameRect: window.frame)
+            let preferredResizeDelta = GeometryRounds.resizeDelta(round: moveResizeRoundsCompleted + 1)
+            // C second step r1 (2026-09-02): round 9's +100 pt resize sent right=2576 on the 2560-wide desktop --
+            // the move leg was bounded, the resize was not. Bound it against the same right edge: widen only
+            // while the margin holds, otherwise narrow by the same amount (MoveResizeGate.boundedResizeDelta).
+            let resizeDelta: CGFloat
+            if let bounds = moveResizeBoundsInPoints {
+                resizeDelta = MoveResizeGate.boundedResizeDelta(
+                    preferred: preferredResizeDelta, contentMaxX: currentContent.maxX, boundsMaxX: bounds.maxX, margin: 20
+                )
+                if resizeDelta != preferredResizeDelta {
+                    print("[move-resize] resize delta \(Int(preferredResizeDelta)) -> \(Int(resizeDelta))pt BOUNDED: widening would put the "
+                        + "right edge past \(bounds.maxX - 20) (content maxX \(currentContent.maxX), bounds maxX \(bounds.maxX), margin 20pt)")
+                }
+            } else {
+                resizeDelta = preferredResizeDelta
+                print("[move-resize] resize delta \(Int(resizeDelta))pt UNCHECKED -- no frozen topology to bound against")
+            }
             let resizeTargetContent = NSRect(
                 x: currentContent.origin.x, y: currentContent.origin.y,
-                width: currentContent.width + GeometryRounds.resizeDelta(round: moveResizeRoundsCompleted + 1), height: currentContent.height
+                width: currentContent.width + resizeDelta, height: currentContent.height
             )
             let resizeTargetFrame = window.frameRect(forContentRect: resizeTargetContent)
             moveResizeObservedContentRects.removeAll()
             window.setFrame(resizeTargetFrame, display: true)
             print("[move-resize] resize leg sent (content-rect space"
-                + (geometryRounds > 1 ? ", round \(moveResizeRoundsCompleted + 1)/\(geometryRounds), delta \(Int(GeometryRounds.resizeDelta(round: moveResizeRoundsCompleted + 1)))pt" : "")
+                + (geometryRounds > 1 ? ", round \(moveResizeRoundsCompleted + 1)/\(geometryRounds)" : "") + ", delta \(Int(resizeDelta))pt"
                 + "): \(currentContent) -> \(resizeTargetContent)")
             // Team-lead review round 5: same "assert against actual, not requested" fix as
             // the move leg above -- a +100pt-wider request could in principle also get
