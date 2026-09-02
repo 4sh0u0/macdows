@@ -293,7 +293,7 @@ simply reinstall Macdows.
 
 | Symptom | Cause |
 | ------- | ----- |
-| `dyld: … not valid for use in process: … have different Team IDs` | The `disable-library-validation` entitlement was not applied, or you signed only some of the dylibs. Re-run step 5 exactly — it signs *every* dylib in the bundle, not just the three you replaced. |
+| `dyld: … not valid for use in process: … have different Team IDs` | The `disable-library-validation` entitlement was not applied, or you signed only some of the dylibs. Re-run step 5 exactly — it signs *every* dylib in the bundle, not just the four you replaced. |
 | App won't launch, Console shows a code signature error | Step 5 was skipped, or the bundle itself was not re-signed after the libraries. Sign inside-out: libraries first, then the bundle. |
 | `codesign -d -v` shows `flags=0x2(adhoc)` instead of `0x10002(adhoc,runtime)` | `--options runtime` was omitted, so the hardened runtime was dropped. Harmless for local use, but you are running with less protection than the shipped build; re-sign with the flag. |
 | `dyld: Library not loaded: @rpath/libavcodec.63.dylib` | The replacement's install name doesn't match. Rebuild with `--install-name-dir=@rpath`, and check with `otool -D`. |

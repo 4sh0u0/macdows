@@ -565,7 +565,7 @@ jq -n \
 				purl: ("pkg:generic/ffmpeg@" + $ffmpegVersion + "?checksum=sha256:" + $ffmpegSrcSha + "&download_url=" + ($ffmpegUrl | @uri)),
 				licenses: [{license: {id: "LGPL-2.1-or-later"}}],
 				hashes: ffmpegHashes,
-				description: "Self-built from the pinned upstream tarball with --disable-gpl --disable-nonfree --disable-version3 (LGPL, not GPL) and a decode-only component set. Dynamically linked and redistributed as four embedded dylibs (libavcodec, libavutil, libswresample) so the library can be replaced per LGPL-2.1 §6 -- see LGPL_RELINK.md. The recorded hash is of the shipped libavcodec.",
+				description: "Self-built from the pinned upstream tarball with --disable-gpl --disable-nonfree --disable-version3 (LGPL, not GPL) and a decode-only component set. Dynamically linked and redistributed as four embedded dylibs (libavcodec, libavutil, libswresample, libswscale) so the library can be replaced per LGPL-2.1 §6 -- see LGPL_RELINK.md. The recorded hash is of the shipped libavcodec.",
 				externalReferences: [
 					{type: "distribution", url: $ffmpegUrl},
 					{type: "website", url: "https://ffmpeg.org"}

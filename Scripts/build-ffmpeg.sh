@@ -11,7 +11,7 @@
 #   2. Homebrew links by absolute path (/opt/homebrew/...), which is undistributable and
 #      breaks on `brew upgrade ffmpeg` — the exact adr/0006 §3 defect #1 that
 #      Scripts/build-openssl.sh already fixed for OpenSSL. `--install-name-dir=@rpath`
-#      here gives the three dylibs @rpath install names, so the app bundle's existing
+#      here gives the shipped dylibs (four since the 3.31.1 pin) @rpath install names, so the app bundle's existing
 #      LD_RUNPATH_SEARCH_PATHS=@executable_path/../Frameworks resolves them with no
 #      install_name_tool rewriting.
 #   3. "Whatever brew resolved to today" is not an SBOM-able version. This is pinned by
@@ -173,9 +173,10 @@ FFMPEG_CONFIGURE_FLAGS=(
 	# --enable-swscale (was --disable-swscale up to the 3.30.0 pin): FreeRDP >= 3.31.0
 	# libfreerdp/codec/h264_ffmpeg.c:28 includes libswscale/swscale.h unconditionally under
 	# WITH_FFMPEG (upstream b1e878a, "support more hardware decoders"), so the file does not
-	# compile against a swscale-less prefix; its sws_getContext / sws_scale_frame /
-	# sws_freeContext calls sit under WITH_VAAPI || WITH_VIDEOTOOLBOX, and this build has
-	# WITH_VIDEOTOOLBOX=ON, so the symbols are linked too. libswscale is
+	# compile against a swscale-less prefix; its sws_getContext / sws_scale_frame calls sit
+	# under WITH_VAAPI || WITH_VIDEOTOOLBOX (:642; sws_freeContext :954 under the three-term
+	# variant that adds WITH_VAAPI_H264_ENCODING), and this build has WITH_VIDEOTOOLBOX=ON,
+	# so the symbols are linked too. libswscale is
 	# LGPL-2.1-or-later like the rest of this build; the --disable-gpl strings check below
 	# still governs.
 	--enable-swscale

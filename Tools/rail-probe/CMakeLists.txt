@@ -72,7 +72,7 @@ target_link_libraries(rail-probe PRIVATE
   pthread
 )
 
-# W8 gave the vendored libfreerdp3 `@rpath/libav*.dylib` load commands -- libavcodec,
+# W8 gave the vendored libfreerdp3 `@rpath/libav*.dylib` (and, since 3.31.1, `libsw*.dylib`) load commands -- libavcodec,
 # libavutil, libswresample and (since the 3.31.1 pin) libswscale, from the self-built LGPL ffmpeg that Scripts/build-ffmpeg.sh
 # installs -- so the FreeRDP prefix alone stopped being a complete runtime search path: dyld
 # aborts before main() is entered with "Library not loaded: @rpath/libavcodec...", which
