@@ -243,6 +243,22 @@ if printf '%s\n' "${DETECTED[@]}" | grep -cx "FFmpeg" >/dev/null; then
 	grep -qF "$LOCKED_FFMPEG_VERSION" "$RELINK_DOC" \
 		|| die "LGPL_RELINK.md does not mention FFmpeg version $LOCKED_FFMPEG_VERSION — §6 instructions must point at the *corresponding* source, so a stale version there makes them unusable"
 	assert_bundled_copy "$RELINK_DOC" "$RESOURCES_DIR/LGPL_RELINK.md" "LGPL_RELINK.md (the LGPL-2.1 §6 offer)"
+	# Every FFmpeg dylib the bundle ships must be named in the relink recipe -- library table,
+	# backup step and install step at minimum (hence >= 3 mentions). A user who follows a recipe
+	# that lists three of four libraries replaces three, leaves the vendor copy of the fourth in
+	# place, and the §6 substitution right is not honoured for it. The configure-flag block
+	# check below cannot see this (it compares flag sets), which is how the 3.31.1 bump's
+	# libswscale addition slipped past a green gen-notices run (upgrade-3311-r1 B-1/I-5).
+	for relink_comp in "${FFMPEG_COMPONENTS[@]}"; do
+		for relink_dylib in "$APP_PATH/Contents/Frameworks/lib$relink_comp".*.dylib; do
+			[ -e "$relink_dylib" ] || continue
+			relink_name="$(basename "$relink_dylib")"
+			relink_hits="$(grep -cF "$relink_name" "$RELINK_DOC" || true)"
+			[ "${relink_hits:-0}" -ge 3 ] \
+				|| die "LGPL_RELINK.md names $relink_name only ${relink_hits:-0} time(s), but the bundle ships it in Contents/Frameworks/ -- the §6 recipe must list every shipped FFmpeg library in its table and in both the backup and install steps (>= 3 mentions)"
+		done
+	done
+	log "LGPL_RELINK.md names every shipped FFmpeg dylib (${FFMPEG_COMPONENTS[*]})"
 	VERSIONS_CHECKED="$VERSIONS_CHECKED, $LOCKED_FFMPEG_VERSION"
 
 	# --- The §6 instructions must still reproduce what we actually shipped --------------
@@ -549,7 +565,7 @@ jq -n \
 				purl: ("pkg:generic/ffmpeg@" + $ffmpegVersion + "?checksum=sha256:" + $ffmpegSrcSha + "&download_url=" + ($ffmpegUrl | @uri)),
 				licenses: [{license: {id: "LGPL-2.1-or-later"}}],
 				hashes: ffmpegHashes,
-				description: "Self-built from the pinned upstream tarball with --disable-gpl --disable-nonfree --disable-version3 (LGPL, not GPL) and a decode-only component set. Dynamically linked and redistributed as three embedded dylibs (libavcodec, libavutil, libswresample) so the library can be replaced per LGPL-2.1 §6 -- see LGPL_RELINK.md. The recorded hash is of the shipped libavcodec.",
+				description: "Self-built from the pinned upstream tarball with --disable-gpl --disable-nonfree --disable-version3 (LGPL, not GPL) and a decode-only component set. Dynamically linked and redistributed as four embedded dylibs (libavcodec, libavutil, libswresample) so the library can be replaced per LGPL-2.1 §6 -- see LGPL_RELINK.md. The recorded hash is of the shipped libavcodec.",
 				externalReferences: [
 					{type: "distribution", url: $ffmpegUrl},
 					{type: "website", url: "https://ffmpeg.org"}

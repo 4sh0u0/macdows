@@ -143,7 +143,7 @@ STAGING_ROOT="$CRDP_BUILD_DIR/deps/ffmpeg-stage"
 #   * --disable-swresample is NOT passed even though FreeRDP never calls swr_*: libavcodec
 #     itself carries an LC_LOAD_DYLIB on libswresample, so dropping it produces a
 #     libavcodec that cannot load. It is a transitively required component, not an
-#     optional one — hence three shipped dylibs, not two.
+#     optional one — hence a transitively required dylib in the shipped set (four with swscale, see below).
 #   * --enable-parser=h264 IS passed (not in the original W8 sketch): --disable-everything
 #     also drops parsers, and FreeRDP's h264_ffmpeg.c:796 calls
 #     av_parser_init(AV_CODEC_ID_H264) and treats NULL as a hard failure
@@ -171,9 +171,11 @@ FFMPEG_CONFIGURE_FLAGS=(
 	--disable-avformat
 	--disable-avfilter
 	# --enable-swscale (was --disable-swscale up to the 3.30.0 pin): FreeRDP >= 3.31.0
-	# libfreerdp/codec/h264_ffmpeg.c includes libswscale/swscale.h and calls sws_getContext /
-	# sws_scale_frame unconditionally when WITH_FFMPEG (upstream b1e878a, "support more
-	# hardware decoders"), so the H264 decoder no longer links without it. libswscale is
+	# libfreerdp/codec/h264_ffmpeg.c:28 includes libswscale/swscale.h unconditionally under
+	# WITH_FFMPEG (upstream b1e878a, "support more hardware decoders"), so the file does not
+	# compile against a swscale-less prefix; its sws_getContext / sws_scale_frame /
+	# sws_freeContext calls sit under WITH_VAAPI || WITH_VIDEOTOOLBOX, and this build has
+	# WITH_VIDEOTOOLBOX=ON, so the symbols are linked too. libswscale is
 	# LGPL-2.1-or-later like the rest of this build; the --disable-gpl strings check below
 	# still governs.
 	--enable-swscale
@@ -274,7 +276,7 @@ for comp in "${EXPECTED_COMPONENTS[@]}"; do
 		|| die "expected lib${comp} dylib not found under $STAGED_PREFIX/lib"
 done
 
-# Nothing beyond those three may be produced: an extra libavformat/libavfilter/libswscale
+# Nothing beyond those four may be produced: an extra libavformat/libavfilter/libavdevice
 # here means a --disable-* stopped taking effect, and FindFFmpeg.cmake links every
 # component it finds, so it would silently re-widen the link line.
 UNEXPECTED_LIBS="$(find "$STAGED_PREFIX/lib" -maxdepth 1 -name '*.dylib' -type f -exec basename {} \; \

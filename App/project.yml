@@ -361,7 +361,7 @@ targets:
         LD_RUNPATH_SEARCH_PATHS:
           - $(inherited)
           - $(SRCROOT)/../.build/freerdp/current/prefix/lib
-          # W8 made libfreerdp3 reference @rpath/libav{codec,util}/libswresample from the
+          # W8 made libfreerdp3 reference @rpath/libav{codec,util}/libswresample/libswscale from the
           # self-built LGPL ffmpeg prefix. The App resolves those inside its own bundle
           # (Copy Files + @executable_path/../Frameworks); these bare tools link the
           # FreeRDP dylibs at their build location instead, so they need the ffmpeg
@@ -419,7 +419,7 @@ targets:
         LD_RUNPATH_SEARCH_PATHS:
           - $(inherited)
           - $(SRCROOT)/../.build/freerdp/current/prefix/lib
-          # W8 made libfreerdp3 reference @rpath/libav{codec,util}/libswresample from the
+          # W8 made libfreerdp3 reference @rpath/libav{codec,util}/libswresample/libswscale from the
           # self-built LGPL ffmpeg prefix. The App resolves those inside its own bundle
           # (Copy Files + @executable_path/../Frameworks); these bare tools link the
           # FreeRDP dylibs at their build location instead, so they need the ffmpeg

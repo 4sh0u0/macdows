@@ -1,6 +1,6 @@
 # Replacing the bundled FFmpeg libraries (LGPL-2.1 §6)
 
-Macdows dynamically links three **FFmpeg** libraries for H.264/AVC decoding, and ships them
+Macdows dynamically links four **FFmpeg** libraries for H.264/AVC decoding, and ships them
 inside the application bundle:
 
 | File in `Macdows.app/Contents/Frameworks/` | Component      |
@@ -8,6 +8,7 @@ inside the application bundle:
 | `libavcodec.63.dylib`                       | libavcodec     |
 | `libavutil.61.dylib`                        | libavutil      |
 | `libswresample.7.dylib`                     | libswresample  |
+| `libswscale.10.dylib`                       | libswscale     |
 
 FFmpeg is licensed under the **LGPL-2.1-or-later** (this build passes `--disable-gpl
 --disable-nonfree --disable-version3`; see `THIRD_PARTY_NOTICES.md`). Section 6 of the
@@ -22,7 +23,7 @@ restricts what you may do with your replacement FFmpeg.
 
 ## What makes this possible
 
-The three libraries are ordinary shared libraries loaded at runtime by
+The four libraries are ordinary shared libraries loaded at runtime by
 `libfreerdp3.3.dylib`, whose load commands reference them purely by
 `@rpath/libavcodec.63.dylib` and friends — no static linking, no absolute paths, no symbol
 inlining across the boundary. Replacing the files in `Contents/Frameworks/` *is* the
@@ -30,8 +31,8 @@ relink; you do not need to rebuild Macdows or FreeRDP, and you do not need this
 repository's toolchain.
 
 The only real constraint is the **soname**: your build must produce libraries whose install
-names still match `@rpath/libavcodec.63.dylib`, `@rpath/libavutil.61.dylib` and
-`@rpath/libswresample.7.dylib`. Building the same major versions with
+names still match `@rpath/libavcodec.63.dylib`, `@rpath/libavutil.61.dylib`,
+`@rpath/libswresample.7.dylib` and `@rpath/libswscale.10.dylib`. Building the same major versions with
 `--install-name-dir=@rpath` (step 2) does that automatically.
 
 ---
@@ -162,6 +163,7 @@ mkdir -p ~/ffmpeg-relink/backup
 cp -p "$APP/Contents/Frameworks/libavcodec.63.dylib" \
       "$APP/Contents/Frameworks/libavutil.61.dylib" \
       "$APP/Contents/Frameworks/libswresample.7.dylib" \
+      "$APP/Contents/Frameworks/libswscale.10.dylib" \
       ~/ffmpeg-relink/backup/
 
 # Install your build. `cp -L` matters: the files in the prefix are symlinks to
@@ -169,6 +171,7 @@ cp -p "$APP/Contents/Frameworks/libavcodec.63.dylib" \
 cp -L "$OUT/libavcodec.63.dylib"    "$APP/Contents/Frameworks/libavcodec.63.dylib"
 cp -L "$OUT/libavutil.61.dylib"     "$APP/Contents/Frameworks/libavutil.61.dylib"
 cp -L "$OUT/libswresample.7.dylib"  "$APP/Contents/Frameworks/libswresample.7.dylib"
+cp -L "$OUT/libswscale.10.dylib"    "$APP/Contents/Frameworks/libswscale.10.dylib"
 ```
 
 ## Step 5 — Re-sign
@@ -218,7 +221,7 @@ plutil -convert xml1 "$ENT"
 
 # --- 5b. Sign inside-out: every embedded library first, then the bundle.
 #         --options runtime keeps the hardened runtime on. Sign ALL the dylibs, not only
-#         the three you replaced: the others still carry the original Developer ID
+#         the four you replaced: the others still carry the original Developer ID
 #         signature, and a bundle signed by you cannot load libraries signed by someone
 #         else.
 find "$APP" -name '*.dylib' -print0 | while IFS= read -r -d '' dylib; do
@@ -272,7 +275,7 @@ Also worth knowing:
 
 ```sh
 # The app now loads your libraries and nothing from outside the bundle:
-otool -L "$APP/Contents/Frameworks/libfreerdp3.3.dylib" | grep libav
+otool -L "$APP/Contents/Frameworks/libfreerdp3.3.dylib" | grep -E 'libav|libsw'
 
 # Your build's own configure line, read back out of the shipped binary:
 strings -a "$APP/Contents/Frameworks/libavutil.61.dylib" | grep -m1 -- --prefix
