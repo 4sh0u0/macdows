@@ -656,13 +656,18 @@ enum SizeBand {
 ///    not trimming newlines, or letting the override replace the gate anchor =>
 ///    `declaredDesktopOverrideParsesOnlyPositiveWxH` / `declaredDesktopKeepsTheGateAnchorReal`; the
 ///    evidence suffix printing when nothing was assigned, or not printing the assigned value =>
-///    `declaredDesktopEvidenceSuffixSaysOnlyWhatWasAssigned`. The anchor assignment itself is typed:
-///    `declaration` returns the real instance or nil as `gateAnchor` and `freezeAndApplyDesktopSize`
-///    assigns THAT, so "anchor takes the override" does not compile. **Not covered here** (live
-///    wiring, no offline seam): the two `session.desktopWidth/Height` assignments taking the anchor
-///    instead of `toServer` -- the connect line prints the value READ BACK from the session, so that
-///    slip shows up as the real size on the F run's `[topology] connect:` line (scaled-map memo §5
-///    branch ①), which is the live check.
+///    `declaredDesktopEvidenceSuffixSaysOnlyWhatWasAssigned`. The anchor is guarded by the TYPE, not
+///    by a pin: `declaration` returns `Real?` as `gateAnchor` and `DesktopSizeInRemotePixels.init` is
+///    internal to MacdowsCore, so "anchor takes the override" does not compile anywhere in this
+///    target (review declared-desktop-r2 C1/C3). **Not covered here** (live wiring, no offline
+///    seam -- review r2 measured each surviving): the two `session.desktopWidth/Height` assignments
+///    taking the anchor instead of `toServer` (the connect line prints the value READ BACK from the
+///    session, so that slip shows up as the real size on the F run's `[topology] connect:` line,
+///    scaled-map memo §5 branch ① -- the live check); `freezeAndApplyDesktopSize`'s else branch not
+///    resetting `declaredDesktopAssigned` (in cycle mode a display-less freeze after a declared one
+///    would make `finishCycles()`'s summary claim the previous cycle's declaration -- review r2 R1);
+///    and the anchor assignment reading `desktop` instead of `declared.gateAnchor` (equivalent, the
+///    pins do not distinguish it -- review r2 C2).
 ///  * **the remap observation** sampled outside the in-flight window, for a non-target window,
 ///    or with no target locked => `remapObservationAppliesOnlyToTheInFlightTarget`. **Not covered
 ///    here** (live wiring, no offline seam): the tap not calling it at all for `surfaceMapped`
@@ -2576,9 +2581,13 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private func freezeAndApplyDesktopSize(to session: CRSession, reason: String) -> DesktopSizeInRemotePixels? {
         let desktop = displayTopology.freezeSessionSnapshot()
         // WINDOW_SMOKE_DECLARED_DESKTOP (fixture-only): the override changes only what is sent.
-        // The gate anchor is taken FROM `declaration` -- typed as the real frozen instance or nil,
-        // it cannot be the override by construction, so the self-test's `gateAnchor` pins cover
-        // this very assignment (review declared-desktop-r1 I-4).
+        // The gate anchor is taken FROM `declaration`, and the guarantee that it can never be the
+        // override is the TYPE, not the pins: `gateAnchor` is `Real?` (here `DesktopSizeInRemotePixels?`)
+        // and that type's initialiser is internal to MacdowsCore, so neither `declaration` nor this
+        // call site can build an anchor from the override at all (review declared-desktop-r2 I-b;
+        // both mutants fail to compile). The self-test's `gateAnchor` pins guard `declaration`'s
+        // return contract, which this line consumes; they do not distinguish this line from
+        // assigning `desktop` directly (an equivalent write -- review r2 C2).
         let declared = DeclaredDesktopOverride.declaration(real: desktop, override: declaredDesktopOverride)
         sessionDesktopSizeInRemotePixels = declared.gateAnchor
         if let desktop, let toServer = declared.toServer {
