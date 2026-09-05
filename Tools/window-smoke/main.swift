@@ -2472,9 +2472,11 @@ enum FocusRotationGate {
 /// About heuristic used to take the lowest id). Pure. Default `.newest`: the window first seen LATEST
 /// wins, because this run's winver is created AFTER connect while a leftover was enumerated at
 /// connect; equal first-seen keeps the historical lowest-id order. The rule can only prefer this run's
-/// window once that window IS a candidate -- the maximize and popup locks wait for `extraAppsLaunched`
-/// (t >= 6 s), the input test for t >= 5 s, the cycle-close lock for a painted About, and the final
-/// size/paint anchor runs at t = 25 s. `.oldest` inverts the time order for the one selection that
+/// window once that window IS a candidate -- the maximize, popup and move/resize locks wait for
+/// `extraAppsLaunched` (t >= 6 s), the input test for t >= 5 s, the cycle-close lock for a painted
+/// About, and the final size/paint anchor runs no earlier than t = 25 s (`FinishGate.minimumElapsed`'s
+/// `base`; the floor stays at `overallDeadline` -- 30/40/45+ s -- until every enabled scenario has
+/// completed, and in cycle mode `finish()` never runs at all). `.oldest` inverts the time order for the one selection that
 /// WANTS the stale window -- the W4b Activate experiment (`activateExperimentWindowId`'s doc; review
 /// about-target-r3 I-1). Every About-anchored selection in this file goes through `AboutTarget`: six
 /// through `choose` -- the maximize, popup, input-test and cycle-close locks and the final size/paint
@@ -2526,6 +2528,7 @@ enum AboutTarget {
     static func describe(_ choice: Choice, of count: Int, prefer: Preference = .newest) -> String {
         let word = prefer == .newest ? "newest" : "oldest"
         let never = "first WindowCreate never observed"
+        let noneObserved = "none observed at a first WindowCreate" // the tie branches' phrasing of `never`; the runner-up clause below has a third ("runner-up never observed") -- all three are pinned as printed
         let seen = choice.firstSeenElapsed < 0 ? "; \(never)" : String(format: " first seen @%.3fs", choice.firstSeenElapsed)
         let stamp = String(format: "%.3fs", choice.firstSeenElapsed)
         if count == 1 { return "the only candidate (windowId=\(choice.windowId)\(seen))" }
@@ -2535,10 +2538,10 @@ enum AboutTarget {
         }
         if choice.tiedAtChosenTime >= count {
             return choice.firstSeenElapsed < 0
-                ? "lowest id of \(count) candidates (none observed at a first WindowCreate; \(word)-wins did not decide)"
+                ? "lowest id of \(count) candidates (\(noneObserved); \(word)-wins did not decide)"
                 : "lowest id of \(count) candidates (all tied at first-seen @\(stamp); \(word)-wins did not decide)"
         }
-        let tieStamp = choice.firstSeenElapsed < 0 ? ", none observed at a first WindowCreate" : " @\(stamp)"
+        let tieStamp = choice.firstSeenElapsed < 0 ? ", \(noneObserved)" : " @\(stamp)"
         return "lowest id among the \(choice.tiedAtChosenTime) candidates tied at the \(word) first-seen\(tieStamp) (of \(count); \(word)-wins eliminated \(count - choice.tiedAtChosenTime))"
     }
 
@@ -3444,7 +3447,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     // background/non-focused window prompt the server to (re)send content it never
     // painted for us? Resolved opportunistically to whichever plausible-title window is
     // observed FIRST -- deliberately checked on every tick starting immediately after
-    // connect, since an already-open (stale) window's existence syncs to a freshly
+    // connect IN SINGLE-CYCLE MODE ONLY (`WINDOW_SMOKE_CYCLES > 1` routes `tick()` through
+    // `tickCycles()` instead, which never calls this experiment at all -- see `tick()`'s
+    // `cyclesTotal > 1` branch), since an already-open (stale) window's existence syncs to a freshly
     // connecting client during the initial RAIL/RDPGFX handshake, well before this run's
     // own `exec` of `launchedProgram` could possibly round-trip and produce a NEW window
     // with a similar title -- "first observed, locked forever" is what keeps this
@@ -4822,8 +4827,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // measures whether ClientActivate makes the server repaint a background window it never
         // painted for us, so it WANTS the stale window -- `activateExperimentWindowId`'s doc: "first
         // observed, locked forever". No wait gate, one lock, never moved; the shared selection is
-        // used with `.oldest` only so simultaneous first-tick candidates resolve deterministically
-        // toward the stale one (4e8834e took dictionary order). The rounds 4e2c679..f268415 re-locked
+        // used with `.oldest` so the first-tick candidates resolve deterministically toward the
+        // EARLIEST-drained (stale) one instead of dictionary order (4e8834e). They are not literally
+        // simultaneous: `drainNow` reads `Date()` per event, so same-batch creates get distinct
+        // stamps and `AboutTarget`'s lowest-id tie-break is, live, effectively unreachable here.
+        // The rounds 4e2c679..f268415 re-locked
         // toward this run's About until t = 6 s -- the inverse of the experiment's purpose -- and are
         // undone here.
         if activateExperimentWindowId == nil {
@@ -6067,10 +6075,12 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// re-evaluates every tick from t >= 5 s until something matches: with ONLY a leftover matching the
     /// title present (an explicit title naming an extra app) it fires at t = 5 s on the leftover and
     /// never re-locks (the run then tests the leftover -- the case that bites); under the default About
-    /// predicate this run's own About is already a candidate at t = 5 s and newest-wins takes it; with
+    /// predicate this run's own About is NORMALLY already a candidate at t = 5 s and newest-wins takes it
+    /// (the filter also demands `hasDisplayedContent`, so a first paint slower than 5 s lets a painted
+    /// leftover win here too -- the same bite, on the default path); with
     /// no match it waits and takes this run's own window when it appears (an extra app's at t ~ 6.x s).
     /// The exclusion set `windowIdsBeforeExtraApps` does not
-    /// exist at t = 5 s, so exclusion is neither possible there nor, in either case, what decides
+    /// exist at t = 5 s, so exclusion is neither possible there nor, in any of the three, what decides
     /// (review about-target-r2 m-8 / r3 m-1; pre-existing behaviour, made deterministic here).
     private static func matchesInputTestTarget(_ title: String) -> Bool {
         if let inputTargetTitleSubstring {
@@ -7324,8 +7334,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             print("[experiment] Activate repaint test: pre=\(String(format: "%.1f%%", pre * 100)) "
                 + "post=\(String(format: "%.1f%%", post * 100)) delta=\(String(format: "%+.1f%%", (post - pre) * 100))")
         } else {
-            print("[experiment] Activate repaint test did not run this session (no Registry-Editor-titled "
-                + "window was ever observed, or the run ended before t=20s)")
+            print("[experiment] Activate repaint test did not complete a pre/post pair this session (no window "
+                + "matching the experiment's title heuristic -- Registry-Editor OR About / 关于, see "
+                + "runActivateExperiment -- was ever locked, a checkpoint reported n/a, or the run ended before t=20s)")
         }
         // Refresh-rect (MS-RDPBCGR TS_REFRESH_RECT_PDU) investigated separately, not
         // attempted here: this vendored FreeRDP exposes no client-callable "send a refresh
