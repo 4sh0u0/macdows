@@ -214,6 +214,14 @@ jobs:
         # one mutation proof (gate bypassed) keeps the refusal pin honest.
         run: ./Scripts/lab/test-probe-offline.sh
 
+      - name: Build-script prefix freshness suite
+        # Scripts/build-ffmpeg.sh's idempotent skip is gated on a freshness verdict
+        # (`--check-prefix`), not on the version stamp alone: a prefix built before a
+        # component was enabled (the 2026-09-05 swscale case) must rebuild. The verdict is
+        # a filesystem question, so it is pinned here on synthetic prefixes without any
+        # compiler, download or macOS tool.
+        run: ./Scripts/test-build-ffmpeg-prefix.sh
+
       - name: Lab host-side PowerShell suites
         # The two host-side scripts that carry real consequences: Set-TsAllowListMatrix.ps1
         # (elevated, owner-manual, rewrites HKLM TSAppAllowList and owns the backup/restore

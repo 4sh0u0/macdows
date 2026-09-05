@@ -22,12 +22,86 @@
 # the corresponding user-facing relink instructions this build is shaped to satisfy.
 #
 # Idempotent: skips the download/build/install if the target version is already installed
-# under .build/deps/ffmpeg-prefix. Delete the stamp file (printed on success) to force a
-# rebuild, or pass --force.
+# under .build/deps/ffmpeg-prefix AND that prefix carries every component this script
+# promises (see EXPECTED_COMPONENTS). The version stamp alone is not enough: on 2026-09-05
+# the 3.31.1 pin flipped this build to --enable-swscale, a prefix built before the flip
+# carried the same version and therefore the same stamp, the skip fired, and
+# build-freerdp.sh then died on the missing libswscale ("launcher/existence check !=
+# freshness"). Delete the stamp file (printed on success) to force a rebuild, or pass
+# --force.
+#
+#   --check-prefix [DIR]   Print the freshness verdict for DIR (default: the configured
+#                          prefix) and exit without building: 0 = complete (a build would
+#                          skip), 1 = incomplete (stale or interrupted -- a build would
+#                          rebuild), 2 = absent. Needs nothing beyond the filesystem, so
+#                          Scripts/test-build-ffmpeg-prefix.sh can pin it on Tier 1's
+#                          ubuntu runner, where otool/perl are not around.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=Scripts/lib.sh
 source "$SCRIPT_DIR/lib.sh"
+
+# The FFmpeg version this script builds -- pinned per deps/freerdp.lock .ffmpeg (checked
+# against the lock further down; the check-only path below must not need jq).
+FFMPEG_VERSION="9.0.1"
+
+# The shared libraries the LGPL build must produce -- and, since 2026-09-05, the set an
+# installed prefix must still contain for the idempotent skip to fire. Both the staging
+# guard and the freshness verdict read this one list, so adding a component (as the
+# swscale flip did) changes both in the same edit.
+EXPECTED_COMPONENTS=(avcodec avutil swresample swscale)
+
+# ffmpeg_prefix_verdict DIR: prints one line -- "complete", "incomplete: <why>" or "absent"
+# -- and returns 0 / 1 / 2 accordingly. "incomplete" covers a stamped prefix that lacks a
+# promised component (built before that component was enabled) and an unstamped or
+# foreign-version prefix (the stamp is written last, so its absence means an interrupted
+# promotion). Only "complete" may skip the build.
+ffmpeg_prefix_verdict() {
+	local dir="$1" comp missing=""
+	if [ ! -d "$dir/lib" ]; then
+		echo "absent"
+		return 2
+	fi
+	for comp in "${EXPECTED_COMPONENTS[@]}"; do
+		if ! find "$dir/lib" -maxdepth 1 -name "lib${comp}.*.dylib" -print -quit | grep -q .; then
+			missing="$missing lib${comp}"
+		fi
+	done
+	if [ -n "$missing" ]; then
+		echo "incomplete: missing${missing} (prefix predates the current component set -- rebuild)"
+		return 1
+	fi
+	if [ ! -f "$dir/.ffmpeg-${FFMPEG_VERSION}.stamp" ]; then
+		echo "incomplete: no version stamp for ${FFMPEG_VERSION} (interrupted promotion or a different pin -- rebuild)"
+		return 1
+	fi
+	echo "complete"
+	return 0
+}
+
+FORCE=0
+CHECK_ONLY=0
+CHECK_DIR=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--force) FORCE=1 ;;
+	--check-prefix)
+		CHECK_ONLY=1
+		if [ $# -gt 1 ] && [ "${2#--}" = "$2" ]; then
+			CHECK_DIR="$2"
+			shift
+		fi
+		;;
+	*) die "unknown argument: $1 (supported: --force, --check-prefix [DIR])" ;;
+	esac
+	shift
+done
+
+if [ "$CHECK_ONLY" -eq 1 ]; then
+	# Answered before any tool requirement: the verdict is a filesystem question.
+	ffmpeg_prefix_verdict "${CHECK_DIR:-$CRDP_FFMPEG_PREFIX}"
+	exit $?
+fi
 
 require_cmd curl
 require_cmd shasum
@@ -38,14 +112,6 @@ require_cmd strings
 require_cmd otool
 require_cmd perl
 
-FORCE=0
-for arg in "$@"; do
-	case "$arg" in
-	--force) FORCE=1 ;;
-	*) die "unknown argument: $arg (supported: --force)" ;;
-	esac
-done
-
 # Pinned per deps/freerdp.lock .ffmpeg (kept in sync manually — same arrangement as
 # Scripts/build-openssl.sh: this script is the one place allowed to know these values;
 # deps/freerdp.lock documents the decision and Scripts/gen-notices.sh cross-checks the
@@ -55,7 +121,8 @@ done
 # script existed (libavcodec major 63, libavutil major 61), so FreeRDP's
 # libfreerdp/codec/h264_ffmpeg.c compiles unchanged across the switch — the swap is a
 # licence/provenance change, not an API-version change.
-FFMPEG_VERSION="9.0.1"
+# (FFMPEG_VERSION itself is set near the top of the script so the --check-prefix path can
+# read it before any tool requirement.)
 FFMPEG_TARBALL="ffmpeg-${FFMPEG_VERSION}.tar.xz"
 FFMPEG_URL="https://ffmpeg.org/releases/${FFMPEG_TARBALL}"
 FFMPEG_SHA256="cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635"
@@ -87,9 +154,16 @@ STAMP_FILE="$CRDP_FFMPEG_PREFIX/.ffmpeg-${FFMPEG_VERSION}.stamp"
 # directory to exist).
 mkdir -p "$DOWNLOAD_DIR" "$CRDP_BUILD_DIR/deps/src"
 
-if [ "$FORCE" -eq 0 ] && [ -f "$STAMP_FILE" ]; then
-	log "FFmpeg $FFMPEG_VERSION already installed at $CRDP_FFMPEG_PREFIX (stamp: $STAMP_FILE); skipping. Pass --force to rebuild."
-	exit 0
+if [ "$FORCE" -eq 0 ]; then
+	# Skip only on a COMPLETE prefix: stamp for this version AND every promised component
+	# present. A stamped prefix missing a component is the 2026-09-05 shape (built before
+	# --enable-swscale) and rebuilds; so does an unstamped one (interrupted promotion).
+	if VERDICT="$(ffmpeg_prefix_verdict "$CRDP_FFMPEG_PREFIX")"; then
+		log "FFmpeg $FFMPEG_VERSION already installed at $CRDP_FFMPEG_PREFIX ($VERDICT; stamp: $STAMP_FILE); skipping. Pass --force to rebuild."
+		exit 0
+	else
+		log "FFmpeg prefix at $CRDP_FFMPEG_PREFIX is not reusable ($VERDICT) -- rebuilding."
+	fi
 fi
 
 TARBALL_PATH="$DOWNLOAD_DIR/$FFMPEG_TARBALL"
@@ -271,7 +345,7 @@ log "  flags: ${FFMPEG_CONFIGURE_FLAGS[*]}"
 STAGED_PREFIX="$STAGING_ROOT$FFMPEG_PREFIX_PLACEHOLDER"
 [ -d "$STAGED_PREFIX/lib" ] || die "staged install is missing $STAGED_PREFIX/lib — 'make install' did not produce the expected layout"
 
-EXPECTED_COMPONENTS=(avcodec avutil swresample swscale)
+# EXPECTED_COMPONENTS is defined near the top of the script (shared with the freshness verdict).
 for comp in "${EXPECTED_COMPONENTS[@]}"; do
 	find "$STAGED_PREFIX/lib" -maxdepth 1 -name "lib${comp}.*.dylib" -print -quit | grep -c . >/dev/null \
 		|| die "expected lib${comp} dylib not found under $STAGED_PREFIX/lib"
