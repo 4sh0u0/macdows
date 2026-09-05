@@ -530,6 +530,36 @@ Test-Case 'the three documented boot types are named; anything else keeps its nu
 }
 
 # -------------------------------------------------------------------------------------------
+# Session history (LocalSessionManager/Operational): id -> name, and a line that carries ONLY the
+# UTC time, the id, its name and the SessionID datum -- never the user or the client address
+# (both live in those events' messages and are red-line items).
+# -------------------------------------------------------------------------------------------
+
+New-Section 'Format-SnapshotSessionEventName / Format-SnapshotSessionEventLine'
+
+Test-Case 'the LSM event ids that matter for same-session reasoning are named; anything else is other' {
+    Assert-Equal 'logon' (Format-SnapshotSessionEventName -Id 21)
+    Assert-Equal 'shell-start' (Format-SnapshotSessionEventName -Id 22)
+    Assert-Equal 'logoff' (Format-SnapshotSessionEventName -Id 23)
+    Assert-Equal 'disconnect' (Format-SnapshotSessionEventName -Id 24)
+    Assert-Equal 'reconnect' (Format-SnapshotSessionEventName -Id 25)
+    Assert-Equal 'other' (Format-SnapshotSessionEventName -Id 41)
+    Assert-Equal 'other' (Format-SnapshotSessionEventName -Id $null)
+}
+
+Test-Case 'a session-history line is time, id, name and SessionID only' {
+    $xml = "<Event><EventData><Data Name='User'>DOMAIN\someone</Data><Data Name='SessionID'>2</Data><Data Name='Address'>203.0.113.7</Data></EventData></Event>"
+    $line = Format-SnapshotSessionEventLine -TimeUtc '2026-09-05T21:10:43.0000000Z' -Id 25 -Xml $xml
+    Assert-Equal 'lsm: 2026-09-05T21:10:43.0000000Z id=25 (reconnect) session=2' $line
+    Assert-True ($line -notlike '*someone*') 'the user must not appear'
+    Assert-True ($line -notlike '*203.0.113.7*') 'the address must not appear'
+}
+
+Test-Case 'a missing SessionID datum renders as <n/a>; a null time as <no-time>' {
+    Assert-Equal 'lsm: <no-time> id=21 (logon) session=<n/a>' (Format-SnapshotSessionEventLine -TimeUtc $null -Id 21 -Xml '<Event/>')
+}
+
+# -------------------------------------------------------------------------------------------
 # Summary
 # -------------------------------------------------------------------------------------------
 
