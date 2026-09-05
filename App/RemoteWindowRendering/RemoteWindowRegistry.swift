@@ -2135,8 +2135,10 @@ final class RemoteWindowRegistry {
         // `?? PendingWindowState()` is a SECOND source of `style == 0` reaching the seam below,
         // besides "no order ever carried WINDOW_ORDER_FIELD_STYLE": defensively, when
         // `geometry[windowId]` has already been dropped by `handleWindowDelete`. It looks
-        // unreachable (the delete path cancels the pending settle via `close(via:)` first) and no
-        // test reaches that branch (review border-per-style-r2 m-5, mutant NEW-C survives).
+        // unreachable: that path drops the geometry entry and then cancels the pending settle via
+        // `close(via:)` inside ONE synchronous call, so the debounced settle callback can never
+        // observe the gap between the two (gate-r3 corrected the order stated here); no test
+        // reaches that branch (review border-per-style-r2 m-5, mutant NEW-C survives).
         let state = geometry[windowId] ?? PendingWindowState()
         let correction = sizeCorrection(for: state, windowId: windowId)
         let railWindowsRect = WindowGeometry.railRect(from: displayedWindowsRect, correction: correction)
