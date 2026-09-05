@@ -327,7 +327,7 @@ fi
 
 # 5. Every TRACKED job (jobs/*.env) drives the relay through the shipped path: the /app argument
 #    is exactly `program:<PROGRAM>` plus `,cmd:<CMDARGS>` when the job has one, as ONE argv
-#    element -- including the `||<alias>` program form five of the seven jobs use.
+#    element -- including the `||<alias>` program form six of the eight jobs use.
 begin '5 tracked jobs'
 jobs_ok=0; jobs_total=0
 for jobfile in "$LAB"/jobs/*.env; do

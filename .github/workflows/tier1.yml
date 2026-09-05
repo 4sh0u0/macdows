@@ -237,12 +237,13 @@ jobs:
           # that is not there, which is worse than a red build. Same discipline as the grep -P
           # probe in the sensitive-content step.
           if ! command -v pwsh >/dev/null 2>&1; then
-            echo "::error::pwsh is not installed on this runner, so the lab's host-side PowerShell suites cannot run. They are the only automated coverage for Set-TsAllowListMatrix.ps1 (the elevated HKLM mutator and its clobber guards) and tsallowlist-matrix-verify.ps1 (the acceptance verdict). Install PowerShell on the runner -- do NOT drop or soft-skip this step."
+            echo "::error::pwsh is not installed on this runner, so the lab's host-side PowerShell suites cannot run. They are the only automated coverage for Set-TsAllowListMatrix.ps1 (the elevated HKLM mutator and its clobber guards), tsallowlist-matrix-verify.ps1 (the acceptance verdict) and server-snapshot.ps1 (the read-only A+E snapshot's channel filter, keyword counts and matrix-field composition). Install PowerShell on the runner -- do NOT drop or soft-skip this step."
             exit 1
           fi
 
           pwsh -NoProfile -File Scripts/lab/share/Set-TsAllowListMatrix.Tests.ps1
           pwsh -NoProfile -File Scripts/lab/share/tsallowlist-matrix-verify.Tests.ps1
+          pwsh -NoProfile -File Scripts/lab/share/server-snapshot.Tests.ps1
 
       - name: Patch queue validation
         run: |
