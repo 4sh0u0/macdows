@@ -2304,10 +2304,12 @@ struct ActivateExperimentCheckpoint {
 /// DWM's invisible frame, NOT the client-area insets. The two frame models are the two measured ones:
 /// About-calibrated (7,0,7,7) -- the left 7 is `WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder` (MacdowsCore;
 /// until the 2026-09-05 per-style lane it was the registry's private `measuredClientWindowMoveLeftBorder`), the right/bottom 7
-/// are the single C-2 run 4 reading (n=1) -- and THICKFRAME/Notepad (5,0,5,5), F-R1's n=8 measurement
-/// (memo :101). Production now deducts the same style-keyed LEFT border (`WindowGeometry.clientWindowMoveLeftBorder(forStyle:)`,
-/// 5 under WS_THICKFRAME, 7 otherwise), so under this model a THICKFRAME leg's dx should read 0 where it read -2 before;
-/// the right/bottom halves of both frames remain fixture-only. Scope: this is the BORDER-MODEL half of §6.2's deductions; `sizeCorrection` (mapped −
+/// are the single C-2 run 4 reading (n=1) -- and THICKFRAME/Notepad (5,0,5,5), F-R1's measurement (n=9 after
+/// C second-step r3, memo :101; the ten-leg frame reading, memo :109). Production now deducts the same style-keyed
+/// LEFT border (`WindowGeometry.clientWindowMoveLeftBorder(forStyle:)`, 5 under WS_THICKFRAME, 7 otherwise), so the
+/// LOCAL `MoveResizeGate` verdict's dx -- the -2 F-R1 counted -- should read 0 on a THICKFRAME move leg; this seam's
+/// own `delta` was already (0,0,0,0) under the correct model and is unchanged by that; the right/bottom halves of
+/// both frames remain fixture-only. Scope: this is the BORDER-MODEL half of §6.2's deductions; `sizeCorrection` (mapped −
 /// accumulated RAIL) is printed next to it, not deducted -- the measurement line says so. The fixture's
 /// gate stays the local content-rect verdict (`MoveResizeGate.evaluate`); this seam is MEASUREMENT ONLY,
 /// so a failing §6.2 comparison never reds a run.
@@ -2320,7 +2322,7 @@ enum RailComparison {
         /// The About calibration (`WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder` = 7 in MacdowsCore -- formerly
         /// the registry's private `measuredClientWindowMoveLeftBorder`; C-2 run 4 measured (7,0,7,7)).
         static let aboutCalibrated = Borders(left: 7, top: 0, right: 7, bottom: 7) // right/bottom 7: single C-2 run 4 reading (n=1)
-        /// F-R1: Notepad/THICKFRAME legs read (5,0,5,5) in eight independent runs.
+        /// F-R1: Notepad/THICKFRAME legs read (5,0,5,5); n=9 independent runs after C second-step r3 (memo :101).
         static let thickFrameMeasured = Borders(left: 5, top: 0, right: 5, bottom: 5)
         /// `WS_THICKFRAME` (== `WS_SIZEBOX`), the bit that distinguishes the two measured styles.
         static let wsThickFrame: UInt32 = 0x0004_0000
@@ -5051,9 +5053,12 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // per-style lane: `WindowGeometry.clientWindowMoveLeftBorder(forStyle:)` -- 5 under
             // WS_THICKFRAME, 7 otherwise -- the same MacdowsCore seam the registry calls, so this is
             // no longer a second copy of the number (review cm4-r1 I-4 closed). `windowStyleBits`
-            // holds the target's WindowCreate/Update style; a window whose orders never carried
-            // WINDOW_ORDER_FIELD_STYLE reads 0 here, which the seam maps to the About-calibrated 7,
-            // exactly as production does for the same window. The bounds are in pt, so convert (I-3).
+            // holds the target's WindowCreate style, and only in runs that launch extra apps or run
+            // the popup scenario (its write site); a style-bearing WindowUpdate never updates it.
+            // Otherwise it reads 0 and the seam yields the About-calibrated 7 even for a THICKFRAME
+            // target -- an over-reservation of 2 px against the 20 pt margin, i.e. the safe direction,
+            // not "exactly as production" (production reads `PendingWindowState.style`, which updates
+            // carry too). The bounds are in pt, so convert (I-3).
             let leftBorderRemotePx = WindowGeometry.clientWindowMoveLeftBorder(forStyle: windowStyleBits[windowId] ?? 0)
             let leftBorderPt = CGFloat(leftBorderRemotePx) / CGFloat(topology.rasterScale)
             moveResizeBoundsInPoints = bounds

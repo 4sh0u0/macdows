@@ -1572,8 +1572,8 @@ final class RemoteWindowRegistry {
     ///   * W3 TRIGGER and TRIGGERED SHAPE (ADR §7 (d)): the trigger is the §8.14 re-verification
     ///     itself, which must happen BEFORE anything is wired -- W3 does not get to skip it on
     ///     the strength of a 2x measurement. If it passes, wire the field and let it replace the
-    ///     hardcoded left border -- which since F-R1 (2026-09-02) is no longer a single constant
-    ///     here but a two-row per-style table,
+    ///     hardcoded left border -- which since the 2026-09-05 per-style lane (F-R1, found
+    ///     2026-09-02) is no longer a single constant here but a two-row per-style table,
     ///     `MacdowsCore.WindowGeometry.clientWindowMoveLeftBorder(forStyle:)` (F6 (a), below).
     ///     That table is a STAND-IN for this road, not a replacement of it: it is two measured
     ///     styles with no rule for a third, whereas `resizeMargin*` would carry the value per
@@ -2130,6 +2130,8 @@ final class RemoteWindowRegistry {
         // One read of this window's wire state, used for BOTH corrections below -- the size
         // correction and the left-border deduction must not be able to disagree about which
         // window they are correcting (the same-read discipline §5.A.4 applies to the topology).
+        // Comment-level discipline only: no test pins the sharing (review border-per-style-r1
+        // m-7, mutant N2 survives), and the refactor is behaviour-preserving either way.
         let state = geometry[windowId] ?? PendingWindowState()
         let correction = sizeCorrection(for: state, windowId: windowId)
         let railWindowsRect = WindowGeometry.railRect(from: displayedWindowsRect, correction: correction)
@@ -2180,7 +2182,8 @@ final class RemoteWindowRegistry {
     /// record and the one place this file names it.
     ///
     /// F6 (a) -- M1/W1 tagging pass; U5 = record-only (`m1-wave1-rulings.md:4`); ADR-0015 §7 (a).
-    /// WHERE THE VALUE WENT (F-R1, 2026-09-02): this used to be a `private static let
+    /// WHERE THE VALUE WENT (the 2026-09-05 per-style lane, on F-R1 found 2026-09-02): this used
+    /// to be a `private static let
     /// measuredClientWindowMoveLeftBorder: Double = 7` here, the single amount
     /// `handleLocalGeometrySettled` fed `WindowGeometry.clientWindowMoveLeft`. §7 (a) named
     /// "a different window/DPI/Windows-build" as its trigger and the WINDOW half of that fired

@@ -11,8 +11,9 @@ import Testing
 //
 // WHY THIS SUITE EXISTS ANYWAY -- the WIRING is a separate claim from the rule. A call site
 // that ignores the window's style and passes a fixed value still satisfies every MacdowsCore
-// test, because those never call the registry (a lane earlier this week shipped exactly that
-// kind of mutation-transparent call-site change). These tests drive the real
+// test, because those never call the registry (the About-target lane shipped exactly that
+// kind of mutation-transparent call-site change -- review about-target-r1 I-1 and r2 I-1,
+// `docs/reviews/2026-09-02-about-target/review-r1.md`). These tests drive the real
 // `RemoteWindowRegistry` and read the VERBATIM rect it sends, so "the window's own style
 // reached the deduction" is asserted rather than assumed.
 //

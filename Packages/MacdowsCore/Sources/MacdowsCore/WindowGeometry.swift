@@ -378,13 +378,14 @@ extension WindowGeometry {
     /// `railRect(from:correction:)` and before the `left`/`top`/`right`/`bottom` integers go
     /// on the wire, so no point conversion or Y flip is involved and no scale applies.
     ///
-    /// WHAT `measuredLeftBorder` IS CALLED WITH, as of F-R1 (2026-09-02): not a single
-    /// constant any more. `clientWindowMoveLeftBorder(forStyle:)` below picks between two
+    /// WHAT `measuredLeftBorder` IS CALLED WITH, since the 2026-09-05 per-style lane (acting on
+    /// F-R1, found 2026-09-02): not a single constant any more. `clientWindowMoveLeftBorder(forStyle:)` below picks between two
     /// measured values from the window's own Win32 style bits, and
     /// `RemoteWindowRegistry.handleLocalGeometrySettled` -- the only production caller -- calls
     /// this function with that result. This function itself is unchanged by that lane: it was
     /// always "subtract whatever border you measured", and the algebra above holds for either
-    /// value (substitute B = 5 or B = 7; nothing in steps 1-4 depends on which).
+    /// value (substitute B = 5 or B = 7; nothing in steps 1-3 depends on which -- step 4 is the
+    /// About instance, `331 + 7 = 338`).
     ///
     /// THE OPEN DPI QUESTION IS STILL OPEN, and F-R1 did NOT answer it. Every measurement
     /// behind both values was taken on the same 1x host (`docs/plans/phase3.md:219`), so
@@ -397,7 +398,8 @@ extension WindowGeometry {
         visibleLeft - measuredLeftBorder
     }
 
-    /// The DWM invisible-frame left thickness measured on the About-Windows dialog (style
+    /// The left inset the server applies to a sent `ClientWindowMove` (modelled as DWM's
+    /// invisible frame; what is measured is `reportedOffsetX - sentLeft`), on the About-Windows dialog (style
     /// `0x80080000` = `WS_POPUP | WS_SYSMENU`, no `WS_THICKFRAME`) -- the original calibration
     /// this whole correction was derived from: THREE runs on 2026-08-23 each sent `left=331`
     /// and got `offsetX=338` back on the next `WindowUpdate`, a clean +7 every time (the
@@ -407,29 +409,35 @@ extension WindowGeometry {
     /// (7,0,7,7) -- n=1 for the right/bottom members of that frame, which nothing here consumes.
     ///
     /// PROVENANCE: this is the value that lived at `RemoteWindowRegistry`'s own
-    /// `measuredClientWindowMoveLeftBorder` (F6 (a); ADR-0015 §7 (a)) until the F-R1 lane moved
-    /// it here so the style rule below could be unit-tested as one pure function. It is the
-    /// same number with the same evidence, not a re-derivation. `Tools/window-smoke`'s
-    /// `RailComparison.Borders.aboutCalibrated` still cites the old name/location for it.
+    /// `measuredClientWindowMoveLeftBorder` (F6 (a); ADR-0015 §7 (a)) until the 2026-09-05 per-style
+    /// lane moved it here so the style rule below could be unit-tested as one pure function. It is
+    /// the same number with the same evidence, not a re-derivation. `Tools/window-smoke`'s
+    /// `RailComparison.Borders.aboutCalibrated` cites this name, keeping the old one as provenance.
     public static let aboutCalibratedClientWindowMoveLeftBorder: Double = 7
 
-    /// The same thickness measured on `WS_THICKFRAME` windows -- F-R1
+    /// The same inset on `WS_THICKFRAME` windows -- F-R1
     /// (`docs/upgrade-gate/2026-09-resize-leg-live.md:32`): a Notepad target (style
     /// `0x000F0000`) was asked for visible left 215, was sent `left=208` under the
     /// About-calibrated 7 above, and came back at `offsetX=213` -- the server had inset by 5,
     /// leaving the `dx = -2` that run's move leg reported. The record's running count reached
-    /// eight independent runs at C second-step r2 and nine at r3
-    /// (`docs/upgrade-gate/2026-09-scaledmap-next-step.md:101`); r3 additionally read the frame
-    /// directly through adr/0015 §6.2's measurement field, `frame=(5,0,5,5)` on all ten legs.
+    /// eight independent runs at C second-step r2 and nine at r3 (the `F-R1 n` counter,
+    /// `docs/upgrade-gate/2026-09-scaledmap-next-step.md:101`); r3 additionally read the frame
+    /// directly through adr/0015 §6.2's measurement field, `frame=(5,0,5,5)` on all ten legs
+    /// (its record entry, `scaledmap-next-step.md:109`).
     ///
-    /// The frame's top member is 0 in both models: these styles have no invisible top edge,
-    /// which is why `clientWindowMoveLeft` has no `top` sibling (and, per its own doc comment,
-    /// no `right`/width sibling either).
+    /// The frame's top member measured 0 in both models (n=9). `clientWindowMoveLeft` has no
+    /// `top` sibling for a DIFFERENT reason -- Y was never exercised in the 2026-08-23 round (its
+    /// own doc comment, a still-registered gap) -- and these measurements are consistent with,
+    /// but do not close, that gap; the same doc explains why there is no `right`/width sibling.
     public static let thickFrameClientWindowMoveLeftBorder: Double = 5
 
-    /// F6 (a), as F-R1 rewrote it (ADR-0015 §7 (a)'s "TRIGGERED SHAPE" for this value): the
-    /// left border `clientWindowMoveLeft` deducts, chosen from the window's own Win32 `style`
-    /// bits. `WS_THICKFRAME` (== `WS_SIZEBOX`, `StyleTranslator.styleThickFrame`) set ->
+    /// F6 (a), as the 2026-09-05 per-style lane rewrote it on F-R1's evidence: the left border
+    /// `clientWindowMoveLeft` deducts, chosen from the window's own Win32 `style` bits. This is a
+    /// shape ADR-0015 §7 (a) does NOT list: its row offers two options decided by W3's 2x
+    /// measurement (a re-measured constant, or a `resizeMargin`-derived expression), and this
+    /// two-row style table is a third, taken on the window axis instead (owner ruling
+    /// 2026-09-05; the ADR amendment -- a third entry in that row and §6.2's reference to the old
+    /// symbol -- is a docs follow-up of the same lane). `WS_THICKFRAME` (== `WS_SIZEBOX`, `StyleTranslator.styleThickFrame`) set ->
     /// `thickFrameClientWindowMoveLeftBorder`; anything else ->
     /// `aboutCalibratedClientWindowMoveLeftBorder`. Each constant carries its own record.
     ///
@@ -447,8 +455,9 @@ extension WindowGeometry {
     /// "reset to zero" -- `WindowState.merge`'s own invariant), and the two are
     /// indistinguishable here. There is no measurement for "style unknown", so the unknown case
     /// keeps the exact value that was sent for every window before this function existed
-    /// instead of acquiring a new, unmeasured one -- the same fail-to-the-known-behaviour
-    /// discipline `WindowMappability.isMappableWindow` applies to unrecognized styles. A window
+    /// instead of acquiring a new, unmeasured one (a different discipline from
+    /// `WindowMappability.isMappableWindow`'s fail-open "unknown styles render visible", but the
+    /// same instinct: never invent a value for a case nobody measured). A window
     /// that never announces a style also never announces `WS_THICKFRAME`, so nothing here can
     /// tell it apart from a genuine non-THICKFRAME window; if that ever needs to be visible,
     /// the discriminator has to be an explicit "style was received" flag on the wire state, not
