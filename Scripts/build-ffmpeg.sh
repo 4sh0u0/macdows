@@ -35,7 +35,8 @@
 #                          skip), 1 = incomplete (stale or interrupted -- a build would
 #                          rebuild), 2 = absent. Needs nothing beyond the filesystem, so
 #                          Scripts/test-build-ffmpeg-prefix.sh can pin it on Tier 1's
-#                          ubuntu runner, where otool/perl are not around.
+#                          ubuntu runner, which has no otool. A --force given alongside
+#                          it is ignored: the check-only path never builds.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=Scripts/lib.sh
