@@ -1572,9 +1572,14 @@ final class RemoteWindowRegistry {
     ///   * W3 TRIGGER and TRIGGERED SHAPE (ADR §7 (d)): the trigger is the §8.14 re-verification
     ///     itself, which must happen BEFORE anything is wired -- W3 does not get to skip it on
     ///     the strength of a 2x measurement. If it passes, wire the field and let it replace the
-    ///     hardcoded `measuredClientWindowMoveLeftBorder` (F6 (a), below). If it fails, record
-    ///     "this road is closed" *with its evidence* at that point, so the next reader does not
-    ///     re-derive the survey a third time.
+    ///     hardcoded left border -- which since the 2026-09-05 per-style lane (F-R1, found
+    ///     2026-09-02) is no longer a single constant here but a two-row per-style table,
+    ///     `MacdowsCore.WindowGeometry.clientWindowMoveLeftBorder(forStyle:)` (F6 (a), below).
+    ///     That table is a STAND-IN for this road, not a replacement of it: it is two measured
+    ///     styles with no rule for a third, whereas `resizeMargin*` would carry the value per
+    ///     window on the wire. If the re-verification fails, record "this road is closed" *with
+    ///     its evidence* at that point, so the next reader does not re-derive the survey a third
+    ///     time -- and the table stays the answer until then.
     ///
     /// Origin is NOT corrected (`WindowGeometryCorrection.originX/Y == 0` always, this
     /// slice): `RDPGFX_MAP_SURFACE_TO_WINDOW_PDU` (`CRSession.mm`'s
@@ -2122,19 +2127,41 @@ final class RemoteWindowRegistry {
         guard let topology = sessionTopologyOrWarn() else { return }
         let macRect = MacRect(x: contentRect.origin.x, y: contentRect.origin.y, width: contentRect.size.width, height: contentRect.size.height)
         let displayedWindowsRect = WindowGeometry.windowsRect(from: macRect, in: topology)
-        let correction = sizeCorrection(for: geometry[windowId] ?? PendingWindowState(), windowId: windowId)
+        // One read of this window's wire state, used for BOTH corrections below -- the size
+        // correction and the left-border deduction must not be able to disagree about which
+        // window they are correcting (the same-read discipline §5.A.4 applies to the topology).
+        // Comment-level discipline only: no test pins the sharing (review border-per-style-r1
+        // m-7, mutant N2 survives), and the refactor is behaviour-preserving either way.
+        // `?? PendingWindowState()` is a SECOND source of `style == 0` reaching the seam below,
+        // besides "no order ever carried WINDOW_ORDER_FIELD_STYLE": defensively, when
+        // `geometry[windowId]` has already been dropped by `handleWindowDelete`. It looks
+        // unreachable: that path drops the geometry entry and then cancels the pending settle via
+        // `close(via:)` inside ONE synchronous call, so the debounced settle callback can never
+        // observe the gap between the two (gate-r3 corrected the order stated here); no test
+        // reaches that branch (review border-per-style-r2 m-5, mutant NEW-C survives).
+        let state = geometry[windowId] ?? PendingWindowState()
+        let correction = sizeCorrection(for: state, windowId: windowId)
         let railWindowsRect = WindowGeometry.railRect(from: displayedWindowsRect, correction: correction)
         // Team-lead review round 5 (2026-08-23): `railWindowsRect.x` above is the VISIBLE
         // left -- `ClientWindowMove`'s own `left` needs the additional, asymmetric,
         // outbound-only border correction `WindowGeometry.clientWindowMoveLeft`'s own doc
-        // comment works the full algebra for (three consecutive real-host runs each showed
-        // a clean +7 echo). `right` shifts by the same amount as a direct consequence of
-        // `left` shifting while `railWindowsRect.width` itself is untouched -- see that
-        // function's own doc comment for why width/right are deliberately NOT also adjusted
-        // (no matching evidence, and a naive symmetric-border guess for width would actually
-        // contradict the already-validated size-correction sign).
+        // comment works the full algebra for. `right` shifts by the same amount as a direct
+        // consequence of `left` shifting while `railWindowsRect.width` itself is untouched --
+        // see that function's own doc comment for why width/right are deliberately NOT also
+        // adjusted (no matching evidence, and a naive symmetric-border guess for width would
+        // actually contradict the already-validated size-correction sign).
+        //
+        // F6 (a), the 2026-09-05 per-style lane on F-R1 (found 2026-09-02): HOW MUCH is deducted
+        // is not one constant -- it is a
+        // function of this window's own `style`, and the decision (with both measured values
+        // and their records) lives in `WindowGeometry.clientWindowMoveLeftBorder(forStyle:)`.
+        // Same "the real decision is a pure MacdowsCore function, this is just field plumbing"
+        // split as `isMappableWindow`/`chrome` above. `state.style` is 0 when this window's
+        // orders never carried `WINDOW_ORDER_FIELD_STYLE`; that seam documents why 0 keeps the
+        // pre-F-R1 value rather than picking a new one.
         let correctedLeft = WindowGeometry.clientWindowMoveLeft(
-            fromVisibleLeft: railWindowsRect.x, measuredLeftBorder: Self.measuredClientWindowMoveLeftBorder
+            fromVisibleLeft: railWindowsRect.x,
+            measuredLeftBorder: Self.clientWindowMoveLeftBorder(forStyle: state.style)
         )
         let left = Int32(correctedLeft.rounded())
         let top = Int32(railWindowsRect.y.rounded())
@@ -2157,41 +2184,44 @@ final class RemoteWindowRegistry {
     /// only -- not read anywhere on the real rendering path.
     var onWindowMoveSent: ((_ windowId: UInt32, _ left: Int32, _ top: Int32, _ right: Int32, _ bottom: Int32) -> Void)?
 
-    /// Team-lead review round 5 (2026-08-23): the outbound-only left-border amount
-    /// `handleLocalGeometrySettled` feeds `WindowGeometry.clientWindowMoveLeft` -- see that
-    /// function's own doc comment for the full algebra. NOT derived from
-    /// `sizeCorrection.width` (deliberately -- that function's own doc comment explains why
-    /// treating "7 == 14/2" as a causal relationship, rather than numerical coincidence for
-    /// this one window, isn't something this evidence actually supports) -- a standalone,
-    /// evidence-cited constant, same "coarse stand-in until per-window data says otherwise"
-    /// status the old `fallbackSizeCorrection` constant had. Unlike `sizeCorrection`, this
-    /// has NO independent per-window wire measurement available at all (see
-    /// `clientWindowMoveLeft`'s own doc comment: it is inferred purely from three repeated
-    /// send/echo deltas, not derived from two independently-known wire quantities the way
-    /// `sizeCorrection` is), so there is no "measured, not hardcoded" version of this to
-    /// build yet -- flagged for revisiting if a real-host run ever shows a different value
-    /// for a different window/DPI/Windows-build.
+    /// Thin call-site wrapper over `MacdowsCore.WindowGeometry.clientWindowMoveLeftBorder(
+    /// forStyle:)`, exactly the `isMappableWindow`/`chrome` split above: the decision (and
+    /// every measured number in it) is the pure MacdowsCore function's, this is the F6 (a)
+    /// record and the one place this file names it.
     ///
-    /// F6 (a) -- M1/W1 tagging pass; U5 = record-only (`m1-wave1-rulings.md:4`); ADR-0015 §7 (a):
-    ///   * UNIT: **remote px**. It shares a domain with RAIL's own `offsetX` -- it is subtracted
-    ///     from `railWindowsRect.x` in Windows space, after the flip and before the
-    ///     `left`/`top`/`right`/`bottom` integers go on the wire -- so no point conversion and
-    ///     no `rasterScale` term is involved at this site.
-    ///   * WHY THE VALUE DOES NOT MOVE IN M1: all three real-host measurements behind the 7 were
-    ///     taken on the same 1x host (`docs/plans/phase3.md:219`), where "7 remote px" and
-    ///     "7 pt" are numerically indistinguishable. Picking one now would be re-guessing, not
-    ///     re-measuring (`phase3.md:223`, §8.5: no 2x measurement exists). The unit above is
-    ///     therefore an attribution of the existing evidence, not a new claim about it.
-    ///   * W3 TRIGGER: the paragraph above already named it before M1 existed -- "a different
-    ///     window/DPI/Windows-build" -- and W3's 2x session is precisely that DPI change.
-    ///   * TRIGGERED SHAPE (the value is W3's, from measurement): either ① a constant re-measured
-    ///     on a 2x session, or ② an expression derived from RAIL's own `resizeMarginLeft` -- see
-    ///     F6 (d) in `macContentRect(for:windowId:in:)`'s doc comment, and note that route
-    ///     unblocks only if the adr/0008 §0 `fieldFlags` re-verification (`phase3.md:232`, §8.14)
-    ///     passes first. Explicitly NOT "multiply by `rasterScale`": this is a server-side
-    ///     window-border thickness, and nothing in evidence says a window-manager border scales
-    ///     linearly with DPI (ADR-0015 §7 (a) rules that option out by name).
-    private static let measuredClientWindowMoveLeftBorder: Double = 7
+    /// F6 (a) -- M1/W1 tagging pass; U5 = record-only (`m1-wave1-rulings.md:4`); ADR-0015 §7 (a).
+    /// WHERE THE VALUE WENT (the 2026-09-05 per-style lane, on F-R1 found 2026-09-02): this used
+    /// to be a `private static let
+    /// measuredClientWindowMoveLeftBorder: Double = 7` here, the single amount
+    /// `handleLocalGeometrySettled` fed `WindowGeometry.clientWindowMoveLeft`. §7 (a) named
+    /// "a different window/DPI/Windows-build" as its trigger and the WINDOW half of that fired
+    /// first: `docs/upgrade-gate/2026-09-resize-leg-live.md:32` measured a `WS_THICKFRAME`
+    /// window's left border at 5 on the same 1x host the 7 was calibrated on. Both values, the
+    /// style rule that picks between them, and their records now live in
+    /// `MacdowsCore.WindowGeometry.clientWindowMoveLeftBorder(forStyle:)` -- one pure function
+    /// with unit tests, rather than a constant here plus a rule at the call site. The call site
+    /// (`handleLocalGeometrySettled`) passes `PendingWindowState.style` into it.
+    ///
+    /// WHAT DID NOT CHANGE, restated because the reasoning still applies to both values: the
+    /// deduction is NOT derived from `sizeCorrection.width` (that function's own doc comment
+    /// explains why treating "7 == 14/2" as a causal relationship, rather than numerical
+    /// coincidence for this one window, isn't something the evidence supports), and unlike
+    /// `sizeCorrection` there is still NO independent per-window wire measurement for it -- both
+    /// numbers are inferred from repeated send/echo deltas, not derived from two independently
+    /// known wire quantities. A two-row style table is therefore a stand-in, exactly as the
+    /// single constant was; F6 (d) in `macContentRect(for:windowId:in:)`'s doc comment records
+    /// the road that would replace it with a per-window wire value, and that road stays blocked
+    /// on the adr/0008 §0 `fieldFlags` re-verification (`docs/plans/phase3.md:232`, §8.14).
+    ///
+    /// UNIT: **remote px**, unchanged -- it is subtracted from `railWindowsRect.x` in Windows
+    /// space, after the flip and before the `left`/`top`/`right`/`bottom` integers go on the
+    /// wire, so no point conversion and no `rasterScale` term is involved at this site. The 2x
+    /// re-measurement §7 (a) asks for is still outstanding (`phase3.md:223`, §8.5: no 2x
+    /// measurement exists), for both values now instead of one -- F-R1 answered "which window",
+    /// not "which DPI".
+    private static func clientWindowMoveLeftBorder(forStyle style: UInt32) -> Double {
+        WindowGeometry.clientWindowMoveLeftBorder(forStyle: style)
+    }
 
     /// The one and only place a mac-screen point becomes a `WindowsPoint`, exactly
     /// mirroring `macContentRect(for:)` above for the reverse (Windows-rect -> mac-rect)

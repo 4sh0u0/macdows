@@ -17,8 +17,11 @@ import Testing
 //    snapshot without a physical display change. The false-when-equal half IS pinned below
 //    (`observerAfterFreezeReportsUnchangedLayoutAsNotStale`), which still kills the
 //    `!=` -> `==` mutation on `DisplayTopologyProvider.swift:269`.
-//  * `RemoteWindowRegistry` / `RemoteWindow`: every decision seam in both is `private`, and
-//    the registry requires a live `CRSession` at init. Their pure decision logic already
+//  * `RemoteWindowRegistry` / `RemoteWindow`: every decision seam in both is `private`. An
+//    UNSTARTED `CRSession` is enough to drive the registry headless
+//    (`RemoteWindowRegistryLeftBorderTests`, 2026-09-05: `initWithHost:` only allocates queues),
+//    so the reachable surface is the outbound rect via `onWindowMoveSent`, not the private
+//    seams. Their pure decision logic already
 //    lives in `MacdowsCore` (`WindowGeometry`/`WindowMappability`/`StyleTranslator`/
 //    `ZOrderSync`/`WindowShape`/`FocusAuthority`, covered by `swift test`); what remains in
 //    the App files is AppKit/session orchestration, reachable only with a live session or a

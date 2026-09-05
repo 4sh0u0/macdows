@@ -411,6 +411,85 @@ struct WindowGeometryTests {
         #expect(uncorrectedReconstruction == 338) // the actual observed echo, 3 runs running
     }
 
+    // MARK: - F-R1: the left border is keyed on the window STYLE, not on DPI (2026-09-02)
+
+    /// F-R1 (`docs/upgrade-gate/2026-09-resize-leg-live.md:32`, nine independent real-host
+    /// runs by `docs/upgrade-gate/2026-09-scaledmap-next-step.md:101`): the DWM invisible
+    /// frame this correction deducts is NOT one number per host. A `WS_THICKFRAME` window
+    /// (Notepad, style `0x000F0000`) is inset by 5 remote px on the left; the About dialog
+    /// (style `0x80080000` = `WS_POPUP | WS_SYSMENU`, no `WS_THICKFRAME`) by 7. Both were
+    /// measured on the SAME 1x host, which is what rules DPI out as the variable.
+    ///
+    /// The style-0 row is the "server never sent `WINDOW_ORDER_FIELD_STYLE`" case, not a
+    /// measured one -- see the seam's own doc comment for why it falls to the About value.
+    @Test(
+        "clientWindowMoveLeftBorder is keyed on WS_THICKFRAME, and style 0 falls to the About-calibrated 7",
+        arguments: [
+            (UInt32(0x000F_0000), 5.0),  // F-R1's Notepad, MAXIMIZEBOX|MINIMIZEBOX|THICKFRAME|SYSMENU
+            (UInt32(0x0004_0000), 5.0),  // WS_THICKFRAME alone -- the bit is what decides, not the rest
+            (UInt32(0x8008_0000), 7.0),  // the About dialog this constant was originally calibrated on
+            (UInt32(0x000B_0000), 7.0),  // MAXIMIZEBOX|MINIMIZEBOX|SYSMENU: chrome bits without THICKFRAME
+            (UInt32(0), 7.0),            // style never received: previous behaviour, deliberately
+        ]
+    )
+    func clientWindowMoveLeftBorderIsStyleKeyed(style: UInt32, expected: Double) {
+        #expect(WindowGeometry.clientWindowMoveLeftBorder(forStyle: style) == expected)
+    }
+
+    /// The two measured values are named, and each name carries its own record -- pinned here
+    /// so a future edit cannot swap them without a red test.
+    @Test("the two measured left borders keep their measured values")
+    func measuredLeftBordersKeepTheirValues() {
+        #expect(WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder == 7)
+        #expect(WindowGeometry.thickFrameClientWindowMoveLeftBorder == 5)
+    }
+
+    /// F-R1's own leg, both models, from the record's numbers
+    /// (`docs/upgrade-gate/2026-09-resize-leg-live.md:32`): the client asked for visible
+    /// left 215. Under the About-calibrated 7 it sent `left = 208` and the server reported
+    /// `offsetX = 213` -- the observed `dx = -2`. Under the style-keyed 5 the same leg sends
+    /// 210 and the server's own outer->visible reconstruction lands exactly on 215.
+    @Test("F-R1's Notepad move leg: the 7 model reproduces the observed dx=-2, the style-keyed 5 model lands on target")
+    func thickFrameLegRoundTripsUnderTheStyleKeyedBorder() {
+        let notepadStyle: UInt32 = 0x000F_0000
+        let visibleLeftTarget = 215.0
+        let serverLeftBorder = 5.0  // what the server actually inset by, per the record
+
+        let sentUnderAboutModel = WindowGeometry.clientWindowMoveLeft(
+            fromVisibleLeft: visibleLeftTarget,
+            measuredLeftBorder: WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder
+        )
+        #expect(sentUnderAboutModel == 208)
+        #expect(sentUnderAboutModel + serverLeftBorder == 213)  // the reported offsetX
+        #expect(sentUnderAboutModel + serverLeftBorder - visibleLeftTarget == -2)  // the reported dx
+
+        let sentUnderStyleKeyedModel = WindowGeometry.clientWindowMoveLeft(
+            fromVisibleLeft: visibleLeftTarget,
+            measuredLeftBorder: WindowGeometry.clientWindowMoveLeftBorder(forStyle: notepadStyle)
+        )
+        #expect(sentUnderStyleKeyedModel == 210)
+        #expect(sentUnderStyleKeyedModel + serverLeftBorder == visibleLeftTarget)
+    }
+
+    /// The other style's data point, so "keyed on the style" is pinned from BOTH sides rather
+    /// than only from the side that changed: C-2 run 4
+    /// (`docs/upgrade-gate/2026-09-scaledmap-next-step.md:101`) sent `left = 195` on an About
+    /// target and the server reported `offsetX = 202` -- a deduction of 7, unchanged by this
+    /// lane. A rule that returned 5 for every style would red here.
+    @Test("C-2 run 4's About move leg still deducts 7 and lands on target")
+    func aboutLegStillDeductsSeven() {
+        let aboutStyle: UInt32 = 0x8008_0000
+        let visibleLeftTarget = 202.0
+        let serverLeftBorder = 7.0  // C-2 run 4's measured frame: (7,0,7,7)
+
+        let sent = WindowGeometry.clientWindowMoveLeft(
+            fromVisibleLeft: visibleLeftTarget,
+            measuredLeftBorder: WindowGeometry.clientWindowMoveLeftBorder(forStyle: aboutStyle)
+        )
+        #expect(sent == 195)
+        #expect(sent + serverLeftBorder == visibleLeftTarget)
+    }
+
     // MARK: - Maximize-scenario real-host regression (2026-08-23, round 6)
 
     /// Team-lead review round 6: `RemoteWindowRegistry.macContentRect(for:windowId:)`
