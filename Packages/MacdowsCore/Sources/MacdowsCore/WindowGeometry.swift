@@ -271,11 +271,16 @@ public enum WindowGeometry {
 /// pixels**. Both quantities they are derived from are wire values in remote pixels -- RAIL's
 /// `windowWidth`/`windowHeight` and GFX's `mappedWidth`/`mappedHeight` -- so this correction
 /// composes with `displayRect`/`railRect` entirely inside Windows space, BEFORE any Y flip or
-/// point conversion, and carries no scale dimension of its own. W3 TRIGGER: if a session ever
-/// runs with `DisplayScale.remotePixelsPerPoint != 1`, re-measure -- these numbers came off a
-/// 1x host (`docs/plans/phase3.md:219`) and nothing establishes that a window-manager border
-/// delta scales linearly with DPI. No value changes in M1 (§3 item 5: this batch moves units
-/// only; the values wait for W3's real-host data).
+/// point conversion, and carries no scale dimension of its own. W3 TRIGGER, half fired: the
+/// values were measured on a 1x host (`docs/plans/phase3.md:219`), and nothing in that data
+/// established whether a window-manager border delta scales with DPI. F round 3 (2026-09-06,
+/// a 2x session -- `docs/upgrade-gate/2026-09-f-live.md` §2b) gives the first 2x point: the
+/// WS_THICKFRAME resize leg reported width 1184 for a sent 1194, the same -10 delta as at 1x
+/// (dh -4 vs -5 is the F1 odd-dimension rounding). The record draws its "remote pixels, not
+/// DPI-scaled" conclusion from the move leg (5 px deducted, dx=0); this comment reads the
+/// unchanged -10 the same way -- an inference consistent with that conclusion, n=1, THICKFRAME
+/// only. No About-class window has been measured at 2x; that half of the trigger is still
+/// outstanding. No value changes here (M1 §3 item 5 moved units only).
 public struct WindowGeometryCorrection: Equatable, Sendable {
     public var originX: Double
     public var originY: Double
@@ -387,13 +392,16 @@ extension WindowGeometry {
     /// value (substitute B = 5 or B = 7; nothing in steps 1-3 depends on which -- step 4 is the
     /// About instance, `331 + 7 = 338`).
     ///
-    /// THE OPEN DPI QUESTION IS STILL OPEN, and F-R1 did NOT answer it. Every measurement
-    /// behind both values was taken on the same 1x host (`docs/plans/phase3.md:219`), so
-    /// "5/7 remote pixels" and "5/7 points" remain indistinguishable in the evidence, and
-    /// re-measuring on a session where `DisplayScale.remotePixelsPerPoint != 1` is still the
-    /// outstanding trigger (§3 item 5, §8.5: no 2x measurement exists yet). What F-R1 changed
-    /// is the *other* variable: the border was found to move with the window STYLE on a fixed
-    /// DPI, which is why the value is now a function rather than a recorded constant.
+    /// THE DPI QUESTION IS HALF ANSWERED. F-R1 did not touch it: every 1x measurement behind
+    /// both values came off the same host (`docs/plans/phase3.md:219`), where "5/7 remote
+    /// pixels" and "5/7 points" are indistinguishable. F round 3 (2026-09-06, a 2x session --
+    /// `docs/upgrade-gate/2026-09-f-live.md` §2b) answered it for WS_THICKFRAME: deducting
+    /// 5 REMOTE PIXELS (2.5 pt at `remotePixelsPerPoint == 2`) gave dx=0 on the move leg, so
+    /// the 5 is a remote-pixel quantity that does not scale with DPI (n=1). The About-class 7
+    /// has NOT been measured at 2x; re-measuring an About-class window on a 2x session is the
+    /// half of the trigger still outstanding (§3 item 5, §8.5). What F-R1 changed is the
+    /// *other* variable: the border was found to move with the window STYLE on a fixed DPI,
+    /// which is why the value is now a function rather than a recorded constant.
     public static func clientWindowMoveLeft(fromVisibleLeft visibleLeft: Double, measuredLeftBorder: Double) -> Double {
         visibleLeft - measuredLeftBorder
     }
