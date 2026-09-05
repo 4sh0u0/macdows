@@ -307,8 +307,13 @@ function Get-SnapshotEventDataValue {
     if ([string]::IsNullOrEmpty($Xml)) { return $null }
     $pattern = '<Data Name=[''"]' + [regex]::Escape($Name) + '[''"]>(.*?)</Data>'
     $m = [regex]::Match($Xml, $pattern, 'Singleline')
-    if (-not $m.Success) { return $null }
-    return $m.Groups[1].Value
+    if ($m.Success) { return $m.Groups[1].Value }
+    # UserData/EventXML form: providers such as TerminalServices-LocalSessionManager emit the datum
+    # as its own element, <SessionID>2</SessionID>, not as <Data Name=...> (dry run 9).
+    $pattern2 = '<' + [regex]::Escape($Name) + '(?:\s[^>]*)?>(.*?)</' + [regex]::Escape($Name) + '>'
+    $m2 = [regex]::Match($Xml, $pattern2, 'Singleline')
+    if ($m2.Success) { return $m2.Groups[1].Value }
+    return $null
 }
 
 function Get-SnapshotBootTypeFromXml {
@@ -422,7 +427,8 @@ function Format-SnapshotSessionEventName {
     <#
       LocalSessionManager/Operational event ids that matter when asking "is this the same session
       the previous client left behind": 21 logon, 22 shell start, 23 logoff, 24 disconnect,
-      25 reconnect. Everything else is 'other' (memo section 5, T6-prime clause (c)).
+      25 reconnect, 39 disconnected by another session, 40 disconnect reason code, 41/42 session
+      arbitration begin/end. Everything else is 'other' (memo section 5, T6-prime clause (c)).
     #>
     [CmdletBinding()]
     param($Id)
@@ -433,6 +439,10 @@ function Format-SnapshotSessionEventName {
         23 { return 'logoff' }
         24 { return 'disconnect' }
         25 { return 'reconnect' }
+        39 { return 'disconnected-by-other-session' }
+        40 { return 'disconnect-reason' }
+        41 { return 'arbitration-begin' }
+        42 { return 'arbitration-end' }
     }
     return 'other'
 }

@@ -386,6 +386,12 @@ Test-Case 'reads a named datum from single- or double-quoted Data elements, null
     Assert-Equal $null (Get-SnapshotEventDataValue -Xml $null -Name 'OldTime')
 }
 
+Test-Case 'a datum in the UserData/EventXML element form (<SessionID>2</SessionID>, as LSM events emit) is read too (dry run 9: every session line read <n/a>)' {
+    $xml = "<Event><UserData><EventXML xmlns='Event_NS'><User>DOMAIN\\someone</User><SessionID>2</SessionID><Address>203.0.113.7</Address></EventXML></UserData></Event>"
+    Assert-Equal '2' (Get-SnapshotEventDataValue -Xml $xml -Name 'SessionID')
+    Assert-Equal $null (Get-SnapshotEventDataValue -Xml $xml -Name 'Session') 'element name matched exactly'
+}
+
 Test-Case 'the datum name is matched exactly, not as a prefix' {
     $xml = "<EventData><Data Name='NewTimeZone'>x</Data><Data Name='NewTime'>y</Data></EventData>"
     Assert-Equal 'y' (Get-SnapshotEventDataValue -Xml $xml -Name 'NewTime')
@@ -543,7 +549,11 @@ Test-Case 'the LSM event ids that matter for same-session reasoning are named; a
     Assert-Equal 'logoff' (Format-SnapshotSessionEventName -Id 23)
     Assert-Equal 'disconnect' (Format-SnapshotSessionEventName -Id 24)
     Assert-Equal 'reconnect' (Format-SnapshotSessionEventName -Id 25)
-    Assert-Equal 'other' (Format-SnapshotSessionEventName -Id 41)
+    Assert-Equal 'disconnected-by-other-session' (Format-SnapshotSessionEventName -Id 39)
+    Assert-Equal 'disconnect-reason' (Format-SnapshotSessionEventName -Id 40)
+    Assert-Equal 'arbitration-begin' (Format-SnapshotSessionEventName -Id 41)
+    Assert-Equal 'arbitration-end' (Format-SnapshotSessionEventName -Id 42)
+    Assert-Equal 'other' (Format-SnapshotSessionEventName -Id 43)
     Assert-Equal 'other' (Format-SnapshotSessionEventName -Id $null)
 }
 
