@@ -7334,9 +7334,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             print("[experiment] Activate repaint test: pre=\(String(format: "%.1f%%", pre * 100)) "
                 + "post=\(String(format: "%.1f%%", post * 100)) delta=\(String(format: "%+.1f%%", (post - pre) * 100))")
         } else {
+            // finish() runs only at elapsed >= FinishGate.minimumElapsed (floor 25 s), after both
+            // checkpoints (t = 6 / 20 s) have settled -- so "the run ended early" is not a reason here.
             print("[experiment] Activate repaint test did not complete a pre/post pair this session (no window "
                 + "matching the experiment's title heuristic -- Registry-Editor OR About / 关于, see "
-                + "runActivateExperiment -- was ever locked, a checkpoint reported n/a, or the run ended before t=20s)")
+                + "runActivateExperiment -- was ever locked, or a checkpoint reported n/a)")
         }
         // Refresh-rect (MS-RDPBCGR TS_REFRESH_RECT_PDU) investigated separately, not
         // attempted here: this vendored FreeRDP exposes no client-callable "send a refresh
