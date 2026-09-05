@@ -64,6 +64,13 @@ function Get-AnalyticPlan {
     switch ($Mode) {
         'Status' { return $plan }
         'Enable' {
+            foreach ($c in $script:AnalyticChannels) {
+                if (-not $Current.ContainsKey($c)) {
+                    $plan.Verdict = 'refuse'
+                    $plan.Reason = "the current state is missing channel $c -- an unreadable channel is never treated as off; fix the read first"
+                    return $plan
+                }
+            }
             if ($BackupExists) {
                 $plan.Verdict = 'refuse'
                 $plan.Reason = 'a backup of the pre-lab channel state already exists; run -Mode Restore first (a second Enable would overwrite the pristine record with the enabled state)'
@@ -156,8 +163,15 @@ function Set-AnalyticState {
     foreach ($c in $script:AnalyticChannels) {
         $cfg = New-Object System.Diagnostics.Eventing.Reader.EventLogConfiguration($c)
         if ([bool]$cfg.IsEnabled -ne [bool]$Desired[$c]) {
-            $cfg.IsEnabled = [bool]$Desired[$c]
-            $cfg.SaveChanges()
+            try {
+                $cfg.IsEnabled = [bool]$Desired[$c]
+                $cfg.SaveChanges()
+            } catch {
+                # Operator-facing (gate m3): say which channel failed and that the backup record is
+                # untouched, so re-running the SAME mode converges (each channel is judged on its own).
+                throw ("SaveChanges failed on {0} (wanted IsEnabled={1}): {2}. The backup record is untouched; " +
+                       "fix the cause and re-run -Mode {3} -- channels already at their target are skipped.") -f $c, $Desired[$c], $_.Exception.Message, $Mode
+            }
             Write-Host ("set {0} IsEnabled={1}" -f $c, $Desired[$c])
         } else {
             Write-Host ("{0} already IsEnabled={1}" -f $c, $Desired[$c])

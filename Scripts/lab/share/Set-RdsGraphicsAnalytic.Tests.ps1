@@ -106,6 +106,23 @@ Test-Case 'Restore without a backup REFUSES (nothing to restore to -- never gues
     Assert-True (-not $p.RemoveBackup)
 }
 
+Test-Case 'Enable REFUSES when the current state is missing a channel (never treats an unreadable channel as off; gate m4)' {
+    $partial = @{ 'Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Debug' = $false }
+    $p = Get-AnalyticPlan -Mode Enable -Current $partial -BackupExists $false
+    Assert-Equal 'refuse' $p.Verdict
+    Assert-True ($p.Reason -like '*missing*') "reason names the gap, got [$($p.Reason)]"
+    Assert-True (-not $p.WriteBackup)
+}
+
+Test-Case 'Enable -> Restore round trip returns a mixed host to exactly its prior state (gate m1: chained, not two independent halves)' {
+    $prior = @{ 'Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Debug' = $true; 'Microsoft-Windows-Rdp-Graphics-RdpLite/Debug' = $false; 'Microsoft-Windows-Rdp-Graphics-RdpAvenc/Debug' = $false }
+    $enable = Get-AnalyticPlan -Mode Enable -Current $prior -BackupExists $false
+    $recorded = ConvertFrom-AnalyticBackupText -Text (ConvertTo-AnalyticBackupText -State $enable.BackupState)
+    $afterEnable = $enable.SetEnabled
+    $restore = Get-AnalyticPlan -Mode Restore -Current $afterEnable -BackupExists $true -Backup $recorded
+    foreach ($c in $script:AnalyticChannels) { Assert-Equal $prior[$c] $restore.SetEnabled[$c] "$c back to prior" }
+}
+
 Test-Case 'Status never writes anything' {
     foreach ($b in @($true, $false)) {
         $p = Get-AnalyticPlan -Mode Status -Current $allOn -BackupExists $b
@@ -119,7 +136,9 @@ New-Section 'ConvertTo-AnalyticBackupText / ConvertFrom-AnalyticBackupText (roun
 
 Test-Case 'the backup text round-trips the three states and nothing else' {
     $txt = ConvertTo-AnalyticBackupText -State $allOn
-    Assert-True ($txt -notmatch 'COMPUTERNAME|USERNAME') 'no host identity in the backup'
+    $lines = @($txt -split "`r?`n" | Where-Object { $_ -ne '' })
+    Assert-Equal 3 $lines.Count 'exactly three lines'
+    foreach ($l in $lines) { Assert-True ($l -match '^Microsoft-Windows-[A-Za-z-]+/Debug=(True|False)$') "line is channel=state only, got [$l]" }
     $back = ConvertFrom-AnalyticBackupText -Text $txt
     Assert-Equal 3 @($back.Keys).Count
     foreach ($k in $script:AnalyticChannels) { Assert-Equal $true $back[$k] "$k" }
