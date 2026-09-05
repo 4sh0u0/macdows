@@ -357,7 +357,12 @@ Test-Case 'BootType is read from the EventData XML, not from the localised messa
     Assert-Equal 1 (Get-SnapshotBootTypeFromXml -Xml $xml)
 }
 
-Test-Case 'BootType rendered as HexInt32 (0x1, as the manifest renders it -- dry run 3 read unknown for all five events) parses too' {
+Test-Case 'the attribute quotes EventRecord.ToXml() actually emits are SINGLE quotes (dry run 4 excerpt: <Data Name=''BootType''>0</Data>)' {
+    Assert-Equal 0 (Get-SnapshotBootTypeFromXml -Xml "<EventData><Data Name='BootType'>0</Data><Data Name='LoadOptions'> NOEXECUTE=OPTIN</Data></EventData>")
+    Assert-Equal 2 (Get-SnapshotBootTypeFromXml -Xml "<Event><EventData><Data Name='BootType'>2</Data></EventData></Event>")
+}
+
+Test-Case 'a hex-rendered BootType (0x1) is accepted as well, although dry run 4 showed the datum is decimal' {
     Assert-Equal 1 (Get-SnapshotBootTypeFromXml -Xml '<EventData><Data Name="BootType">0x1</Data></EventData>')
     Assert-Equal 0 (Get-SnapshotBootTypeFromXml -Xml '<EventData><Data Name="BootType">0x0</Data></EventData>')
     Assert-Equal 2 (Get-SnapshotBootTypeFromXml -Xml '<EventData><Data Name="BootType">0x2</Data></EventData>')

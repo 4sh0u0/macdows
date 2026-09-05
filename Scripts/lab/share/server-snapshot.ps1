@@ -245,14 +245,17 @@ function Get-SnapshotFreshnessConsistency {
 
 function Get-SnapshotBootTypeFromXml {
     <#
-      Kernel-Boot event 27's BootType datum from the event XML (locale-independent). The
-      manifest renders it as HexInt32 -- "0x1" -- which is what dry run 3 met (all five events
-      read unknown under a decimal-only pattern); a plain decimal is accepted as well.
+      Kernel-Boot event 27's BootType datum from the event XML (locale-independent).
+      EventRecord.ToXml() emits attribute values in SINGLE quotes -- <Data Name='BootType'>0</Data>
+      is what dry run 4's excerpt showed -- so both quote styles are accepted; the value is a
+      plain decimal there (0 = cold boot), and a hex rendering (0x1) is tolerated in case another
+      build renders it that way. Dry runs 3 and 4 read unknown for all five events under a
+      double-quote-only pattern.
     #>
     [CmdletBinding()]
     param([AllowNull()][string] $Xml)
     if ([string]::IsNullOrEmpty($Xml)) { return $null }
-    $m = [regex]::Match($Xml, '<Data Name="BootType">(0x[0-9A-Fa-f]+|[0-9]+)</Data>')
+    $m = [regex]::Match($Xml, '<Data Name=[''"]BootType[''"]>(0x[0-9A-Fa-f]+|[0-9]+)</Data>')
     if (-not $m.Success) { return $null }
     $v = $m.Groups[1].Value
     if ($v.StartsWith('0x')) { return [int][Convert]::ToInt32($v.Substring(2), 16) }
@@ -410,13 +413,19 @@ function Invoke-SnapshotCollection {
     $tickSeconds = [int][math]::Floor([Environment]::TickCount / 1000)
     [void]$L.Add("  TickCountSeconds(32-bit, wraps 24.9d) = $tickSeconds")
     [void]$L.Add('  freshness_consistency = ' + (Get-SnapshotFreshnessConsistency -BootUptimeSeconds $up -TickSeconds $tickSeconds))
-    # Boot history from the System log (readable by a standard account): Kernel-Boot 27 carries
-    # BootType, which is the authoritative answer to "was that a cold boot or fast startup".
+    # Boot/sleep history from the System log (readable by a standard account): Kernel-Boot 27
+    # carries BootType (cold boot / fast startup / resume from hibernation); Kernel-Power 42/107
+    # are sleep entry / resume. Together they say what the tick-vs-boot gap was.
     [void]$L.Add('  boot history (System log, newest first):')
     foreach ($q in @(
         @{ Label = 'Kernel-Boot 27';    Provider = 'Microsoft-Windows-Kernel-Boot';    Id = 27; Max = 5; BootType = $true },
         @{ Label = 'Kernel-General 12'; Provider = 'Microsoft-Windows-Kernel-General'; Id = 12; Max = 3; BootType = $false },
-        @{ Label = 'Kernel-General 13'; Provider = 'Microsoft-Windows-Kernel-General'; Id = 13; Max = 3; BootType = $false })) {
+        @{ Label = 'Kernel-General 13'; Provider = 'Microsoft-Windows-Kernel-General'; Id = 13; Max = 3; BootType = $false },
+        # Sleep/resume: dry run 4 showed every Kernel-Boot 27 as cold-boot and none at the
+        # 03:40 JST power-on the tick gap points at, so the gap is a sleep, not fast startup;
+        # Kernel-Power 42 (entering sleep) / 107 (resumed) are the events that say so directly.
+        @{ Label = 'Kernel-Power 42';   Provider = 'Microsoft-Windows-Kernel-Power';   Id = 42;  Max = 3; BootType = $false },
+        @{ Label = 'Kernel-Power 107';  Provider = 'Microsoft-Windows-Kernel-Power';   Id = 107; Max = 3; BootType = $false })) {
         try {
             $evs = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = $q.Provider; Id = $q.Id } -MaxEvents $q.Max -ErrorAction Stop)
             foreach ($e in $evs) {
