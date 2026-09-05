@@ -243,23 +243,73 @@ function Get-SnapshotFreshnessConsistency {
     return "inconsistent $detail"
 }
 
+function Get-SnapshotEventDataValue {
+    <#
+      One named EventData datum from an EventRecord.ToXml() string (locale-independent: the
+      XML carries the raw data, the Message carries the localised rendering). ToXml() emits
+      attribute values in SINGLE quotes -- <Data Name='BootType'>0</Data> is what dry run 4's
+      excerpt showed -- so both quote styles are accepted. Null when the datum is absent.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][string] $Xml, [string] $Name)
+    if ([string]::IsNullOrEmpty($Xml)) { return $null }
+    $pattern = '<Data Name=[''"]' + [regex]::Escape($Name) + '[''"]>(.*?)</Data>'
+    $m = [regex]::Match($Xml, $pattern, 'Singleline')
+    if (-not $m.Success) { return $null }
+    return $m.Groups[1].Value
+}
+
 function Get-SnapshotBootTypeFromXml {
     <#
-      Kernel-Boot event 27's BootType datum from the event XML (locale-independent).
-      EventRecord.ToXml() emits attribute values in SINGLE quotes -- <Data Name='BootType'>0</Data>
-      is what dry run 4's excerpt showed -- so both quote styles are accepted; the value is a
-      plain decimal there (0 = cold boot), and a hex rendering (0x1) is tolerated in case another
-      build renders it that way. Dry runs 3 and 4 read unknown for all five events under a
-      double-quote-only pattern.
+      Kernel-Boot event 27's BootType datum. Dry run 4 showed it is a plain decimal (0 = cold
+      boot); a hex rendering (0x1) is tolerated in case another build renders it that way. Dry
+      runs 3 and 4 read unknown for all five events under a double-quote-only pattern.
     #>
     [CmdletBinding()]
     param([AllowNull()][string] $Xml)
-    if ([string]::IsNullOrEmpty($Xml)) { return $null }
-    $m = [regex]::Match($Xml, '<Data Name=[''"]BootType[''"]>(0x[0-9A-Fa-f]+|[0-9]+)</Data>')
-    if (-not $m.Success) { return $null }
-    $v = $m.Groups[1].Value
-    if ($v.StartsWith('0x')) { return [int][Convert]::ToInt32($v.Substring(2), 16) }
-    return [int]$v
+    $v = Get-SnapshotEventDataValue -Xml $Xml -Name 'BootType'
+    if ($null -eq $v) { return $null }
+    $v = $v.Trim()
+    if ($v -match '^0x[0-9A-Fa-f]+$') { return [int][Convert]::ToInt32($v.Substring(2), 16) }
+    if ($v -match '^[0-9]+$') { return [int]$v }
+    return $null
+}
+
+function Select-SnapshotHostFreshnessLabel {
+    <#
+      Which uptime the matrix host_freshness label is taken from, and why.
+
+      Dry run 5 read boot-based 38556 s against tick-based 6156 s with NO sleep/resume events
+      and a gap of exactly 32400 s -- nine hours, the host's UTC offset. That is not a sleep:
+      the host booted with its clock nine hours behind (a dual-boot machine whose other OS
+      leaves the RTC in UTC), so LastBootUpTime and the boot-time event stamps are nine hours
+      early, and the later correction shows up as a Kernel-General 1 "system time changed" event
+      whose old->new jump equals the gap. In that regime the TICK count is the truthful "since
+      boot" and the label is taken from it.
+        Basis boot: tick unavailable | gap within tolerance | gap NOT matched by a clock jump
+                    (then Reason carries Get-SnapshotFreshnessConsistency's suspicion)
+        Basis tick: |ClockJumpSeconds| matches |gap| within the tolerance
+    #>
+    [CmdletBinding()]
+    param($BootUptimeSeconds, $TickSeconds, $ClockJumpSeconds, [int] $ToleranceSeconds = 300)
+    $cons = Get-SnapshotFreshnessConsistency -BootUptimeSeconds $BootUptimeSeconds -TickSeconds $TickSeconds -ToleranceSeconds $ToleranceSeconds
+    $basis = 'boot'
+    $reason = $cons
+    if ($cons -ne 'tick-unavailable' -and $cons -ne 'consistent' -and $null -ne $ClockJumpSeconds) {
+        $gap = [int][math]::Round([double]$BootUptimeSeconds - [double]$TickSeconds)
+        $jump = [int][math]::Round([double]$ClockJumpSeconds)
+        if ([math]::Abs([math]::Abs($jump) - [math]::Abs($gap)) -le $ToleranceSeconds) {
+            $basis = 'tick'
+            $reason = ('clock-corrected-after-boot (jump={0}s gap={1}s)' -f $jump, $gap)
+        }
+    }
+    $seconds = $BootUptimeSeconds
+    if ($basis -eq 'tick') { $seconds = $TickSeconds }
+    return [pscustomobject]@{
+        Basis  = $basis
+        Label  = (Get-SnapshotHostFreshness -UptimeSeconds $seconds)
+        Reason = $reason
+    }
 }
 
 function Format-SnapshotBootType {
@@ -398,7 +448,6 @@ function Invoke-SnapshotCollection {
     try {
         $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
         $up = ($os.LocalDateTime - $os.LastBootUpTime).TotalSeconds
-        [void]$L.Add('host_freshness: ' + (Get-SnapshotHostFreshness -UptimeSeconds $up))
         [void]$L.Add('  LastBootUpTime(local) = ' + $os.LastBootUpTime.ToString('o'))
         [void]$L.Add('  LocalDateTime = ' + $os.LocalDateTime.ToString('o'))
         [void]$L.Add('  UptimeSeconds = ' + [int][math]::Floor($up))
@@ -406,13 +455,47 @@ function Invoke-SnapshotCollection {
         [void]$L.Add('  Version = ' + (ConvertTo-SnapshotValueText -Value $os.Version))
         [void]$L.Add('  BuildNumber = ' + (ConvertTo-SnapshotValueText -Value $os.BuildNumber))
     } catch {
-        [void]$L.Add('host_freshness: unknown')
         [void]$L.Add('  Win32_OperatingSystem unreadable: ' + $_.Exception.GetType().Name)
     }
-    # 32-bit ms since boot; wraps every 24.9 days, so it is a cross-check, not the source.
+    # 32-bit ms since boot; wraps every 24.9 days. Not a cross-check only: when the boot-time
+    # clock was wrong (see Select-SnapshotHostFreshnessLabel) it is the truthful source.
     $tickSeconds = [int][math]::Floor([Environment]::TickCount / 1000)
     [void]$L.Add("  TickCountSeconds(32-bit, wraps 24.9d) = $tickSeconds")
+    # Clock corrections since boot: Kernel-General 1 (system time changed), newest 5, with the
+    # old->new jump computed from the EventData (ISO stamps; a parse failure leaves delta blank).
+    $clockJump = $null
+    [void]$L.Add('  clock changes (Kernel-General 1, System log, newest first):')
+    try {
+        $tcs = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-General'; Id = 1 } -MaxEvents 5 -ErrorAction Stop)
+        foreach ($e in $tcs) {
+            $x = $e.ToXml()
+            $oldT = Get-SnapshotEventDataValue -Xml $x -Name 'OldTime'
+            $newT = Get-SnapshotEventDataValue -Xml $x -Name 'NewTime'
+            $why = Get-SnapshotEventDataValue -Xml $x -Name 'Reason'
+            $delta = ''
+            try {
+                $inv = [Globalization.CultureInfo]::InvariantCulture
+                $rk = [Globalization.DateTimeStyles]::RoundtripKind
+                $d = ([DateTime]::Parse($newT, $inv, $rk) - [DateTime]::Parse($oldT, $inv, $rk)).TotalSeconds
+                $delta = [int][math]::Round($d)
+                if ($null -eq $clockJump -and [math]::Abs($delta) -gt 300) { $clockJump = $delta }
+            } catch { $delta = '<unparsed>' }
+            [void]$L.Add(('    Kernel-General 1 {0} old={1} new={2} delta={3}s reason={4}' -f $e.TimeCreated.ToUniversalTime().ToString('o'), $oldT, $newT, $delta, $why))
+        }
+    } catch {
+        if ($_.FullyQualifiedErrorId -match 'NoMatchingEventsFound') {
+            [void]$L.Add('    Kernel-General 1: none')
+        } else {
+            [void]$L.Add('    Kernel-General 1: unreadable ' + $_.Exception.GetType().Name + ' (' + $_.FullyQualifiedErrorId + ')')
+        }
+    }
     [void]$L.Add('  freshness_consistency = ' + (Get-SnapshotFreshnessConsistency -BootUptimeSeconds $up -TickSeconds $tickSeconds))
+    $pick = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds $up -TickSeconds $tickSeconds -ClockJumpSeconds $clockJump
+    [void]$L.Add('  host_freshness_boot = ' + (Get-SnapshotHostFreshness -UptimeSeconds $up))
+    [void]$L.Add('  host_freshness_tick = ' + (Get-SnapshotHostFreshness -UptimeSeconds $tickSeconds))
+    [void]$L.Add('host_freshness: ' + $pick.Label)
+    [void]$L.Add('  basis = ' + $pick.Basis)
+    [void]$L.Add('  reason = ' + $pick.Reason)
     # Boot/sleep history from the System log (readable by a standard account): Kernel-Boot 27
     # carries BootType (cold boot / fast startup / resume from hibernation); Kernel-Power 42/107
     # are sleep entry / resume. Together they say what the tick-vs-boot gap was.

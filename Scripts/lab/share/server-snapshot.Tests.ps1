@@ -347,6 +347,73 @@ Test-Case 'the tolerance is 300 s: a 299 s gap is consistent, a 301 s gap is not
 }
 
 # -------------------------------------------------------------------------------------------
+# Get-SnapshotEventDataValue (generic EventData datum by name, either quote style)
+# -------------------------------------------------------------------------------------------
+
+New-Section 'Get-SnapshotEventDataValue'
+
+Test-Case 'reads a named datum from single- or double-quoted Data elements, null when absent' {
+    $xml = "<Event><EventData><Data Name='OldTime'>2026-09-05T09:40:30.000Z</Data><Data Name=""NewTime"">2026-09-05T18:40:30.000Z</Data><Data Name='Reason'>2</Data></EventData></Event>"
+    Assert-Equal '2026-09-05T09:40:30.000Z' (Get-SnapshotEventDataValue -Xml $xml -Name 'OldTime')
+    Assert-Equal '2026-09-05T18:40:30.000Z' (Get-SnapshotEventDataValue -Xml $xml -Name 'NewTime')
+    Assert-Equal '2' (Get-SnapshotEventDataValue -Xml $xml -Name 'Reason')
+    Assert-Equal $null (Get-SnapshotEventDataValue -Xml $xml -Name 'Missing')
+    Assert-Equal $null (Get-SnapshotEventDataValue -Xml $null -Name 'OldTime')
+}
+
+Test-Case 'the datum name is matched exactly, not as a prefix' {
+    $xml = "<EventData><Data Name='NewTimeZone'>x</Data><Data Name='NewTime'>y</Data></EventData>"
+    Assert-Equal 'y' (Get-SnapshotEventDataValue -Xml $xml -Name 'NewTime')
+}
+
+# -------------------------------------------------------------------------------------------
+# Select-SnapshotHostFreshnessLabel (dry run 5: gap of exactly 32400 s = 9 h = the host's UTC
+# offset, no sleep events -- a boot-time clock skew corrected later, not a sleep)
+# -------------------------------------------------------------------------------------------
+
+New-Section 'Select-SnapshotHostFreshnessLabel'
+
+Test-Case 'consistent boot and tick uptimes -> boot basis, boot-based label' {
+    $r = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 37830 -TickSeconds 37700 -ClockJumpSeconds $null
+    Assert-Equal 'boot' $r.Basis
+    Assert-Equal 'uptime-10h' $r.Label
+    Assert-Equal 'consistent' $r.Reason
+}
+
+Test-Case 'a gap matched by a clock jump after boot -> tick basis (the boot stamp was taken on a wrong clock)' {
+    $r = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 38556 -TickSeconds 6156 -ClockJumpSeconds 32399
+    Assert-Equal 'tick' $r.Basis
+    Assert-Equal 'uptime-1h' $r.Label '6156 s -> uptime-1h'
+    Assert-True ($r.Reason.StartsWith('clock-corrected-after-boot')) "reason, got [$($r.Reason)]"
+    Assert-True ($r.Reason -like '*jump=32399s*') 'the jump is quoted'
+    Assert-True ($r.Reason -like '*gap=32400s*') 'the gap is quoted'
+}
+
+Test-Case 'a gap NOT explained by any clock jump -> boot basis with the sleep/fast-startup suspicion' {
+    $r = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 38556 -TickSeconds 6156 -ClockJumpSeconds $null
+    Assert-Equal 'boot' $r.Basis
+    Assert-Equal 'uptime-10h' $r.Label
+    Assert-True ($r.Reason.StartsWith('fast-startup-or-sleep-suspected')) "reason, got [$($r.Reason)]"
+    $r2 = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 38556 -TickSeconds 6156 -ClockJumpSeconds 600
+    Assert-Equal 'boot' $r2.Basis 'a 600 s jump does not explain a 32400 s gap'
+}
+
+Test-Case 'tick unavailable -> boot basis, reason tick-unavailable' {
+    $r = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 38556 -TickSeconds -3 -ClockJumpSeconds 32400
+    Assert-Equal 'boot' $r.Basis
+    Assert-Equal 'tick-unavailable' $r.Reason
+}
+
+Test-Case 'the clock jump must match the gap within the 300 s tolerance, in either sign' {
+    $a = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 38556 -TickSeconds 6156 -ClockJumpSeconds 32101
+    Assert-Equal 'tick' $a.Basis '299 s off still matches'
+    $b = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 38556 -TickSeconds 6156 -ClockJumpSeconds 32099
+    Assert-Equal 'boot' $b.Basis '301 s off does not'
+    $c = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 38556 -TickSeconds 6156 -ClockJumpSeconds -32400
+    Assert-Equal 'tick' $c.Basis 'a negative jump of the same magnitude matches too'
+}
+
+# -------------------------------------------------------------------------------------------
 # Kernel-Boot event 27 BootType (System log; XML EventData, locale-independent)
 # -------------------------------------------------------------------------------------------
 
