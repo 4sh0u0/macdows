@@ -244,13 +244,19 @@ function Get-SnapshotFreshnessConsistency {
 }
 
 function Get-SnapshotBootTypeFromXml {
-    <# Kernel-Boot event 27's BootType datum from the event XML (locale-independent). #>
+    <#
+      Kernel-Boot event 27's BootType datum from the event XML (locale-independent). The
+      manifest renders it as HexInt32 -- "0x1" -- which is what dry run 3 met (all five events
+      read unknown under a decimal-only pattern); a plain decimal is accepted as well.
+    #>
     [CmdletBinding()]
     param([AllowNull()][string] $Xml)
     if ([string]::IsNullOrEmpty($Xml)) { return $null }
-    $m = [regex]::Match($Xml, '<Data Name="BootType">(\d+)</Data>')
+    $m = [regex]::Match($Xml, '<Data Name="BootType">(0x[0-9A-Fa-f]+|[0-9]+)</Data>')
     if (-not $m.Success) { return $null }
-    return [int]$m.Groups[1].Value
+    $v = $m.Groups[1].Value
+    if ($v.StartsWith('0x')) { return [int][Convert]::ToInt32($v.Substring(2), 16) }
+    return [int]$v
 }
 
 function Format-SnapshotBootType {
@@ -415,7 +421,17 @@ function Invoke-SnapshotCollection {
             $evs = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = $q.Provider; Id = $q.Id } -MaxEvents $q.Max -ErrorAction Stop)
             foreach ($e in $evs) {
                 $extra = ''
-                if ($q.BootType) { $extra = ' boot_type=' + (Format-SnapshotBootType -BootType (Get-SnapshotBootTypeFromXml -Xml $e.ToXml())) }
+                if ($q.BootType) {
+                    $xml = $e.ToXml()
+                    $bt = Get-SnapshotBootTypeFromXml -Xml $xml
+                    $extra = ' boot_type=' + (Format-SnapshotBootType -BootType $bt)
+                    if ($null -eq $bt) {
+                        # Unparsed: show the EventData so the next fold can see the real shape.
+                        $ed = [regex]::Match($xml, '<EventData>.*?</EventData>', 'Singleline').Value
+                        if ($ed.Length -gt 240) { $ed = $ed.Substring(0, 240) + '...' }
+                        $extra = $extra + ' eventdata=' + $ed
+                    }
+                }
                 [void]$L.Add(('    {0} {1}{2}' -f $q.Label, $e.TimeCreated.ToUniversalTime().ToString('o'), $extra))
             }
         } catch {

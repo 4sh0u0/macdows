@@ -357,6 +357,12 @@ Test-Case 'BootType is read from the EventData XML, not from the localised messa
     Assert-Equal 1 (Get-SnapshotBootTypeFromXml -Xml $xml)
 }
 
+Test-Case 'BootType rendered as HexInt32 (0x1, as the manifest renders it -- dry run 3 read unknown for all five events) parses too' {
+    Assert-Equal 1 (Get-SnapshotBootTypeFromXml -Xml '<EventData><Data Name="BootType">0x1</Data></EventData>')
+    Assert-Equal 0 (Get-SnapshotBootTypeFromXml -Xml '<EventData><Data Name="BootType">0x0</Data></EventData>')
+    Assert-Equal 2 (Get-SnapshotBootTypeFromXml -Xml '<EventData><Data Name="BootType">0x2</Data></EventData>')
+}
+
 Test-Case 'an event without a BootType datum yields null' {
     Assert-Equal $null (Get-SnapshotBootTypeFromXml -Xml '<Event><EventData><Data Name="Other">1</Data></EventData></Event>')
     Assert-Equal $null (Get-SnapshotBootTypeFromXml -Xml $null)
