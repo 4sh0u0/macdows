@@ -1244,6 +1244,21 @@ enum WindowSmokeGateSelfTest {
             "multiWindowGateCountsVisibleOrHarnessClosedNewWindows: a new window counts if still visible at finish or closed by this run's own close leg (and it showed content); a mere flash does not; pre-existing ids never do"
         )
 
+        // --- multi-window gate excludes the base app's own About windows ----------------------
+        // (F r2a, 2026-09-06 03:45: notepad never appeared after its ClientExecute, yet the gate read
+        // PASS `got 1, 1 still visible: 328166="关于Windows"` -- it had counted this run's OWN winver
+        // About, which happened to be created after `windowIdsBeforeExtraApps` was captured, as the
+        // extra app's content window -- docs/upgrade-gate/2026-09-f-live.md §2a. About-titled windows
+        // are never extra-app content in this harness's scenarios.)
+        expect(
+            MultiWindowGate.newContentWindowIds(visibleAtFinish: [5, 328166], closedByHarness: [], everSeenContent: [5, 328166], before: [5], exclude: [328166]).isEmpty
+                && MultiWindowGate.newContentWindowIds(visibleAtFinish: [5, 328166, 800], closedByHarness: [], everSeenContent: [5, 328166, 800], before: [5], exclude: [328166]) == [800]
+                && MultiWindowGate.newContentWindowIds(visibleAtFinish: [5, 800], closedByHarness: [], everSeenContent: [5, 800], before: [5], exclude: []) == [800]
+                // exclusion also applies to a harness-closed window
+                && MultiWindowGate.newContentWindowIds(visibleAtFinish: [5], closedByHarness: [328166], everSeenContent: [5, 328166], before: [5], exclude: [328166]).isEmpty,
+            "multiWindowGateExcludesBaseAppAboutWindows: an About-titled window of this run's own base app never counts as an extra-app content window, even when new, visible, or closed by us"
+        )
+
         // --- move/resize legs also observe the post-remap content rect -------------------------
         // (F0-2, 2026-09-02 F0 r1/r2: the resize leg's only observation was taken at the
         // WindowUpdate, when the local content rect still carried the OLD GFX-mapped size; the
@@ -2756,11 +2771,17 @@ enum MultiWindowGate {
     /// any window that merely flashed after the exec -- a popup, a transient dialog -- satisfy the
     /// count; binding it to our own SC_CLOSE targets keeps the causal link to the extra apps).
     /// `everSeenContent` still gates `closedByHarness`: a close target that never showed content
-    /// does not count either. `before` = `windowIdsBeforeExtraApps`, subtracted last.
+    /// does not count either. `before` = `windowIdsBeforeExtraApps`, subtracted last together with
+    /// `exclude` -- the ids of this run's OWN base-app About windows (F r2a, 2026-09-06: notepad
+    /// never appeared after its ClientExecute, yet the gate read PASS because the run's own winver
+    /// About had been created after `before` was captured and was counted as the extra app's
+    /// content window; docs/upgrade-gate/2026-09-f-live.md §2a). About-titled windows are never
+    /// extra-app content in this harness's scenarios, whatever the base app is.
     static func newContentWindowIds(
-        visibleAtFinish: Set<UInt32>, closedByHarness: Set<UInt32>, everSeenContent: Set<UInt32>, before: Set<UInt32>
+        visibleAtFinish: Set<UInt32>, closedByHarness: Set<UInt32>, everSeenContent: Set<UInt32>, before: Set<UInt32>,
+        exclude: Set<UInt32> = []
     ) -> Set<UInt32> {
-        visibleAtFinish.union(closedByHarness.intersection(everSeenContent)).subtracting(before)
+        visibleAtFinish.union(closedByHarness.intersection(everSeenContent)).subtracting(before).subtracting(exclude)
     }
 }
 
@@ -2916,6 +2937,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private var contentWindowsSeenAfterExtraApps: [UInt32: String] = [:]
     /// Every ExecResult with a nonzero (failed) result observed this run.
     private var failedExecResults: [String] = []
+    /// Every ServerExecuteResult seen, `program -> code` (0 = S_OK), for the multi-window
+    /// diagnostic: a gate that reads short must be able to say whether the exec was even answered.
+    private var execResultsSeen: [String] = []
     private var cycleIndex = 0
     private var cycleDeadline: Date?
     private var cycleStartedAt: Date?
@@ -4091,6 +4115,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // ClientExecute (e.g. RAIL_EXEC_E_FILE_NOT_FOUND) must not hide behind
             // leftover windows from an earlier session satisfying the count -- record
             // every failure so finish() can gate on none having occurred.
+            if event.kind == .execResult {
+                self.execResultsSeen.append("\(event.program) -> \(event.execResult)")
+            }
             if event.kind == .execResult, event.execResult != 0 {
                 self.failedExecResults.append("\(event.program) -> \(event.execResult)")
             }
@@ -7101,15 +7128,32 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 // never the lock-time target: a window merely aimed at and gone on its own must
                 // not read as "closed by us" (review multiwindow-gate-r2 I-1).
                 let closedByHarness = Set([moveResizeCloseTargetId, maximizeCloseTargetId].compactMap { $0 })
+                // This run's own base-app About windows never count as extra-app content (F r2a,
+                // 2026-09-06): identified by the same About-title heuristic the target locks use.
+                var aboutTitles: [UInt32: String] = contentWindowsSeenAfterExtraApps
+                for w in visibleWindows { aboutTitles[w.windowId] = w.title }
+                let aboutIds = Set(aboutTitles.filter { MoveResizeTarget.matches(title: $0.value, filter: nil) }.map(\.key))
                 let newContentIds = MultiWindowGate.newContentWindowIds(
                     visibleAtFinish: visibleNewContent, closedByHarness: closedByHarness,
-                    everSeenContent: Set(contentWindowsSeenAfterExtraApps.keys), before: windowIdsBeforeExtraApps
+                    everSeenContent: Set(contentWindowsSeenAfterExtraApps.keys), before: windowIdsBeforeExtraApps,
+                    exclude: aboutIds
                 )
+                if newContentIds.count < extraApps.count {
+                    // The line the F r2a record asked for: when the gate reads short, say what the
+                    // exec did return and what was set aside, so an invalid run is visible as such.
+                    print(
+                        "[extra-apps] DIAG: fewer new non-About content windows than extra apps -- expected >=\(extraApps.count), got \(newContentIds.count); "
+                            + "exec results seen: \(execResultsSeen.isEmpty ? "none" : execResultsSeen.joined(separator: ", ")); "
+                            + "About-titled windows set aside: \(aboutIds.isEmpty ? "none" : aboutIds.sorted().map { "\($0)=\"\(aboutTitles[$0] ?? "")\"" }.joined(separator: " | ")); "
+                            + "ids present before the execs: \(windowIdsBeforeExtraApps.count)"
+                    )
+                }
                 check(
                     newContentIds.count >= extraApps.count,
                     "multi-window scenario: >=\(extraApps.count) NEW content windows appeared after the extra "
-                        + "execs (still visible at finish, or closed by this run's own close leg) (got "
-                        + "\(newContentIds.count), \(visibleNewContent.count) still visible: "
+                        + "execs (still visible at finish, or closed by this run's own close leg; this run's own "
+                        + "About-titled windows excluded) (got "
+                        + "\(newContentIds.count), \(visibleNewContent.subtracting(aboutIds).count) still visible: "
                         + "\(newContentIds.sorted().map { "\($0)=\"\(contentWindowsSeenAfterExtraApps[$0] ?? "")\"" }.joined(separator: " | ")))"
                 )
                 check(
