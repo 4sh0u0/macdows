@@ -1501,8 +1501,17 @@ enum WindowSmokeGateSelfTest {
                 == "the only candidate (windowId=2; first WindowCreate never observed)"
                 && AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 5, firstSeenElapsed: -1), AboutTarget.Candidate(windowId: 3, firstSeenElapsed: -1)], prefer: .oldest)
                 == AboutTarget.Choice(windowId: 3, firstSeenElapsed: -1, tiedAtChosenTime: 2, runnerUpFirstSeen: -1)
+                // gate oldest-unobserved-r1 I-3: with NO stamped candidate the lowest-id tie-break decides under .newest too --
+                // an unobserved window can win .newest when every candidate is unobserved, not only when it is alone
+                && AboutTarget.pick(candidates: [AboutTarget.Candidate(windowId: 9, firstSeenElapsed: -1), AboutTarget.Candidate(windowId: 4, firstSeenElapsed: -1)], prefer: .newest)
+                == AboutTarget.Choice(windowId: 4, firstSeenElapsed: -1, tiedAtChosenTime: 2, runnerUpFirstSeen: -1)
+                // gate oldest-unobserved-r1 m-1: the full-tie, all-unobserved wording was reachable but unpinned
+                && AboutTarget.describe(AboutTarget.Choice(windowId: 3, firstSeenElapsed: -1, tiedAtChosenTime: 2, runnerUpFirstSeen: -1), of: 2, prefer: .oldest)
+                == "lowest id of 2 candidates (none observed at a first WindowCreate; oldest-wins did not decide)"
+                && AboutTarget.describe(AboutTarget.Choice(windowId: 4, firstSeenElapsed: -1, tiedAtChosenTime: 2, runnerUpFirstSeen: -1), of: 2, prefer: .newest)
+                == "lowest id of 2 candidates (none observed at a first WindowCreate; newest-wins did not decide)"
                 && FirstSeenClock().elapsed(of: 2) < 0,
-            "unobservedIsOldestByDefinition: a candidate whose first WindowCreate this run never drained (-1) beats every stamped candidate under .oldest and is named, not printed as -1.000s; under .newest it loses to any stamped candidate and wins only as the lone candidate; two unobserved break by lowest id; a fresh clock reads every id as unobserved"
+            "unobservedIsOldestByDefinition: a candidate whose first WindowCreate this run never drained (-1) beats every stamped candidate under .oldest and is named, not printed as -1.000s; under .newest it loses to any stamped candidate and wins only when none is stamped (alone, or lowest id among all-unobserved); an all-unobserved tie is worded as none observed under either preference; a fresh clock reads every id as unobserved"
         )
         // --- review about-target-r2 I-2 / m-4: the drain feeds the clock through ONE observe(kind:) step, so
         // "only a WindowCreate records, a WindowDelete forgets (a recycled id starts fresh)" is pinned ---
@@ -2612,8 +2621,9 @@ struct FirstSeenClock {
     /// so it is at least as old as anything this run created -- "never observed" == "pre-dates this
     /// run" == oldest. Consequences, pinned in `unobservedIsOldestByDefinition`: under `.oldest` an
     /// unobserved candidate beats every stamped one (two unobserved break by lowest id); under
-    /// `.newest` it never wins unless it is the only candidate; `describe` names it ("first
-    /// WindowCreate never observed") and never prints -1.000s.
+    /// `.newest` it loses to every stamped candidate and wins only when none is stamped -- alone,
+    /// or the lowest id among all-unobserved candidates (gate oldest-unobserved-r1 I-3); `describe`
+    /// names it ("first WindowCreate never observed") and never prints -1.000s.
     func elapsed(of windowId: UInt32) -> TimeInterval { stamps[windowId] ?? -1 }
 
     func candidates(for windowIds: [UInt32]) -> [AboutTarget.Candidate] {
