@@ -1601,8 +1601,17 @@ enum WindowSmokeGateSelfTest {
                 // the two RAIL order-field bits the live wiring keys on (WindowOrderField in MacdowsCore/WindowModel.swift)
                 && RailComparison.OrderField.wndOffset == 0x0000_0800
                 && RailComparison.OrderField.wndSize == 0x0000_0400
-                && RailComparison.OrderField.style == 0x0000_0008,
-            "railComparisonBorderModelsAreTheTwoMeasuredOnes: About-calibrated (7,0,7,7) is the default (right/bottom 7 are a single-run reading, n=1); THICKFRAME (5,0,5,5) is the F-R1 measurement (n=8 independent runs, memo :101); the wiring's field bits are WND_OFFSET 0x800, WND_SIZE 0x400 and STYLE 0x8"
+                && RailComparison.OrderField.style == 0x0000_0008
+                // review border-per-style-r2 I-3: the fixture's WS_THICKFRAME literal is a forced duplicate of MacdowsCore's
+                // internal `StyleTranslator.styleThickFrame`; feeding it through the production seam pins the two copies
+                // to each other (a different bit here would make production answer 7 for it), and both left values too
+                && RailComparison.Borders.wsThickFrame == 0x0004_0000
+                && WindowGeometry.clientWindowMoveLeftBorder(forStyle: RailComparison.Borders.wsThickFrame) == WindowGeometry.thickFrameClientWindowMoveLeftBorder
+                && WindowGeometry.clientWindowMoveLeftBorder(forStyle: 0x000B_0000) == WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder
+                && RailComparison.Borders.forStyleBits(0x000B_0000) == RailComparison.Borders.aboutCalibrated
+                && Double(RailComparison.Borders.thickFrameMeasured.left) == WindowGeometry.thickFrameClientWindowMoveLeftBorder
+                && Double(RailComparison.Borders.aboutCalibrated.left) == WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder,
+            "railComparisonBorderModelsAreTheTwoMeasuredOnes: About-calibrated (7,0,7,7) is the default (right/bottom 7 are a single-run reading, n=1); THICKFRAME (5,0,5,5) is the F-R1 measurement (n=9 independent runs, memo :101); the fixture's WS_THICKFRAME literal and both left values agree with MacdowsCore's production seam (WindowGeometry.clientWindowMoveLeftBorder(forStyle:)) -- pinned, not assumed (review border-per-style-r2 I-3); the wiring's field bits are WND_OFFSET 0x800, WND_SIZE 0x400 and STYLE 0x8"
         )
         // style bits from the RAIL WindowCreate (the `[style-dump] style=0x…` value): WS_THICKFRAME (0x00040000)
         // selects the measured THICKFRAME model -- Notepad 0x000F0000 and Realtek 0x800F0000 carry it, About
@@ -3266,8 +3275,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// judged or to an earlier one -- an unlabelled "the deduction was N" taken from the previous
     /// leg's send is exactly the silent absorption §6.2 forbids.
     /// adr/0015 §6.2 measurement inputs, per window: the last RAIL-reported client-area OFFSET (only from
-    /// orders that carried WINDOW_ORDER_FIELD_WND_OFFSET, 0x800) and the WindowCreate/Update style bits (only
-    /// from orders that carried WINDOW_ORDER_FIELD_STYLE, 0x8). Sizes come from the registry's accumulated
+    /// orders that carried WINDOW_ORDER_FIELD_WND_OFFSET, 0x800) and the WindowCreate style bits (only
+    /// from WindowCreate orders that carried WINDOW_ORDER_FIELD_STYLE, 0x8, and only in runs that launch extra
+    /// apps or run the popup scenario -- see the write site; a style-bearing WindowUpdate never updates them).
+    /// Sizes come from the registry's accumulated
     /// RAIL size at comparison time, the same state its own sizeCorrection uses.
     private var latestRailOffset: [UInt32: (x: Int, y: Int, elapsed: TimeInterval)] = [:]
     /// When the last size-bearing RAIL order (WINDOW_ORDER_FIELD_WND_SIZE, 0x400) arrived, per window -- the
@@ -5056,7 +5067,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // holds the target's WindowCreate style, and only in runs that launch extra apps or run
             // the popup scenario (its write site); a style-bearing WindowUpdate never updates it.
             // Otherwise it reads 0 and the seam yields the About-calibrated 7 even for a THICKFRAME
-            // target -- an over-reservation of 2 px against the 20 pt margin, i.e. the safe direction,
+            // target -- an over-reservation of 2 remote px (2 pt at this host's 1x) against the 20 pt
+            // margin, i.e. the safe direction,
             // not "exactly as production" (production reads `PendingWindowState.style`, which updates
             // carry too). The bounds are in pt, so convert (I-3).
             let leftBorderRemotePx = WindowGeometry.clientWindowMoveLeftBorder(forStyle: windowStyleBits[windowId] ?? 0)

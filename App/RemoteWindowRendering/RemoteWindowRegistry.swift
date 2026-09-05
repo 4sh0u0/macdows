@@ -2132,6 +2132,11 @@ final class RemoteWindowRegistry {
         // window they are correcting (the same-read discipline §5.A.4 applies to the topology).
         // Comment-level discipline only: no test pins the sharing (review border-per-style-r1
         // m-7, mutant N2 survives), and the refactor is behaviour-preserving either way.
+        // `?? PendingWindowState()` is a SECOND source of `style == 0` reaching the seam below,
+        // besides "no order ever carried WINDOW_ORDER_FIELD_STYLE": defensively, when
+        // `geometry[windowId]` has already been dropped by `handleWindowDelete`. It looks
+        // unreachable (the delete path cancels the pending settle via `close(via:)` first) and no
+        // test reaches that branch (review border-per-style-r2 m-5, mutant NEW-C survives).
         let state = geometry[windowId] ?? PendingWindowState()
         let correction = sizeCorrection(for: state, windowId: windowId)
         let railWindowsRect = WindowGeometry.railRect(from: displayedWindowsRect, correction: correction)
@@ -2144,7 +2149,8 @@ final class RemoteWindowRegistry {
         // adjusted (no matching evidence, and a naive symmetric-border guess for width would
         // actually contradict the already-validated size-correction sign).
         //
-        // F6 (a), F-R1 (2026-09-02): HOW MUCH is deducted is not one constant -- it is a
+        // F6 (a), the 2026-09-05 per-style lane on F-R1 (found 2026-09-02): HOW MUCH is deducted
+        // is not one constant -- it is a
         // function of this window's own `style`, and the decision (with both measured values
         // and their records) lives in `WindowGeometry.clientWindowMoveLeftBorder(forStyle:)`.
         // Same "the real decision is a pure MacdowsCore function, this is just field plumbing"

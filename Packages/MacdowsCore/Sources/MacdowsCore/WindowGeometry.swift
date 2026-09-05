@@ -425,7 +425,9 @@ extension WindowGeometry {
     /// directly through adr/0015 §6.2's measurement field, `frame=(5,0,5,5)` on all ten legs
     /// (its record entry, `scaledmap-next-step.md:109`).
     ///
-    /// The frame's top member measured 0 in both models (n=9). `clientWindowMoveLeft` has no
+    /// The frame's top member measured 0 in both models -- n=9 on the THICKFRAME side (the F-R1
+    /// counter) and n=1 on the About side (C-2 run 4's single (7,0,7,7) reading; the 2026-08-23
+    /// runs measured `left` only). `clientWindowMoveLeft` has no
     /// `top` sibling for a DIFFERENT reason -- Y was never exercised in the 2026-08-23 round (its
     /// own doc comment, a still-registered gap) -- and these measurements are consistent with,
     /// but do not close, that gap; the same doc explains why there is no `right`/width sibling.
@@ -473,9 +475,14 @@ extension WindowGeometry {
     ///
     /// The same rule, as a measurement-only fixture seam, is `RailComparison.Borders`
     /// `.forStyleBits` in `Tools/window-smoke/main.swift` -- that copy prints §6.2's comparison
-    /// and never feeds the wire; this one is the production decision. They agree by
-    /// construction on the same bit and the same two values, and a divergence between them is a
-    /// bug in whichever was edited alone.
+    /// and never feeds the wire; this one is the production decision. They are written to agree
+    /// on the same bit and the same two values, but NOT by construction: `StyleTranslator
+    /// .styleThickFrame` is internal to this module, so the fixture necessarily carries its own
+    /// literal (`RailComparison.Borders.wsThickFrame`). The agreement is pinned instead by the
+    /// fixture's self-test, which feeds that literal through this function
+    /// (`railComparisonBorderModelsAreTheTwoMeasuredOnes`; review border-per-style-r2 I-3 showed
+    /// the bit was unpinned before). A divergence is a bug in whichever was edited alone, and
+    /// outside that pin it would surface only as a wrong §6.2 measurement line.
     ///
     /// UNIT: **remote px**, the same domain `clientWindowMoveLeft`'s parameters are in.
     public static func clientWindowMoveLeftBorder(forStyle style: UInt32) -> Double {

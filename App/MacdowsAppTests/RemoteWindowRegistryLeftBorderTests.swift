@@ -3,8 +3,8 @@ import MacdowsCore
 import Testing
 
 // F-R1 (`docs/upgrade-gate/2026-09-resize-leg-live.md:32`, running count in
-// `docs/upgrade-gate/2026-09-scaledmap-next-step.md:101`): the DWM invisible-frame left
-// thickness `ClientWindowMove` has to deduct depends on the window's Win32 STYLE -- 5 remote px
+// `docs/upgrade-gate/2026-09-scaledmap-next-step.md:101`): the left inset the server applies to a
+// sent `ClientWindowMove` (modelled as DWM's invisible frame) depends on the window's Win32 STYLE -- 5 remote px
 // for a `WS_THICKFRAME` window, 7 for the About dialog it was originally calibrated on, both
 // measured on the same 1x host. `MacdowsCore.WindowGeometry.clientWindowMoveLeftBorder(
 // forStyle:)` is that rule and `WindowGeometryTests` pins its arithmetic offline.
