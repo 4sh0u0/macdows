@@ -551,8 +551,8 @@ Test-Case 'the LSM event ids that matter for same-session reasoning are named; a
     Assert-Equal 'reconnect' (Format-SnapshotSessionEventName -Id 25)
     Assert-Equal 'disconnected-by-other-session' (Format-SnapshotSessionEventName -Id 39)
     Assert-Equal 'disconnect-reason' (Format-SnapshotSessionEventName -Id 40)
-    Assert-Equal 'arbitration-begin' (Format-SnapshotSessionEventName -Id 41)
-    Assert-Equal 'arbitration-end' (Format-SnapshotSessionEventName -Id 42)
+    Assert-Equal 'arbitration-begin(unconfirmed)' (Format-SnapshotSessionEventName -Id 41)
+    Assert-Equal 'arbitration-end(unconfirmed)' (Format-SnapshotSessionEventName -Id 42)
     Assert-Equal 'other' (Format-SnapshotSessionEventName -Id 43)
     Assert-Equal 'other' (Format-SnapshotSessionEventName -Id $null)
 }

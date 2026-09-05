@@ -427,8 +427,10 @@ function Format-SnapshotSessionEventName {
     <#
       LocalSessionManager/Operational event ids that matter when asking "is this the same session
       the previous client left behind": 21 logon, 22 shell start, 23 logoff, 24 disconnect,
-      25 reconnect, 39 disconnected by another session, 40 disconnect reason code, 41/42 session
-      arbitration begin/end. Everything else is 'other' (memo section 5, T6-prime clause (c)).
+      25 reconnect, 39 disconnected by another session, 40 disconnect reason code -- documented
+      meanings; 41/42 are named 'arbitration begin/end' from observation only (dry runs 9/10 show them
+      bracketing every reconnect) and carry an (unconfirmed) qualifier. Everything else is 'other'
+      (memo section 5, T6-prime clause (c)).
     #>
     [CmdletBinding()]
     param($Id)
@@ -441,8 +443,8 @@ function Format-SnapshotSessionEventName {
         25 { return 'reconnect' }
         39 { return 'disconnected-by-other-session' }
         40 { return 'disconnect-reason' }
-        41 { return 'arbitration-begin' }
-        42 { return 'arbitration-end' }
+        41 { return 'arbitration-begin(unconfirmed)' }
+        42 { return 'arbitration-end(unconfirmed)' }
     }
     return 'other'
 }
