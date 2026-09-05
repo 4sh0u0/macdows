@@ -153,10 +153,12 @@ Test-Case 'Wordpad is NOT selected: the rdp inside "Wordpad" is not the RDP toke
 }
 
 Test-Case 'the hyphenated RDMS channel is selected by the optional hyphen, not by another token' {
-    # Remove every other alternative from the fixture: the only thing that can select this name
-    # is Remote-?Desktop matching "Remote-Desktop".
-    $sel = @(Select-SnapshotLogName -Names @('Microsoft-Windows-Remote-Desktop-Management-Service/Admin'))
+    $name = 'Microsoft-Windows-Remote-Desktop-Management-Service/Admin'
+    $sel = @(Select-SnapshotLogName -Names @($name))
     Assert-Equal 1 $sel.Count
+    # Pin the claim rather than assert it in a comment (r1): the name matches none of the other
+    # alternatives on their own, so Remote-?Desktop is what admitted it.
+    Assert-True ($name -notmatch 'TerminalServices|Remote-?App|RemoteFX|Rdms|(^|[-/ ])Rdp([-/ ]|$)|(?-i:Rdp[A-Z])') 'no other alternative matches this name'
 }
 
 Test-Case 'the bare tokens RemoteFX, Rdms and RDP select a channel named by them alone' {
@@ -246,6 +248,29 @@ Test-Case 'Format-SnapshotKeywordHitLine renders the counts in keyword order plu
     Assert-Equal 'scanned=7 graphics=1 scal=1 gfx=2 surface=1 any=4' $line
 }
 
+Test-Case 'Select-SnapshotScanText scans the rendered Message when there is one and the event XML otherwise (r1 B2: analytic channels carry no message)' {
+    Assert-Equal 'rendered text' (Select-SnapshotScanText -Message 'rendered text' -Xml '<Event>x</Event>')
+    Assert-Equal '<Event>x</Event>' (Select-SnapshotScanText -Message $null -Xml '<Event>x</Event>')
+    Assert-Equal '<Event>x</Event>' (Select-SnapshotScanText -Message '' -Xml '<Event>x</Event>')
+    Assert-Equal '' (Select-SnapshotScanText -Message $null -Xml $null)
+}
+
+Test-Case 'Format-SnapshotScanLine: a readable channel renders scanned, no_message, per-keyword, any and any3 (memo three only)' {
+    # The shared fixture's surface message also says GFX, so any3 would equal any there; add a
+    # surface-only message so the two columns must differ (any=5, any3=4).
+    $msgs = @($fixtureMessages) + @('Surface-only line, nothing else.')
+    $hit = Measure-SnapshotKeywordHit -Messages $msgs -Keywords $script:SnapshotKeywords
+    $hit3 = Measure-SnapshotKeywordHit -Messages $msgs -Keywords @($script:SnapshotKeywords[0..2])
+    $line = Format-SnapshotScanLine -Readable 'true' -Hit $hit -Hit3 $hit3 -NoMessage 2 -Keywords $script:SnapshotKeywords
+    Assert-Equal 'readable=true scanned=8 no_message=2 graphics=1 scal=1 gfx=2 surface=2 any=5 any3=4' $line
+}
+
+Test-Case 'Format-SnapshotScanLine: an unreadable channel renders <not-scanned>, never zero counts (r1 test-honesty note)' {
+    $hit = Measure-SnapshotKeywordHit -Messages @() -Keywords $script:SnapshotKeywords
+    $line = Format-SnapshotScanLine -Readable 'false UnauthorizedAccessException (x)' -Hit $hit -Hit3 $hit -NoMessage 0 -Keywords $script:SnapshotKeywords
+    Assert-Equal 'readable=false UnauthorizedAccessException (x) scanned=<not-scanned>' $line
+}
+
 # -------------------------------------------------------------------------------------------
 # Format-SnapshotWindowsBuild (format.md windows_build: 10.0.<build>.<ubr> | unknown)
 # -------------------------------------------------------------------------------------------
@@ -327,9 +352,9 @@ Test-Case 'boot-based and tick-based uptimes within tolerance are consistent' {
     Assert-Equal 'consistent' (Get-SnapshotFreshnessConsistency -BootUptimeSeconds 37830 -TickSeconds 37700)
 }
 
-Test-Case 'a tick-based uptime far below the boot-based one names a fast-startup or sleep gap with the three numbers' {
+Test-Case 'a tick-based uptime far below the boot-based one is reported as an unexplained gap with the three numbers -- no mechanism named (r1 B1)' {
     $r = Get-SnapshotFreshnessConsistency -BootUptimeSeconds 37830 -TickSeconds 5432
-    Assert-True ($r.StartsWith('fast-startup-or-sleep-suspected')) "label, got [$r]"
+    Assert-True ($r.StartsWith('boot-tick-gap-unexplained')) "label, got [$r]"
     Assert-True ($r -like '*tick=5432s*') 'tick seconds'
     Assert-True ($r -like '*boot=37830s*') 'boot seconds'
     Assert-True ($r -like '*gap=32398s*') 'gap = boot - tick'
@@ -343,7 +368,7 @@ Test-Case 'a negative (wrapped) tick or a boot uptime beyond the 32-bit range is
 
 Test-Case 'the tolerance is 300 s: a 299 s gap is consistent, a 301 s gap is not' {
     Assert-Equal 'consistent' (Get-SnapshotFreshnessConsistency -BootUptimeSeconds 10000 -TickSeconds 9701)
-    Assert-True ((Get-SnapshotFreshnessConsistency -BootUptimeSeconds 10000 -TickSeconds 9699).StartsWith('fast-startup-or-sleep-suspected'))
+    Assert-True ((Get-SnapshotFreshnessConsistency -BootUptimeSeconds 10000 -TickSeconds 9699).StartsWith('boot-tick-gap-unexplained'))
 }
 
 # -------------------------------------------------------------------------------------------
@@ -392,6 +417,15 @@ Test-Case 'a correction whose delta could not be parsed is skipped, not treated 
     Assert-Equal 100 (Measure-SnapshotClockJump -Events $ev -BootTime $bootStamp)
 }
 
+Test-Case 'a correction whose TimeCreated is on the set-back clock (before the boot stamp) still counts when its OldTime is after boot (r1 I3)' {
+    # Boot stamp 18:40:10; one hour later the clock is set back nine hours: the event is stamped
+    # 10:40 (new clock, before boot) but its OldTime 19:40 is after boot.
+    $ev = @([pscustomobject]@{ Time = [datetime]::new(2026, 9, 5, 10, 40, 10); Old = [datetime]::new(2026, 9, 5, 19, 40, 10); Delta = -32400 })
+    Assert-Equal -32400 (Measure-SnapshotClockJump -Events $ev -BootTime $bootStamp)
+    $pre = @([pscustomobject]@{ Time = [datetime]::new(2026, 9, 5, 10, 40, 10); Old = [datetime]::new(2026, 9, 5, 10, 40, 0); Delta = -32400 })
+    Assert-Equal $null (Measure-SnapshotClockJump -Events $pre -BootTime $bootStamp) 'both stamps before boot -> not since boot'
+}
+
 Test-Case 'no corrections since boot -> null (no jump), not 0' {
     Assert-Equal $null (Measure-SnapshotClockJump -Events @($clockEvents[3], $clockEvents[4]) -BootTime $bootStamp)
     Assert-Equal $null (Measure-SnapshotClockJump -Events @() -BootTime $bootStamp)
@@ -421,13 +455,22 @@ Test-Case 'a gap matched by a clock jump after boot -> tick basis (the boot stam
     Assert-True ($r.Reason -like '*gap=32400s*') 'the gap is quoted'
 }
 
-Test-Case 'a gap NOT explained by any clock jump -> boot basis with the sleep/fast-startup suspicion' {
+Test-Case 'a gap NOT explained by any clock jump -> no basis, label unknown (r1 I3: never a fabricated freshness), reason names the gap' {
     $r = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 38556 -TickSeconds 6156 -ClockJumpSeconds $null
-    Assert-Equal 'boot' $r.Basis
-    Assert-Equal 'uptime-10h' $r.Label
-    Assert-True ($r.Reason.StartsWith('fast-startup-or-sleep-suspected')) "reason, got [$($r.Reason)]"
+    Assert-Equal 'none' $r.Basis
+    Assert-Equal 'unknown' $r.Label
+    Assert-True ($r.Reason.StartsWith('boot-tick-gap-unexplained')) "reason, got [$($r.Reason)]"
     $r2 = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 38556 -TickSeconds 6156 -ClockJumpSeconds 600
-    Assert-Equal 'boot' $r2.Basis 'a 600 s jump does not explain a 32400 s gap'
+    Assert-Equal 'none' $r2.Basis 'a 600 s jump does not explain a 32400 s gap'
+    Assert-Equal 'unknown' $r2.Label
+}
+
+Test-Case 'a clock set BACK after boot (tick exceeds boot) with a matching negative jump -> tick basis, label from the tick (r1 I3 scenario: 10 h up, not 1 h)' {
+    $r = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 3600 -TickSeconds 36000 -ClockJumpSeconds -32400
+    Assert-Equal 'tick' $r.Basis
+    Assert-Equal 'uptime-10h' $r.Label
+    $r2 = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 3600 -TickSeconds 36000 -ClockJumpSeconds $null
+    Assert-Equal 'unknown' $r2.Label 'without the jump the 1 h boot reading must NOT be reported as freshness'
 }
 
 Test-Case 'tick unavailable -> boot basis, reason tick-unavailable' {
@@ -436,13 +479,19 @@ Test-Case 'tick unavailable -> boot basis, reason tick-unavailable' {
     Assert-Equal 'tick-unavailable' $r.Reason
 }
 
-Test-Case 'the clock jump must match the gap within the 300 s tolerance, in either sign' {
+Test-Case 'the clock jump must match the gap within 300 s WITH its sign: gap = sum of corrections, so a set-back cannot explain a forward gap (r1 I1)' {
     $a = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 38556 -TickSeconds 6156 -ClockJumpSeconds 32101
     Assert-Equal 'tick' $a.Basis '299 s off still matches'
     $b = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 38556 -TickSeconds 6156 -ClockJumpSeconds 32099
-    Assert-Equal 'boot' $b.Basis '301 s off does not'
+    Assert-Equal 'none' $b.Basis '301 s off does not'
     $c = Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 38556 -TickSeconds 6156 -ClockJumpSeconds -32400
-    Assert-Equal 'tick' $c.Basis 'a negative jump of the same magnitude matches too'
+    Assert-Equal 'none' $c.Basis 'a negative jump of the same magnitude does NOT explain a positive gap'
+}
+
+Test-Case 'a jump only counts as an explanation when it is itself larger than the tolerance (r1 I2: 1 s must not explain 301 s)' {
+    Assert-Equal 'none' (Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 6457 -TickSeconds 6156 -ClockJumpSeconds 1).Basis 'gap 301, jump 1'
+    Assert-Equal 'none' (Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 6756 -TickSeconds 6156 -ClockJumpSeconds 300).Basis 'gap 600, jump 300 (residual 300 but jump not > 300)'
+    Assert-Equal 'tick' (Select-SnapshotHostFreshnessLabel -BootUptimeSeconds 6756 -TickSeconds 6156 -ClockJumpSeconds 301).Basis 'gap 600, jump 301'
 }
 
 # -------------------------------------------------------------------------------------------

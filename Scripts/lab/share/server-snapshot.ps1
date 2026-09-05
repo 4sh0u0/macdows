@@ -5,16 +5,23 @@
 
 .DESCRIPTION
     Standard lab account, no elevation, nothing written on the host. One report goes back over
-    the redirected drive; it is rewritten at three checkpoints (after winver/freshness, after the
-    registry section, at the end) so a relay TIMEOUT still leaves the sections that finished --
-    the same shape tsallowlist-matrix-verify.ps1 uses and for the same reason.
+    the redirected drive; it is rewritten at every checkpoint -- immediately at start (so a run
+    that dies early cannot leave the PREVIOUS run's complete report on the drive, r1 B3), after
+    winver/freshness, after the registry section, after the channel list, after every channel,
+    and at the end -- so a relay TIMEOUT still leaves the sections that finished; the same shape
+    tsallowlist-matrix-verify.ps1 uses and for the same reason.
 
     What it collects (docs/upgrade-gate/2026-09-scaledmap-next-step.md section 3, rows A and E):
 
       winver / host_freshness  -- the two matrix fields (docs/matrix/format.md section 2.1) that
                                   every live-host env record must carry: windows_build as
                                   10.0.<CurrentBuild>.<UBR> from HKLM CurrentVersion, and
-                                  host_freshness from Win32_OperatingSystem.LastBootUpTime.
+                                  host_freshness from EITHER Win32_OperatingSystem.LastBootUpTime
+                                  or the 32-bit tick count -- Select-SnapshotHostFreshnessLabel
+                                  decides which from the System log's clock-correction history
+                                  (Kernel-General 1), and writes `unknown` when neither is
+                                  trustworthy. Boot/sleep history (Kernel-Boot 27, Kernel-General
+                                  12/13, Kernel-Power 42/107) is printed alongside.
       E. configuration surface -- every value under the RDS-relevant registry keys listed in
                                   $script:SnapshotRegistryKeys (policy hive, Terminal Server,
                                   TSAppAllowList, the RDP-Tcp winstation, session DPI), rendered
@@ -25,9 +32,14 @@
                                   (Select-SnapshotLogName), each with enabled/record-count/mode
                                   and a readability probe (a standard account may be refused the
                                   Operational channels -- the refusal is itself a result), then
-                                  the newest events of every readable channel scanned for the
-                                  pre-registered keywords (graphics / scal / gfx, plus surface),
-                                  with counts per keyword and up to five sample hits.
+                                  then up to MaxEventsPerChannel events of every readable channel
+                                  (newest-first; Analytic/Debug channels can only be read
+                                  oldest-first and are marked so on their window line) scanned for
+                                  the pre-registered keywords (graphics / scal / gfx, plus surface)
+                                  in the rendered Message or, when an event has none (analytic
+                                  channels usually do not), in its XML; counts per keyword, any,
+                                  any3 (memo keywords only), no_message, and up to five sample
+                                  hits. Channels with at most three events list them all.
 
     Deliberately NOT written into the report: $env:COMPUTERNAME and $env:USERNAME. Event
     messages and registry values are copied verbatim, so the report may still carry host
@@ -35,8 +47,9 @@
     build strings are transcribed into docs.
 
     Windows PowerShell 5.1 notes: no ??, no ternary, no -Parallel; [Environment]::TickCount64
-    does not exist on .NET Framework, so the boot-time cross-check uses the 32-bit TickCount and
-    says so.
+    does not exist on .NET Framework, so the tick-based uptime uses the 32-bit TickCount (24.9-day
+    wrap guarded: tick-unavailable). Every [channel] and [reg] block carries its own UTC read time
+    and the literal cmdlet it ran (memo section 8 columns).
 
 .PARAMETER NoRun
     Define the functions but do not touch the host. Used by server-snapshot.Tests.ps1 to
@@ -122,6 +135,47 @@ $script:SnapshotRegistryKeys = @(
 # -------------------------------------------------------------------------------------------
 # Pure helpers (no host state; exercised off-Windows by the test suite)
 # -------------------------------------------------------------------------------------------
+
+function Get-SnapshotProp {
+    <# A property value, or null when the object is null or lacks the property (StrictMode-safe). #>
+    [CmdletBinding()]
+    param([AllowNull()] $Object, [string] $Name)
+    if ($null -eq $Object) { return $null }
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($null -eq $prop) { return $null }
+    return $prop.Value
+}
+
+function Select-SnapshotScanText {
+    <#
+      The text a keyword scan runs over for one event: the rendered Message when the event has
+      one, otherwise its XML (analytic/debug channels usually carry no message resource -- r1 B2:
+      scanning Message alone reported them as scanned-and-clean).
+    #>
+    [CmdletBinding()]
+    param([AllowNull()] $Message, [AllowNull()] $Xml)
+    if ($null -ne $Message -and ([string]$Message).Length -gt 0) { return [string]$Message }
+    if ($null -ne $Xml) { return [string]$Xml }
+    return ''
+}
+
+function Format-SnapshotScanLine {
+    <#
+      The per-channel result line. Unreadable channels render `scanned=<not-scanned>` instead of
+      a row of zeros, so a refusal can never be misread as "scanned and clean".
+    #>
+    [CmdletBinding()]
+    param([string] $Readable, $Hit, $Hit3, [int] $NoMessage, [string[]] $Keywords)
+    if ($Readable -like 'false*') { return "readable=$Readable scanned=<not-scanned>" }
+    $parts = New-Object System.Collections.ArrayList
+    [void]$parts.Add("readable=$Readable")
+    [void]$parts.Add("scanned=$($Hit.Scanned)")
+    [void]$parts.Add("no_message=$NoMessage")
+    foreach ($k in $Keywords) { [void]$parts.Add("$k=$($Hit.PerKeyword[$k])") }
+    [void]$parts.Add("any=$($Hit.Any)")
+    [void]$parts.Add("any3=$($Hit3.Any)")
+    return ($parts.ToArray() -join ' ')
+}
 
 function Select-SnapshotLogName {
     <# The RDS-related subset of a list of event log names, input order kept. #>
@@ -219,16 +273,15 @@ function Get-SnapshotHostFreshness {
 function Get-SnapshotFreshnessConsistency {
     <#
       Compares the boot-based uptime (Win32_OperatingSystem LastBootUpTime) with the tick-based
-      one ([Environment]::TickCount). Dry run 2 read 37830 s against 5432 s on a host the owner
-      had powered on 90 minutes earlier: Windows Fast Startup hibernates the kernel session, so
-      LastBootUpTime survives a shutdown/power-on while the tick count does not -- the boot-based
-      label is the right host_freshness for termsrv churn (the service state survives too), and
-      this line is what tells the reader which regime the host is in.
-        consistent                       |gap| <= tolerance
-        fast-startup-or-sleep-suspected  boot exceeds tick by more than the tolerance
-        inconsistent                     tick exceeds boot by more than the tolerance
-        tick-unavailable                 null boot, negative (wrapped) tick, or boot past the
-                                         32-bit tick range (2147483 s)
+      one ([Environment]::TickCount) and names the gap WITHOUT naming a mechanism (r1 B1: an
+      earlier version called it fast-startup/sleep; dry runs 5-7 showed the only gap this host
+      produces is a boot-time clock error later corrected -- 37830 vs 5432 s on dry run 2 was
+      already that same nine-hour offset). Which mechanism explains a gap is decided by
+      Select-SnapshotHostFreshnessLabel from the clock-correction history, never here.
+        consistent                  |gap| <= tolerance
+        boot-tick-gap-unexplained   |gap| > tolerance, either sign (gap = boot - tick is quoted)
+        tick-unavailable            null boot, negative (wrapped) tick, or boot past the 32-bit
+                                    tick range (2147483 s)
     #>
     [CmdletBinding()]
     param($BootUptimeSeconds, $TickSeconds, [int] $ToleranceSeconds = 300)
@@ -239,8 +292,7 @@ function Get-SnapshotFreshnessConsistency {
     $gap = [int][math]::Round($boot - $tick)
     if ([math]::Abs($gap) -le $ToleranceSeconds) { return 'consistent' }
     $detail = ('(tick={0}s boot={1}s gap={2}s)' -f [int][math]::Round($tick), [int][math]::Round($boot), $gap)
-    if ($gap -gt 0) { return "fast-startup-or-sleep-suspected $detail" }
-    return "inconsistent $detail"
+    return "boot-tick-gap-unexplained $detail"
 }
 
 function Get-SnapshotEventDataValue {
@@ -280,6 +332,9 @@ function Measure-SnapshotClockJump {
       Net clock correction since boot: the sum of the Kernel-General 1 deltas stamped at or after
       the boot stamp. Dry run 6 showed the nine hours arrive as TWO corrections (+28671 s, then
       +3729 s an hour later); the newest alone does not account for the gap, the sum does.
+      "Since boot" means TimeCreated at or after the boot stamp OR OldTime at or after it (r1 I3):
+      a correction that sets the clock BACK is stamped on the new, earlier clock and can land
+      before the boot stamp although it happened after boot -- its OldTime says so.
       Deltas that could not be parsed are skipped; null when there is nothing to sum (no events
       since boot, or no boot time), so the caller can tell "no correction" from "corrected by 0".
     #>
@@ -290,7 +345,9 @@ function Measure-SnapshotClockJump {
     $n = 0
     foreach ($e in $Events) {
         if ($null -eq $e) { continue }
-        if ($e.Time -lt $BootTime) { continue }
+        $old = Get-SnapshotProp -Object $e -Name 'Old'
+        $sinceBoot = ($e.Time -ge $BootTime) -or ($null -ne $old -and $old -ge $BootTime)
+        if (-not $sinceBoot) { continue }
         $d = $e.Delta
         if ($null -eq $d) { continue }
         $parsed = 0
@@ -313,28 +370,37 @@ function Select-SnapshotHostFreshnessLabel {
       early, and the later correction shows up as Kernel-General 1 "system time changed" events
       whose old->new jumps SUM to the gap (Measure-SnapshotClockJump). In that regime the TICK
       count is the truthful "since boot" and the label is taken from it.
-        Basis boot: tick unavailable | gap within tolerance | gap NOT matched by a clock jump
-                    (then Reason carries Get-SnapshotFreshnessConsistency's suspicion)
-        Basis tick: |ClockJumpSeconds| matches |gap| within the tolerance
+        Basis boot: tick unavailable, or gap within tolerance
+        Basis tick: ClockJumpSeconds matches gap within the tolerance WITH ITS SIGN (gap = boot -
+                    tick = the net correction, r1 I1) and the jump itself exceeds the tolerance
+                    (r1 I2: a 1 s correction does not explain a 301 s gap)
+        Basis none: gap beyond tolerance and not explained -- Label is the matrix literal
+                    `unknown` (r1 I3: a boot reading on an unexplained gap could report a
+                    degraded host as fresh, the one direction adr/0012 section 4.7 forbids); the
+                    boot- and tick-based labels are still printed for the reader.
     #>
     [CmdletBinding()]
     param($BootUptimeSeconds, $TickSeconds, $ClockJumpSeconds, [int] $ToleranceSeconds = 300)
     $cons = Get-SnapshotFreshnessConsistency -BootUptimeSeconds $BootUptimeSeconds -TickSeconds $TickSeconds -ToleranceSeconds $ToleranceSeconds
     $basis = 'boot'
     $reason = $cons
-    if ($cons -ne 'tick-unavailable' -and $cons -ne 'consistent' -and $null -ne $ClockJumpSeconds) {
-        $gap = [int][math]::Round([double]$BootUptimeSeconds - [double]$TickSeconds)
-        $jump = [int][math]::Round([double]$ClockJumpSeconds)
-        if ([math]::Abs([math]::Abs($jump) - [math]::Abs($gap)) -le $ToleranceSeconds) {
-            $basis = 'tick'
-            $reason = ('clock-corrected-after-boot (jump={0}s gap={1}s)' -f $jump, $gap)
+    if ($cons -ne 'tick-unavailable' -and $cons -ne 'consistent') {
+        $basis = 'none'
+        if ($null -ne $ClockJumpSeconds) {
+            $gap = [int][math]::Round([double]$BootUptimeSeconds - [double]$TickSeconds)
+            $jump = [int][math]::Round([double]$ClockJumpSeconds)
+            if ([math]::Abs($jump - $gap) -le $ToleranceSeconds -and [math]::Abs($jump) -gt $ToleranceSeconds) {
+                $basis = 'tick'
+                $reason = ('clock-corrected-after-boot (jump={0}s gap={1}s)' -f $jump, $gap)
+            }
         }
     }
-    $seconds = $BootUptimeSeconds
-    if ($basis -eq 'tick') { $seconds = $TickSeconds }
+    $label = 'unknown'
+    if ($basis -eq 'boot') { $label = Get-SnapshotHostFreshness -UptimeSeconds $BootUptimeSeconds }
+    if ($basis -eq 'tick') { $label = Get-SnapshotHostFreshness -UptimeSeconds $TickSeconds }
     return [pscustomobject]@{
         Basis  = $basis
-        Label  = (Get-SnapshotHostFreshness -UptimeSeconds $seconds)
+        Label  = $label
         Reason = $reason
     }
 }
@@ -388,21 +454,28 @@ function Add-SnapshotRegistrySection {
     [CmdletBinding()]
     param($Lines, $KeySpec)
     $path = $KeySpec.Path
-    if (-not (Test-Path -LiteralPath $path)) {
-        [void]$Lines.Add("[reg] $path : <key absent>")
-        foreach ($n in $KeySpec.Names) { [void]$Lines.Add("  $n = <absent>") }
-        return
-    }
+    $at = (Get-Date).ToUniversalTime().ToString('o')
+    # Get-Item first, not Test-Path: Test-Path folds "no such key" and "access denied" into one
+    # false, and a baseline snapshot must not record an unreadable key as unconfigured (r1 I8).
     $item = $null
     try { $item = Get-Item -LiteralPath $path -ErrorAction Stop } catch {
-        [void]$Lines.Add("[reg] $path : <unreadable " + $_.Exception.GetType().Name + '>')
+        if ($_.Exception -is [System.Management.Automation.ItemNotFoundException]) {
+            [void]$Lines.Add("[reg] $path : <key absent> at=$at")
+            [void]$Lines.Add("  cmd: Get-Item -LiteralPath '$path'")
+            foreach ($n in $KeySpec.Names) { [void]$Lines.Add("  $n = <absent>") }
+        } else {
+            [void]$Lines.Add("[reg] $path : <key unreadable " + $_.Exception.GetType().Name + "> at=$at")
+            [void]$Lines.Add("  cmd: Get-Item -LiteralPath '$path'")
+            foreach ($n in $KeySpec.Names) { [void]$Lines.Add("  $n = <unreadable>") }
+        }
         return
     }
     $present = @(Get-SnapshotRegistryValueNames -Path $path)
     $subkeys = @($item.GetSubKeyNames())
     $mode = 'all-values'
     if (-not $KeySpec.AllValues) { $mode = 'pre-registered-names-only' }
-    [void]$Lines.Add("[reg] $path : values=$($present.Count) subkeys=$($subkeys.Count) mode=$mode")
+    [void]$Lines.Add("[reg] $path : values=$($present.Count) subkeys=$($subkeys.Count) mode=$mode at=$at")
+    [void]$Lines.Add("  cmd: Get-Item -LiteralPath '$path'; .GetValue(<name>, `$null, DoNotExpandEnvironmentNames)")
     $reported = New-Object System.Collections.ArrayList
     $toDump = $present
     if (-not $KeySpec.AllValues) {
@@ -410,7 +483,10 @@ function Add-SnapshotRegistrySection {
         $toDump = @($present | Where-Object { $wanted -contains $_.ToLowerInvariant() })
     }
     foreach ($n in $toDump) {
-        $v = $item.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        # The provider shows the unnamed default value as "(default)"; the API reads it as "".
+        $apiName = $n
+        if ($n -eq '(default)') { $apiName = '' }
+        $v = $item.GetValue($apiName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
         [void]$Lines.Add("  $n = " + (ConvertTo-SnapshotValueText -Value $v))
         [void]$reported.Add($n.ToLowerInvariant())
     }
@@ -449,6 +525,10 @@ function Invoke-SnapshotCollection {
     $sn = '<unset>'
     if (Test-Path Env:SESSIONNAME) { $sn = $env:SESSIONNAME }
     [void]$L.Add("SessionId: $sid  SessionName: $sn")
+    # First write before anything slow runs: from here on the drive never holds a previous run's
+    # complete report under this run's name (r1 B3). A relay job that never starts the script
+    # (RAIL exec refused) still leaves the previous file -- the operator removes it before launch.
+    Write-Checkpoint 'started'
 
     # --- winver -------------------------------------------------------------------------------
     [void]$L.Add('')
@@ -466,7 +546,7 @@ function Invoke-SnapshotCollection {
         [void]$L.Add('windows_build: unknown')
         [void]$L.Add('  CurrentVersion unreadable: ' + $_.Exception.GetType().Name)
     }
-    [void]$L.Add('  OSVersion = ' + [Environment]::OSVersion.VersionString)
+    [void]$L.Add('  OSVersion = ' + [Environment]::OSVersion.VersionString + '   (secondary: subject to the .NET Framework compatibility manifest)')
 
     # --- host_freshness -------------------------------------------------------------------------
     [void]$L.Add('')
@@ -508,7 +588,9 @@ function Invoke-SnapshotCollection {
                 $d = ([DateTime]::Parse($newT, $inv, $rk) - [DateTime]::Parse($oldT, $inv, $rk)).TotalSeconds
                 $delta = [int][math]::Round($d)
             } catch { $delta = '<unparsed>' }
-            [void]$clockEvents.Add([pscustomobject]@{ Time = $e.TimeCreated; Delta = $delta })
+            $oldParsed = $null
+            try { $oldParsed = [DateTime]::Parse($oldT, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToLocalTime() } catch { }
+            [void]$clockEvents.Add([pscustomobject]@{ Time = $e.TimeCreated; Old = $oldParsed; Delta = $delta })
             [void]$L.Add(('    Kernel-General 1 {0} old={1} new={2} delta={3}s reason={4}' -f $e.TimeCreated.ToUniversalTime().ToString('o'), $oldT, $newT, $delta, $why))
         }
         $bootLocal = $null
@@ -539,9 +621,9 @@ function Invoke-SnapshotCollection {
         @{ Label = 'Kernel-Boot 27';    Provider = 'Microsoft-Windows-Kernel-Boot';    Id = 27; Max = 5; BootType = $true },
         @{ Label = 'Kernel-General 12'; Provider = 'Microsoft-Windows-Kernel-General'; Id = 12; Max = 3; BootType = $false },
         @{ Label = 'Kernel-General 13'; Provider = 'Microsoft-Windows-Kernel-General'; Id = 13; Max = 3; BootType = $false },
-        # Sleep/resume: dry run 4 showed every Kernel-Boot 27 as cold-boot and none at the
-        # 03:40 JST power-on the tick gap points at, so the gap is a sleep, not fast startup;
-        # Kernel-Power 42 (entering sleep) / 107 (resumed) are the events that say so directly.
+        # Kernel-Power 42 (entering sleep) / 107 (resumed): read so a sleep can be told apart from
+        # a clock correction when boot- and tick-based uptimes disagree. Dry runs 5-7 found none
+        # on this host; the gap there was the clock correction the Kernel-General 1 block shows.
         @{ Label = 'Kernel-Power 42';   Provider = 'Microsoft-Windows-Kernel-Power';   Id = 42;  Max = 3; BootType = $false },
         @{ Label = 'Kernel-Power 107';  Provider = 'Microsoft-Windows-Kernel-Power';   Id = 107; Max = 3; BootType = $false })) {
         try {
@@ -585,13 +667,16 @@ function Invoke-SnapshotCollection {
     [void]$L.Add('')
     [void]$L.Add('== A. event log channels')
     $allLogs = @()
+    $listErr = @()
     try {
         # -Force includes disabled analytic/debug channels in the listing. Channels this account
-        # may not even list are skipped by SilentlyContinue and counted below by their absence.
-        $allLogs = @(Get-WinEvent -ListLog * -Force -ErrorAction SilentlyContinue)
+        # cannot even list raise non-terminating errors; they are collected and COUNTED below
+        # (list_failures=), not silently dropped (r1 I7).
+        $allLogs = @(Get-WinEvent -ListLog * -Force -ErrorAction SilentlyContinue -ErrorVariable listErr)
     } catch {
         [void]$L.Add('ListLog failed: ' + $_.Exception.GetType().Name)
     }
+    [void]$L.Add('cmd: Get-WinEvent -ListLog * -Force   list_failures=' + @($listErr).Count)
     $selected = @(Select-SnapshotLogName -Names @($allLogs | ForEach-Object { $_.LogName }))
     [void]$L.Add("ListLog total=$($allLogs.Count) rds_related=$($selected.Count) keywords=" + ($script:SnapshotKeywords -join ','))
     $providers = @()
@@ -604,22 +689,32 @@ function Invoke-SnapshotCollection {
     Write-Checkpoint 'channel-list'
 
     foreach ($name in $selected) {
+      try {
         $info = $allLogs | Where-Object { $_.LogName -eq $name } | Select-Object -First 1
+        $at = (Get-Date).ToUniversalTime().ToString('o')
         $rc = '<n/a>'
-        if ($null -ne $info.RecordCount) { $rc = $info.RecordCount }
-        [void]$L.Add("[channel] $name enabled=$($info.IsEnabled) records=$rc mode=$($info.LogMode) type=$($info.LogType)")
+        $rcv = Get-SnapshotProp -Object $info -Name 'RecordCount'
+        if ($null -ne $rcv) { $rc = $rcv }
+        $logType = [string](Get-SnapshotProp -Object $info -Name 'LogType')
+        [void]$L.Add("[channel] $name enabled=$(Get-SnapshotProp -Object $info -Name 'IsEnabled') records=$rc mode=$(Get-SnapshotProp -Object $info -Name 'LogMode') type=$logType at=$at")
         $events = @()
         $readable = 'true'
         # Analytic and Debug channels can only be read oldest-first (Get-WinEvent refuses them
-        # otherwise: SpecifyOldestForLog -- every one dry run 2 met came back that way). They are
-        # normally disabled and empty, so oldest-first with the same cap loses nothing.
-        $oldest = ($info.LogType -eq 'Analytical' -or $info.LogType -eq 'Debug')
+        # otherwise: SpecifyOldestForLog -- every one dry run 2 met came back that way). The
+        # window line names the direction, because on an ENABLED analytic channel with more than
+        # MaxEventsPerChannel records the scanned slice is the OLD end (r1 I4).
+        $oldest = ($logType -eq 'Analytical' -or $logType -eq 'Debug')
+        $order = 'newest-first'
+        $cmd = "Get-WinEvent -LogName '$name' -MaxEvents $MaxEventsPerChannel"
+        if ($oldest) { $order = 'oldest-first'; $cmd = $cmd + ' -Oldest' }
+        [void]$L.Add("  cmd: $cmd")
         try {
             if ($oldest) {
                 $events = @(Get-WinEvent -LogName $name -MaxEvents $MaxEventsPerChannel -Oldest -ErrorAction Stop)
             } else {
                 $events = @(Get-WinEvent -LogName $name -MaxEvents $MaxEventsPerChannel -ErrorAction Stop)
             }
+            if ($events.Count -eq 0) { $readable = 'true-empty' }
         } catch {
             # Locale-independent: the "no events" case is told apart by its FullyQualifiedErrorId,
             # not by the (localised) message text. Anything else -- typically
@@ -631,30 +726,57 @@ function Invoke-SnapshotCollection {
                 $readable = 'false ' + $_.Exception.GetType().Name + ' (' + $_.FullyQualifiedErrorId + ')'
             }
         }
-        $hit = Measure-SnapshotKeywordHit -Messages @($events | ForEach-Object { $_.Message }) -Keywords $script:SnapshotKeywords
-        [void]$L.Add("  readable=$readable " + (Format-SnapshotKeywordHitLine -Hit $hit -Keywords $script:SnapshotKeywords))
-        if ($events.Count -gt 0) {
-            $times = @($events | ForEach-Object { $_.TimeCreated } | Sort-Object)
-            [void]$L.Add(('  window: oldest={0} newest={1} ({2} of {3} records scanned)' -f
-                $times[0].ToUniversalTime().ToString('o'), $times[$times.Count - 1].ToUniversalTime().ToString('o'),
-                $events.Count, $rc))
-        }
-        $samples = 0
+        # Scan text per event: the rendered Message, or the event XML when there is none (r1 B2).
+        $texts = New-Object System.Collections.ArrayList
+        $noMessage = 0
         foreach ($e in $events) {
-            if ($samples -ge 5) { break }
-            $msg = $e.Message
-            if ($null -eq $msg) { continue }
+            $m = Get-SnapshotProp -Object $e -Name 'Message'
+            $x = $null
+            if ($null -eq $m -or ([string]$m).Length -eq 0) { $noMessage++; try { $x = $e.ToXml() } catch { $x = $null } }
+            [void]$texts.Add((Select-SnapshotScanText -Message $m -Xml $x))
+        }
+        $hit = Measure-SnapshotKeywordHit -Messages @($texts.ToArray()) -Keywords $script:SnapshotKeywords
+        $hit3 = Measure-SnapshotKeywordHit -Messages @($texts.ToArray()) -Keywords @($script:SnapshotKeywords[0..2])
+        [void]$L.Add('  ' + (Format-SnapshotScanLine -Readable $readable -Hit $hit -Hit3 $hit3 -NoMessage $noMessage -Keywords $script:SnapshotKeywords))
+        if ($events.Count -gt 0) {
+            $times = @($events | ForEach-Object { Get-SnapshotProp -Object $_ -Name 'TimeCreated' } | Where-Object { $null -ne $_ } | Sort-Object)
+            if ($times.Count -gt 0) {
+                [void]$L.Add(('  window: oldest={0} newest={1} order={2} ({3} of {4} records scanned)' -f
+                    $times[0].ToUniversalTime().ToString('o'), $times[$times.Count - 1].ToUniversalTime().ToString('o'),
+                    $order, $events.Count, $rc))
+            } else {
+                [void]$L.Add("  window: <no timestamps> order=$order ($($events.Count) of $rc records scanned)")
+            }
+        }
+        # Samples: every event of a channel with at most three (so a lone record -- the one
+        # SessionServices/Operational event of 2026-08-21 -- is read, not just counted); otherwise
+        # up to five keyword hits.
+        $listAll = ($events.Count -le 3)
+        $samples = 0
+        for ($ei = 0; $ei -lt $events.Count; $ei++) {
+            if (-not $listAll -and $samples -ge 5) { break }
+            $e = $events[$ei]
+            $text = [string]$texts[$ei]
             $isHit = $false
             foreach ($k in $script:SnapshotKeywords) {
-                if ($msg.IndexOf($k, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $isHit = $true; break }
+                if ($text.IndexOf($k, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $isHit = $true; break }
             }
-            if (-not $isHit) { continue }
-            $flat = ($msg -replace '\r?\n', ' / ')
+            if (-not $listAll -and -not $isHit) { continue }
+            $flat = ($text -replace '\r?\n', ' / ')
             if ($flat.Length -gt 200) { $flat = $flat.Substring(0, 200) + '...' }
-            [void]$L.Add(('  hit: {0} id={1} provider={2} :: {3}' -f $e.TimeCreated.ToUniversalTime().ToString('o'), $e.Id, $e.ProviderName, $flat))
+            $tc = Get-SnapshotProp -Object $e -Name 'TimeCreated'
+            $tcText = '<no-time>'
+            if ($null -ne $tc) { $tcText = $tc.ToUniversalTime().ToString('o') }
+            $tag = 'event'
+            if ($isHit) { $tag = 'hit' }
+            [void]$L.Add(('  {0}: {1} id={2} provider={3} :: {4}' -f $tag, $tcText, (Get-SnapshotProp -Object $e -Name 'Id'), (Get-SnapshotProp -Object $e -Name 'ProviderName'), $flat))
             $samples++
         }
-        Write-Checkpoint "channel $name"
+      } catch {
+        # One channel must not take the rest of the report (and RESULT: DONE) with it (r1 I9).
+        [void]$L.Add("  <error " + $_.Exception.GetType().Name + ': ' + ($_.Exception.Message -replace '\r?\n', ' ') + '>')
+      }
+      Write-Checkpoint "channel $name"
     }
 
     [void]$L.Add('')
