@@ -386,6 +386,12 @@ Test-Case 'reads a named datum from single- or double-quoted Data elements, null
     Assert-Equal $null (Get-SnapshotEventDataValue -Xml $null -Name 'OldTime')
 }
 
+Test-Case 'a datum in the UserData/EventXML element form (<SessionID>2</SessionID>, as LSM events emit) is read too (dry run 9: every session line read <n/a>)' {
+    $xml = "<Event><UserData><EventXML xmlns='Event_NS'><User>DOMAIN\\someone</User><SessionID>2</SessionID><Address>203.0.113.7</Address></EventXML></UserData></Event>"
+    Assert-Equal '2' (Get-SnapshotEventDataValue -Xml $xml -Name 'SessionID')
+    Assert-Equal $null (Get-SnapshotEventDataValue -Xml $xml -Name 'Session') 'element name matched exactly'
+}
+
 Test-Case 'the datum name is matched exactly, not as a prefix' {
     $xml = "<EventData><Data Name='NewTimeZone'>x</Data><Data Name='NewTime'>y</Data></EventData>"
     Assert-Equal 'y' (Get-SnapshotEventDataValue -Xml $xml -Name 'NewTime')
@@ -527,6 +533,40 @@ Test-Case 'the three documented boot types are named; anything else keeps its nu
     Assert-Equal 'resume-from-hibernation' (Format-SnapshotBootType -BootType 2)
     Assert-Equal 'unknown(7)' (Format-SnapshotBootType -BootType 7)
     Assert-Equal 'unknown' (Format-SnapshotBootType -BootType $null)
+}
+
+# -------------------------------------------------------------------------------------------
+# Session history (LocalSessionManager/Operational): id -> name, and a line that carries ONLY the
+# UTC time, the id, its name and the SessionID datum -- never the user or the client address
+# (both live in those events' messages and are red-line items).
+# -------------------------------------------------------------------------------------------
+
+New-Section 'Format-SnapshotSessionEventName / Format-SnapshotSessionEventLine'
+
+Test-Case 'the LSM event ids that matter for same-session reasoning are named; anything else is other' {
+    Assert-Equal 'logon' (Format-SnapshotSessionEventName -Id 21)
+    Assert-Equal 'shell-start' (Format-SnapshotSessionEventName -Id 22)
+    Assert-Equal 'logoff' (Format-SnapshotSessionEventName -Id 23)
+    Assert-Equal 'disconnect' (Format-SnapshotSessionEventName -Id 24)
+    Assert-Equal 'reconnect' (Format-SnapshotSessionEventName -Id 25)
+    Assert-Equal 'disconnected-by-other-session' (Format-SnapshotSessionEventName -Id 39)
+    Assert-Equal 'disconnect-reason' (Format-SnapshotSessionEventName -Id 40)
+    Assert-Equal 'arbitration-begin(unconfirmed)' (Format-SnapshotSessionEventName -Id 41)
+    Assert-Equal 'arbitration-end(unconfirmed)' (Format-SnapshotSessionEventName -Id 42)
+    Assert-Equal 'other' (Format-SnapshotSessionEventName -Id 43)
+    Assert-Equal 'other' (Format-SnapshotSessionEventName -Id $null)
+}
+
+Test-Case 'a session-history line is time, id, name and SessionID only' {
+    $xml = "<Event><EventData><Data Name='User'>DOMAIN\someone</Data><Data Name='SessionID'>2</Data><Data Name='Address'>203.0.113.7</Data></EventData></Event>"
+    $line = Format-SnapshotSessionEventLine -TimeUtc '2026-09-05T21:10:43.0000000Z' -Id 25 -Xml $xml
+    Assert-Equal 'lsm: 2026-09-05T21:10:43.0000000Z id=25 (reconnect) session=2' $line
+    Assert-True ($line -notlike '*someone*') 'the user must not appear'
+    Assert-True ($line -notlike '*203.0.113.7*') 'the address must not appear'
+}
+
+Test-Case 'a missing SessionID datum renders as <n/a>; a null time as <no-time>' {
+    Assert-Equal 'lsm: <no-time> id=21 (logon) session=<n/a>' (Format-SnapshotSessionEventLine -TimeUtc $null -Id 21 -Xml '<Event/>')
 }
 
 # -------------------------------------------------------------------------------------------

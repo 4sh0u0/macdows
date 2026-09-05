@@ -307,8 +307,13 @@ function Get-SnapshotEventDataValue {
     if ([string]::IsNullOrEmpty($Xml)) { return $null }
     $pattern = '<Data Name=[''"]' + [regex]::Escape($Name) + '[''"]>(.*?)</Data>'
     $m = [regex]::Match($Xml, $pattern, 'Singleline')
-    if (-not $m.Success) { return $null }
-    return $m.Groups[1].Value
+    if ($m.Success) { return $m.Groups[1].Value }
+    # UserData/EventXML form: providers such as TerminalServices-LocalSessionManager emit the datum
+    # as its own element, <SessionID>2</SessionID>, not as <Data Name=...> (dry run 9).
+    $pattern2 = '<' + [regex]::Escape($Name) + '(?:\s[^>]*)?>(.*?)</' + [regex]::Escape($Name) + '>'
+    $m2 = [regex]::Match($Xml, $pattern2, 'Singleline')
+    if ($m2.Success) { return $m2.Groups[1].Value }
+    return $null
 }
 
 function Get-SnapshotBootTypeFromXml {
@@ -416,6 +421,48 @@ function Format-SnapshotBootType {
         2 { return 'resume-from-hibernation' }
     }
     return ('unknown({0})' -f [int]$BootType)
+}
+
+function Format-SnapshotSessionEventName {
+    <#
+      LocalSessionManager/Operational event ids that matter when asking "is this the same session
+      the previous client left behind": 21 logon, 22 shell start, 23 logoff, 24 disconnect,
+      25 reconnect, 39 disconnected by another session, 40 disconnect reason code -- documented
+      meanings; 41/42 are named 'arbitration begin/end' from observation only (dry runs 9/10 show them
+      bracketing every reconnect) and carry an (unconfirmed) qualifier. Everything else is 'other'
+      (memo section 5, T6-prime clause (c)).
+    #>
+    [CmdletBinding()]
+    param($Id)
+    if ($null -eq $Id) { return 'other' }
+    switch ([int]$Id) {
+        21 { return 'logon' }
+        22 { return 'shell-start' }
+        23 { return 'logoff' }
+        24 { return 'disconnect' }
+        25 { return 'reconnect' }
+        39 { return 'disconnected-by-other-session' }
+        40 { return 'disconnect-reason' }
+        41 { return 'arbitration-begin(unconfirmed)' }
+        42 { return 'arbitration-end(unconfirmed)' }
+    }
+    return 'other'
+}
+
+function Format-SnapshotSessionEventLine {
+    <#
+      One session-history line: UTC time, id, name, SessionID -- and nothing else. The LSM events'
+      messages and EventData also carry the user name and the client's network address, both
+      red-line items (format.md section 2.2); this function reads only the SessionID datum.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()] $TimeUtc, $Id, [AllowNull()][string] $Xml)
+    $t = '<no-time>'
+    if ($null -ne $TimeUtc -and ([string]$TimeUtc).Length -gt 0) { $t = [string]$TimeUtc }
+    $sid = Get-SnapshotEventDataValue -Xml $Xml -Name 'SessionID'
+    if ($null -eq $sid -or ([string]$sid).Length -eq 0) { $sid = '<n/a>' }
+    $name = Format-SnapshotSessionEventName -Id $Id
+    return "lsm: $t id=$Id ($name) session=$sid"
 }
 
 function ConvertTo-SnapshotValueText {
@@ -649,6 +696,28 @@ function Invoke-SnapshotCollection {
             } else {
                 [void]$L.Add('    ' + $q.Label + ': unreadable ' + $_.Exception.GetType().Name + ' (' + $_.FullyQualifiedErrorId + ')')
             }
+        }
+    }
+    # Session history (LocalSessionManager/Operational, newest 12): logon / shell-start / logoff /
+    # disconnect / reconnect with the SessionID datum only -- user and client address deliberately
+    # NOT read (red line). This is what turns the T6-prime clause (c) "same session" assumption into
+    # a measurement: a 24 (disconnect) followed by a 25 (reconnect) on the same SessionID.
+    [void]$L.Add('  session history (LSM/Operational, newest 12; user and address omitted by design):')
+    try {
+        $lsm = @(Get-WinEvent -LogName 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational' -MaxEvents 12 -ErrorAction Stop)
+        foreach ($e in $lsm) {
+            $tc = Get-SnapshotProp -Object $e -Name 'TimeCreated'
+            $tcText = $null
+            if ($null -ne $tc) { $tcText = $tc.ToUniversalTime().ToString('o') }
+            $x = $null
+            try { $x = $e.ToXml() } catch { $x = $null }
+            [void]$L.Add('    ' + (Format-SnapshotSessionEventLine -TimeUtc $tcText -Id (Get-SnapshotProp -Object $e -Name 'Id') -Xml $x))
+        }
+    } catch {
+        if ($_.FullyQualifiedErrorId -match 'NoMatchingEventsFound') {
+            [void]$L.Add('    lsm: none')
+        } else {
+            [void]$L.Add('    lsm: unreadable ' + $_.Exception.GetType().Name + ' (' + $_.FullyQualifiedErrorId + ')')
         }
     }
     Write-Checkpoint 'winver+freshness'
