@@ -1046,7 +1046,7 @@ static UINT crb_gfx_map_surface_to_scaled_window(RdpgfxClientContext *context,
          * What was falsified (L4 round-2 audit, recorded in docs/matrix/sample-audit-2026-09.md
          * §7): this comment used to say the server picks the scaled variant "whenever the
          * client's GFX caps don't carry AVC_DISABLED (e.g. H264-enabled builds)". Our caps
-         * ALWAYS carry AVC_DISABLED -- rdpgfx_main.c:373-387 sets it in BOTH arms of its
+         * ALWAYS carry AVC_DISABLED -- rdpgfx_main.c:386 and :389 (3.31.1; :373-387 at 3.30.0) set it in BOTH arms of its
          * `#ifdef WITH_GFX_H264` (the H264 arm is gated on `!GfxAVC444`, and `FreeRDP_GfxAVC444`
          * defaults FALSE and is set nowhere in this repo), so the flag does not move with the
          * build config at all. The timeline independently rules the flip out: this observation
@@ -1128,7 +1128,7 @@ static UINT crb_gfx_reset_graphics(RdpgfxClientContext *context, const RDPGFX_RE
  *
  * Unlike the Map*-and-ResetGraphics hooks, CapsAdvertise is the SENDER slot: rdpgfx_on_open's
  * rdpgfx_send_supported_caps hands the PDU to context->CapsAdvertise, whose default IS
- * the function that puts the advertise on the wire (rdpgfx_main.c:2612). Not forwarding
+ * the function that puts the advertise on the wire (rdpgfx_main.c:2623 at 3.31.1; :2612 at 3.30.0). Not forwarding
  * would silently break GFX negotiation for the session, so when orig is somehow absent we
  * mirror IFCALLRESULT's own default (ERROR_BAD_CONFIGURATION) rather than pretend the
  * advertise was sent. CapsConfirm's client-side default is NULL (only the server half of

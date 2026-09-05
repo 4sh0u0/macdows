@@ -46,15 +46,20 @@ policy).
 
 ## Current state
 
-One patch against FreeRDP 3.30.0. Patches are applied in `sort` order of their filenames,
-hence the numeric prefix.
+**No patches** against FreeRDP 3.31.1 (`63b948ca5cb94307fd5444ee6e73927a41ccdab4`). The queue
+is empty on purpose: the one patch this project ever carried was absorbed upstream and retired
+on the 3.31.1 pin bump (2026-09-02).
 
-- `0001-core-capabilities-apply-input-caps-from-src.patch` —
-  `rdp_apply_input_capability_set()` reads two received-capability values out of the
-  destination `settings` instead of the parsed server answer `src`, discarding the
-  server's Input Capability Set answer. One token per hunk. Defect detail, provenance,
-  upstream status and the per-hunk retirement conditions live in the patch header; it
-  travels with the patch, so that is the one place they are written.
+### Retired
 
-The rules above predate the first patch on purpose — the bar was set before anything was
-ever added to this directory.
+- `0001-core-capabilities-apply-input-caps-from-src.patch` (carried against 3.30.0) --
+  `rdp_apply_input_capability_set()` read two received-capability values out of the
+  destination `settings` instead of the parsed server answer `src`. Hunk 1 fixed upstream by
+  PR #13287 (commit 21cd3d6), hunk 2 by this project's PR #13313 (commit 7447382); both are in
+  the 3.31.1 tag (`libfreerdp/core/capabilities.c:1414` and `:1423` read `src`). `git apply
+  --check` against the 3.31.1 tree fails, which is exactly rule 2's "upstream absorbed the
+  fix -- drop the patch" case. The retirement record with the verification lives in
+  `deps/freerdp.lock` (`retired_patches`).
+
+The rules above predate the first patch on purpose -- the bar was set before anything was
+ever added to this directory, and it stays set with the directory empty.

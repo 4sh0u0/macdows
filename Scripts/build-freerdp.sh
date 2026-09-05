@@ -72,8 +72,8 @@ It is either a failed/interrupted build or a leftover from a different pin -- re
 	# path, PATH only prepends to it. That difference is load-bearing here.
 	# ThirdParty/FreeRDP/cmake/FindFFmpeg.cmake probes all eight ffmpeg components and links
 	# every one it finds; with PKG_CONFIG_PATH merely prepended, our prefix would satisfy
-	# avcodec/avutil/swresample while Homebrew's default pkgconfig dir would still satisfy
-	# avformat/avfilter/avdevice/swscale -- silently reintroducing four GPL, absolute-path
+	# avcodec/avutil/swresample/swscale while Homebrew's default pkgconfig dir would still
+	# satisfy avformat/avfilter/avdevice -- silently reintroducing three GPL, absolute-path
 	# Homebrew dylibs into the link line for libraries libfreerdp3 references zero symbols
 	# from. Replacing the search path makes the minimal link line structurally impossible to
 	# widen by accident.
@@ -235,12 +235,15 @@ while IFS= read -r flag; do
 	# See deps/freerdp.lock's matching corrections_applied entry for the full why; the
 	# short version is that the module links every component it *finds*, its find_library
 	# fallback reaches Homebrew's prefix on a brew-installed CMake, and it skips its entire
-	# discovery block when FFMPEG_LIBRARIES is already set. Seeding exactly the three
-	# components we build is what keeps libavformat/libavfilter/libavdevice/libswscale out
-	# of libfreerdp3's link line no matter what happens to be installed on the machine.
+	# discovery block when FFMPEG_LIBRARIES is already set. Seeding exactly the four
+	# components we build (avcodec, avutil, swresample, and -- since the 3.31.1 pin --
+	# swscale, whose header h264_ffmpeg.c includes unconditionally from 3.31.0 on and whose
+	# sws_* symbols it calls under WITH_VIDEOTOOLBOX, which this build enables) is what keeps
+	# libavformat/libavfilter/libavdevice out of libfreerdp3's link line no matter what
+	# happens to be installed on the machine.
 	-DFFMPEG_INCLUDE_DIRS=*) flag="-DFFMPEG_INCLUDE_DIRS=$CRDP_FFMPEG_PREFIX/include" ;;
 	-DFFMPEG_LIBRARIES=*)
-		flag="-DFFMPEG_LIBRARIES=$CRDP_FFMPEG_PREFIX/lib/libavcodec.dylib;$CRDP_FFMPEG_PREFIX/lib/libavutil.dylib;$CRDP_FFMPEG_PREFIX/lib/libswresample.dylib"
+		flag="-DFFMPEG_LIBRARIES=$CRDP_FFMPEG_PREFIX/lib/libavcodec.dylib;$CRDP_FFMPEG_PREFIX/lib/libavutil.dylib;$CRDP_FFMPEG_PREFIX/lib/libswresample.dylib;$CRDP_FFMPEG_PREFIX/lib/libswscale.dylib"
 		;;
 	-DAVCODEC_INCLUDE_DIRS=*) flag="-DAVCODEC_INCLUDE_DIRS=$CRDP_FFMPEG_PREFIX/include" ;;
 	-DAVCODEC_LIBRARIES=*) flag="-DAVCODEC_LIBRARIES=$CRDP_FFMPEG_PREFIX/lib/libavcodec.dylib" ;;

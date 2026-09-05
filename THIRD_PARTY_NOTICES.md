@@ -53,7 +53,7 @@ everything the licences require.
 
 ## FreeRDP
 
-- **Version**: 3.30.0 (tag `3.30.0`, commit `6b107f0aadbabc47941c5a5b893b88c01792af6d`) —
+- **Version**: 3.31.1 (tag `3.31.1`, commit `63b948ca5cb94307fd5444ee6e73927a41ccdab4`) —
   synced with `deps/freerdp.lock`'s `.tag`; `Scripts/gen-notices.sh` reads that field and
   dies if this file doesn't mention it, so the two can't silently drift apart.
 - **Upstream**: https://github.com/FreeRDP/FreeRDP
@@ -62,24 +62,22 @@ everything the licences require.
   headers untouched — see `ThirdParty/patches/README.md`). Shipped with the app as
   `Contents/Resources/licenses/LICENSE-FreeRDP-Apache-2.0.txt`, a byte-identical copy
   tracked at `ThirdParty/licenses/LICENSE-FreeRDP-Apache-2.0.txt`.
-- **Modified**: Yes — one patch, applied at build time from the external patch queue at
-  `ThirdParty/patches/` (the vendored checkout itself stays a verbatim copy of the pinned
-  tag; `Scripts/build-freerdp.sh` applies the queue before configuring and reverts it
-  afterwards). The entry is
-  `0001-core-capabilities-apply-input-caps-from-src.patch`: two one-token fixes in
-  `libfreerdp/core/capabilities.c`'s `rdp_apply_input_capability_set()`, one a backport of
-  upstream PR #13287 (`FreeRDP_UnicodeInput`), the other the same-shape fix for
-  `FreeRDP_HasQoeEvent`, which upstream has not yet fixed. The queue is also auto-populated
-  into `sbom/macdows.cdx.json`'s `pedigree.patches` for this component, as CycloneDX `patch`
-  objects carrying the upstream reference from each patch's header.
-  The Apache-2.0 obligations are met, not waived, by that arrangement. §4(b) ("modified files
-  carry prominent notices") is discharged by the patch file itself: the modified source is
-  never distributed — only the patch is — and its header records what changed, why, its
-  upstream status and the condition under which it is dropped. The licence text and every
-  upstream copyright header ship unaltered. §4(d) adds nothing here: FreeRDP 3.30.0 has no
-  top-level `NOTICE` file, only `LICENSE`. (The one `NOTICE` anywhere in its tree,
+- **Modified**: No — the external patch queue at `ThirdParty/patches/` is empty as of the
+  3.31.1 pin (2026-09-02). The vendored checkout is a verbatim copy of the pinned tag, and
+  `Scripts/build-freerdp.sh` still applies whatever the queue holds before configuring and
+  reverts it afterwards, so a future patch would re-enter this section the same way. The one
+  patch this project ever carried, `0001-core-capabilities-apply-input-caps-from-src.patch`
+  (two one-token fixes in `libfreerdp/core/capabilities.c`'s
+  `rdp_apply_input_capability_set()`, carried against 3.30.0), was absorbed upstream — hunk 1
+  by PR #13287, hunk 2 by this project's PR #13313 — and both are in the 3.31.1 tag; the
+  retirement record with its verification lives in `deps/freerdp.lock` (`retired_patches`).
+  `sbom/macdows.cdx.json`'s `pedigree.patches` for this component is therefore empty; the
+  SBOM generator reads the queue directory, not this text.
+  The Apache-2.0 obligations are met as before: the licence text and every upstream copyright
+  header ship unaltered. §4(d) adds nothing here: FreeRDP 3.31.1 has no top-level `NOTICE`
+  file, only `LICENSE`. (The one `NOTICE` anywhere in its tree,
   `winpr/libwinpr/sysinfo/cpufeatures/NOTICE`, belongs to a vendored third-party component
-  that this configuration does not compile and that this patch does not touch.)
+  that this configuration does not compile.)
 - **Includes**: WinPR (WinPR is part of the FreeRDP repository/release and shares the
   same license and copyright).
 - **How it's packaged**: built as dynamic libraries and embedded into the app bundle's
@@ -118,7 +116,7 @@ everything the licences require.
 
 - **Version**: 9.0.1 — synced with `deps/freerdp.lock`'s `.ffmpeg.version`; see the FreeRDP
   entry above for how that sync is enforced. (`libavcodec` 63, `libavutil` 61,
-  `libswresample` 7.)
+  `libswresample` 7, `libswscale` 10.)
 - **Upstream**: https://ffmpeg.org — source tarball
   https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz
   (SHA-256 `cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635`, pinned and
@@ -153,7 +151,7 @@ everything the licences require.
   --disable-gpl --disable-nonfree --disable-version3
   --enable-shared --disable-static --install-name-dir=@rpath
   --disable-everything --disable-programs --disable-doc
-  --disable-avdevice --disable-avformat --disable-avfilter --disable-swscale
+  --disable-avdevice --disable-avformat --disable-avfilter --enable-swscale
   --enable-decoder=h264 --enable-parser=h264
   --enable-videotoolbox --enable-hwaccel=h264_videotoolbox
   --disable-autodetect --enable-pthreads
@@ -167,15 +165,16 @@ everything the licences require.
 
 - **How it's packaged**: built as **dynamic libraries** and embedded into the app bundle's
   `Contents/Frameworks`: `libavcodec.63.dylib`, `libavutil.61.dylib`,
-  `libswresample.7.dylib`. Static linking is prohibited here (adr/0007) precisely because
+  `libswresample.7.dylib`, `libswscale.10.dylib`. Static linking is prohibited here (adr/0007) precisely because
   LGPL-2.1 §6 requires that a user be able to substitute their own build of the library.
   `libswresample` is shipped even though Macdows and FreeRDP call no `swr_*` symbol:
   `libavcodec` carries its own load command on it, so it is a required part of the set.
-  Nothing else from FFmpeg is built or shipped — `libavformat`, `libavfilter`,
-  `libavdevice` and `libswscale` are not produced at all.
+  `libswscale` is shipped because `libfreerdp3` (FreeRDP >= 3.31.0, `h264_ffmpeg.c`) calls
+  `sws_*` directly in its H264 decode path. Nothing else from FFmpeg is built or shipped —
+  `libavformat`, `libavfilter` and `libavdevice` are not produced at all.
 - **How to replace it with your own build**: see **[`LGPL_RELINK.md`](LGPL_RELINK.md)** in
   this repository — step-by-step, runnable instructions for obtaining the exact
-  corresponding source, rebuilding it (modified or not), swapping the three dylibs inside
+  corresponding source, rebuilding it (modified or not), swapping the four dylibs inside
   `Macdows.app`, and re-signing. That document is this project's LGPL-2.1 §6 offer;
   `Scripts/gen-notices.sh` fails the release gate if it is missing or names a different
   version than the one actually shipped.
@@ -186,7 +185,7 @@ everything the licences require.
   any external distribution. (2) It links by absolute `/opt/homebrew/...` path, which is
   undistributable and breaks on `brew upgrade ffmpeg` — the same adr/0006 §3 defect #1 that
   the OpenSSL entry above describes. The self-built version additionally narrows what is
-  shipped from seven libraries to three.
+  shipped from seven libraries to four.
 
 ## zlib
 
