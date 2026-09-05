@@ -47,8 +47,10 @@
 param(
     [string] $OutPath = '\\tsclient\lab\server-snapshot-out.txt',
     # Newest events read per readable channel. Bounded so the whole scan stays inside the relay
-    # job's TIMEOUT even on a channel with years of history.
-    [int] $MaxEventsPerChannel = 500,
+    # job's TIMEOUT even on a channel with years of history; 2500 covers the whole of every
+    # channel dry run 2 met (largest: RdpCoreTS/Operational, 1952 records), and the report
+    # prints the covered time window per channel so a partial scan is visible as such.
+    [int] $MaxEventsPerChannel = 2500,
     [switch] $NoRun
 )
 
@@ -63,18 +65,24 @@ $script:SnapshotKeywords = @('graphics', 'scal', 'gfx', 'surface')
 # Which Get-WinEvent -ListLog names count as RDS-related. Case-insensitive regex alternatives:
 # TerminalServices (the TS-* channels), Remote-?Desktop (RemoteDesktopServices-* AND the
 # hyphenated Remote-Desktop-Management-Service), Remote-?App (RemoteApp and Desktop
-# Connections), and the bare tokens RemoteFX / Rdms / RDP for channels named by those alone.
-# RdpCore is not listed: every RdpCore* channel is a RemoteDesktopServices-* channel and RDP
-# covers a bare one. Dwm is deliberately NOT included (a DWM channel exists on every desktop
-# and says nothing about the RDP graphics pipeline).
-$script:SnapshotChannelPattern = 'TerminalServices|Remote-?Desktop|Remote-?App|RemoteFX|Rdms|RDP'
+# Connections), the bare tokens RemoteFX / Rdms, and Rdp either as a separated token
+# (Microsoft-Windows-Rdp-Graphics-RdpLite: "-Rdp-") or as a CamelCase stem (RdpCoreTS, RdpLite,
+# RdpAvenc -- that group is case-SENSITIVE via (?-i:...), which is what keeps
+# Microsoft-Windows-Wordpad out: dry run 2 selected all three Wordpad channels on the bare
+# "rdp" inside "Wordpad"). Dwm is deliberately NOT included (a DWM channel exists on every
+# desktop and says nothing about the RDP graphics pipeline).
+$script:SnapshotChannelPattern = 'TerminalServices|Remote-?Desktop|Remote-?App|RemoteFX|Rdms|(^|[-/ ])Rdp([-/ ]|$)|(?-i:Rdp[A-Z])'
 
-# Registry keys read for path E. Every value present under each key is reported; Names lists
-# the pre-registered names that are additionally reported as <absent> when not set, so the
-# report shape does not depend on what the host happens to have configured.
+# Registry keys read for path E. AllValues=$true: every value present under the key is
+# reported; Names lists the pre-registered names that are additionally reported as <absent>
+# when not set, so the report shape does not depend on what the host happens to have configured.
+# AllValues=$false (the HKCU desktop key): only the pre-registered names are read -- dry run 2
+# showed the full key is 46 mostly unrelated values including the wallpaper path and an 800-byte
+# image cache, none of which belongs in an RDS configuration snapshot.
 $script:SnapshotRegistryKeys = @(
     [pscustomobject]@{
         Path  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+        AllValues = $true
         Names = @('fAllowUnlistedRemotePrograms', 'fEnableRemoteFXAdvancedRemoteApp',
                   'fEnableVirtualGraphics', 'bEnumerateHWBeforeSW', 'AVC444ModePreferred',
                   'AVCHardwareEncodePreferred', 'fEnableWddmDriver', 'MaxMonitors',
@@ -84,25 +92,30 @@ $script:SnapshotRegistryKeys = @(
     },
     [pscustomobject]@{
         Path  = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Terminal Server'
+        AllValues = $true
         Names = @('fAllowUnlistedRemotePrograms', 'fDenyTSConnections')
     },
     [pscustomobject]@{
         Path  = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Terminal Server\TSAppAllowList'
+        AllValues = $true
         Names = @('fDisabledAllowList', 'fHasCertificate', 'CustomRDPSettings')
     },
     [pscustomobject]@{
         Path  = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+        AllValues = $true
         Names = @('fDenyTSConnections', 'fSingleSessionPerUser', 'TSUserEnabled')
     },
     [pscustomobject]@{
         Path  = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+        AllValues = $true
         Names = @('UserAuthentication', 'SecurityLayer', 'MinEncryptionLevel', 'ColorDepth',
                   'MaxMonitors', 'MaxXResolution', 'MaxYResolution', 'fEnableWinStation',
                   'SelectTransport', 'fInheritColorDepth')
     },
     [pscustomobject]@{
         Path  = 'HKCU:\Control Panel\Desktop'
-        Names = @('LogPixels', 'Win8DpiScaling', 'DpiScalingVer')
+        AllValues = $false
+        Names = @('LogPixels', 'Win8DpiScaling', 'DpiScalingVer', 'MaxVirtualDesktopDimension', 'MaxMonitorDimension')
     }
 )
 
@@ -203,14 +216,69 @@ function Get-SnapshotHostFreshness {
     return ('uptime-{0}h' -f [int][math]::Floor($s / 3600))
 }
 
+function Get-SnapshotFreshnessConsistency {
+    <#
+      Compares the boot-based uptime (Win32_OperatingSystem LastBootUpTime) with the tick-based
+      one ([Environment]::TickCount). Dry run 2 read 37830 s against 5432 s on a host the owner
+      had powered on 90 minutes earlier: Windows Fast Startup hibernates the kernel session, so
+      LastBootUpTime survives a shutdown/power-on while the tick count does not -- the boot-based
+      label is the right host_freshness for termsrv churn (the service state survives too), and
+      this line is what tells the reader which regime the host is in.
+        consistent                       |gap| <= tolerance
+        fast-startup-or-sleep-suspected  boot exceeds tick by more than the tolerance
+        inconsistent                     tick exceeds boot by more than the tolerance
+        tick-unavailable                 null boot, negative (wrapped) tick, or boot past the
+                                         32-bit tick range (2147483 s)
+    #>
+    [CmdletBinding()]
+    param($BootUptimeSeconds, $TickSeconds, [int] $ToleranceSeconds = 300)
+    if ($null -eq $BootUptimeSeconds -or $null -eq $TickSeconds) { return 'tick-unavailable' }
+    $boot = [double]$BootUptimeSeconds
+    $tick = [double]$TickSeconds
+    if ($tick -lt 0 -or $boot -gt 2147483) { return 'tick-unavailable' }
+    $gap = [int][math]::Round($boot - $tick)
+    if ([math]::Abs($gap) -le $ToleranceSeconds) { return 'consistent' }
+    $detail = ('(tick={0}s boot={1}s gap={2}s)' -f [int][math]::Round($tick), [int][math]::Round($boot), $gap)
+    if ($gap -gt 0) { return "fast-startup-or-sleep-suspected $detail" }
+    return "inconsistent $detail"
+}
+
+function Get-SnapshotBootTypeFromXml {
+    <# Kernel-Boot event 27's BootType datum from the event XML (locale-independent). #>
+    [CmdletBinding()]
+    param([AllowNull()][string] $Xml)
+    if ([string]::IsNullOrEmpty($Xml)) { return $null }
+    $m = [regex]::Match($Xml, '<Data Name="BootType">(\d+)</Data>')
+    if (-not $m.Success) { return $null }
+    return [int]$m.Groups[1].Value
+}
+
+function Format-SnapshotBootType {
+    <# 0 cold boot, 1 fast startup (hybrid shutdown), 2 resume from hibernation. #>
+    [CmdletBinding()]
+    param($BootType)
+    if ($null -eq $BootType) { return 'unknown' }
+    switch ([int]$BootType) {
+        0 { return 'cold-boot' }
+        1 { return 'fast-startup' }
+        2 { return 'resume-from-hibernation' }
+    }
+    return ('unknown({0})' -f [int]$BootType)
+}
+
 function ConvertTo-SnapshotValueText {
     <# One registry value as report text: <absent> for null, hex for binary, " | " for arrays. #>
     [CmdletBinding()]
     param([AllowNull()] $Value)
     if ($null -eq $Value) { return '<absent>' }
     if ($Value -is [byte[]]) {
-        $hex = ($Value | ForEach-Object { $_.ToString('x2') }) -join ''
-        return ('bytes[{0}]:{1}' -f $Value.Length, $hex)
+        # Length prefix exact, payload capped at 32 bytes: a snapshot diff needs "changed or
+        # not", not an image cache verbatim (dry run 2 met an 800-byte one).
+        $shown = $Value
+        $tail = ''
+        if ($Value.Length -gt 32) { $shown = $Value[0..31]; $tail = '...' }
+        $hex = ($shown | ForEach-Object { $_.ToString('x2') }) -join ''
+        return ('bytes[{0}]:{1}{2}' -f $Value.Length, $hex, $tail)
     }
     if ($Value -is [array]) {
         return (($Value | ForEach-Object { [string]$_ }) -join ' | ')
@@ -246,9 +314,16 @@ function Add-SnapshotRegistrySection {
     }
     $present = @(Get-SnapshotRegistryValueNames -Path $path)
     $subkeys = @($item.GetSubKeyNames())
-    [void]$Lines.Add("[reg] $path : values=$($present.Count) subkeys=$($subkeys.Count)")
+    $mode = 'all-values'
+    if (-not $KeySpec.AllValues) { $mode = 'pre-registered-names-only' }
+    [void]$Lines.Add("[reg] $path : values=$($present.Count) subkeys=$($subkeys.Count) mode=$mode")
     $reported = New-Object System.Collections.ArrayList
-    foreach ($n in $present) {
+    $toDump = $present
+    if (-not $KeySpec.AllValues) {
+        $wanted = @($KeySpec.Names | ForEach-Object { $_.ToLowerInvariant() })
+        $toDump = @($present | Where-Object { $wanted -contains $_.ToLowerInvariant() })
+    }
+    foreach ($n in $toDump) {
         $v = $item.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
         [void]$Lines.Add("  $n = " + (ConvertTo-SnapshotValueText -Value $v))
         [void]$reported.Add($n.ToLowerInvariant())
@@ -310,6 +385,7 @@ function Invoke-SnapshotCollection {
     # --- host_freshness -------------------------------------------------------------------------
     [void]$L.Add('')
     [void]$L.Add('== host_freshness')
+    $up = $null
     try {
         $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
         $up = ($os.LocalDateTime - $os.LastBootUpTime).TotalSeconds
@@ -325,7 +401,31 @@ function Invoke-SnapshotCollection {
         [void]$L.Add('  Win32_OperatingSystem unreadable: ' + $_.Exception.GetType().Name)
     }
     # 32-bit ms since boot; wraps every 24.9 days, so it is a cross-check, not the source.
-    [void]$L.Add('  TickCountSeconds(32-bit, wraps 24.9d) = ' + [int][math]::Floor([Environment]::TickCount / 1000))
+    $tickSeconds = [int][math]::Floor([Environment]::TickCount / 1000)
+    [void]$L.Add("  TickCountSeconds(32-bit, wraps 24.9d) = $tickSeconds")
+    [void]$L.Add('  freshness_consistency = ' + (Get-SnapshotFreshnessConsistency -BootUptimeSeconds $up -TickSeconds $tickSeconds))
+    # Boot history from the System log (readable by a standard account): Kernel-Boot 27 carries
+    # BootType, which is the authoritative answer to "was that a cold boot or fast startup".
+    [void]$L.Add('  boot history (System log, newest first):')
+    foreach ($q in @(
+        @{ Label = 'Kernel-Boot 27';    Provider = 'Microsoft-Windows-Kernel-Boot';    Id = 27; Max = 5; BootType = $true },
+        @{ Label = 'Kernel-General 12'; Provider = 'Microsoft-Windows-Kernel-General'; Id = 12; Max = 3; BootType = $false },
+        @{ Label = 'Kernel-General 13'; Provider = 'Microsoft-Windows-Kernel-General'; Id = 13; Max = 3; BootType = $false })) {
+        try {
+            $evs = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = $q.Provider; Id = $q.Id } -MaxEvents $q.Max -ErrorAction Stop)
+            foreach ($e in $evs) {
+                $extra = ''
+                if ($q.BootType) { $extra = ' boot_type=' + (Format-SnapshotBootType -BootType (Get-SnapshotBootTypeFromXml -Xml $e.ToXml())) }
+                [void]$L.Add(('    {0} {1}{2}' -f $q.Label, $e.TimeCreated.ToUniversalTime().ToString('o'), $extra))
+            }
+        } catch {
+            if ($_.FullyQualifiedErrorId -match 'NoMatchingEventsFound') {
+                [void]$L.Add('    ' + $q.Label + ': none')
+            } else {
+                [void]$L.Add('    ' + $q.Label + ': unreadable ' + $_.Exception.GetType().Name + ' (' + $_.FullyQualifiedErrorId + ')')
+            }
+        }
+    }
     Write-Checkpoint 'winver+freshness'
 
     # --- E. registry ---------------------------------------------------------------------------
@@ -367,8 +467,16 @@ function Invoke-SnapshotCollection {
         [void]$L.Add("[channel] $name enabled=$($info.IsEnabled) records=$rc mode=$($info.LogMode) type=$($info.LogType)")
         $events = @()
         $readable = 'true'
+        # Analytic and Debug channels can only be read oldest-first (Get-WinEvent refuses them
+        # otherwise: SpecifyOldestForLog -- every one dry run 2 met came back that way). They are
+        # normally disabled and empty, so oldest-first with the same cap loses nothing.
+        $oldest = ($info.LogType -eq 'Analytical' -or $info.LogType -eq 'Debug')
         try {
-            $events = @(Get-WinEvent -LogName $name -MaxEvents $MaxEventsPerChannel -ErrorAction Stop)
+            if ($oldest) {
+                $events = @(Get-WinEvent -LogName $name -MaxEvents $MaxEventsPerChannel -Oldest -ErrorAction Stop)
+            } else {
+                $events = @(Get-WinEvent -LogName $name -MaxEvents $MaxEventsPerChannel -ErrorAction Stop)
+            }
         } catch {
             # Locale-independent: the "no events" case is told apart by its FullyQualifiedErrorId,
             # not by the (localised) message text. Anything else -- typically
@@ -382,6 +490,12 @@ function Invoke-SnapshotCollection {
         }
         $hit = Measure-SnapshotKeywordHit -Messages @($events | ForEach-Object { $_.Message }) -Keywords $script:SnapshotKeywords
         [void]$L.Add("  readable=$readable " + (Format-SnapshotKeywordHitLine -Hit $hit -Keywords $script:SnapshotKeywords))
+        if ($events.Count -gt 0) {
+            $times = @($events | ForEach-Object { $_.TimeCreated } | Sort-Object)
+            [void]$L.Add(('  window: oldest={0} newest={1} ({2} of {3} records scanned)' -f
+                $times[0].ToUniversalTime().ToString('o'), $times[$times.Count - 1].ToUniversalTime().ToString('o'),
+                $events.Count, $rc))
+        }
         $samples = 0
         foreach ($e in $events) {
             if ($samples -ge 5) { break }

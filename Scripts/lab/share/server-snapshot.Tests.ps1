@@ -93,6 +93,19 @@ Test-Case 'the registry key list names the policy hive and the RDP-Tcp winstatio
     }
 }
 
+Test-Case 'every HKLM key dumps all values; the HKCU Desktop key dumps only its pre-registered DPI/desktop names' {
+    foreach ($k in @($script:SnapshotRegistryKeys)) {
+        if ($k.Path -like 'HKCU:*') {
+            Assert-True (-not $k.AllValues) "HKCU key must not dump every value: $($k.Path)"
+            foreach ($n in @('LogPixels', 'Win8DpiScaling', 'DpiScalingVer', 'MaxVirtualDesktopDimension', 'MaxMonitorDimension')) {
+                Assert-True (@($k.Names) -contains $n) "HKCU Desktop must pre-register $n"
+            }
+        } else {
+            Assert-True ($k.AllValues) "HKLM key must dump every value: $($k.Path)"
+        }
+    }
+}
+
 # -------------------------------------------------------------------------------------------
 # Select-SnapshotLogName
 # -------------------------------------------------------------------------------------------
@@ -110,6 +123,9 @@ $fixtureLogs = @(
     'Microsoft-Windows-RemoteDesktopServices-RemoteFX-Synth3dvsc/Admin',
     'Microsoft-Windows-RemoteApp and Desktop Connections/Admin',
     'Microsoft-Windows-Remote-Desktop-Management-Service/Admin',
+    'Microsoft-Windows-Rdp-Graphics-RdpLite/Operational',
+    'Microsoft-Windows-Rdp-Graphics-RdpAvenc/Debug',
+    'Microsoft-Windows-Wordpad/Admin',
     'Microsoft-Windows-Dwm-Core/Diagnostic',
     'Microsoft-Windows-PowerShell/Operational',
     'Microsoft-Windows-Kernel-Boot/Operational'
@@ -124,9 +140,16 @@ Test-Case 'keeps every TerminalServices / RemoteDesktop / RemoteFX / RemoteApp /
         'Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Admin',
         'Microsoft-Windows-RemoteDesktopServices-RemoteFX-Synth3dvsc/Admin',
         'Microsoft-Windows-RemoteApp and Desktop Connections/Admin',
-        'Microsoft-Windows-Remote-Desktop-Management-Service/Admin')) {
+        'Microsoft-Windows-Remote-Desktop-Management-Service/Admin',
+        'Microsoft-Windows-Rdp-Graphics-RdpLite/Operational',
+        'Microsoft-Windows-Rdp-Graphics-RdpAvenc/Debug')) {
         Assert-True ($sel -contains $want) "expected [$want] to be selected"
     }
+}
+
+Test-Case 'Wordpad is NOT selected: the rdp inside "Wordpad" is not the RDP token (dry run 2 false positive)' {
+    $sel = @(Select-SnapshotLogName -Names @('Microsoft-Windows-Wordpad/Admin', 'Microsoft-Windows-Wordpad/Debug', 'x-Wordpad-y'))
+    Assert-Equal 0 $sel.Count
 }
 
 Test-Case 'the hyphenated RDMS channel is selected by the optional hyphen, not by another token' {
@@ -142,15 +165,23 @@ Test-Case 'the bare tokens RemoteFX, Rdms and RDP select a channel named by them
     Assert-True ($sel -notcontains 'x-Remotefax-y')
 }
 
+Test-Case 'Rdp as a token needs a separator or a CamelCase continuation: RdpCoreTS/RdpLite yes, "xrdpx" and "-rdpfoo-" no' {
+    $sel = @(Select-SnapshotLogName -Names @('a-RdpCoreTS/Operational', 'a-RdpLite/Admin', 'xrdpx', 'a-rdpfoo-b'))
+    Assert-Equal 2 $sel.Count
+    Assert-True ($sel -contains 'a-RdpCoreTS/Operational')
+    Assert-True ($sel -contains 'a-RdpLite/Admin')
+}
+
 Test-Case 'drops the unrelated channels (Application, Security, System, PowerShell, Kernel-Boot, Dwm)' {
     $sel = @(Select-SnapshotLogName -Names $fixtureLogs)
     foreach ($drop in @('Application', 'Security', 'System',
                         'Microsoft-Windows-PowerShell/Operational',
                         'Microsoft-Windows-Kernel-Boot/Operational',
+                        'Microsoft-Windows-Wordpad/Admin',
                         'Microsoft-Windows-Dwm-Core/Diagnostic')) {
         Assert-True ($sel -notcontains $drop) "expected [$drop] to be dropped"
     }
-    Assert-Equal 7 $sel.Count 'exactly the seven RDS channels survive'
+    Assert-Equal 9 $sel.Count 'exactly the nine RDS channels survive'
 }
 
 Test-Case 'is case-insensitive and preserves input order' {
@@ -274,6 +305,69 @@ Test-Case 'null renders as <absent>, scalars as their string, string arrays join
 
 Test-Case 'binary values render as a length-prefixed hex string' {
     Assert-Equal 'bytes[3]:01ff10' (ConvertTo-SnapshotValueText -Value ([byte[]]@(1, 255, 16)))
+}
+
+Test-Case 'binary values longer than 32 bytes are truncated to the first 32 bytes plus an ellipsis (the length prefix stays exact)' {
+    $long = [byte[]](1..100 | ForEach-Object { [byte]($_ % 256) })
+    $text = ConvertTo-SnapshotValueText -Value $long
+    Assert-True ($text.StartsWith('bytes[100]:')) "prefix, got [$text]"
+    Assert-True ($text.EndsWith('...')) 'ellipsis'
+    $hex = $text.Substring('bytes[100]:'.Length, $text.Length - 'bytes[100]:'.Length - 3)
+    Assert-Equal 64 $hex.Length '32 bytes = 64 hex chars'
+    Assert-True ($hex.StartsWith('010203')) 'first bytes'
+}
+
+# -------------------------------------------------------------------------------------------
+# Get-SnapshotFreshnessConsistency (dry run 2: LastBootUpTime said 10.5 h, TickCount said 1.5 h)
+# -------------------------------------------------------------------------------------------
+
+New-Section 'Get-SnapshotFreshnessConsistency'
+
+Test-Case 'boot-based and tick-based uptimes within tolerance are consistent' {
+    Assert-Equal 'consistent' (Get-SnapshotFreshnessConsistency -BootUptimeSeconds 37830 -TickSeconds 37700)
+}
+
+Test-Case 'a tick-based uptime far below the boot-based one names a fast-startup or sleep gap with the three numbers' {
+    $r = Get-SnapshotFreshnessConsistency -BootUptimeSeconds 37830 -TickSeconds 5432
+    Assert-True ($r.StartsWith('fast-startup-or-sleep-suspected')) "label, got [$r]"
+    Assert-True ($r -like '*tick=5432s*') 'tick seconds'
+    Assert-True ($r -like '*boot=37830s*') 'boot seconds'
+    Assert-True ($r -like '*gap=32398s*') 'gap = boot - tick'
+}
+
+Test-Case 'a negative (wrapped) tick or a boot uptime beyond the 32-bit range is not judged' {
+    Assert-Equal 'tick-unavailable' (Get-SnapshotFreshnessConsistency -BootUptimeSeconds 37830 -TickSeconds -12)
+    Assert-Equal 'tick-unavailable' (Get-SnapshotFreshnessConsistency -BootUptimeSeconds 2200000 -TickSeconds 100)
+    Assert-Equal 'tick-unavailable' (Get-SnapshotFreshnessConsistency -BootUptimeSeconds $null -TickSeconds 100)
+}
+
+Test-Case 'the tolerance is 300 s: a 299 s gap is consistent, a 301 s gap is not' {
+    Assert-Equal 'consistent' (Get-SnapshotFreshnessConsistency -BootUptimeSeconds 10000 -TickSeconds 9701)
+    Assert-True ((Get-SnapshotFreshnessConsistency -BootUptimeSeconds 10000 -TickSeconds 9699).StartsWith('fast-startup-or-sleep-suspected'))
+}
+
+# -------------------------------------------------------------------------------------------
+# Kernel-Boot event 27 BootType (System log; XML EventData, locale-independent)
+# -------------------------------------------------------------------------------------------
+
+New-Section 'Get-SnapshotBootTypeFromXml / Format-SnapshotBootType'
+
+Test-Case 'BootType is read from the EventData XML, not from the localised message' {
+    $xml = '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><EventID>27</EventID></System><EventData><Data Name="BootType">1</Data><Data Name="LoadOptions"></Data></EventData></Event>'
+    Assert-Equal 1 (Get-SnapshotBootTypeFromXml -Xml $xml)
+}
+
+Test-Case 'an event without a BootType datum yields null' {
+    Assert-Equal $null (Get-SnapshotBootTypeFromXml -Xml '<Event><EventData><Data Name="Other">1</Data></EventData></Event>')
+    Assert-Equal $null (Get-SnapshotBootTypeFromXml -Xml $null)
+}
+
+Test-Case 'the three documented boot types are named; anything else keeps its number' {
+    Assert-Equal 'cold-boot' (Format-SnapshotBootType -BootType 0)
+    Assert-Equal 'fast-startup' (Format-SnapshotBootType -BootType 1)
+    Assert-Equal 'resume-from-hibernation' (Format-SnapshotBootType -BootType 2)
+    Assert-Equal 'unknown(7)' (Format-SnapshotBootType -BootType 7)
+    Assert-Equal 'unknown' (Format-SnapshotBootType -BootType $null)
 }
 
 # -------------------------------------------------------------------------------------------
