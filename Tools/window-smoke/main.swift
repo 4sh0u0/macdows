@@ -1864,6 +1864,18 @@ enum WindowSmokeGateSelfTest {
 // Runs before ANY of the environment/credential/boundary work below: this mode never reads
 // host.env, never resolves a credential and never constructs a session, which is what makes it
 // safe to run in an offline lane (and what makes it usable as a mutation-test surface at all).
+// stdout is LINE-buffered from the first statement on. When the launcher redirects this process
+// into the evidence log (`"$BIN" >>"$LOG" 2>&1`, run-window-smoke.command) stdout is not a TTY and
+// libc makes it FULLY buffered: `print` lines accumulate and reach the file in block-sized chunks
+// whose boundaries fall mid-line, while CRBridge's WLog writes to stderr immediately -- so a WLog
+// line lands INSIDE a half-flushed harness line and the record cannot read the harness line
+// (F0 r2 / F r3 records: "WLog 行内插入截断", the §6.2 measurement line and the experiment lock
+// line lost their fields). With _IOLBF every `print` is flushed at its newline as one write, and a
+// 64 KiB buffer keeps even the longest summary line in a single write() (POSIX guarantees
+// atomicity only up to PIPE_BUF on pipes; the evidence log is a regular file opened O_APPEND,
+// where each write() lands whole). Nothing in this harness relies on stdout batching.
+setvbuf(stdout, nil, _IOLBF, 1 << 16)
+
 if ProcessInfo.processInfo.environment["WINDOW_SMOKE_SELFTEST"] == "1" {
     exit(WindowSmokeGateSelfTest.run() ? 0 : 1)
 }
