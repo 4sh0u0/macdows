@@ -367,6 +367,38 @@ Test-Case 'the datum name is matched exactly, not as a prefix' {
 }
 
 # -------------------------------------------------------------------------------------------
+# Measure-SnapshotClockJump (dry run 6: the 9 h came as TWO corrections after boot, +28671 s and
+# +3729 s; the newest alone does not explain the gap, their sum does)
+# -------------------------------------------------------------------------------------------
+
+New-Section 'Measure-SnapshotClockJump'
+
+$bootStamp = [datetime]::new(2026, 9, 5, 18, 40, 10)
+$clockEvents = @(
+    [pscustomobject]@{ Time = [datetime]::new(2026, 9, 6, 4, 45, 16); Delta = 0 },
+    [pscustomobject]@{ Time = [datetime]::new(2026, 9, 6, 4, 45, 16); Delta = 3729 },
+    [pscustomobject]@{ Time = [datetime]::new(2026, 9, 6, 2, 43, 7);  Delta = 28671 },
+    [pscustomobject]@{ Time = [datetime]::new(2026, 9, 3, 19, 31, 28); Delta = 0 },
+    [pscustomobject]@{ Time = [datetime]::new(2026, 9, 1, 23, 15, 22); Delta = -5000 }
+)
+
+Test-Case 'sums the deltas of the corrections stamped at or after the boot stamp only' {
+    Assert-Equal 32400 (Measure-SnapshotClockJump -Events $clockEvents -BootTime $bootStamp)
+}
+
+Test-Case 'a correction whose delta could not be parsed is skipped, not treated as zero-or-crash' {
+    $ev = @([pscustomobject]@{ Time = [datetime]::new(2026, 9, 6, 1, 0, 0); Delta = '<unparsed>' },
+            [pscustomobject]@{ Time = [datetime]::new(2026, 9, 6, 2, 0, 0); Delta = 100 })
+    Assert-Equal 100 (Measure-SnapshotClockJump -Events $ev -BootTime $bootStamp)
+}
+
+Test-Case 'no corrections since boot -> null (no jump), not 0' {
+    Assert-Equal $null (Measure-SnapshotClockJump -Events @($clockEvents[3], $clockEvents[4]) -BootTime $bootStamp)
+    Assert-Equal $null (Measure-SnapshotClockJump -Events @() -BootTime $bootStamp)
+    Assert-Equal $null (Measure-SnapshotClockJump -Events $clockEvents -BootTime $null)
+}
+
+# -------------------------------------------------------------------------------------------
 # Select-SnapshotHostFreshnessLabel (dry run 5: gap of exactly 32400 s = 9 h = the host's UTC
 # offset, no sleep events -- a boot-time clock skew corrected later, not a sleep)
 # -------------------------------------------------------------------------------------------

@@ -275,6 +275,33 @@ function Get-SnapshotBootTypeFromXml {
     return $null
 }
 
+function Measure-SnapshotClockJump {
+    <#
+      Net clock correction since boot: the sum of the Kernel-General 1 deltas stamped at or after
+      the boot stamp. Dry run 6 showed the nine hours arrive as TWO corrections (+28671 s, then
+      +3729 s an hour later); the newest alone does not account for the gap, the sum does.
+      Deltas that could not be parsed are skipped; null when there is nothing to sum (no events
+      since boot, or no boot time), so the caller can tell "no correction" from "corrected by 0".
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyCollection()][object[]] $Events, $BootTime)
+    if ($null -eq $BootTime -or $null -eq $Events) { return $null }
+    $sum = 0
+    $n = 0
+    foreach ($e in $Events) {
+        if ($null -eq $e) { continue }
+        if ($e.Time -lt $BootTime) { continue }
+        $d = $e.Delta
+        if ($null -eq $d) { continue }
+        $parsed = 0
+        if (-not [int]::TryParse([string]$d, [ref]$parsed)) { continue }
+        $sum += $parsed
+        $n++
+    }
+    if ($n -eq 0) { return $null }
+    return $sum
+}
+
 function Select-SnapshotHostFreshnessLabel {
     <#
       Which uptime the matrix host_freshness label is taken from, and why.
@@ -283,9 +310,9 @@ function Select-SnapshotHostFreshnessLabel {
       and a gap of exactly 32400 s -- nine hours, the host's UTC offset. That is not a sleep:
       the host booted with its clock nine hours behind (a dual-boot machine whose other OS
       leaves the RTC in UTC), so LastBootUpTime and the boot-time event stamps are nine hours
-      early, and the later correction shows up as a Kernel-General 1 "system time changed" event
-      whose old->new jump equals the gap. In that regime the TICK count is the truthful "since
-      boot" and the label is taken from it.
+      early, and the later correction shows up as Kernel-General 1 "system time changed" events
+      whose old->new jumps SUM to the gap (Measure-SnapshotClockJump). In that regime the TICK
+      count is the truthful "since boot" and the label is taken from it.
         Basis boot: tick unavailable | gap within tolerance | gap NOT matched by a clock jump
                     (then Reason carries Get-SnapshotFreshnessConsistency's suspicion)
         Basis tick: |ClockJumpSeconds| matches |gap| within the tolerance
@@ -445,6 +472,7 @@ function Invoke-SnapshotCollection {
     [void]$L.Add('')
     [void]$L.Add('== host_freshness')
     $up = $null
+    $os = $null
     try {
         $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
         $up = ($os.LocalDateTime - $os.LastBootUpTime).TotalSeconds
@@ -464,6 +492,7 @@ function Invoke-SnapshotCollection {
     # Clock corrections since boot: Kernel-General 1 (system time changed), newest 5, with the
     # old->new jump computed from the EventData (ISO stamps; a parse failure leaves delta blank).
     $clockJump = $null
+    $clockEvents = New-Object System.Collections.ArrayList
     [void]$L.Add('  clock changes (Kernel-General 1, System log, newest first):')
     try {
         $tcs = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-General'; Id = 1 } -MaxEvents 5 -ErrorAction Stop)
@@ -478,10 +507,16 @@ function Invoke-SnapshotCollection {
                 $rk = [Globalization.DateTimeStyles]::RoundtripKind
                 $d = ([DateTime]::Parse($newT, $inv, $rk) - [DateTime]::Parse($oldT, $inv, $rk)).TotalSeconds
                 $delta = [int][math]::Round($d)
-                if ($null -eq $clockJump -and [math]::Abs($delta) -gt 300) { $clockJump = $delta }
             } catch { $delta = '<unparsed>' }
+            [void]$clockEvents.Add([pscustomobject]@{ Time = $e.TimeCreated; Delta = $delta })
             [void]$L.Add(('    Kernel-General 1 {0} old={1} new={2} delta={3}s reason={4}' -f $e.TimeCreated.ToUniversalTime().ToString('o'), $oldT, $newT, $delta, $why))
         }
+        $bootLocal = $null
+        if ($null -ne $os) { $bootLocal = $os.LastBootUpTime }
+        $clockJump = Measure-SnapshotClockJump -Events @($clockEvents.ToArray()) -BootTime $bootLocal
+        $jumpText = '<none since boot>'
+        if ($null -ne $clockJump) { $jumpText = "$clockJump" + 's' }
+        [void]$L.Add('  clock_jump_since_boot = ' + $jumpText)
     } catch {
         if ($_.FullyQualifiedErrorId -match 'NoMatchingEventsFound') {
             [void]$L.Add('    Kernel-General 1: none')
