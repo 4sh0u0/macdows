@@ -376,16 +376,102 @@ extension WindowGeometry {
     /// UNIT (M1/W1 tagging pass; U5 ruling = record-only): both parameters and the result are
     /// **remote pixels**, in Windows space -- this subtraction happens after
     /// `railRect(from:correction:)` and before the `left`/`top`/`right`/`bottom` integers go
-    /// on the wire, so no point conversion or Y flip is involved and no scale applies. The 7
-    /// this is called with lives at its own call site
-    /// (`RemoteWindowRegistry.swift:1818-1820`, F6(a)); M1 changes neither that value nor this
-    /// function's arithmetic. W3 TRIGGER: re-measure the border on a session where
-    /// `DisplayScale.remotePixelsPerPoint != 1`. A window-manager border is plausibly a
-    /// DPI-dependent quantity, and all three real-host measurements behind the 7 were taken on
-    /// the same 1x host (`docs/plans/phase3.md:219`), so "7 remote pixels" and "7 points"
-    /// are indistinguishable in the existing evidence -- which is exactly why the value is
-    /// recorded rather than migrated (§3 item 5, §8.5: no 2x measurement exists yet).
+    /// on the wire, so no point conversion or Y flip is involved and no scale applies.
+    ///
+    /// WHAT `measuredLeftBorder` IS CALLED WITH, as of F-R1 (2026-09-02): not a single
+    /// constant any more. `clientWindowMoveLeftBorder(forStyle:)` below picks between two
+    /// measured values from the window's own Win32 style bits, and
+    /// `RemoteWindowRegistry.handleLocalGeometrySettled` -- the only production caller -- calls
+    /// this function with that result. This function itself is unchanged by that lane: it was
+    /// always "subtract whatever border you measured", and the algebra above holds for either
+    /// value (substitute B = 5 or B = 7; nothing in steps 1-4 depends on which).
+    ///
+    /// THE OPEN DPI QUESTION IS STILL OPEN, and F-R1 did NOT answer it. Every measurement
+    /// behind both values was taken on the same 1x host (`docs/plans/phase3.md:219`), so
+    /// "5/7 remote pixels" and "5/7 points" remain indistinguishable in the evidence, and
+    /// re-measuring on a session where `DisplayScale.remotePixelsPerPoint != 1` is still the
+    /// outstanding trigger (§3 item 5, §8.5: no 2x measurement exists yet). What F-R1 changed
+    /// is the *other* variable: the border was found to move with the window STYLE on a fixed
+    /// DPI, which is why the value is now a function rather than a recorded constant.
     public static func clientWindowMoveLeft(fromVisibleLeft visibleLeft: Double, measuredLeftBorder: Double) -> Double {
         visibleLeft - measuredLeftBorder
+    }
+
+    /// The DWM invisible-frame left thickness measured on the About-Windows dialog (style
+    /// `0x80080000` = `WS_POPUP | WS_SYSMENU`, no `WS_THICKFRAME`) -- the original calibration
+    /// this whole correction was derived from: THREE runs on 2026-08-23 each sent `left=331`
+    /// and got `offsetX=338` back on the next `WindowUpdate`, a clean +7 every time (the
+    /// algebra is worked in `clientWindowMoveLeft`'s own doc comment). Corroborated once more
+    /// by C-2 run 4 (`docs/upgrade-gate/2026-09-scaledmap-next-step.md:101`), whose About-target
+    /// move leg sent `left=195` and was reported back at `offsetX=202`, i.e. a measured frame of
+    /// (7,0,7,7) -- n=1 for the right/bottom members of that frame, which nothing here consumes.
+    ///
+    /// PROVENANCE: this is the value that lived at `RemoteWindowRegistry`'s own
+    /// `measuredClientWindowMoveLeftBorder` (F6 (a); ADR-0015 §7 (a)) until the F-R1 lane moved
+    /// it here so the style rule below could be unit-tested as one pure function. It is the
+    /// same number with the same evidence, not a re-derivation. `Tools/window-smoke`'s
+    /// `RailComparison.Borders.aboutCalibrated` still cites the old name/location for it.
+    public static let aboutCalibratedClientWindowMoveLeftBorder: Double = 7
+
+    /// The same thickness measured on `WS_THICKFRAME` windows -- F-R1
+    /// (`docs/upgrade-gate/2026-09-resize-leg-live.md:32`): a Notepad target (style
+    /// `0x000F0000`) was asked for visible left 215, was sent `left=208` under the
+    /// About-calibrated 7 above, and came back at `offsetX=213` -- the server had inset by 5,
+    /// leaving the `dx = -2` that run's move leg reported. The record's running count reached
+    /// eight independent runs at C second-step r2 and nine at r3
+    /// (`docs/upgrade-gate/2026-09-scaledmap-next-step.md:101`); r3 additionally read the frame
+    /// directly through adr/0015 §6.2's measurement field, `frame=(5,0,5,5)` on all ten legs.
+    ///
+    /// The frame's top member is 0 in both models: these styles have no invisible top edge,
+    /// which is why `clientWindowMoveLeft` has no `top` sibling (and, per its own doc comment,
+    /// no `right`/width sibling either).
+    public static let thickFrameClientWindowMoveLeftBorder: Double = 5
+
+    /// F6 (a), as F-R1 rewrote it (ADR-0015 §7 (a)'s "TRIGGERED SHAPE" for this value): the
+    /// left border `clientWindowMoveLeft` deducts, chosen from the window's own Win32 `style`
+    /// bits. `WS_THICKFRAME` (== `WS_SIZEBOX`, `StyleTranslator.styleThickFrame`) set ->
+    /// `thickFrameClientWindowMoveLeftBorder`; anything else ->
+    /// `aboutCalibratedClientWindowMoveLeftBorder`. Each constant carries its own record.
+    ///
+    /// WHY A STYLE KEY AND NOT A DPI ONE: ADR-0015 §7 (a) named "a different window/DPI/
+    /// Windows-build" as this value's trigger, and the one that actually fired was the FIRST
+    /// of the three. Both measurements come from the same 1x host and the same Windows build;
+    /// the only thing that differs between them is the window's style. Explicitly NOT a
+    /// `rasterScale` multiplication -- §7 (a) rules that option out by name, and no evidence
+    /// says a window-manager border scales linearly with DPI.
+    ///
+    /// `style == 0` FALLS TO THE ABOUT VALUE, and that is a decision rather than an accident.
+    /// Zero is what `RemoteWindowRegistry`'s `PendingWindowState.style` holds both for a window
+    /// whose style genuinely is 0 and for one whose window orders never carried
+    /// `WINDOW_ORDER_FIELD_STYLE` at all (a delta order's unset bit means "unchanged", never
+    /// "reset to zero" -- `WindowState.merge`'s own invariant), and the two are
+    /// indistinguishable here. There is no measurement for "style unknown", so the unknown case
+    /// keeps the exact value that was sent for every window before this function existed
+    /// instead of acquiring a new, unmeasured one -- the same fail-to-the-known-behaviour
+    /// discipline `WindowMappability.isMappableWindow` applies to unrecognized styles. A window
+    /// that never announces a style also never announces `WS_THICKFRAME`, so nothing here can
+    /// tell it apart from a genuine non-THICKFRAME window; if that ever needs to be visible,
+    /// the discriminator has to be an explicit "style was received" flag on the wire state, not
+    /// a third value invented in this function.
+    ///
+    /// A TWO-ROW TABLE IS A STAND-IN, not the destination. F6 (d) (see
+    /// `RemoteWindowRegistry.macContentRect(for:windowId:in:)`'s doc comment) records the other
+    /// road: RAIL's own `resizeMarginLeft/Top/Right/Bottom` would carry this per window on the
+    /// wire, with no table at all -- but that road stays blocked until the adr/0008 §0
+    /// `fieldFlags` re-verification (`docs/plans/phase3.md:232`, §8.14) decides whether those
+    /// bits are reliably sent. Until it does, this table is what the two measurements support:
+    /// two styles, two numbers, no interpolation and no third row.
+    ///
+    /// The same rule, as a measurement-only fixture seam, is `RailComparison.Borders`
+    /// `.forStyleBits` in `Tools/window-smoke/main.swift` -- that copy prints §6.2's comparison
+    /// and never feeds the wire; this one is the production decision. They agree by
+    /// construction on the same bit and the same two values, and a divergence between them is a
+    /// bug in whichever was edited alone.
+    ///
+    /// UNIT: **remote px**, the same domain `clientWindowMoveLeft`'s parameters are in.
+    public static func clientWindowMoveLeftBorder(forStyle style: UInt32) -> Double {
+        style & StyleTranslator.styleThickFrame != 0
+            ? thickFrameClientWindowMoveLeftBorder
+            : aboutCalibratedClientWindowMoveLeftBorder
     }
 }
