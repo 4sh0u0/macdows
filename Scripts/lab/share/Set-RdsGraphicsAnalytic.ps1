@@ -142,6 +142,17 @@ function Format-AnalyticReadback {
     return 'READBACK: ' + ($parts.ToArray() -join ' ')
 }
 
+function Format-AnalyticBackupRecordLine {
+    <# The script's trailing line: where the pre-lab record is NOW. Decided from the record's
+       existence AFTER the action -- A-prime r1 (2026-09-07) printed "restored; backup record
+       removed (...)" followed by "backup record: <the same path>" because the line was decided
+       from the pre-action check; Restore had just deleted the file it named. #>
+    [CmdletBinding()]
+    param([bool] $Exists, [string] $Path)
+    if ($Exists) { return "backup record: $Path" }
+    return 'backup record: none'
+}
+
 # ---------------------------------------------------------------------------------------------
 # Host side (Windows only; never reached under -NoRun)
 # ---------------------------------------------------------------------------------------------
@@ -205,5 +216,5 @@ if (-not $NoRun) {
     }
     # Read back what the host now actually reports -- never trust the write, verify it.
     Write-Host (Format-AnalyticReadback -State (Get-AnalyticCurrentState))
-    if ($backupExists -or $plan.WriteBackup) { Write-Host "backup record: $backupPath" } else { Write-Host 'backup record: none' }
+    Write-Host (Format-AnalyticBackupRecordLine -Exists (Test-Path -LiteralPath $backupPath) -Path $backupPath)
 }
