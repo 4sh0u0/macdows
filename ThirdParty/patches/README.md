@@ -50,9 +50,10 @@ policy).
    argument, which a hunk cannot prove, so none is admitted; the knob's description string
    carries the notice); (2) every other added line is a one-line C comment that is nothing else
    (`/* ... */` alone, `//`) or exactly `#cmakedefine MACDOWS_LAB_<X>` in a `*.in` template --
-   no code line is admitted, even one that names the knob, and no added line may contain a
-   backslash or `??` (a comment ending in `\` or the `??/` trigraph is spliced with the next
-   physical line before comments are recognised and would swallow real code); (3) every removed line is a
+   no code line is admitted, even one that names the knob; (2a) independently of (2), NO added
+   line of any kind in any hunk may contain a backslash or `??` (a line ending in `\` or the
+   `??/` trigraph is spliced with the next physical line before comments are recognised and
+   would swallow real code); (3) every removed line is a
    `#if`/`#elif` line re-added in the same hunk as the removed text followed by
    ` && !defined(MACDOWS_LAB_<X>)` -- a guard appended, nothing else; (4) text hunks of
    existing files only: every `diff --git` block carries a `---`/`+++` pair naming the same file
