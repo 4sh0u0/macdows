@@ -739,16 +739,19 @@ enum SizeBand {
 ///    the wrong one of its two one-shot log lines -- live wiring, no offline seam.
 ///  * **the multi-window gate** counting a window that merely flashed after the exec, counting a
 ///    close target that never showed content, or re-adding pre-existing ids =>
-///    `multiWindowGateCountsVisibleOrHarnessClosedNewWindows`.
-///  * **the generic visible-window gate** losing its ever-visible half (back to "visible at finish"
-///    only, the A-prime r1 spurious red), losing its finish half, inverted, or demanding more than
-///    one => `visibleWindowGateJudgesEverVisible`. **Not covered here**: `finish()` passing
-///    something other than `firstFrameGateChecked.count` (live wiring, no offline seam).
-///    **Not covered here** (live wiring,
+///    `multiWindowGateCountsVisibleOrHarnessClosedNewWindows`. **Not covered here** (live wiring,
 ///    no offline seam): `finish()` passing an empty `closedByHarness`, or only one of its two
 ///    halves (the F0-H1 defect itself; review multiwindow-gate-r2 MF); the per-tick accumulator
 ///    dropping `hasDisplayedContent` or the band floor (a weaker accumulator survives every pin,
 ///    as review multiwindow-gate-r1 M2 measured); the F0 rerun is the live check for the first.
+///  * **the generic visible-window gate** losing its ever-visible half (back to "visible at finish"
+///    only, the A-prime r1 spurious red), losing its finish half, inverted, or demanding more than
+///    one => `visibleWindowGateJudgesEverVisible`. **Not covered here** (live wiring, no offline
+///    seam): `finish()` passing something other than `firstFrameGateChecked.count`; and the gate is
+///    origin-agnostic BY DESIGN -- a leftover window this client showed satisfies it, exactly as it
+///    satisfied the finish-only check it replaces (F r3 passed on three leftovers); the multi-window,
+///    maximize and move-resize gates are the ones that judge windows this run itself created
+///    (review visible-gate I-1).
 ///  * **the declared-desktop override** accepting 0/negative/non-`<w>x<h>` values, a trailing or
 ///    doubled `x` (`omittingEmptySubsequences` flipped -- review declared-desktop-r1 M3 measured that
 ///    mutant surviving before the pin), whitespace-only as unset, an extent past the wire ceiling,
@@ -2805,6 +2808,13 @@ enum MoveResizeTarget {
 /// session showed at least one window", so it reads the first-frame gate's ever-visible set as well
 /// as the finish snapshot; either alone suffices. The tray and input-test exemptions in `finish()` are
 /// untouched. Pinned offline by `visibleWindowGateJudgesEverVisible`.
+///
+/// Origin-agnostic by design (review visible-gate I-1): a leftover window from an earlier round that
+/// this client mapped and showed satisfies the check -- it did under the finish-only check too (F r3,
+/// 2026-09-06, passed on three leftovers) -- because the property judged is "the pixel path showed a
+/// RemoteWindow in this session", not "this run's own app appeared". Whether THIS run's windows
+/// appeared is the business of the multi-window gate (`windowIdsBeforeExtraApps` subtraction), the
+/// maximize scenario and the move-resize scenario, each of which fails on its own.
 enum VisibleWindowGate {
     /// `visibleAtFinish`: RemoteWindows visible in the finish snapshot. `everVisible`: windowIds the
     /// first-frame gate ever observed visible during the run (`firstFrameGateChecked`). A window that
