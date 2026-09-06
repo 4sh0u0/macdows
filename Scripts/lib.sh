@@ -40,19 +40,24 @@ require_cmd() {
 # gate r1 m-3): a link that merely appears inside a hunk's context or additions does not count.
 #
 # The marker is a claim, so a marker-admitted patch must have the lab-only SHAPE, checked
-# mechanically over its whole diff body (gate d1-lane r1 I-3, r2 I-7, r3 B-4, r4 B-6):
+# mechanically over its whole diff body (gate d1-lane r1 I-3, r2 I-7, r3 B-4, r4 B-6, r5 B-7/B-8).
+# The rules are a GRAMMAR of what a guarded default-OFF knob looks like, not a token test:
 #   1. exactly ONE new CMake `option(MACDOWS_LAB_<X> "..." OFF)` line, added in a hunk of a
-#      *.cmake / CMakeLists.txt file (the knob; its name is the KEY every other change hangs on);
-#   2. every other ADDED line either names that knob as a whole token, or is a one-line comment
-#      (C `/* ... */` or `//` anywhere; `#` in CMake files) -- so the patch can insert guards and
-#      say what it did, and nothing else;
-#   3. every REMOVED line is re-added in the same hunk as a line that starts with the removed text
-#      and names the knob -- a guard appended to an existing line, never a line changed or dropped;
-#   4. files are modified in place only: no new/deleted files, no renames or copies, and the file a
-#      hunk targets is what its `+++ b/` line names (what `git apply` reads) -- a `diff --git` line
-#      naming a different file is refused; a bare `--- a/` / `+++ b/` hunk is judged like any other.
+#      *.cmake / CMakeLists.txt file (the knob);
+#   2. every other ADDED line is one of: a one-line comment that is nothing else (C `/* ... */`
+#      alone on the line, `//`, or `#` in a CMake file without a `[[` / `]]` bracket-comment
+#      delimiter); or exactly `#cmakedefine MACDOWS_LAB_<X>`. No code line is admitted, whether
+#      or not it names the knob;
+#   3. every REMOVED line is a `#if` / `#elif` line re-added in the same hunk as exactly the removed
+#      text followed by ` && !defined(MACDOWS_LAB_<X>)` -- a guard appended, nothing else;
+#   4. text hunks of existing files only: every `diff --git` block carries a `--- a/` / `+++ b/`
+#      pair naming the SAME file the block names (what `git apply` reads), so a bare hunk, a
+#      mode-only block, a binary block, a new/deleted file, a rename or a copy is refused.
 #   CR is stripped first so a CRLF patch is judged on its content. A bug fix, a behaviour change,
-#   an extra hunk riding along, or a knob named outside MACDOWS_LAB_* all fail one of the four.
+#   an extra hunk riding along, a `set(KNOB ...)` override, a runtime `if (KNOB)`, or a knob named
+#   outside MACDOWS_LAB_* all fail one of the four. What the shape does NOT judge: the option's
+#   description string and comment text (inert), and whether the guarded `#if` sites are the right
+#   ones -- that is the ADR's and the reviewer's job.
 #
 # This is the ONE implementation of the rule. Scripts/build-freerdp.sh consults it before
 # folding the queue into the config hash, Scripts/check-patch-queue.sh (Tier 1's patch
@@ -68,37 +73,52 @@ crdp_patch_record_ok() {
 	if printf '%s\n' "$header" | grep -qE '^# Lab-only: default OFF; ADR: docs/adr/[0-9]{4}-[A-Za-z0-9._-]+\.md'; then
 		awk '
 			{ sub(/\r$/, "") }
-			/^diff --git / { inbody = 1; hdr = $NF; sub(/^b\//, "", hdr); file = ""; cmake = 0; next }
-			/^--- (a\/|\/dev\/null)/ { inbody = 1; next }
+			/^diff --git / { inbody = 1; ndg++; hdr = $NF; sub(/^b\//, "", hdr); file = ""; cmake = 0; next }
+			/^--- (a\/|\/dev\/null)/ { inbody = 1; if (hdr == "") { bad = 1 }; next }
 			!inbody { next }
-			/^(rename (from|to)|copy (from|to)|new file mode|deleted file mode|similarity index)/ { bad = 1; next }
-			/^\+\+\+ / { file = $2
+			/^(rename (from|to)|copy (from|to)|new file mode|deleted file mode|similarity index|old mode|new mode|GIT binary patch|Binary files )/ { bad = 1; next }
+			/^\+\+\+ / { file = $2; npp++
 			             if (file == "/dev/null") { bad = 1; next }
 			             sub(/^b\//, "", file)
-			             if (hdr != "" && file != hdr) { bad = 1 }
+			             if (hdr == "" || file != hdr) { bad = 1 }
 			             hdr = ""; cmake = (file ~ /(\.cmake|CMakeLists\.txt)$/); next }
 			/^@@ / { h++; next }
-			/^\+[[:space:]]*option\([[:space:]]*MACDOWS_LAB_[A-Za-z0-9_]+[[:space:]]+"[^"]*"[[:space:]]+OFF[[:space:]]*\)/ && cmake {
+			/^\+[[:space:]]*option\([[:space:]]*MACDOWS_LAB_[A-Za-z0-9_]+[[:space:]]+"[^"]*"[[:space:]]+OFF[[:space:]]*\)[[:space:]]*$/ && cmake {
 				name = $0; sub(/^\+[[:space:]]*option\([[:space:]]*/, "", name); sub(/[[:space:]].*/, "", name)
 				nopt++; knob = name; next }
 			/^\+/ { np[h]++; plus[h, np[h]] = substr($0, 2); pcm[h, np[h]] = cmake; next }
 			/^-/  { nm[h]++; minus[h, nm[h]] = substr($0, 2); next }
 			END {
-				if (bad || nopt != 1) exit 1
-				tok = "(^|[^A-Za-z0-9_])" knob "([^A-Za-z0-9_]|$)"
+				if (bad || nopt != 1 || ndg != npp || hdr != "") exit 1
+				guardtail = "^[[:space:]]*&&[[:space:]]*!defined\\(" knob "\\)[[:space:]]*$"
+				guardline = "^[[:space:]]*#[[:space:]]*(if|elif)[[:space:]].*&&[[:space:]]*!defined\\(" knob "\\)[[:space:]]*$"
 				for (k = 1; k <= h; k++) {
+					# rule 2: every added line is a comment, the cmakedefine, or a guard re-add (which
+					# rule 3 then pairs with a removed line -- a guard line with no removed twin is refused)
+					ng = 0
 					for (i = 1; i <= np[k]; i++) {
 						l = plus[k, i]
-						if (l ~ tok) continue
-						if (l ~ /^[[:space:]]*\/\*.*\*\/[[:space:]]*$/ || l ~ /^[[:space:]]*\/\//) continue
-						if (pcm[k, i] && l ~ /^[[:space:]]*#/) continue
+						if (l ~ /^[[:space:]]*\/\*([^*]|\*+[^*\/])*\*+\/[[:space:]]*$/) continue
+						if (l ~ /^[[:space:]]*\/\//) continue
+						if (pcm[k, i] && l ~ /^[[:space:]]*#/ && l !~ /\[\[|\]\]/) continue
+						if (l ~ ("^[[:space:]]*#cmakedefine[[:space:]]+" knob "[[:space:]]*$")) continue
+						if (l ~ guardline) { ng++; continue }
 						exit 1
 					}
+					# rule 3: every removed line is a #if/#elif re-added as itself + the guard tail;
+					# the number of guard re-adds must equal the number of removed lines (bijection)
+					matched = 0
 					for (i = 1; i <= nm[k]; i++) {
 						r = minus[k, i]; found = 0
-						for (j = 1; j <= np[k]; j++) { l = plus[k, j]; if (index(l, r) == 1 && l ~ tok) { found = 1; break } }
+						if (r !~ /^[[:space:]]*#[[:space:]]*(if|elif)[[:space:]]/) exit 1
+						for (j = 1; j <= np[k]; j++) {
+							l = plus[k, j]
+							if (substr(l, 1, length(r)) == r && substr(l, length(r) + 1) ~ guardtail) { found = 1; break }
+						}
 						if (!found) exit 1
+						matched++
 					}
+					if (ng != matched) exit 1
 				}
 				exit 0
 			}

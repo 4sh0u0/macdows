@@ -203,6 +203,67 @@ mkdir -p "$TMP/shape-two"
 { printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${OPTION_HUNK//MACDOWS_LAB_FIXTURE/MACDOWS_LAB_SECOND}"; } > "$TMP/shape-two/0001-lab.patch"
 check 'two new knobs in one patch refuses (exactly one knob per lab patch)'         1 'rule 1' --patch-dir "$TMP/shape-two" --no-apply
 
+echo "== rules 2/3 are a GRAMMAR, not a token test (gate r5 B-8); blocks without text hunks refuse (B-7)"
+CMAKEDEFINE_HUNK='diff --git a/include/config/config.h.in b/include/config/config.h.in
+--- a/include/config/config.h.in
++++ b/include/config/config.h.in
+@@ -1,2 +1,4 @@
+ #cmakedefine WITH_SWSCALE
++/* Macdows lab patch: lab-only, default OFF */
++#cmakedefine MACDOWS_LAB_FIXTURE
+ #cmakedefine WITH_SWSCALE_LOADING'
+mkdir -p "$TMP/g-ok" "$TMP/g-if" "$TMP/g-append" "$TMP/g-set" "$TMP/g-bracket" "$TMP/g-tail" "$TMP/g-mode" "$TMP/g-binary"
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$GUARD_HUNK"; printf '%s\n' "$CMAKEDEFINE_HUNK"; } > "$TMP/g-ok/0001-lab.patch"
+check 'the real shape -- option, #cmakedefine KNOB, comments, #if lines re-added with && !defined(KNOB) -- passes' 0 '1 patch(es) validated' --patch-dir "$TMP/g-ok" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${GUARD_HUNK/+\/\* Macdows lab patch: the lab-only option omits the flag. \*\//+	if (MACDOWS_LAB_FIXTURE) system(\"x\");}"; } > "$TMP/g-if/0001-lab.patch"
+check 'a new runtime line that merely names the knob refuses (B-8)'                1 'rule 1' --patch-dir "$TMP/g-if" --no-apply
+APPEND_HUNK='diff --git a/libfreerdp/core/rdp.c b/libfreerdp/core/rdp.c
+--- a/libfreerdp/core/rdp.c
++++ b/libfreerdp/core/rdp.c
+@@ -1,2 +1,2 @@
+ 	int x;
+-	foo(a);
++	foo(a); bar(); /* MACDOWS_LAB_FIXTURE */'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$APPEND_HUNK"; } > "$TMP/g-append/0001-lab.patch"
+check 'a removed line re-added with code appended (knob only in a comment) refuses (B-8)' 1 'rule 1' --patch-dir "$TMP/g-append" --no-apply
+SET_HUNK='diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,1 +1,2 @@
+ project(FreeRDP)
++set(MACDOWS_LAB_FIXTURE ON CACHE BOOL "override" FORCE)'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$SET_HUNK"; } > "$TMP/g-set/0001-lab.patch"
+check 'a set(KNOB ON ... FORCE) line refuses (it would defeat "default OFF")'       1 'rule 1' --patch-dir "$TMP/g-set" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "${OPTION_HUNK/@@ -1,1 +1,2 @@/@@ -1,1 +1,3 @@}" | sed 's|^+option(MACDOWS_LAB_FIXTURE|+#[[ bracket comment start\n+option(MACDOWS_LAB_FIXTURE|'; } > "$TMP/g-bracket/0001-lab.patch"
+check 'a CMake bracket-comment opener as an added line refuses'                    1 'rule 1' --patch-dir "$TMP/g-bracket" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${GUARD_HUNK/+\/\* Macdows lab patch: the lab-only option omits the flag. \*\//+\/* MACDOWS_LAB_FIXTURE *\/ system(\"x\");}"; } > "$TMP/g-tail/0001-lab.patch"
+check 'a comment followed by code on the same line refuses'                        1 'rule 1' --patch-dir "$TMP/g-tail" --no-apply
+MODE_BLOCK='diff --git a/scripts/run.sh b/scripts/run.sh
+old mode 100644
+new mode 100755'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$MODE_BLOCK"; } > "$TMP/g-mode/0001-lab.patch"
+check 'a mode-only block (no text hunk) refuses (B-7)'                             1 'rule 1' --patch-dir "$TMP/g-mode" --no-apply
+BINARY_BLOCK='diff --git a/resources/icon.png b/resources/icon.png
+index 1111111..2222222 100644
+Binary files a/resources/icon.png and b/resources/icon.png differ'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$BINARY_BLOCK"; } > "$TMP/g-binary/0001-lab.patch"
+check 'a binary block refuses (B-7)'                                                1 'rule 1' --patch-dir "$TMP/g-binary" --no-apply
+mkdir -p "$TMP/g-tail2" "$TMP/g-lone"
+# rule 3's tail is exactly " && !defined(KNOB)": a #if re-added with any other tail -- even one that
+# names the knob and keeps the removed text as its prefix -- is a changed condition and refuses.
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${GUARD_HUNK/&& !defined(MACDOWS_LAB_FIXTURE)/|| defined(MACDOWS_LAB_FIXTURE)}"; } > "$TMP/g-tail2/0001-lab.patch"
+check 'a #if re-added with a different tail (|| defined(KNOB)) refuses'               1 'rule 1' --patch-dir "$TMP/g-tail2" --no-apply
+# a guard-shaped added line with no removed twin is a NEW condition, not a guard appended: refused.
+LONE_HUNK='diff --git a/libfreerdp/core/rdp.c b/libfreerdp/core/rdp.c
+--- a/libfreerdp/core/rdp.c
++++ b/libfreerdp/core/rdp.c
+@@ -1,2 +1,3 @@
+ 	int x;
++#if 0 && !defined(MACDOWS_LAB_FIXTURE)
+ 	int y;'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$LONE_HUNK"; } > "$TMP/g-lone/0001-lab.patch"
+check 'a guard-shaped added line with no removed twin refuses (bijection)'            1 'rule 1' --patch-dir "$TMP/g-lone" --no-apply
+
 echo "== header boundary: only a real diff line ends the header (gate r1 m-3)"
 mkdir -p "$TMP/dashes"
 { printf '%s\n' '# a header comment'; printf '%s\n' '--- notes: this line starts with three dashes but is prose'; printf '%s\n' "$LINK"; printf '%s\n' "$BOGUS_HUNK"; } > "$TMP/dashes/0001-dashes.patch"
