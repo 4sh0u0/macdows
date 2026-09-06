@@ -106,7 +106,10 @@ FREERDP_PREFIX="${CRDP_FREERDP_PREFIX:-$CRDP_BUILD_DIR/freerdp/current/prefix}"
 PROBE_DIR="$CRDP_REPO_ROOT/Tools/rail-probe"
 BUILD_DIR="$PROBE_DIR/build"
 if [ -n "${CRDP_FREERDP_PREFIX:-}" ]; then
-	BUILD_DIR="$CRDP_BUILD_DIR/rail-probe-$(basename "$(cd "$FREERDP_PREFIX/.." && pwd)")"
+	# pwd -P: a prefix reached through the `current` symlink must name its real hash dir, not "current".
+	BUILD_DIR="$CRDP_BUILD_DIR/rail-probe-$(basename "$(cd "$FREERDP_PREFIX/.." && pwd -P)")"
+	# Note: Scripts/test-lab-boundary.sh inspects Tools/rail-probe/build/rail-probe (the default
+	# build dir); an override run refreshes only its own build dir, never that binary.
 	log "CRDP_FREERDP_PREFIX override: rail-probe links against $FREERDP_PREFIX (build dir $BUILD_DIR)"
 fi
 if [ -f "$FREERDP_PREFIX/../build-manifest.json" ] && command -v jq >/dev/null 2>&1; then

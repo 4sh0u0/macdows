@@ -38,7 +38,7 @@ jobs:
       - name: Install shellcheck
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y shellcheck
+          sudo apt-get install -y shellcheck ninja-build
 
       - name: shellcheck all Scripts
         # W4c review: -S style pins the strictness level explicitly (was implicitly
@@ -255,3 +255,7 @@ jobs:
         run: |
           ./Scripts/test-patch-queue.sh
           ./Scripts/check-patch-queue.sh
+          # build-freerdp.sh's lab toggle through its --print-config-hash seam (needs cmake, ninja,
+          # jq, shasum, git and the pinned submodule; CRDP_WITH_FFMPEG=0 inside the suite keeps it
+          # independent of a self-built ffmpeg). It says SKIP if a prerequisite is missing.
+          ./Scripts/test-build-freerdp-toggle.sh

@@ -34,6 +34,10 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
+# Absolute paths before anything is handed to `git -C "$FREERDP_SRC"`, which resolves a
+# relative patch path INSIDE the submodule (the pitfall tier1.yml's old step documented).
+[ -d "$PATCH_DIR" ] && PATCH_DIR="$(cd "$PATCH_DIR" && pwd)"
+[ -d "$FREERDP_SRC" ] && FREERDP_SRC="$(cd "$FREERDP_SRC" && pwd)"
 PATCHES=()
 if [ -d "$PATCH_DIR" ]; then
 	while IFS= read -r -d '' p; do PATCHES+=("$p"); done \

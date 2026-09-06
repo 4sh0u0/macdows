@@ -40,6 +40,13 @@ check() {
 LINK='# Upstream: https://github.com/FreeRDP/FreeRDP/issues/12345'
 MARKER='# Lab-only: default OFF; ADR: docs/adr/0016-scaledmap-disable-configurable-d1.md'
 # A hunk that cannot apply to any file in the pinned tree: rule 2 must refuse it.
+# A lab-only patch must ADD a default-OFF option (rule 1 exception, gate r1 I-3); this hunk is that line.
+OPTION_HUNK='diff --git a/cmake/ConfigOptions.cmake b/cmake/ConfigOptions.cmake
+--- a/cmake/ConfigOptions.cmake
++++ b/cmake/ConfigOptions.cmake
+@@ -1,1 +1,2 @@
+ option(WITH_SWSCALE "Use SWScale image library for screen resizing" ON)
++option(MACDOWS_LAB_FIXTURE "Lab-only fixture knob" OFF)'
 BOGUS_HUNK='diff --git a/CMakeLists.txt b/CMakeLists.txt
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
@@ -59,8 +66,9 @@ rm -f "$TMP/empty/.keep"
 check 'empty queue passes and says so'                       0 'No patches'          --patch-dir "$TMP/empty" --no-apply
 mk "$TMP/link"   0001-link.patch   "$LINK"
 check 'a GitHub issue/PR link in the header passes'          0 '1 patch(es) validated' --patch-dir "$TMP/link" --no-apply
-mk "$TMP/marker" 0001-lab.patch    "$MARKER"
-check 'the lab-only marker (default OFF + ADR) passes'        0 '1 patch(es) validated' --patch-dir "$TMP/marker" --no-apply
+mkdir -p "$TMP/marker"
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$BOGUS_HUNK"; } > "$TMP/marker/0001-lab.patch"
+check 'the lab-only marker (default OFF + ADR) with an added default-OFF option passes' 0 '1 patch(es) validated' --patch-dir "$TMP/marker" --no-apply
 mk "$TMP/none"   0001-none.patch   '# a patch with no record at all'
 check 'neither record refuses, naming rule 1 and the file'   1 'rule 1'              --patch-dir "$TMP/none" --no-apply
 check 'the refusal names the offending file'                 1 '0001-none.patch'     --patch-dir "$TMP/none" --no-apply
@@ -75,13 +83,54 @@ mk "$TMP/mixed"  0001-link.patch   "$LINK"
 mk "$TMP/mixed"  0002-none.patch   '# nothing'
 check 'one bad patch fails the whole queue'                  1 '0002-none.patch'     --patch-dir "$TMP/mixed" --no-apply
 
+echo "== rule 1, lab-only exception: the marker alone is a sentence; the patch must ADD a default-OFF option (gate r1 I-3)"
+# The fixtures above carry only a bogus hunk. A real lab-only patch adds `option(<NAME> "..." OFF)`
+# to a CMake file; a bug fix wearing the marker adds no such line and must be refused.
+mkdir -p "$TMP/labopt" "$TMP/labon" "$TMP/labfix"
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; } > "$TMP/labopt/0001-lab.patch"
+check 'marker + an added default-OFF option passes'          0 '1 patch(es) validated' --patch-dir "$TMP/labopt" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "${OPTION_HUNK/OFF)/ON)}"; } > "$TMP/labon/0001-lab.patch"
+check 'marker + an added option defaulting ON refuses'       1 'rule 1'              --patch-dir "$TMP/labon" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$BOGUS_HUNK"; } > "$TMP/labfix/0001-bugfix.patch"
+check 'marker on a patch that adds no option (a bug fix in disguise) refuses' 1 'rule 1' --patch-dir "$TMP/labfix" --no-apply
+
+echo "== header boundary: only a real diff line ends the header (gate r1 m-3)"
+mkdir -p "$TMP/dashes"
+{ printf '%s\n' '# a header comment'; printf '%s\n' '--- notes: this line starts with three dashes but is prose'; printf '%s\n' "$LINK"; printf '%s\n' "$BOGUS_HUNK"; } > "$TMP/dashes/0001-dashes.patch"
+check 'a header line starting with "--- " (prose) does not cut the header' 0 '1 patch(es) validated' --patch-dir "$TMP/dashes" --no-apply
+
 echo "== rule 2: git apply --check against the pinned checkout"
 if [ -e "$FREERDP_SRC/.git" ]; then
     check 'a header-valid patch that does not apply refuses (rule 2)' 1 'apply --check' --patch-dir "$TMP/marker" --freerdp-src "$FREERDP_SRC"
     check 'the real queue passes rule 1 and rule 2 against the pinned checkout' 0 '' --freerdp-src "$FREERDP_SRC"
+    # gate r1 m-4: a RELATIVE --patch-dir must be normalised before `git -C <submodule> apply --check`
+    # resolves it -- otherwise git looks for the patch inside the submodule (the documented pitfall).
+    REL_DIR="$REPO_ROOT/.build/patch-queue-test-rel"
+    rm -rf "$REL_DIR"; mkdir -p "$REL_DIR"
+    if compgen -G "$REPO_ROOT/ThirdParty/patches/*.patch" >/dev/null; then
+        cp "$REPO_ROOT"/ThirdParty/patches/*.patch "$REL_DIR/"
+        pushd "$REPO_ROOT" >/dev/null
+        check 'a relative --patch-dir is normalised before git apply --check' 0 'validated' --patch-dir .build/patch-queue-test-rel --freerdp-src ThirdParty/FreeRDP
+        popd >/dev/null
+    else
+        echo "  skip relative --patch-dir case: the real queue is empty (nothing that applies to copy)"
+    fi
+    rm -rf "$REL_DIR"
 else
     echo "  FAIL rule 2 cases need the ThirdParty/FreeRDP submodule checkout (git submodule update --init)"; fail=$((fail + 2))
 fi
+
+echo "== one implementation: every enforcement point calls lib.sh, none carries its own grep (gate r1 B-1)"
+callers=(Scripts/build-freerdp.sh Scripts/check-patch-queue.sh Scripts/gen-notices.sh)
+one_impl=0
+for f in "${callers[@]}"; do
+    grep -q 'crdp_patch_record_ok' "$REPO_ROOT/$f" || { one_impl=1; echo "  missing call in $f"; }
+    # a private VERDICT is `grep -q` on the link pattern; gen-notices.sh may still EXTRACT links
+    # (`grep -oE ... /[0-9]+`) to fill the SBOM's resolves[] -- that is data, not a verdict.
+    if grep -qE 'grep -qE? .*FreeRDP/\(issues\|pull\)' "$REPO_ROOT/$f"; then one_impl=1; echo "  private rule-1 verdict in $f"; fi
+done
+if grep -qE 'FreeRDP/\(issues\|pull\)' "$REPO_ROOT/.github/workflows/tier1.yml"; then one_impl=1; echo "  private rule-1 grep in tier1.yml"; fi
+if [ "$one_impl" -eq 0 ]; then pass=$((pass + 1)); echo "  ok   build-freerdp.sh, check-patch-queue.sh and gen-notices.sh all call crdp_patch_record_ok; no private copy of the grep"; else fail=$((fail + 1)); echo "  FAIL rule 1 has more than one implementation"; fi
 
 echo "== lib.sh: crdp_patch_record_ok is the same verdict"
 # shellcheck source=Scripts/lib.sh

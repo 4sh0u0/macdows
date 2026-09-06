@@ -478,8 +478,10 @@ PATCH_BLOB_BASE="https://github.com/4sh0u0/macdows/blob/main/ThirdParty/patches"
 # of the file either way, where "backport" would only be true of part of it.
 #
 # `resolves[].references` is not a second source of truth: the URLs are grepped out of the patch
-# header, i.e. the same "# Upstream: …" link that ThirdParty/patches/README.md rule 1 mandates and
-# that both Scripts/build-freerdp.sh and tier1.yml's patch-queue validation already enforce.
+# header, i.e. the "# Upstream: …" link ThirdParty/patches/README.md rule 1 mandates. The rule-1
+# VERDICT itself is lib.sh's crdp_patch_record_ok (shared with Scripts/build-freerdp.sh and
+# Scripts/check-patch-queue.sh, 2026-09-07); a patch admitted under the lab-only exception has no
+# upstream link and therefore an empty `resolves` (optional in CycloneDX 1.6).
 PATCH_FILES=()
 while IFS= read -r -d '' patch_path; do PATCH_FILES+=("$patch_path"); done \
 	< <(find "$PATCH_DIR" -maxdepth 1 -name '*.patch' -print0 2>/dev/null | sort -z)
@@ -489,13 +491,13 @@ if [ "${#PATCH_FILES[@]}" -gt 0 ]; then
 	PATCH_OBJECTS=()
 	for patch_path in "${PATCH_FILES[@]}"; do
 		patch_name="$(basename "$patch_path")"
-		# Same PCRE-free pattern the other two enforcement points use. Fails closed: an SBOM that
-		# declares a modification with no upstream record is exactly the privately-maintained-fork
-		# shape README rule 1 exists to prevent, so refuse to emit one rather than drop `resolves`.
+		# Fails closed on the shared verdict: an SBOM that declares a modification with no record
+		# (neither upstream link nor the lab-only marker) is exactly the privately-maintained-fork
+		# shape README rule 1 exists to prevent, so refuse to emit one.
+		crdp_patch_record_ok "$patch_path" \
+			|| die "patch $patch_name has no upstream issue/PR link and no lab-only marker in its header (ThirdParty/patches/README.md rule 1) — refusing to emit an SBOM that records a modification with no record"
 		patch_refs="$(grep -oE 'https://github\.com/FreeRDP/FreeRDP/(issues|pull)/[0-9]+' "$patch_path" | sort -u | jq -R . | jq -s .)" \
 			|| patch_refs="[]"
-		[ "$patch_refs" != "[]" ] \
-			|| die "patch $patch_name has no upstream issue/PR link in its header (ThirdParty/patches/README.md rule 1) — refusing to emit an SBOM that records a modification with no upstream record"
 		PATCH_OBJECTS+=("$(jq -n --arg url "$PATCH_BLOB_BASE/$patch_name" --argjson refs "$patch_refs" '
 			{
 				type: "unofficial",

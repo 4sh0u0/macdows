@@ -71,8 +71,11 @@ policy).
   `RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE` from the advertised RDPGFX capability sets. OFF leaves
   every preprocessed line as it was; ON is a protocol-level false advertisement used only by
   `Tools/rail-probe` for the D1 contrast experiment (`Scripts/build-freerdp.sh` with
-  `CRDP_LAB_SCALEDMAP_ADVERTISE=1`, a separate config-hash prefix never made `current`).
-  Retire when D1's record is filed.
+  `CRDP_LAB_SCALEDMAP_ADVERTISE=1`, a separate config-hash prefix never made `current`). Each
+  modified site carries a one-line `Macdows lab patch 0002` notice (Apache-2.0 §4(b));
+  `THIRD_PARTY_NOTICES.md`'s FreeRDP entry says "Modified: Yes" and names it. Retire when D1's
+  record is filed -- and remove nothing else: `Scripts/build-freerdp.sh` records the option's
+  cache value as an OPTIONAL manifest key precisely so retiring this patch is a one-file change.
 
 Before it (2026-09-02 to 2026-09-07) the queue was empty on purpose: the one patch this project
 carried before was absorbed upstream and retired on the 3.31.1 pin bump.

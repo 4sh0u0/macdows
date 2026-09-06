@@ -35,8 +35,12 @@ require_cmd() {
 # the lab-only marker
 #     # Lab-only: default OFF; ADR: docs/adr/NNNN-<slug>.md
 # which is valid only for a default-OFF build knob backed by an Accepted ADR (the README's
-# rule 1 exception). "Header" means the lines before the first diff line (`diff --git ` or
-# `--- `): a link that merely appears inside a hunk's context or additions does not count.
+# rule 1 exception). The marker is a claim, so the patch must substantiate it: it has to ADD a
+# CMake `option(<NAME> "..." OFF)` line (gate d1-lane r1 I-3 -- a bug fix wearing the marker
+# adds no such line and is refused). "Header" means the lines before the first real diff line
+# (`diff --git `, `--- a/` or `--- /dev/null`; a prose line that merely starts with "--- " does
+# not end it, gate r1 m-3): a link that merely appears inside a hunk's context or additions
+# does not count.
 #
 # This is the ONE implementation of the rule. Scripts/build-freerdp.sh consults it before
 # folding the queue into the config hash, and Scripts/check-patch-queue.sh (Tier 1's patch
@@ -47,10 +51,23 @@ require_cmd() {
 crdp_patch_record_ok() {
 	local file="${1:-}" header
 	[ -f "$file" ] || return 1
-	header="$(awk '/^(diff --git |--- )/ { exit } { print }' "$file")"
+	header="$(awk '/^(diff --git |--- (a\/|\/dev\/null))/ { exit } { print }' "$file")"
 	printf '%s\n' "$header" | grep -qE 'github\.com/FreeRDP/FreeRDP/(issues|pull)/[0-9]+' && return 0
-	printf '%s\n' "$header" | grep -qE '^# Lab-only: default OFF; ADR: docs/adr/[0-9]{4}-[A-Za-z0-9._-]+\.md' && return 0
+	if printf '%s\n' "$header" | grep -qE '^# Lab-only: default OFF; ADR: docs/adr/[0-9]{4}-[A-Za-z0-9._-]+\.md'; then
+		grep -qE '^\+[[:space:]]*option\([A-Za-z0-9_]+[[:space:]]+"[^"]*"[[:space:]]+OFF\)' "$file" && return 0
+	fi
 	return 1
+}
+
+# Does a Scripts/build-freerdp.sh run get to publish its prefix as .build/freerdp/current?
+# Only the product build (CRDP_LAB_SCALEDMAP_ADVERTISE=0) does; a lab build (1) never does, so
+# App/ and every default consumer keep the product build (ADR-0016 section 1.2). Both places the
+# build script links `current` consult this, and Scripts/test-build-freerdp-toggle.sh pins it
+# (gate d1-lane r1 I-5).
+#
+# Usage:  crdp_freerdp_build_publishes_current "$CRDP_LAB_SCALEDMAP_ADVERTISE"   (0 = publish)
+crdp_freerdp_build_publishes_current() {
+	[ "${1:-0}" = "0" ]
 }
 
 # Live-host testing boundary gate (owner rule, 2026-08-31): a real-host debugging step may

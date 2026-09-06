@@ -177,23 +177,30 @@ compute_config_hash() {
 }
 CONFIG_HASH="$(compute_config_hash)"
 log "Config hash: $CONFIG_HASH"
-if [ "$PRINT_HASH" = "1" ]; then
-	printf '%s\n' "$CONFIG_HASH"
-	exit 0
-fi
 
 CONFIG_ROOT="$CRDP_BUILD_DIR/freerdp/$CONFIG_HASH"
 BUILD_DIR="$CONFIG_ROOT/build"
 INSTALL_PREFIX="$CONFIG_ROOT/prefix"
 MANIFEST="$CONFIG_ROOT/build-manifest.json"
 CURRENT_LINK="$CRDP_BUILD_DIR/freerdp/current"
+# A lab build must land in its OWN prefix. If the toggle somehow resolved to the hash `current`
+# already points at (the fold into the hash lost, a stale link...), building would overwrite the
+# product prefix in place while the "NOT updating current" log line reassures -- refuse instead
+# (gate d1-lane r1 I-2). Read-only, so it also runs under --print-config-hash.
+if [ "$CRDP_LAB_SCALEDMAP_ADVERTISE" = "1" ] && [ -L "$CURRENT_LINK" ] && [ "$(readlink "$CURRENT_LINK")" = "$CONFIG_HASH" ]; then
+	die "CRDP_LAB_SCALEDMAP_ADVERTISE=1 resolved to config hash $CONFIG_HASH, which is what $CURRENT_LINK already points at -- the lab build is not separated from the product build; refusing to build into the product prefix"
+fi
+if [ "$PRINT_HASH" = "1" ]; then
+	printf '%s\n' "$CONFIG_HASH"
+	exit 0
+fi
 
 if [ "$FORCE" -eq 0 ] && [ -f "$MANIFEST" ] && [ -f "$INSTALL_PREFIX/lib/libfreerdp3.dylib" ]; then
 	log "Config $CONFIG_HASH already built at $INSTALL_PREFIX; skipping. Pass --force to rebuild."
-	if [ "$CRDP_LAB_SCALEDMAP_ADVERTISE" = "1" ]; then
-		log "lab build (CRDP_LAB_SCALEDMAP_ADVERTISE=1): NOT updating $CURRENT_LINK; use $INSTALL_PREFIX explicitly"
-	else
+	if crdp_freerdp_build_publishes_current "$CRDP_LAB_SCALEDMAP_ADVERTISE"; then
 		ln -sfn "$CONFIG_HASH" "$CURRENT_LINK"
+	else
+		log "lab build (CRDP_LAB_SCALEDMAP_ADVERTISE=1): NOT updating $CURRENT_LINK; use $INSTALL_PREFIX explicitly"
 	fi
 	exit 0
 fi
@@ -330,7 +337,6 @@ CACHE_KEYS=(
 	CMAKE_BUILD_TYPE CMAKE_OSX_ARCHITECTURES CMAKE_OSX_DEPLOYMENT_TARGET
 	CHANNEL_URBDRC WITH_VIDEOTOOLBOX WITH_FFMPEG WITH_VIDEO_FFMPEG WITH_SWSCALE WITH_DSP_FFMPEG
 	WITH_OPENH264 WITH_URIPARSER WITH_JSON_DISABLED
-	MACDOWS_LAB_SCALEDMAP_ADVERTISE
 	OPENSSL_ROOT_DIR OPENSSL_USE_STATIC_LIBS
 )
 CACHE_JSON="{}"
@@ -339,6 +345,13 @@ for key in "${CACHE_KEYS[@]}"; do
 		|| die "expected CMakeCache key '$key' not found in $CACHE_FILE — either a real config regression or this key needs removing from CACHE_KEYS (e.g. it isn't a real cache variable)"
 	CACHE_JSON="$(jq --arg k "$key" --arg v "$value" '. + {($k): $v}' <<<"$CACHE_JSON")"
 done
+
+# The lab option (ADR-0016) exists only while ThirdParty/patches/0002-rdpgfx-lab-scaledmap-advertise-
+# option.patch is in the queue, so it is recorded as an OPTIONAL key: its cache value when present,
+# "<absent>" otherwise. Listing it in CACHE_KEYS would make retiring the patch break every build
+# (gate d1-lane r1 I-4).
+lab_cache_value="$(grep -E '^MACDOWS_LAB_SCALEDMAP_ADVERTISE(:[A-Za-z]+)?=' "$CACHE_FILE" | head -1 | cut -d= -f2- || true)"
+CACHE_JSON="$(jq --arg v "${lab_cache_value:-<absent>}" '. + {MACDOWS_LAB_SCALEDMAP_ADVERTISE: $v}' <<<"$CACHE_JSON")"
 
 PATCHES_JSON="[]"
 if [ "${#PATCHES[@]}" -gt 0 ]; then
@@ -360,19 +373,24 @@ jq -n \
 
 log "FreeRDP installed to $INSTALL_PREFIX"
 log "Manifest: $MANIFEST"
-if [ "$CRDP_LAB_SCALEDMAP_ADVERTISE" = "1" ]; then
-	log "lab build (CRDP_LAB_SCALEDMAP_ADVERTISE=1): NOT updating $CURRENT_LINK; link Tools/rail-probe against $INSTALL_PREFIX explicitly (Scripts/probe.sh CRDP_FREERDP_PREFIX)"
-else
+if crdp_freerdp_build_publishes_current "$CRDP_LAB_SCALEDMAP_ADVERTISE"; then
 	ln -sfn "$CONFIG_HASH" "$CURRENT_LINK"
 	log "Stable path: $CURRENT_LINK -> $CONFIG_HASH"
+else
+	log "lab build (CRDP_LAB_SCALEDMAP_ADVERTISE=1): NOT updating $CURRENT_LINK; link Tools/rail-probe against $INSTALL_PREFIX explicitly (Scripts/probe.sh CRDP_FREERDP_PREFIX)"
 fi
 
 # --- Retention: keep only the 2 most recently built config-hash dirs -----------------
 # Each full FreeRDP build is ~100s of MB; old config-hash dirs from superseded lock/patch
 # states otherwise accumulate forever. Keep the current one plus one prior (covers "just
 # rolled back a bad change") and drop the rest, sorted by mtime.
+# Never prune what `current` points at: a lab build (never published as `current`) followed by
+# another build would otherwise leave `current` dangling (gate d1-lane r1 I-1, reproduced in a
+# sandbox). The product prefix is protected by name whatever this run built.
+CURRENT_TARGET=""
+[ -L "$CURRENT_LINK" ] && CURRENT_TARGET="$(readlink "$CURRENT_LINK")"
 mapfile -t OLD_CONFIGS < <(
-	find "$CRDP_BUILD_DIR/freerdp" -mindepth 1 -maxdepth 1 -type d ! -name "$CONFIG_HASH" -print0 \
+	find "$CRDP_BUILD_DIR/freerdp" -mindepth 1 -maxdepth 1 -type d ! -name "$CONFIG_HASH" ${CURRENT_TARGET:+! -name "$CURRENT_TARGET"} -print0 \
 		| xargs -0 -I{} stat -f '%m%t%N' {} 2>/dev/null \
 		| sort -rn -t"$(printf '\t')" -k1,1 \
 		| cut -f2- \

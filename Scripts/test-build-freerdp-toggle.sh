@@ -43,5 +43,15 @@ if [ "$r1" -eq 0 ] && [[ "$h1" =~ ^[0-9a-f]{16}$ ]] && [ "$h1" != "$h0" ]; then 
 if [ "$r2" -ne 0 ] && [[ "$e2" == *"CRDP_LAB_SCALEDMAP_ADVERTISE must be 0 or 1"* ]]; then ok "CRDP_LAB_SCALEDMAP_ADVERTISE=2 is refused by name"; else bad "toggle=2: rc=$r2 out=[$e2]"; fi
 if [ "$before" = "$after" ]; then ok "the hash seam created nothing under .build/freerdp"; else bad "seam side effect: before=[$before] after=[$after]"; fi
 
+# gate r1 I-5: "a lab build never publishes `current`" is a lib.sh predicate both link sites call.
+# shellcheck source=Scripts/lib.sh
+source "$SCRIPT_DIR/lib.sh"
+set +e
+crdp_freerdp_build_publishes_current 0; p0=$?
+crdp_freerdp_build_publishes_current 1; p1=$?
+set -e
+if [ "$p0" -eq 0 ] && [ "$p1" -ne 0 ]; then ok "crdp_freerdp_build_publishes_current: product build publishes current, lab build (toggle 1) never does"; else bad "publishes_current predicate: toggle0=$p0 toggle1=$p1"; fi
+if [ "$(grep -c 'crdp_freerdp_build_publishes_current' "$BUILD_FREERDP")" -ge 2 ]; then ok "both current-link sites in build-freerdp.sh consult the predicate"; else bad "build-freerdp.sh does not consult the predicate at both current-link sites"; fi
+
 echo; echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

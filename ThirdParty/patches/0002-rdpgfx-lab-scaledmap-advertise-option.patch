@@ -20,78 +20,84 @@
 # Retire: when D1 is closed and its record (docs/upgrade-gate/2026-09-d1-scaledmap-contrast.md)
 # is filed, or on the next pin bump if the hunks stop applying (README rule 2).
 diff --git a/channels/rdpgfx/client/rdpgfx_main.c b/channels/rdpgfx/client/rdpgfx_main.c
-index 3dba68715..dbfcc15d1 100644
+index 3dba68715..91ef24883 100644
 --- a/channels/rdpgfx/client/rdpgfx_main.c
 +++ b/channels/rdpgfx/client/rdpgfx_main.c
-@@ -488,7 +488,7 @@ static UINT rdpgfx_send_supported_caps(GENERIC_CHANNEL_CALLBACK* callback)
+@@ -488,7 +488,8 @@ static UINT rdpgfx_send_supported_caps(GENERIC_CHANNEL_CALLBACK* callback)
  			capsSet->version = RDPGFX_CAPVERSION_107;
  			capsSet->length = 0x4;
  			capsSet->flags = caps10Flags;
 -#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE)
++/* Macdows lab patch 0002 (ThirdParty/patches/): the lab-only option omits the flag. */
 +#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE) && !defined(MACDOWS_LAB_SCALEDMAP_ADVERTISE)
  			capsSet->flags |= RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE;
  #endif
  		}
-@@ -502,7 +502,7 @@ static UINT rdpgfx_send_supported_caps(GENERIC_CHANNEL_CALLBACK* callback)
+@@ -502,7 +503,8 @@ static UINT rdpgfx_send_supported_caps(GENERIC_CHANNEL_CALLBACK* callback)
  			capsSet->version = RDPGFX_CAPVERSION_111;
  			capsSet->length = 0x4;
  			capsSet->flags = caps10Flags;
 -#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE)
++/* Macdows lab patch 0002 (ThirdParty/patches/): the lab-only option omits the flag. */
 +#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE) && !defined(MACDOWS_LAB_SCALEDMAP_ADVERTISE)
  			capsSet->flags |= RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE;
  #endif
  		}
-@@ -515,7 +515,7 @@ static UINT rdpgfx_send_supported_caps(GENERIC_CHANNEL_CALLBACK* callback)
+@@ -515,7 +517,8 @@ static UINT rdpgfx_send_supported_caps(GENERIC_CHANNEL_CALLBACK* callback)
  			capsSet->version = RDPGFX_CAPVERSION_112;
  			capsSet->length = 0x4;
  			capsSet->flags = caps10Flags;
 -#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE)
++/* Macdows lab patch 0002 (ThirdParty/patches/): the lab-only option omits the flag. */
 +#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE) && !defined(MACDOWS_LAB_SCALEDMAP_ADVERTISE)
  			capsSet->flags |= RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE;
  #endif
  		}
-@@ -528,7 +528,7 @@ static UINT rdpgfx_send_supported_caps(GENERIC_CHANNEL_CALLBACK* callback)
+@@ -528,7 +531,8 @@ static UINT rdpgfx_send_supported_caps(GENERIC_CHANNEL_CALLBACK* callback)
  			capsSet->version = RDPGFX_CAPVERSION_113;
  			capsSet->length = 0x4;
  			capsSet->flags = caps10Flags;
 -#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE)
++/* Macdows lab patch 0002 (ThirdParty/patches/): the lab-only option omits the flag. */
 +#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE) && !defined(MACDOWS_LAB_SCALEDMAP_ADVERTISE)
  			capsSet->flags |= RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE;
  #endif
  		}
-@@ -552,7 +552,7 @@ static UINT rdpgfx_send_supported_caps(GENERIC_CHANNEL_CALLBACK* callback)
+@@ -552,7 +556,8 @@ static UINT rdpgfx_send_supported_caps(GENERIC_CHANNEL_CALLBACK* callback)
  			if (profile == 0)
  				capsSet->flags |= RDPGFX_CAPS_FLAG_AV1_I444_DISABLED;
  
 -#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE)
++/* Macdows lab patch 0002 (ThirdParty/patches/): the lab-only option omits the flag. */
 +#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE) && !defined(MACDOWS_LAB_SCALEDMAP_ADVERTISE)
  			capsSet->flags |= RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE;
  #endif
  		}
 diff --git a/cmake/ConfigOptions.cmake b/cmake/ConfigOptions.cmake
-index 1660d2ef8..550ad0a68 100644
+index 1660d2ef8..ddf2f8ff6 100644
 --- a/cmake/ConfigOptions.cmake
 +++ b/cmake/ConfigOptions.cmake
 @@ -161,6 +161,11 @@ endif()
  
  option(WITH_CAIRO "Use CAIRO image library for screen resizing" OFF)
  option(WITH_SWSCALE "Use SWScale image library for screen resizing" ON)
-+# Macdows lab-only (docs/adr/0016): omit RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE from the advertised
-+# RDPGFX capability sets even though no scaler is compiled in. Default OFF -- the product
-+# build is unchanged. ON is a protocol-level false advertisement (MS-RDPEGFX 2.2.3.10) and is
-+# only for a non-rendering capture client (Tools/rail-probe) running the D1 contrast.
++# Macdows lab patch 0002 (ThirdParty/patches/, docs/adr/0016): omit RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE
++# from the advertised RDPGFX capability sets even though no scaler is compiled in. Default OFF --
++# the product build is unchanged. ON is a protocol-level false advertisement (MS-RDPEGFX 2.2.3.10)
++# and is only for a non-rendering capture client (Tools/rail-probe) running the D1 contrast.
 +option(MACDOWS_LAB_SCALEDMAP_ADVERTISE "Lab-only: advertise scaled-map capability without a scaler (never for a rendering client)" OFF)
  
  if(ANDROID)
    include(ConfigOptionsAndroid)
 diff --git a/include/config/config.h.in b/include/config/config.h.in
-index 95b024c48..a84848a4e 100644
+index 95b024c48..d80194d5f 100644
 --- a/include/config/config.h.in
 +++ b/include/config/config.h.in
-@@ -30,6 +30,7 @@
+@@ -30,6 +30,8 @@
  #cmakedefine WITH_CAIRO
  #cmakedefine WITH_SWSCALE
  #cmakedefine WITH_SWSCALE_LOADING
++/* Macdows lab patch 0002 (ThirdParty/patches/): lab-only, default OFF -- see cmake/ConfigOptions.cmake */
 +#cmakedefine MACDOWS_LAB_SCALEDMAP_ADVERTISE
  #cmakedefine WITH_RDPSND_DSOUND
  
