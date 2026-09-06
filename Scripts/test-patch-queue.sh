@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+# test-patch-queue.sh: offline pins for the patch-queue rules (ThirdParty/patches/README.md
+# rules 1 and 2) as enforced by Scripts/check-patch-queue.sh and lib.sh's
+# crdp_patch_record_ok -- the ONE implementation Scripts/build-freerdp.sh and Tier 1 both call.
+#
+# Why this exists (2026-09-07, ADR-0016 D1): the queue gained its first lab-only patch (a
+# default-OFF CMake option with no upstream record) and rule 1 gained the owner-ruled
+# exception for exactly that shape. Until now rule 1 lived as two copies of one grep (the
+# build script and the workflow); an exception added to one copy and not the other would
+# have let the build and CI disagree. The regex now lives in lib.sh, and this suite pins what
+# it accepts and refuses on synthetic patch files -- no compiler, no network, no shared
+# .build/ state. Case 7/8 need the pinned FreeRDP submodule checkout (`git apply --check`
+# is rule 2 itself); Tier 1 checks out submodules for that reason.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CHECK="$SCRIPT_DIR/check-patch-queue.sh"
+FREERDP_SRC="$REPO_ROOT/ThirdParty/FreeRDP"
+
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/patch-queue-test.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+
+pass=0
+fail=0
+check() {
+    # check <name> <expected-exit> <expected-output-substring> <check-patch-queue args...>
+    local name="$1" want_rc="$2" want_out="$3"; shift 3
+    local out rc
+    set +e
+    out="$("$CHECK" "$@" 2>&1)"
+    rc=$?
+    set -e
+    if [ "$rc" -eq "$want_rc" ] && [[ "$out" == *"$want_out"* ]]; then
+        pass=$((pass + 1)); echo "  ok   $name"
+    else
+        fail=$((fail + 1)); echo "  FAIL $name :: rc=$rc (want $want_rc); output: $out" | head -c 800; echo
+    fi
+}
+
+LINK='# Upstream: https://github.com/FreeRDP/FreeRDP/issues/12345'
+MARKER='# Lab-only: default OFF; ADR: docs/adr/0016-scaledmap-disable-configurable-d1.md'
+# A hunk that cannot apply to any file in the pinned tree: rule 2 must refuse it.
+# A lab-only patch must ADD a default-OFF option (rule 1 exception, gate r1 I-3); this hunk is that line.
+OPTION_HUNK='diff --git a/cmake/ConfigOptions.cmake b/cmake/ConfigOptions.cmake
+--- a/cmake/ConfigOptions.cmake
++++ b/cmake/ConfigOptions.cmake
+@@ -1,1 +1,2 @@
+ option(WITH_SWSCALE "Use SWScale image library for screen resizing" ON)
++option(MACDOWS_LAB_FIXTURE "Lab-only fixture knob" OFF)'
+BOGUS_HUNK='diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,1 +1,1 @@
+-this line does not exist in the pinned CMakeLists.txt
++nor does this one'
+
+mk() { # mk <dir> <name> <header-lines...>
+    local dir="$1" name="$2"; shift 2
+    mkdir -p "$dir"
+    { for h in "$@"; do printf '%s\n' "$h"; done; printf '%s\n' "$BOGUS_HUNK"; } > "$dir/$name"
+}
+
+echo "== rule 1: upstream record OR the lab-only marker, in the header"
+mk "$TMP/empty" .keep   # no *.patch files at all
+rm -f "$TMP/empty/.keep"
+check 'empty queue passes and says so'                       0 'No patches'          --patch-dir "$TMP/empty" --no-apply
+mk "$TMP/link"   0001-link.patch   "$LINK"
+check 'a GitHub issue/PR link in the header passes'          0 '1 patch(es) validated' --patch-dir "$TMP/link" --no-apply
+mkdir -p "$TMP/marker"
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; } > "$TMP/marker/0001-lab.patch"
+check 'the lab-only marker (default OFF + ADR) with an added default-OFF option passes' 0 '1 patch(es) validated' --patch-dir "$TMP/marker" --no-apply
+mk "$TMP/none"   0001-none.patch   '# a patch with no record at all'
+check 'neither record refuses, naming rule 1 and the file'   1 'rule 1'              --patch-dir "$TMP/none" --no-apply
+check 'the refusal names the offending file'                 1 '0001-none.patch'     --patch-dir "$TMP/none" --no-apply
+mk "$TMP/on"     0001-on.patch     '# Lab-only: default ON; ADR: docs/adr/0016-scaledmap-disable-configurable-d1.md'
+check 'a lab-only marker that is not default OFF refuses'     1 'rule 1'              --patch-dir "$TMP/on" --no-apply
+mk "$TMP/noadr"  0001-noadr.patch  '# Lab-only: default OFF'
+check 'a lab-only marker without an ADR refuses'              1 'rule 1'              --patch-dir "$TMP/noadr" --no-apply
+mkdir -p "$TMP/buried"
+{ printf '%s\n' '# no record up here'; printf '%s\n' "$BOGUS_HUNK"; printf '%s\n' "+// see $LINK"; } > "$TMP/buried/0001-buried.patch"
+check 'a link only inside a hunk (not the header) refuses'   1 'rule 1'              --patch-dir "$TMP/buried" --no-apply
+mk "$TMP/mixed"  0001-link.patch   "$LINK"
+mk "$TMP/mixed"  0002-none.patch   '# nothing'
+check 'one bad patch fails the whole queue'                  1 '0002-none.patch'     --patch-dir "$TMP/mixed" --no-apply
+
+echo "== rule 1, lab-only exception: the marker alone is a sentence; the patch must ADD a default-OFF option (gate r1 I-3)"
+# The fixtures above carry only a bogus hunk. A real lab-only patch adds `option(<NAME> "..." OFF)`
+# to a CMake file; a bug fix wearing the marker adds no such line and must be refused.
+mkdir -p "$TMP/labopt" "$TMP/labon" "$TMP/labfix"
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; } > "$TMP/labopt/0001-lab.patch"
+check 'marker + an added default-OFF option passes'          0 '1 patch(es) validated' --patch-dir "$TMP/labopt" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "${OPTION_HUNK/OFF)/ON)}"; } > "$TMP/labon/0001-lab.patch"
+check 'marker + an added option defaulting ON refuses'       1 'rule 1'              --patch-dir "$TMP/labon" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$BOGUS_HUNK"; } > "$TMP/labfix/0001-bugfix.patch"
+check 'marker on a patch that adds no option (a bug fix in disguise) refuses' 1 'rule 1' --patch-dir "$TMP/labfix" --no-apply
+
+echo "== the added option must be a NEW option in a CMake file's hunk (gate r2 I-7)"
+mkdir -p "$TMP/opthdr" "$TMP/optmd" "$TMP/optflip"
+# (a) the option line sits in the HEADER (before any diff line), not in a hunk
+{ printf '%s\n' "$MARKER"; printf '%s\n' '+option(MACDOWS_LAB_FIXTURE "smuggled into the header" OFF)'; printf '%s\n' "$BOGUS_HUNK"; } > "$TMP/opthdr/0001-lab.patch"
+check 'an option line in the header (not a hunk) does not count'   1 'rule 1' --patch-dir "$TMP/opthdr" --no-apply
+# (b) the option line is added to a non-CMake file
+MD_HUNK='diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,1 +1,2 @@
+ # FreeRDP
++option(MACDOWS_LAB_FIXTURE "not a CMake file" OFF)'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$MD_HUNK"; } > "$TMP/optmd/0001-lab.patch"
+check 'an option line added to a non-CMake file does not count'     1 'rule 1' --patch-dir "$TMP/optmd" --no-apply
+# (c) an existing upstream option flipped ON -> OFF is a behaviour change, not a new knob
+FLIP_HUNK='diff --git a/cmake/ConfigOptions.cmake b/cmake/ConfigOptions.cmake
+--- a/cmake/ConfigOptions.cmake
++++ b/cmake/ConfigOptions.cmake
+@@ -1,1 +1,1 @@
+-option(WITH_SWSCALE "Use SWScale image library for screen resizing" ON)
++option(WITH_SWSCALE "Use SWScale image library for screen resizing" OFF)'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$FLIP_HUNK"; } > "$TMP/optflip/0001-lab.patch"
+check 'flipping an existing option ON->OFF is not an added knob'   1 'rule 1' --patch-dir "$TMP/optflip" --no-apply
+
+echo "== the file a hunk targets is what git apply reads (--- / +++), not what diff --git claims (gate r3 B-4)"
+mkdir -p "$TMP/lie" "$TMP/crlf" "$TMP/spaced" "$TMP/xfile"
+# (a) diff --git names a .cmake file but --- / +++ target a C file: git apply patches the C file.
+LIE_HUNK='diff --git a/cmake/ConfigOptions.cmake b/cmake/ConfigOptions.cmake
+--- a/libfreerdp/core/rdp.c
++++ b/libfreerdp/core/rdp.c
+@@ -1,1 +1,2 @@
+ #include <freerdp/config.h>
++option(MACDOWS_LAB_FIXTURE "the header lies about the file" OFF)'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$LIE_HUNK"; } > "$TMP/lie/0001-lab.patch"
+check 'a diff --git line that disagrees with --- / +++ refuses'      1 'rule 1' --patch-dir "$TMP/lie" --no-apply
+# (b) CRLF line endings must not turn a valid lab patch into a refusal (r3 N-2)
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; } | sed 's/$/\r/' > "$TMP/crlf/0001-lab.patch"
+check 'a CRLF-terminated lab patch with an added default-OFF option passes' 0 '1 patch(es) validated' --patch-dir "$TMP/crlf" --no-apply
+# (c) CMake allows whitespace after the opening parenthesis (r3 N-3)
+{ printf '%s\n' "$MARKER"; printf '%s\n' "${OPTION_HUNK/option(MACDOWS_LAB_FIXTURE/option( MACDOWS_LAB_FIXTURE}"; } > "$TMP/spaced/0001-lab.patch"
+check '"option( NAME ..." with a space after the parenthesis passes'  0 '1 patch(es) validated' --patch-dir "$TMP/spaced" --no-apply
+# (d) a removed option line in a DIFFERENT file: not a flip of the new knob (r3 N-4), but under the
+#     shape rules below it is an unrelated removal with no guarded re-add, so the patch is refused.
+OTHER_REMOVE='diff --git a/client/CMakeLists.txt b/client/CMakeLists.txt
+--- a/client/CMakeLists.txt
++++ b/client/CMakeLists.txt
+@@ -1,2 +1,1 @@
+ project(client)
+-option(MACDOWS_LAB_FIXTURE "an unrelated line in another file" ON)'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$OTHER_REMOVE"; } > "$TMP/xfile/0001-lab.patch"
+check 'a same-named removal in another file is an unrelated change and refuses' 1 'rule 1' --patch-dir "$TMP/xfile" --no-apply
+
+echo "== the lab-only SHAPE: every other hunk may only insert the knob's guard or comments (gate r4 B-6)"
+# The real lab patch's shape: a source hunk that re-writes an #if line with one more !defined(<NAME>)
+# term and a one-line comment. Every added line names the knob or is a comment; every removed line
+# is re-added in the same hunk carrying the knob's name.
+GUARD_HUNK='diff --git a/channels/rdpgfx/client/rdpgfx_main.c b/channels/rdpgfx/client/rdpgfx_main.c
+--- a/channels/rdpgfx/client/rdpgfx_main.c
++++ b/channels/rdpgfx/client/rdpgfx_main.c
+@@ -1,3 +1,4 @@
+ 	capsSet->flags = caps10Flags;
+-#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE)
++/* Macdows lab patch: the lab-only option omits the flag. */
++#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE) && !defined(MACDOWS_LAB_FIXTURE)
+ 	capsSet->flags |= RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE;'
+UNRELATED_HUNK='diff --git a/libfreerdp/core/rdp.c b/libfreerdp/core/rdp.c
+--- a/libfreerdp/core/rdp.c
++++ b/libfreerdp/core/rdp.c
+@@ -1,2 +1,2 @@
+ 	int x;
+-	return TRUE;
++	return FALSE;'
+BARE_UNRELATED='--- a/libfreerdp/core/rdp.c
++++ b/libfreerdp/core/rdp.c
+@@ -1,2 +1,2 @@
+ 	int x;
+-	return TRUE;
++	return FALSE;'
+RENAME_HDR='diff --git a/libfreerdp/core/rdp.c b/libfreerdp/core/rdp2.c
+similarity index 100%
+rename from libfreerdp/core/rdp.c
+rename to libfreerdp/core/rdp2.c'
+NEWFILE_HUNK='diff --git a/libfreerdp/core/lab.c b/libfreerdp/core/lab.c
+new file mode 100644
+--- /dev/null
++++ b/libfreerdp/core/lab.c
+@@ -0,0 +1,1 @@
++/* MACDOWS_LAB_FIXTURE */'
+mkdir -p "$TMP/shape-ok" "$TMP/shape-unrel" "$TMP/shape-line" "$TMP/shape-rm" "$TMP/shape-bare" "$TMP/shape-rename" "$TMP/shape-new" "$TMP/shape-prefix"
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$GUARD_HUNK"; } > "$TMP/shape-ok/0001-lab.patch"
+check 'option hunk + a guard-insertion hunk (comment + re-written #if naming the knob) passes' 0 '1 patch(es) validated' --patch-dir "$TMP/shape-ok" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$UNRELATED_HUNK"; } > "$TMP/shape-unrel/0001-lab.patch"
+check 'option hunk + an honest unrelated hunk in another file refuses (B-6)'   1 'rule 1' --patch-dir "$TMP/shape-unrel" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${GUARD_HUNK/+\/\* Macdows lab patch: the lab-only option omits the flag. \*\//+	settings->foo = 1;}"; } > "$TMP/shape-line/0001-lab.patch"
+check 'an added source line that neither names the knob nor is a comment refuses'  1 'rule 1' --patch-dir "$TMP/shape-line" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${GUARD_HUNK/+#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE) && !defined(MACDOWS_LAB_FIXTURE)/+#if 0}"; } > "$TMP/shape-rm/0001-lab.patch"
+check 'a removed line not re-added with the knob name in the same hunk refuses'    1 'rule 1' --patch-dir "$TMP/shape-rm" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$BARE_UNRELATED"; } > "$TMP/shape-bare/0001-lab.patch"
+check 'a bare --- / +++ hunk (no diff --git line) is still judged, and refuses here' 1 'rule 1' --patch-dir "$TMP/shape-bare" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$RENAME_HDR"; } > "$TMP/shape-rename/0001-lab.patch"
+check 'a rename header refuses (lab patches modify files in place only)'           1 'rule 1' --patch-dir "$TMP/shape-rename" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$NEWFILE_HUNK"; } > "$TMP/shape-new/0001-lab.patch"
+check 'a new-file hunk refuses (even one naming the knob)'                        1 'rule 1' --patch-dir "$TMP/shape-new" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "${OPTION_HUNK//MACDOWS_LAB_FIXTURE/LAB_FIXTURE}"; } > "$TMP/shape-prefix/0001-lab.patch"
+check 'a knob not named MACDOWS_LAB_* refuses (the prefix is what the line rule keys on)' 1 'rule 1' --patch-dir "$TMP/shape-prefix" --no-apply
+mkdir -p "$TMP/shape-two"
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${OPTION_HUNK//MACDOWS_LAB_FIXTURE/MACDOWS_LAB_SECOND}"; } > "$TMP/shape-two/0001-lab.patch"
+check 'two new knobs in one patch refuses (exactly one knob per lab patch)'         1 'rule 1' --patch-dir "$TMP/shape-two" --no-apply
+
+echo "== rules 2/3 are a GRAMMAR, not a token test (gate r5 B-8); blocks without text hunks refuse (B-7)"
+CMAKEDEFINE_HUNK='diff --git a/include/config/config.h.in b/include/config/config.h.in
+--- a/include/config/config.h.in
++++ b/include/config/config.h.in
+@@ -1,2 +1,4 @@
+ #cmakedefine WITH_SWSCALE
++/* Macdows lab patch: lab-only, default OFF */
++#cmakedefine MACDOWS_LAB_FIXTURE
+ #cmakedefine WITH_SWSCALE_LOADING'
+mkdir -p "$TMP/g-ok" "$TMP/g-if" "$TMP/g-append" "$TMP/g-set" "$TMP/g-bracket" "$TMP/g-tail" "$TMP/g-mode" "$TMP/g-binary"
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$GUARD_HUNK"; printf '%s\n' "$CMAKEDEFINE_HUNK"; } > "$TMP/g-ok/0001-lab.patch"
+check 'the real shape -- option, #cmakedefine KNOB, comments, #if lines re-added with && !defined(KNOB) -- passes' 0 '1 patch(es) validated' --patch-dir "$TMP/g-ok" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${GUARD_HUNK/+\/\* Macdows lab patch: the lab-only option omits the flag. \*\//+	if (MACDOWS_LAB_FIXTURE) system(\"x\");}"; } > "$TMP/g-if/0001-lab.patch"
+check 'a new runtime line that merely names the knob refuses (B-8)'                1 'rule 1' --patch-dir "$TMP/g-if" --no-apply
+APPEND_HUNK='diff --git a/libfreerdp/core/rdp.c b/libfreerdp/core/rdp.c
+--- a/libfreerdp/core/rdp.c
++++ b/libfreerdp/core/rdp.c
+@@ -1,2 +1,2 @@
+ 	int x;
+-	foo(a);
++	foo(a); bar(); /* MACDOWS_LAB_FIXTURE */'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$APPEND_HUNK"; } > "$TMP/g-append/0001-lab.patch"
+check 'a removed line re-added with code appended (knob only in a comment) refuses (B-8)' 1 'rule 1' --patch-dir "$TMP/g-append" --no-apply
+SET_HUNK='diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,1 +1,2 @@
+ project(FreeRDP)
++set(MACDOWS_LAB_FIXTURE ON CACHE BOOL "override" FORCE)'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$SET_HUNK"; } > "$TMP/g-set/0001-lab.patch"
+check 'a set(KNOB ON ... FORCE) line refuses (it would defeat "default OFF")'       1 'rule 1' --patch-dir "$TMP/g-set" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "${OPTION_HUNK/@@ -1,1 +1,2 @@/@@ -1,1 +1,3 @@}" | sed 's|^+option(MACDOWS_LAB_FIXTURE|+#[[ bracket comment start\n+option(MACDOWS_LAB_FIXTURE|'; } > "$TMP/g-bracket/0001-lab.patch"
+check 'a CMake bracket-comment opener as an added line refuses'                    1 'rule 1' --patch-dir "$TMP/g-bracket" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${GUARD_HUNK/+\/\* Macdows lab patch: the lab-only option omits the flag. \*\//+\/* MACDOWS_LAB_FIXTURE *\/ system(\"x\");}"; } > "$TMP/g-tail/0001-lab.patch"
+check 'a comment followed by code on the same line refuses'                        1 'rule 1' --patch-dir "$TMP/g-tail" --no-apply
+MODE_BLOCK='diff --git a/scripts/run.sh b/scripts/run.sh
+old mode 100644
+new mode 100755'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$MODE_BLOCK"; } > "$TMP/g-mode/0001-lab.patch"
+check 'a mode-only block (no text hunk) refuses (B-7)'                             1 'rule 1' --patch-dir "$TMP/g-mode" --no-apply
+BINARY_BLOCK='diff --git a/resources/icon.png b/resources/icon.png
+index 1111111..2222222 100644
+Binary files a/resources/icon.png and b/resources/icon.png differ'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$BINARY_BLOCK"; } > "$TMP/g-binary/0001-lab.patch"
+check 'a binary block refuses (B-7)'                                                1 'rule 1' --patch-dir "$TMP/g-binary" --no-apply
+mkdir -p "$TMP/g-tail2" "$TMP/g-lone"
+# rule 3's tail is exactly " && !defined(KNOB)": a #if re-added with any other tail -- even one that
+# names the knob and keeps the removed text as its prefix -- is a changed condition and refuses.
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${GUARD_HUNK/&& !defined(MACDOWS_LAB_FIXTURE)/|| defined(MACDOWS_LAB_FIXTURE)}"; } > "$TMP/g-tail2/0001-lab.patch"
+check 'a #if re-added with a different tail (|| defined(KNOB)) refuses'               1 'rule 1' --patch-dir "$TMP/g-tail2" --no-apply
+# a guard-shaped added line with no removed twin is a NEW condition, not a guard appended: refused.
+LONE_HUNK='diff --git a/libfreerdp/core/rdp.c b/libfreerdp/core/rdp.c
+--- a/libfreerdp/core/rdp.c
++++ b/libfreerdp/core/rdp.c
+@@ -1,2 +1,3 @@
+ 	int x;
++#if 0 && !defined(MACDOWS_LAB_FIXTURE)
+ 	int y;'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$LONE_HUNK"; } > "$TMP/g-lone/0001-lab.patch"
+check 'a guard-shaped added line with no removed twin refuses (bijection)'            1 'rule 1' --patch-dir "$TMP/g-lone" --no-apply
+
+echo "== a CMake '#' line is not provably a comment (it may sit inside a multi-line string), so none is admitted (gate r6 B-9)"
+mkdir -p "$TMP/g-hash" "$TMP/g-cmakedefine-c"
+{ printf '%s\n' "$MARKER"; printf '%s\n' "${OPTION_HUNK/@@ -1,1 +1,2 @@/@@ -1,1 +1,3 @@}" | sed 's|^+option(MACDOWS_LAB_FIXTURE|+# a comment-looking line in a CMake file\n+option(MACDOWS_LAB_FIXTURE|'; } > "$TMP/g-hash/0001-lab.patch"
+check 'an added "#" line in a CMake file refuses (could be inside a quoted argument)'   1 'rule 1' --patch-dir "$TMP/g-hash" --no-apply
+CMAKEDEFINE_C_HUNK='diff --git a/libfreerdp/core/rdp.c b/libfreerdp/core/rdp.c
+--- a/libfreerdp/core/rdp.c
++++ b/libfreerdp/core/rdp.c
+@@ -1,1 +1,2 @@
+ 	int x;
++#cmakedefine MACDOWS_LAB_FIXTURE'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$CMAKEDEFINE_C_HUNK"; } > "$TMP/g-cmakedefine-c/0001-lab.patch"
+check 'a #cmakedefine KNOB line outside a *.in template refuses'                        1 'rule 1' --patch-dir "$TMP/g-cmakedefine-c" --no-apply
+
+echo "== a comment line must not splice: no trailing backslash, no trigraph (gate r7 B-10)"
+mkdir -p "$TMP/g-splice" "$TMP/g-splice2" "$TMP/g-trigraph" "$TMP/g-slashslash"
+SPLICE_HUNK='diff --git a/channels/rdpgfx/client/rdpgfx_main.c b/channels/rdpgfx/client/rdpgfx_main.c
+--- a/channels/rdpgfx/client/rdpgfx_main.c
++++ b/channels/rdpgfx/client/rdpgfx_main.c
+@@ -1,2 +1,3 @@
+ #include <freerdp/config.h>
++// Macdows lab patch: cosmetic note \
+ #include <winpr/assert.h>'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$SPLICE_HUNK"; } > "$TMP/g-splice/0001-lab.patch"
+check 'a // comment ending in a backslash (splices the next line) refuses (B-10)'      1 'rule 1' --patch-dir "$TMP/g-splice" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${SPLICE_HUNK/+\/\/ Macdows lab patch: cosmetic note \\/+\/* Macdows lab patch *\/ \\}"; } > "$TMP/g-splice2/0001-lab.patch"
+check 'a /* */ comment followed by a backslash refuses'                                 1 'rule 1' --patch-dir "$TMP/g-splice2" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${SPLICE_HUNK/+\/\/ Macdows lab patch: cosmetic note \\/+\/\/ Macdows lab patch: note ??\/}"; } > "$TMP/g-trigraph/0001-lab.patch"
+check 'a // comment ending in the ??/ trigraph (a backslash in ISO mode) refuses'       1 'rule 1' --patch-dir "$TMP/g-trigraph" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${SPLICE_HUNK/+\/\/ Macdows lab patch: cosmetic note \\/+\/\/ Macdows lab patch: a plain note}"; } > "$TMP/g-slashslash/0001-lab.patch"
+check 'a plain // comment line passes'                                                   0 '1 patch(es) validated' --patch-dir "$TMP/g-slashslash" --no-apply
+
+echo "== header boundary: only a real diff line ends the header (gate r1 m-3)"
+mkdir -p "$TMP/dashes"
+{ printf '%s\n' '# a header comment'; printf '%s\n' '--- notes: this line starts with three dashes but is prose'; printf '%s\n' "$LINK"; printf '%s\n' "$BOGUS_HUNK"; } > "$TMP/dashes/0001-dashes.patch"
+check 'a header line starting with "--- " (prose) does not cut the header' 0 '1 patch(es) validated' --patch-dir "$TMP/dashes" --no-apply
+
+echo "== rule 2: git apply --check against the pinned checkout"
+if [ -e "$FREERDP_SRC/.git" ]; then
+    check 'a header-valid patch that does not apply refuses (rule 2)' 1 'apply --check' --patch-dir "$TMP/marker" --freerdp-src "$FREERDP_SRC"
+    check 'the real queue passes rule 1 and rule 2 against the pinned checkout' 0 '' --freerdp-src "$FREERDP_SRC"
+    # gate r1 m-4: a RELATIVE --patch-dir must be normalised before `git -C <submodule> apply --check`
+    # resolves it -- otherwise git looks for the patch inside the submodule (the documented pitfall).
+    # Relative names are exercised from inside $TMP (never from the repo, never under .build/).
+    mkdir -p "$TMP/rel/queue"
+    if compgen -G "$REPO_ROOT/ThirdParty/patches/*.patch" >/dev/null; then
+        cp "$REPO_ROOT"/ThirdParty/patches/*.patch "$TMP/rel/queue/"
+        pushd "$TMP/rel" >/dev/null
+        check 'a relative --patch-dir is normalised before git apply --check' 0 'validated' --patch-dir queue --freerdp-src "$FREERDP_SRC"
+        popd >/dev/null
+    else
+        echo "  skip relative --patch-dir case: the real queue is empty (nothing that applies to copy)"
+    fi
+else
+    echo "  FAIL rule 2 cases need the ThirdParty/FreeRDP submodule checkout (git submodule update --init)"; fail=$((fail + 2))
+fi
+
+echo "== one implementation: every enforcement point calls lib.sh, none carries its own grep (gate r1 B-1)"
+# Known limit (gate r4 N-1): this pin recognises the link PATTERN on a line; a deliberately
+# obfuscated private verdict (a case-glob, a pattern split across variables) is a review matter.
+callers=(Scripts/build-freerdp.sh Scripts/check-patch-queue.sh Scripts/gen-notices.sh)
+one_impl=0
+for f in "${callers[@]}"; do
+    # a CALL line: the function name at the start of a statement (a comment mentioning it is not a call)
+    grep -qE '^[[:space:]]*(if[[:space:]]+)?(!?[[:space:]]*)?crdp_patch_record_ok[[:space:]]+"' "$REPO_ROOT/$f" || { one_impl=1; echo "  missing call in $f"; }
+    # The link pattern itself may appear in these scripts ONLY as gen-notices.sh's `grep -oE`
+    # link EXTRACTION for the SBOM's resolves[] (data, not a verdict). Any other line carrying it
+    # -- a grep verdict, a `[[ =~ ]]`, a case pattern -- is a private rule-1 implementation (r3 N-1).
+    if grep -E 'FreeRDP/\(issues\|pull\)' "$REPO_ROOT/$f" | grep -vE '^[[:space:]]*#' | grep -vE 'grep -oE' | grep -q .; then one_impl=1; echo "  private rule-1 verdict in $f"; fi
+done
+if grep -qE 'FreeRDP/\(issues\|pull\)' "$REPO_ROOT/.github/workflows/tier1.yml"; then one_impl=1; echo "  private rule-1 grep in tier1.yml"; fi
+if [ "$one_impl" -eq 0 ]; then pass=$((pass + 1)); echo "  ok   build-freerdp.sh, check-patch-queue.sh and gen-notices.sh all call crdp_patch_record_ok; no private copy of the grep"; else fail=$((fail + 1)); echo "  FAIL rule 1 has more than one implementation"; fi
+
+echo "== lib.sh: crdp_patch_record_ok is the same verdict"
+# shellcheck source=Scripts/lib.sh
+source "$SCRIPT_DIR/lib.sh"
+set +e
+crdp_patch_record_ok "$TMP/link/0001-link.patch";     r1=$?
+crdp_patch_record_ok "$TMP/marker/0001-lab.patch";    r2=$?
+crdp_patch_record_ok "$TMP/none/0001-none.patch";     r3=$?
+crdp_patch_record_ok "$TMP/buried/0001-buried.patch"; r4=$?
+set -e
+if [ "$r1" -eq 0 ] && [ "$r2" -eq 0 ] && [ "$r3" -ne 0 ] && [ "$r4" -ne 0 ]; then
+    pass=$((pass + 1)); echo "  ok   lib function: link ok, marker ok, none refused, buried refused"
+else
+    fail=$((fail + 1)); echo "  FAIL lib function verdicts: link=$r1 marker=$r2 none=$r3 buried=$r4"
+fi
+
+echo
+echo "$pass passed, $fail failed"
+[ "$fail" -eq 0 ]

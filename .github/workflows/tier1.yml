@@ -38,7 +38,7 @@ jobs:
       - name: Install shellcheck
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y shellcheck
+          sudo apt-get install -y shellcheck ninja-build
 
       - name: shellcheck all Scripts
         # W4c review: -S style pins the strictness level explicitly (was implicitly
@@ -247,27 +247,15 @@ jobs:
           pwsh -NoProfile -File Scripts/lab/share/Set-RdsGraphicsAnalytic.Tests.ps1
 
       - name: Patch queue validation
+        # One implementation for the build script and CI: rule 1 (upstream record or the
+        # lab-only marker) is lib.sh's crdp_patch_record_ok, rule 2 is `git apply --check`
+        # against the pinned submodule -- both in Scripts/check-patch-queue.sh, pinned by
+        # Scripts/test-patch-queue.sh. Before 2026-09-07 this step carried its own copy of the
+        # rule-1 grep, which is exactly how an exception lands in one place and not the other.
         run: |
-          set -euo pipefail
-          shopt -s nullglob
-          patches=(ThirdParty/patches/*.patch)
-          if [ ${#patches[@]} -eq 0 ]; then
-            echo "No patches in ThirdParty/patches/ — nothing to validate."
-            exit 0
-          fi
-          for p in "${patches[@]}"; do
-            echo "Checking $p"
-            if ! grep -qE 'github\.com/FreeRDP/FreeRDP/(issues|pull)' "$p"; then
-              echo "::error file=$p::patch has no upstream issue/PR link in its header (ThirdParty/patches/README.md rule 1)"
-              exit 1
-            fi
-            # $p is repo-root-relative ("ThirdParty/patches/foo.patch"); `-C
-            # ThirdParty/FreeRDP` changes git's working directory before resolving it,
-            # so the path must be re-anchored at $GITHUB_WORKSPACE (or it resolves
-            # against ThirdParty/FreeRDP/ThirdParty/patches/... , which never exists).
-            if ! git -C ThirdParty/FreeRDP apply --check "$GITHUB_WORKSPACE/$p"; then
-              echo "::error file=$p::patch fails 'git apply --check' against the pinned FreeRDP commit"
-              exit 1
-            fi
-          done
-          echo "All ${#patches[@]} patch(es) validated."
+          ./Scripts/test-patch-queue.sh
+          ./Scripts/check-patch-queue.sh
+          # build-freerdp.sh's lab toggle through its --print-config-hash seam (needs cmake, ninja,
+          # jq, shasum, git and the pinned submodule; CRDP_WITH_FFMPEG=0 inside the suite keeps it
+          # independent of a self-built ffmpeg). It says SKIP if a prerequisite is missing.
+          ./Scripts/test-build-freerdp-toggle.sh

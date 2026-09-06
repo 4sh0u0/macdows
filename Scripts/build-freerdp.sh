@@ -20,10 +20,14 @@ require_cmd shasum
 require_cmd git
 
 FORCE=0
+PRINT_HASH=0
 for arg in "$@"; do
 	case "$arg" in
 	--force) FORCE=1 ;;
-	*) die "unknown argument: $arg (supported: --force)" ;;
+	# --print-config-hash: compute and print the config hash, then exit without touching
+	# .build/ -- the offline seam Scripts/test-build-freerdp-toggle.sh pins the toggles on.
+	--print-config-hash) PRINT_HASH=1 ;;
+	*) die "unknown argument: $arg (supported: --force, --print-config-hash)" ;;
 	esac
 done
 
@@ -40,9 +44,109 @@ case "$CRDP_WITH_FFMPEG" in
 *) die "CRDP_WITH_FFMPEG must be 0 or 1, got: $CRDP_WITH_FFMPEG" ;;
 esac
 
+# CRDP_LAB_SCALEDMAP_ADVERTISE: ADR-0016 (D1 contrast experiment). Default 0 = the product
+# build. 1 passes -DMACDOWS_LAB_SCALEDMAP_ADVERTISE=ON to the (patched) FreeRDP configure so the
+# RDPGFX capability sets are advertised WITHOUT RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE -- a
+# protocol-level false advertisement (no scaler is compiled in) that is only ever linked by the
+# non-rendering capture client Tools/rail-probe (Scripts/probe.sh with CRDP_FREERDP_PREFIX).
+# Three guards keep it out of the product: it folds into the config hash (its own prefix dir),
+# that prefix is NEVER made `current` (App/ and every default consumer keep the product build),
+# and the run refuses unless the patch that defines the option is actually in the applied tree
+# (a stale queue would otherwise let cmake ignore the flag and build a "lab" prefix that is
+# really the product build).
+CRDP_LAB_SCALEDMAP_ADVERTISE="${CRDP_LAB_SCALEDMAP_ADVERTISE:-0}"
+case "$CRDP_LAB_SCALEDMAP_ADVERTISE" in
+0 | 1) ;;
+*) die "CRDP_LAB_SCALEDMAP_ADVERTISE must be 0 or 1, got: $CRDP_LAB_SCALEDMAP_ADVERTISE" ;;
+esac
+
 LOCK_FILE="$CRDP_REPO_ROOT/deps/freerdp.lock"
 [ -f "$LOCK_FILE" ] || die "missing $LOCK_FILE"
 
+FREERDP_SRC="$CRDP_REPO_ROOT/ThirdParty/FreeRDP"
+# A submodule's .git is a *file* (a gitdir pointer), not a directory — hence -e, not -d.
+[ -e "$FREERDP_SRC/.git" ] || die "ThirdParty/FreeRDP submodule not initialized — run Scripts/bootstrap.sh first"
+
+SUBMODULE_SHA="$(git -C "$FREERDP_SRC" rev-parse HEAD)"
+EXPECTED_SHA="$(jq -er '.commit' "$LOCK_FILE")" || die "deps/freerdp.lock has no .commit field"
+[ "$SUBMODULE_SHA" = "$EXPECTED_SHA" ] || die "ThirdParty/FreeRDP HEAD ($SUBMODULE_SHA) != deps/freerdp.lock commit ($EXPECTED_SHA). Run Scripts/bootstrap.sh."
+
+DEPLOYMENT_TARGET="$(jq -er '.deployment_target' "$LOCK_FILE")" || die "deps/freerdp.lock has no .deployment_target field"
+
+if ! git -C "$FREERDP_SRC" diff --quiet -- . || ! git -C "$FREERDP_SRC" diff --cached --quiet -- .; then
+	die "ThirdParty/FreeRDP has local modifications outside the patch queue.
+This should never happen from a clean run of this script (it always reverts patches on
+exit). Clean it manually and re-run: git -C ThirdParty/FreeRDP checkout -- ."
+fi
+
+# --- Patch queue --------------------------------------------------------------------
+PATCH_DIR="$CRDP_REPO_ROOT/ThirdParty/patches"
+PATCHES=()
+if [ -d "$PATCH_DIR" ]; then
+	while IFS= read -r -d '' p; do PATCHES+=("$p"); done \
+		< <(find "$PATCH_DIR" -maxdepth 1 -name '*.patch' -print0 | sort -z)
+fi
+log "Patch queue: ${#PATCHES[@]} patch(es)"
+
+# Rule 1 is lib.sh's crdp_patch_record_ok -- the same verdict Tier 1's Scripts/check-patch-queue.sh
+# uses, so the build and CI cannot disagree about what a valid header is.
+for patch in "${PATCHES[@]:-}"; do
+	[ -n "$patch" ] || continue
+	crdp_patch_record_ok "$patch" \
+		|| die "patch $patch has no upstream issue/PR link and no lab-only marker in its header (ThirdParty/patches/README.md rule 1)"
+done
+
+# --- Config hash (mirrors the CI cache key formula in adr/0006 §6) ------------------
+XCODE_VERSION="$(xcodebuild -version 2>/dev/null | tr '\n' ' ' || echo 'no-xcode')"
+
+compute_config_hash() {
+	{
+		printf 'submodule_sha=%s\n' "$SUBMODULE_SHA"
+		printf 'xcode_version=%s\n' "$XCODE_VERSION"
+		printf 'crdp_with_ffmpeg=%s\n' "$CRDP_WITH_FFMPEG"
+		printf 'crdp_lab_scaledmap_advertise=%s\n' "$CRDP_LAB_SCALEDMAP_ADVERTISE"
+		printf -- '--- build-freerdp.sh ---\n'
+		cat "$SCRIPT_DIR/build-freerdp.sh"
+		printf -- '--- lib.sh ---\n'
+		cat "$SCRIPT_DIR/lib.sh"
+		printf -- '--- lock cmake_config ---\n'
+		jq -c '.cmake_config' "$LOCK_FILE"
+		printf -- '--- lock openssl ---\n'
+		jq -c '.openssl' "$LOCK_FILE"
+		# Same role the .openssl block plays: an ffmpeg version/flag bump changes what
+		# libfreerdp3 links against, so it has to invalidate this build cache. (Like
+		# .openssl, this hashes the lock's record rather than Scripts/build-ffmpeg.sh's
+		# contents -- the lock is the reviewable pin, and the script cross-checks its own
+		# version/sha256 against it on every run, so they cannot drift apart unnoticed.)
+		printf -- '--- lock ffmpeg ---\n'
+		jq -c '.ffmpeg' "$LOCK_FILE"
+		printf -- '--- patches ---\n'
+		for patch in "${PATCHES[@]:-}"; do
+			[ -n "$patch" ] || continue
+			printf -- '-- %s --\n' "$(basename "$patch")"
+			cat "$patch"
+		done
+	} | shasum -a 256 | awk '{print $1}' | cut -c1-16
+}
+CONFIG_HASH="$(compute_config_hash)"
+log "Config hash: $CONFIG_HASH"
+
+CONFIG_ROOT="$CRDP_BUILD_DIR/freerdp/$CONFIG_HASH"
+BUILD_DIR="$CONFIG_ROOT/build"
+INSTALL_PREFIX="$CONFIG_ROOT/prefix"
+MANIFEST="$CONFIG_ROOT/build-manifest.json"
+CURRENT_LINK="$CRDP_BUILD_DIR/freerdp/current"
+if [ "$PRINT_HASH" = "1" ]; then
+	printf '%s\n' "$CONFIG_HASH"
+	exit 0
+fi
+
+# --- Prerequisites that do not feed the hash (checked only when we are going to build) --------
+# The static OpenSSL prefix and the self-built ffmpeg prefix are inputs to CONFIGURE, not to the
+# config hash (the hash folds the lock's records of both), so they are checked here, AFTER the
+# --print-config-hash seam: Tier 1's ubuntu runner has neither prefix and runs the seam-based
+# Scripts/test-build-freerdp-toggle.sh (gate d1-lane r2 B-3).
+[ -f "$CRDP_DEPS_PREFIX/lib/libssl.a" ] || die "static OpenSSL not found at $CRDP_DEPS_PREFIX — run Scripts/build-openssl.sh first"
 # --- ffmpeg (H264 decode) -------------------------------------------------------------
 # adr/0007: ffmpeg dynamically linked (LGPL §6; never static) + VideoToolbox hwaccel.
 # Phase 2 W8 replaced the previous Homebrew source with a pinned, self-built, LGPL-only
@@ -88,82 +192,23 @@ It is either a failed/interrupted build or a leftover from a different pin -- re
 	log "ffmpeg: $CRDP_FFMPEG_PREFIX (self-built, pinned, LGPL; dynamic link only; PKG_CONFIG_LIBDIR pinned to it for CMake's find_package(FFmpeg))"
 fi
 
-FREERDP_SRC="$CRDP_REPO_ROOT/ThirdParty/FreeRDP"
-# A submodule's .git is a *file* (a gitdir pointer), not a directory — hence -e, not -d.
-[ -e "$FREERDP_SRC/.git" ] || die "ThirdParty/FreeRDP submodule not initialized — run Scripts/bootstrap.sh first"
-
-[ -f "$CRDP_DEPS_PREFIX/lib/libssl.a" ] || die "static OpenSSL not found at $CRDP_DEPS_PREFIX — run Scripts/build-openssl.sh first"
-
-SUBMODULE_SHA="$(git -C "$FREERDP_SRC" rev-parse HEAD)"
-EXPECTED_SHA="$(jq -er '.commit' "$LOCK_FILE")" || die "deps/freerdp.lock has no .commit field"
-[ "$SUBMODULE_SHA" = "$EXPECTED_SHA" ] || die "ThirdParty/FreeRDP HEAD ($SUBMODULE_SHA) != deps/freerdp.lock commit ($EXPECTED_SHA). Run Scripts/bootstrap.sh."
-
-DEPLOYMENT_TARGET="$(jq -er '.deployment_target' "$LOCK_FILE")" || die "deps/freerdp.lock has no .deployment_target field"
-
-if ! git -C "$FREERDP_SRC" diff --quiet -- . || ! git -C "$FREERDP_SRC" diff --cached --quiet -- .; then
-	die "ThirdParty/FreeRDP has local modifications outside the patch queue.
-This should never happen from a clean run of this script (it always reverts patches on
-exit). Clean it manually and re-run: git -C ThirdParty/FreeRDP checkout -- ."
+# A lab build must land in its OWN prefix. If the toggle somehow resolved to the hash `current`
+# already points at (the fold into the hash lost, a stale link...), building would overwrite the
+# product prefix in place while the "NOT updating current" log line reassures -- refuse instead
+# (gate d1-lane r1 I-2; expressed through the same predicate the two `current` link sites use,
+# r2 m-11; compared by basename so an absolute link target cannot slip past, r2 m-7).
+if ! crdp_freerdp_build_publishes_current "$CRDP_LAB_SCALEDMAP_ADVERTISE" \
+	&& [ -L "$CURRENT_LINK" ] && [ "$(basename "$(readlink "$CURRENT_LINK")")" = "$CONFIG_HASH" ]; then
+	die "CRDP_LAB_SCALEDMAP_ADVERTISE=1 resolved to config hash $CONFIG_HASH, which is what $CURRENT_LINK already points at -- the lab build is not separated from the product build; refusing to build into the product prefix"
 fi
-
-# --- Patch queue --------------------------------------------------------------------
-PATCH_DIR="$CRDP_REPO_ROOT/ThirdParty/patches"
-PATCHES=()
-if [ -d "$PATCH_DIR" ]; then
-	while IFS= read -r -d '' p; do PATCHES+=("$p"); done \
-		< <(find "$PATCH_DIR" -maxdepth 1 -name '*.patch' -print0 | sort -z)
-fi
-log "Patch queue: ${#PATCHES[@]} patch(es)"
-
-for patch in "${PATCHES[@]:-}"; do
-	[ -n "$patch" ] || continue
-	grep -qE 'github\.com/FreeRDP/FreeRDP/(issues|pull)' "$patch" \
-		|| die "patch $patch has no upstream issue/PR link in its header (ThirdParty/patches/README.md rule 1)"
-done
-
-# --- Config hash (mirrors the CI cache key formula in adr/0006 §6) ------------------
-XCODE_VERSION="$(xcodebuild -version 2>/dev/null | tr '\n' ' ' || echo 'no-xcode')"
-
-compute_config_hash() {
-	{
-		printf 'submodule_sha=%s\n' "$SUBMODULE_SHA"
-		printf 'xcode_version=%s\n' "$XCODE_VERSION"
-		printf 'crdp_with_ffmpeg=%s\n' "$CRDP_WITH_FFMPEG"
-		printf -- '--- build-freerdp.sh ---\n'
-		cat "$SCRIPT_DIR/build-freerdp.sh"
-		printf -- '--- lib.sh ---\n'
-		cat "$SCRIPT_DIR/lib.sh"
-		printf -- '--- lock cmake_config ---\n'
-		jq -c '.cmake_config' "$LOCK_FILE"
-		printf -- '--- lock openssl ---\n'
-		jq -c '.openssl' "$LOCK_FILE"
-		# Same role the .openssl block plays: an ffmpeg version/flag bump changes what
-		# libfreerdp3 links against, so it has to invalidate this build cache. (Like
-		# .openssl, this hashes the lock's record rather than Scripts/build-ffmpeg.sh's
-		# contents -- the lock is the reviewable pin, and the script cross-checks its own
-		# version/sha256 against it on every run, so they cannot drift apart unnoticed.)
-		printf -- '--- lock ffmpeg ---\n'
-		jq -c '.ffmpeg' "$LOCK_FILE"
-		printf -- '--- patches ---\n'
-		for patch in "${PATCHES[@]:-}"; do
-			[ -n "$patch" ] || continue
-			printf -- '-- %s --\n' "$(basename "$patch")"
-			cat "$patch"
-		done
-	} | shasum -a 256 | awk '{print $1}' | cut -c1-16
-}
-CONFIG_HASH="$(compute_config_hash)"
-log "Config hash: $CONFIG_HASH"
-
-CONFIG_ROOT="$CRDP_BUILD_DIR/freerdp/$CONFIG_HASH"
-BUILD_DIR="$CONFIG_ROOT/build"
-INSTALL_PREFIX="$CONFIG_ROOT/prefix"
-MANIFEST="$CONFIG_ROOT/build-manifest.json"
-CURRENT_LINK="$CRDP_BUILD_DIR/freerdp/current"
 
 if [ "$FORCE" -eq 0 ] && [ -f "$MANIFEST" ] && [ -f "$INSTALL_PREFIX/lib/libfreerdp3.dylib" ]; then
 	log "Config $CONFIG_HASH already built at $INSTALL_PREFIX; skipping. Pass --force to rebuild."
-	ln -sfn "$CONFIG_HASH" "$CURRENT_LINK"
+	if crdp_freerdp_build_publishes_current "$CRDP_LAB_SCALEDMAP_ADVERTISE"; then
+		ln -sfn "$CONFIG_HASH" "$CURRENT_LINK"
+	else
+		log "lab build (CRDP_LAB_SCALEDMAP_ADVERTISE=1): NOT updating $CURRENT_LINK; use $INSTALL_PREFIX explicitly"
+	fi
 	exit 0
 fi
 
@@ -193,6 +238,10 @@ for patch in "${PATCHES[@]:-}"; do
 	log "  applying $patch"
 	git -C "$FREERDP_SRC" apply "$patch"
 done
+if [ "$CRDP_LAB_SCALEDMAP_ADVERTISE" = "1" ]; then
+	grep -q 'option(MACDOWS_LAB_SCALEDMAP_ADVERTISE' "$FREERDP_SRC/cmake/ConfigOptions.cmake" \
+		|| die "CRDP_LAB_SCALEDMAP_ADVERTISE=1 but the applied tree defines no MACDOWS_LAB_SCALEDMAP_ADVERTISE option -- the lab patch (ThirdParty/patches/0002-rdpgfx-lab-scaledmap-advertise-option.patch) is missing, so cmake would silently ignore the flag"
+fi
 
 # --- Configure -----------------------------------------------------------------------
 mkdir -p "$CONFIG_ROOT"
@@ -258,6 +307,9 @@ while IFS= read -r flag; do
 	esac
 	FLAGS+=("$flag")
 done <<<"$FLAGS_RAW"
+if [ "$CRDP_LAB_SCALEDMAP_ADVERTISE" = "1" ]; then
+	FLAGS+=("-DMACDOWS_LAB_SCALEDMAP_ADVERTISE=ON")
+fi
 GENERATOR="$(jq -er '.cmake_config.generator' "$LOCK_FILE")" || die "deps/freerdp.lock has no .cmake_config.generator field"
 
 # Guardrail against a truncated/corrupted flags read silently configuring FreeRDP with
@@ -301,6 +353,13 @@ for key in "${CACHE_KEYS[@]}"; do
 	CACHE_JSON="$(jq --arg k "$key" --arg v "$value" '. + {($k): $v}' <<<"$CACHE_JSON")"
 done
 
+# The lab option (ADR-0016) exists only while ThirdParty/patches/0002-rdpgfx-lab-scaledmap-advertise-
+# option.patch is in the queue, so it is recorded as an OPTIONAL key: its cache value when present,
+# "<absent>" otherwise. Listing it in CACHE_KEYS would make retiring the patch break every build
+# (gate d1-lane r1 I-4).
+lab_cache_value="$(grep -E '^MACDOWS_LAB_SCALEDMAP_ADVERTISE(:[A-Za-z]+)?=' "$CACHE_FILE" | head -1 | cut -d= -f2- || true)"
+CACHE_JSON="$(jq --arg v "${lab_cache_value:-<absent>}" '. + {MACDOWS_LAB_SCALEDMAP_ADVERTISE: $v}' <<<"$CACHE_JSON")"
+
 PATCHES_JSON="[]"
 if [ "${#PATCHES[@]}" -gt 0 ]; then
 	PATCHES_JSON="$(printf '%s\n' "${PATCHES[@]}" | xargs -n1 basename | jq -R . | jq -s .)"
@@ -313,22 +372,32 @@ jq -n \
 	--arg installPrefix "$INSTALL_PREFIX" \
 	--arg xcodeVersion "$XCODE_VERSION" \
 	--arg crdpWithFfmpeg "$CRDP_WITH_FFMPEG" \
+	--arg crdpLabScaledmapAdvertise "$CRDP_LAB_SCALEDMAP_ADVERTISE" \
 	--argjson patches "$PATCHES_JSON" \
 	--argjson cmakeCache "$CACHE_JSON" \
-	'{configHash: $configHash, submoduleSha: $submoduleSha, builtAt: $builtAt, installPrefix: $installPrefix, xcodeVersion: $xcodeVersion, crdpWithFfmpeg: $crdpWithFfmpeg, patches: $patches, cmakeCache: $cmakeCache}' \
+	'{configHash: $configHash, submoduleSha: $submoduleSha, builtAt: $builtAt, installPrefix: $installPrefix, xcodeVersion: $xcodeVersion, crdpWithFfmpeg: $crdpWithFfmpeg, crdpLabScaledmapAdvertise: $crdpLabScaledmapAdvertise, patches: $patches, cmakeCache: $cmakeCache}' \
 	>"$MANIFEST"
 
-ln -sfn "$CONFIG_HASH" "$CURRENT_LINK"
 log "FreeRDP installed to $INSTALL_PREFIX"
 log "Manifest: $MANIFEST"
-log "Stable path: $CURRENT_LINK -> $CONFIG_HASH"
+if crdp_freerdp_build_publishes_current "$CRDP_LAB_SCALEDMAP_ADVERTISE"; then
+	ln -sfn "$CONFIG_HASH" "$CURRENT_LINK"
+	log "Stable path: $CURRENT_LINK -> $CONFIG_HASH"
+else
+	log "lab build (CRDP_LAB_SCALEDMAP_ADVERTISE=1): NOT updating $CURRENT_LINK; link Tools/rail-probe against $INSTALL_PREFIX explicitly (Scripts/probe.sh CRDP_FREERDP_PREFIX)"
+fi
 
-# --- Retention: keep only the 2 most recently built config-hash dirs -----------------
+# --- Retention: keep this build, `current`'s target, and the newest other config-hash dir ----
 # Each full FreeRDP build is ~100s of MB; old config-hash dirs from superseded lock/patch
-# states otherwise accumulate forever. Keep the current one plus one prior (covers "just
-# rolled back a bad change") and drop the rest, sorted by mtime.
+# states otherwise accumulate forever. Keep the one just built, whatever `current` points at
+# (never pruned: a lab build is not published as `current`, and a later build must not leave the
+# link dangling -- gate d1-lane r1 I-1, reproduced in a sandbox), plus one more prior (covers
+# "just rolled back a bad change"), and drop the rest, sorted by mtime. Compared by basename
+# so an absolute link target is protected too (r2 m-7).
+CURRENT_TARGET=""
+[ -L "$CURRENT_LINK" ] && CURRENT_TARGET="$(basename "$(readlink "$CURRENT_LINK")")"
 mapfile -t OLD_CONFIGS < <(
-	find "$CRDP_BUILD_DIR/freerdp" -mindepth 1 -maxdepth 1 -type d ! -name "$CONFIG_HASH" -print0 \
+	find "$CRDP_BUILD_DIR/freerdp" -mindepth 1 -maxdepth 1 -type d ! -name "$CONFIG_HASH" ${CURRENT_TARGET:+! -name "$CURRENT_TARGET"} -print0 \
 		| xargs -0 -I{} stat -f '%m%t%N' {} 2>/dev/null \
 		| sort -rn -t"$(printf '\t')" -k1,1 \
 		| cut -f2- \

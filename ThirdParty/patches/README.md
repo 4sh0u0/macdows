@@ -28,6 +28,44 @@ policy).
    # or: https://github.com/FreeRDP/FreeRDP/pull/12345
    ```
 
+   **Lab-only exception (owner ruling 2026-09-07, ADR-0016 §5 question 2).** A patch that
+   introduces a build knob which (a) defaults OFF so the default build is unchanged, (b) is
+   only ever enabled for a non-rendering lab tool, and (c) is backed by an *Accepted* ADR,
+   may carry this header line instead of an upstream link:
+
+   ```
+   # Lab-only: default OFF; ADR: docs/adr/NNNN-<slug>.md
+   ```
+
+   The line is matched literally by `crdp_patch_record_ok` in `Scripts/lib.sh` (the one
+   implementation `Scripts/build-freerdp.sh`, Tier 1's `Scripts/check-patch-queue.sh` and the
+   release SBOM generator `Scripts/gen-notices.sh` all consult; `Scripts/test-patch-queue.sh`
+   pins it): "default OFF" and the `docs/adr/` path are mandatory, and the record must be in
+   the patch *header* -- the lines before the first real diff line (`diff --git `, `--- a/` or
+   `--- /dev/null`) -- so a link that merely appears inside a hunk does not count. The marker
+   is a claim, and the patch has to have the **lab-only shape**, a grammar checked
+   mechanically over its whole diff body: (1) exactly one new `option(MACDOWS_LAB_<X> "..." OFF)`
+   line added in a hunk of a `*.cmake` / `CMakeLists.txt` file -- the knob, and the ONLY line a
+   CMake file may gain (a `#` line there is a comment only outside a multi-line quoted or bracket
+   argument, which a hunk cannot prove, so none is admitted; the knob's description string
+   carries the notice); (2) every other added line is a one-line C comment that is nothing else
+   (`/* ... */` alone, `//`) or exactly `#cmakedefine MACDOWS_LAB_<X>` in a `*.in` template --
+   no code line is admitted, even one that names the knob; (2a) independently of (2), NO added
+   line of any kind in any hunk may contain a backslash or `??` (a line ending in `\` or the
+   `??/` trigraph is spliced with the next physical line before comments are recognised and
+   would swallow real code); (3) every removed line is a
+   `#if`/`#elif` line re-added in the same hunk as the removed text followed by
+   ` && !defined(MACDOWS_LAB_<X>)` -- a guard appended, nothing else; (4) text hunks of
+   existing files only: every `diff --git` block carries a `---`/`+++` pair naming the same file
+   the block names (what `git apply` reads), so bare hunks, mode-only blocks, binary blocks,
+   new or deleted files, renames and copies are refused. A bug fix, a behaviour change, an
+   extra hunk riding along, a `set(KNOB ...)` override, a runtime `if (KNOB)` or a knob named
+   outside `MACDOWS_LAB_*` fails one of the four, which is the point: rule 1 exists to stop this
+   directory becoming an undocumented fork, and the exception admits nothing but a guarded,
+   default-OFF knob. The shape does not judge comment text or the option's description (inert),
+   nor whether the guarded `#if` sites are the right ones -- that is the ADR's and the reviewer's
+   job. Such a patch is retired when its experiment closes, not carried.
+
 2. **`git apply` failure is a hard build failure.** `Scripts/build-freerdp.sh` applies
    every `*.patch` file in this directory with `git apply --check` first; if any patch
    fails to apply cleanly, the build stops. There is no silent skip and no fuzzy-apply
@@ -46,9 +84,22 @@ policy).
 
 ## Current state
 
-**No patches** against FreeRDP 3.31.1 (`63b948ca5cb94307fd5444ee6e73927a41ccdab4`). The queue
-is empty on purpose: the one patch this project ever carried was absorbed upstream and retired
-on the 3.31.1 pin bump (2026-09-02).
+**One patch** against FreeRDP 3.31.1 (`63b948ca5cb94307fd5444ee6e73927a41ccdab4`):
+
+- `0002-rdpgfx-lab-scaledmap-advertise-option.patch` (2026-09-07, lab-only exception, ADR-0016)
+  -- adds the CMake option `MACDOWS_LAB_SCALEDMAP_ADVERTISE` (default **OFF**) that omits
+  `RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE` from the advertised RDPGFX capability sets. OFF leaves
+  every preprocessed line as it was; ON is a protocol-level false advertisement used only by
+  `Tools/rail-probe` for the D1 contrast experiment (`Scripts/build-freerdp.sh` with
+  `CRDP_LAB_SCALEDMAP_ADVERTISE=1`, a separate config-hash prefix never made `current`). Each
+  modified site carries a `Macdows lab patch 0002` notice -- a one-line comment at the six C /
+  template sites, the option's own description string in ConfigOptions.cmake (Apache-2.0 §4(b));
+  `THIRD_PARTY_NOTICES.md`'s FreeRDP entry says "Modified: Yes" and names it. Retire when D1's
+  record is filed -- and remove nothing else: `Scripts/build-freerdp.sh` records the option's
+  cache value as an OPTIONAL manifest key precisely so retiring this patch is a one-file change.
+
+Before it (2026-09-02 to 2026-09-07) the queue was empty on purpose: the one patch this project
+carried before was absorbed upstream and retired on the 3.31.1 pin bump.
 
 ### Retired
 

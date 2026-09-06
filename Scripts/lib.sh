@@ -30,6 +30,123 @@ require_cmd() {
 	command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+# Patch-queue rule 1 (ThirdParty/patches/README.md): every .patch file's HEADER must carry an
+# upstream record -- a FreeRDP issue/PR link -- or, since ADR-0016 (owner ruling 2026-09-07),
+# the lab-only marker
+#     # Lab-only: default OFF; ADR: docs/adr/NNNN-<slug>.md
+# which is valid only for a default-OFF build knob backed by an Accepted ADR (the README's
+# rule 1 exception). "Header" means the lines before the first real diff line (`diff --git `,
+# `--- a/` or `--- /dev/null`; a prose line that merely starts with "--- " does not end it,
+# gate r1 m-3): a link that merely appears inside a hunk's context or additions does not count.
+#
+# The marker is a claim, so a marker-admitted patch must have the lab-only SHAPE, checked
+# mechanically over its whole diff body (gate d1-lane r1 I-3, r2 I-7, r3 B-4, r4 B-6, r5 B-7/B-8).
+# The rules are a GRAMMAR of what a guarded default-OFF knob looks like, not a token test:
+#   1. exactly ONE new CMake `option(MACDOWS_LAB_<X> "..." OFF)` line, added in a hunk of a
+#      *.cmake / CMakeLists.txt file (the knob);
+#   2. every other ADDED line is one of: a one-line C comment that is nothing else (`/* ... */`
+#      alone on the line, or `//`); or exactly `#cmakedefine MACDOWS_LAB_<X>` in a `*.in` template.
+#      No code line is admitted, whether or not it names the knob, and NO added line at all is
+#      admitted in a CMake file besides the knob itself: a `#` line there is a comment only outside
+#      a multi-line quoted or bracket argument, which a hunk cannot prove (gate r6 B-9 -- the pinned
+#      tree embeds C++ test sources in CMake strings). No added line may contain a backslash or
+#      the sequence `??`: a comment ending in `\` (or in the `??/` trigraph under ISO modes) is
+#      spliced with the NEXT physical line before comments are even recognised (C translation
+#      phase 2 precedes phase 3), so it would swallow real code (gate r7 B-10, demonstrated
+#      against rdpgfx_main.c). Residual, stated: a C comment line added inside a C++ raw string
+#      literal (R"(...)") would be string content; the pinned tree's channels/ and libfreerdp/
+#      contain no raw string literal, and the reviewer of a lab patch checks its sites;
+#   3. every REMOVED line is a `#if` / `#elif` line re-added in the same hunk as exactly the removed
+#      text followed by ` && !defined(MACDOWS_LAB_<X>)` -- a guard appended, nothing else;
+#   4. text hunks of existing files only: every `diff --git` block carries a `--- a/` / `+++ b/`
+#      pair naming the SAME file the block names (what `git apply` reads), so a bare hunk, a
+#      mode-only block, a binary block, a new/deleted file, a rename or a copy is refused.
+#   CR is stripped first so a CRLF patch is judged on its content. A bug fix, a behaviour change,
+#   an extra hunk riding along, a `set(KNOB ...)` override, a runtime `if (KNOB)`, or a knob named
+#   outside MACDOWS_LAB_* all fail one of the four. What the shape does NOT judge: the option's
+#   description string and comment text (inert), and whether the guarded `#if` sites are the right
+#   ones -- that is the ADR's and the reviewer's job.
+#
+# This is the ONE implementation of the rule. Scripts/build-freerdp.sh consults it before
+# folding the queue into the config hash, Scripts/check-patch-queue.sh (Tier 1's patch
+# validation step) and Scripts/gen-notices.sh (the release SBOM) consult it too -- keep it here
+# so the build, CI and the release can never disagree. Scripts/test-patch-queue.sh pins the verdicts.
+#
+# Usage:  crdp_patch_record_ok "$patch_file"   (0 = record present, 1 = refuse)
+crdp_patch_record_ok() {
+	local file="${1:-}" header
+	[ -f "$file" ] || return 1
+	header="$(awk '/^(diff --git |--- (a\/|\/dev\/null))/ { exit } { print }' "$file")"
+	printf '%s\n' "$header" | grep -qE 'github\.com/FreeRDP/FreeRDP/(issues|pull)/[0-9]+' && return 0
+	if printf '%s\n' "$header" | grep -qE '^# Lab-only: default OFF; ADR: docs/adr/[0-9]{4}-[A-Za-z0-9._-]+\.md'; then
+		awk '
+			{ sub(/\r$/, "") }
+			/^diff --git / { inbody = 1; ndg++; hdr = $NF; sub(/^b\//, "", hdr); file = ""; cmake = 0; next }
+			/^--- (a\/|\/dev\/null)/ { inbody = 1; if (hdr == "") { bad = 1 }; next }
+			!inbody { next }
+			/^(rename (from|to)|copy (from|to)|new file mode|deleted file mode|similarity index|old mode|new mode|GIT binary patch|Binary files )/ { bad = 1; next }
+			/^\+\+\+ / { file = $2; npp++
+			             if (file == "/dev/null") { bad = 1; next }
+			             sub(/^b\//, "", file)
+			             if (hdr == "" || file != hdr) { bad = 1 }
+			             hdr = ""; cmake = (file ~ /(\.cmake|CMakeLists\.txt)$/); next }
+			/^@@ / { h++; next }
+			/^\+[[:space:]]*option\([[:space:]]*MACDOWS_LAB_[A-Za-z0-9_]+[[:space:]]+"[^"]*"[[:space:]]+OFF[[:space:]]*\)[[:space:]]*$/ && cmake {
+				name = $0; sub(/^\+[[:space:]]*option\([[:space:]]*/, "", name); sub(/[[:space:]].*/, "", name)
+				nopt++; knob = name; next }
+			/^\+/ { np[h]++; plus[h, np[h]] = substr($0, 2); pcm[h, np[h]] = cmake; pin[h, np[h]] = (file ~ /\.in$/); next }
+			/^-/  { nm[h]++; minus[h, nm[h]] = substr($0, 2); next }
+			END {
+				if (bad || nopt != 1 || ndg != npp || hdr != "") exit 1
+				guardtail = "^[[:space:]]*&&[[:space:]]*!defined\\(" knob "\\)[[:space:]]*$"
+				guardline = "^[[:space:]]*#[[:space:]]*(if|elif)[[:space:]].*&&[[:space:]]*!defined\\(" knob "\\)[[:space:]]*$"
+				for (k = 1; k <= h; k++) {
+					# rule 2: every added line is a comment, the cmakedefine, or a guard re-add (which
+					# rule 3 then pairs with a removed line -- a guard line with no removed twin is refused)
+					ng = 0
+					for (i = 1; i <= np[k]; i++) {
+						l = plus[k, i]
+						if (l ~ /\\|\?\?/) exit 1
+						if (l ~ /^[[:space:]]*\/\*([^*]|\*+[^*\/])*\*+\/[[:space:]]*$/) continue
+						if (l ~ /^[[:space:]]*\/\//) continue
+						if (pcm[k, i]) exit 1
+						if (pin[k, i] && l ~ ("^[[:space:]]*#cmakedefine[[:space:]]+" knob "[[:space:]]*$")) continue
+						if (l ~ guardline) { ng++; continue }
+						exit 1
+					}
+					# rule 3: every removed line is a #if/#elif re-added as itself + the guard tail;
+					# the number of guard re-adds must equal the number of removed lines (bijection)
+					matched = 0
+					for (i = 1; i <= nm[k]; i++) {
+						r = minus[k, i]; found = 0
+						if (r !~ /^[[:space:]]*#[[:space:]]*(if|elif)[[:space:]]/) exit 1
+						for (j = 1; j <= np[k]; j++) {
+							l = plus[k, j]
+							if (substr(l, 1, length(r)) == r && substr(l, length(r) + 1) ~ guardtail) { found = 1; break }
+						}
+						if (!found) exit 1
+						matched++
+					}
+					if (ng != matched) exit 1
+				}
+				exit 0
+			}
+		' "$file" && return 0
+	fi
+	return 1
+}
+
+# Does a Scripts/build-freerdp.sh run get to publish its prefix as .build/freerdp/current?
+# Only the product build (CRDP_LAB_SCALEDMAP_ADVERTISE=0) does; a lab build (1) never does, so
+# App/ and every default consumer keep the product build (ADR-0016 section 1.2). Both places the
+# build script links `current` consult this, and Scripts/test-build-freerdp-toggle.sh pins it
+# (gate d1-lane r1 I-5).
+#
+# Usage:  crdp_freerdp_build_publishes_current "$CRDP_LAB_SCALEDMAP_ADVERTISE"   (0 = publish)
+crdp_freerdp_build_publishes_current() {
+	[ "${1:-0}" = "0" ]
+}
+
 # Live-host testing boundary gate (owner rule, 2026-08-31): a real-host debugging step may
 # only ever target the owner's own machine inside the owner's own lab network. Prose in a
 # rules file cannot enforce that, so every script that is about to touch a live host calls
