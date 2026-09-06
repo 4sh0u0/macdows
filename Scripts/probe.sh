@@ -94,11 +94,24 @@ export MACDOWS_BOUNDARY_GATED=1
 
 require_cmd cmake
 
-FREERDP_PREFIX="$CRDP_BUILD_DIR/freerdp/current/prefix"
+# CRDP_FREERDP_PREFIX (ADR-0016 D1): link rail-probe against an explicit FreeRDP prefix instead
+# of `current` -- the lab build Scripts/build-freerdp.sh produces with
+# CRDP_LAB_SCALEDMAP_ADVERTISE=1 is deliberately never made `current`, so this is the only way
+# to run the D1 contrast. Each prefix gets its own rail-probe build dir (a cmake cache is bound
+# to one FREERDP_PREFIX), and the prefix's manifest is echoed so the run log states which build
+# actually dialled.
+FREERDP_PREFIX="${CRDP_FREERDP_PREFIX:-$CRDP_BUILD_DIR/freerdp/current/prefix}"
 [ -d "$FREERDP_PREFIX" ] || die "no FreeRDP build found at $FREERDP_PREFIX — run Scripts/build-freerdp.sh first"
 
 PROBE_DIR="$CRDP_REPO_ROOT/Tools/rail-probe"
 BUILD_DIR="$PROBE_DIR/build"
+if [ -n "${CRDP_FREERDP_PREFIX:-}" ]; then
+	BUILD_DIR="$CRDP_BUILD_DIR/rail-probe-$(basename "$(cd "$FREERDP_PREFIX/.." && pwd)")"
+	log "CRDP_FREERDP_PREFIX override: rail-probe links against $FREERDP_PREFIX (build dir $BUILD_DIR)"
+fi
+if [ -f "$FREERDP_PREFIX/../build-manifest.json" ] && command -v jq >/dev/null 2>&1; then
+	log "FreeRDP prefix manifest: $(jq -c '{configHash, crdpWithFfmpeg, crdpLabScaledmapAdvertise, patches}' "$FREERDP_PREFIX/../build-manifest.json")"
+fi
 
 log "Configuring rail-probe against $FREERDP_PREFIX"
 cmake -S "$PROBE_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFREERDP_PREFIX="$FREERDP_PREFIX"

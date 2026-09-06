@@ -5,7 +5,16 @@
   "tag": "3.31.1",
   "commit": "63b948ca5cb94307fd5444ee6e73927a41ccdab4",
   "upstream_url": "https://github.com/FreeRDP/FreeRDP.git",
-  "patches": [],
+  "patches": [
+    {
+      "file": "0002-rdpgfx-lab-scaledmap-advertise-option.patch",
+      "targets": ["cmake/ConfigOptions.cmake", "include/config/config.h.in", "channels/rdpgfx/client/rdpgfx_main.c"],
+      "upstream": "none -- lab-only exception (ThirdParty/patches/README.md rule 1; owner ruling 2026-09-07), ADR docs/adr/0016-scaledmap-disable-configurable-d1.md",
+      "added_on": "2026-09-07",
+      "summary": "CMake option MACDOWS_LAB_SCALEDMAP_ADVERTISE, default OFF: omits RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE from the advertised RDPGFX capability sets (five sites in rdpgfx_main.c) for the D1 contrast experiment on Tools/rail-probe only. With the option OFF the preprocessed source is unchanged; the option is surfaced by Scripts/build-freerdp.sh as CRDP_LAB_SCALEDMAP_ADVERTISE=1, which builds a separate config-hash prefix that is never made `current`.",
+      "retire_when": "D1's record (docs/upgrade-gate/2026-09-d1-scaledmap-contrast.md) is filed, or the hunks stop applying on a pin bump."
+    }
+  ],
   "_patches_note": "Inventory and rationale only — ThirdParty/patches/*.patch is the authoritative queue. Scripts/build-freerdp.sh discovers patches by globbing that directory (never from this field) and folds their file *contents* into the config hash, and Scripts/gen-notices.sh derives the SBOM's pedigree.patches from the same directory, so nothing mechanical reads this block and it cannot drift the build. It exists because this lock is the reviewable pin record: a reader must be able to see from here alone that the pinned checkout is not built verbatim. Per-hunk detail (defect, provenance, upstream status, retirement condition) lives in each patch file's own header; the queue's rules live in ThirdParty/patches/README.md.",
   "deployment_target": "14.0",
   "_deployment_target_note": "Single source for the minimum macOS version this repo targets. Scripts/build-openssl.sh reads this for -mmacosx-version-min; Scripts/build-freerdp.sh substitutes it into the -DCMAKE_OSX_DEPLOYMENT_TARGET flag below (the literal '14.0' in cmake_config.flags is a fallback/documentation value only — the running script always overrides it from this field, so the two can never drift silently).",

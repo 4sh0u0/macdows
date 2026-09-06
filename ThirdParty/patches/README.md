@@ -28,6 +28,24 @@ policy).
    # or: https://github.com/FreeRDP/FreeRDP/pull/12345
    ```
 
+   **Lab-only exception (owner ruling 2026-09-07, ADR-0016 §5 question 2).** A patch that
+   introduces a build knob which (a) defaults OFF so the default build is unchanged, (b) is
+   only ever enabled for a non-rendering lab tool, and (c) is backed by an *Accepted* ADR,
+   may carry this header line instead of an upstream link:
+
+   ```
+   # Lab-only: default OFF; ADR: docs/adr/NNNN-<slug>.md
+   ```
+
+   The line is matched literally by `crdp_patch_record_ok` in `Scripts/lib.sh` (the one
+   implementation both `Scripts/build-freerdp.sh` and Tier 1's `Scripts/check-patch-queue.sh`
+   consult; `Scripts/test-patch-queue.sh` pins it): "default OFF" and the `docs/adr/` path are
+   mandatory, and the record must be in the patch *header* (before the first `diff --git`
+   line) -- a link that merely appears inside a hunk does not count. The exception does not
+   apply to bug fixes or behaviour changes: those still need an upstream record, because the
+   point of rule 1 is to stop this directory becoming an undocumented fork. Such a patch is
+   retired when its experiment closes, not carried.
+
 2. **`git apply` failure is a hard build failure.** `Scripts/build-freerdp.sh` applies
    every `*.patch` file in this directory with `git apply --check` first; if any patch
    fails to apply cleanly, the build stops. There is no silent skip and no fuzzy-apply
@@ -46,9 +64,18 @@ policy).
 
 ## Current state
 
-**No patches** against FreeRDP 3.31.1 (`63b948ca5cb94307fd5444ee6e73927a41ccdab4`). The queue
-is empty on purpose: the one patch this project ever carried was absorbed upstream and retired
-on the 3.31.1 pin bump (2026-09-02).
+**One patch** against FreeRDP 3.31.1 (`63b948ca5cb94307fd5444ee6e73927a41ccdab4`):
+
+- `0002-rdpgfx-lab-scaledmap-advertise-option.patch` (2026-09-07, lab-only exception, ADR-0016)
+  -- adds the CMake option `MACDOWS_LAB_SCALEDMAP_ADVERTISE` (default **OFF**) that omits
+  `RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE` from the advertised RDPGFX capability sets. OFF leaves
+  every preprocessed line as it was; ON is a protocol-level false advertisement used only by
+  `Tools/rail-probe` for the D1 contrast experiment (`Scripts/build-freerdp.sh` with
+  `CRDP_LAB_SCALEDMAP_ADVERTISE=1`, a separate config-hash prefix never made `current`).
+  Retire when D1's record is filed.
+
+Before it (2026-09-02 to 2026-09-07) the queue was empty on purpose: the one patch this project
+carried before was absorbed upstream and retired on the 3.31.1 pin bump.
 
 ### Retired
 

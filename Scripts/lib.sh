@@ -30,6 +30,29 @@ require_cmd() {
 	command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+# Patch-queue rule 1 (ThirdParty/patches/README.md): every .patch file's HEADER must carry an
+# upstream record -- a FreeRDP issue/PR link -- or, since ADR-0016 (owner ruling 2026-09-07),
+# the lab-only marker
+#     # Lab-only: default OFF; ADR: docs/adr/NNNN-<slug>.md
+# which is valid only for a default-OFF build knob backed by an Accepted ADR (the README's
+# rule 1 exception). "Header" means the lines before the first diff line (`diff --git ` or
+# `--- `): a link that merely appears inside a hunk's context or additions does not count.
+#
+# This is the ONE implementation of the rule. Scripts/build-freerdp.sh consults it before
+# folding the queue into the config hash, and Scripts/check-patch-queue.sh (Tier 1's patch
+# validation step) consults it too -- keep it here so the build and CI can never disagree
+# about what the rule accepts. Scripts/test-patch-queue.sh pins the verdicts.
+#
+# Usage:  crdp_patch_record_ok "$patch_file"   (0 = record present, 1 = refuse)
+crdp_patch_record_ok() {
+	local file="${1:-}" header
+	[ -f "$file" ] || return 1
+	header="$(awk '/^(diff --git |--- )/ { exit } { print }' "$file")"
+	printf '%s\n' "$header" | grep -qE 'github\.com/FreeRDP/FreeRDP/(issues|pull)/[0-9]+' && return 0
+	printf '%s\n' "$header" | grep -qE '^# Lab-only: default OFF; ADR: docs/adr/[0-9]{4}-[A-Za-z0-9._-]+\.md' && return 0
+	return 1
+}
+
 # Live-host testing boundary gate (owner rule, 2026-08-31): a real-host debugging step may
 # only ever target the owner's own machine inside the owner's own lab network. Prose in a
 # rules file cannot enforce that, so every script that is about to touch a live host calls
