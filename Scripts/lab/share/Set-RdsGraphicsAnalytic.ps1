@@ -216,5 +216,8 @@ if (-not $NoRun) {
     }
     # Read back what the host now actually reports -- never trust the write, verify it.
     Write-Host (Format-AnalyticReadback -State (Get-AnalyticCurrentState))
+    # The Test-Path here MUST stay after the Enable/Restore actions above and MUST NOT be replaced by
+    # the pre-action $backupExists: this line is inside the -NoRun-gated host block, so the pwsh
+    # suite cannot catch that regression (analytic-tail-gate m1) -- only the operator's eyes can.
     Write-Host (Format-AnalyticBackupRecordLine -Exists (Test-Path -LiteralPath $backupPath) -Path $backupPath)
 }
