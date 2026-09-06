@@ -35,9 +35,11 @@ require_cmd() {
 # the lab-only marker
 #     # Lab-only: default OFF; ADR: docs/adr/NNNN-<slug>.md
 # which is valid only for a default-OFF build knob backed by an Accepted ADR (the README's
-# rule 1 exception). The marker is a claim, so the patch must substantiate it: it has to ADD a
-# CMake `option(<NAME> "..." OFF)` line (gate d1-lane r1 I-3 -- a bug fix wearing the marker
-# adds no such line and is refused). "Header" means the lines before the first real diff line
+# rule 1 exception). The marker is a claim, so the patch must substantiate it: a hunk of a CMake
+# file (`*.cmake` / `CMakeLists.txt`) has to ADD an `option(<NAME> "..." OFF)` line whose <NAME>
+# is not also on a removed line -- i.e. a NEW knob, not an existing option flipped ON->OFF, not a
+# line smuggled into the header or into a non-CMake file (gate d1-lane r1 I-3, r2 I-7 -- a bug
+# fix wearing the marker adds no such line and is refused). "Header" means the lines before the first real diff line
 # (`diff --git `, `--- a/` or `--- /dev/null`; a prose line that merely starts with "--- " does
 # not end it, gate r1 m-3): a link that merely appears inside a hunk's context or additions
 # does not count.
@@ -54,7 +56,18 @@ crdp_patch_record_ok() {
 	header="$(awk '/^(diff --git |--- (a\/|\/dev\/null))/ { exit } { print }' "$file")"
 	printf '%s\n' "$header" | grep -qE 'github\.com/FreeRDP/FreeRDP/(issues|pull)/[0-9]+' && return 0
 	if printf '%s\n' "$header" | grep -qE '^# Lab-only: default OFF; ADR: docs/adr/[0-9]{4}-[A-Za-z0-9._-]+\.md'; then
-		grep -qE '^\+[[:space:]]*option\([A-Za-z0-9_]+[[:space:]]+"[^"]*"[[:space:]]+OFF\)' "$file" && return 0
+		# Walk the diff body: remember which file each hunk belongs to; collect the names of
+		# option(... OFF) lines ADDED inside CMake-file hunks and the names of every option line
+		# REMOVED anywhere. A name in both sets is a modified option, not a new one.
+		awk '
+			/^diff --git / { file = $NF; cmake = (file ~ /(\.cmake|CMakeLists\.txt)$/); inbody = 1; next }
+			!inbody { next }
+			/^\+[[:space:]]*option\([A-Za-z0-9_]+[[:space:]]+"[^"]*"[[:space:]]+OFF\)/ && cmake {
+				name = $0; sub(/^\+[[:space:]]*option\(/, "", name); sub(/[[:space:]].*/, "", name); added[name] = 1; next }
+			/^-[[:space:]]*option\([A-Za-z0-9_]+[[:space:]]/ {
+				name = $0; sub(/^-[[:space:]]*option\(/, "", name); sub(/[[:space:]].*/, "", name); removed[name] = 1; next }
+			END { for (n in added) if (!(n in removed)) { ok = 1 }; exit ok ? 0 : 1 }
+		' "$file" && return 0
 	fi
 	return 1
 }

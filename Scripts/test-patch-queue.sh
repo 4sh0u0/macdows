@@ -94,6 +94,30 @@ check 'marker + an added option defaulting ON refuses'       1 'rule 1'         
 { printf '%s\n' "$MARKER"; printf '%s\n' "$BOGUS_HUNK"; } > "$TMP/labfix/0001-bugfix.patch"
 check 'marker on a patch that adds no option (a bug fix in disguise) refuses' 1 'rule 1' --patch-dir "$TMP/labfix" --no-apply
 
+echo "== the added option must be a NEW option in a CMake file's hunk (gate r2 I-7)"
+mkdir -p "$TMP/opthdr" "$TMP/optmd" "$TMP/optflip"
+# (a) the option line sits in the HEADER (before any diff line), not in a hunk
+{ printf '%s\n' "$MARKER"; printf '%s\n' '+option(MACDOWS_LAB_FIXTURE "smuggled into the header" OFF)'; printf '%s\n' "$BOGUS_HUNK"; } > "$TMP/opthdr/0001-lab.patch"
+check 'an option line in the header (not a hunk) does not count'   1 'rule 1' --patch-dir "$TMP/opthdr" --no-apply
+# (b) the option line is added to a non-CMake file
+MD_HUNK='diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,1 +1,2 @@
+ # FreeRDP
++option(MACDOWS_LAB_FIXTURE "not a CMake file" OFF)'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$MD_HUNK"; } > "$TMP/optmd/0001-lab.patch"
+check 'an option line added to a non-CMake file does not count'     1 'rule 1' --patch-dir "$TMP/optmd" --no-apply
+# (c) an existing upstream option flipped ON -> OFF is a behaviour change, not a new knob
+FLIP_HUNK='diff --git a/cmake/ConfigOptions.cmake b/cmake/ConfigOptions.cmake
+--- a/cmake/ConfigOptions.cmake
++++ b/cmake/ConfigOptions.cmake
+@@ -1,1 +1,1 @@
+-option(WITH_SWSCALE "Use SWScale image library for screen resizing" ON)
++option(WITH_SWSCALE "Use SWScale image library for screen resizing" OFF)'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$FLIP_HUNK"; } > "$TMP/optflip/0001-lab.patch"
+check 'flipping an existing option ON->OFF is not an added knob'   1 'rule 1' --patch-dir "$TMP/optflip" --no-apply
+
 echo "== header boundary: only a real diff line ends the header (gate r1 m-3)"
 mkdir -p "$TMP/dashes"
 { printf '%s\n' '# a header comment'; printf '%s\n' '--- notes: this line starts with three dashes but is prose'; printf '%s\n' "$LINK"; printf '%s\n' "$BOGUS_HUNK"; } > "$TMP/dashes/0001-dashes.patch"
@@ -105,17 +129,16 @@ if [ -e "$FREERDP_SRC/.git" ]; then
     check 'the real queue passes rule 1 and rule 2 against the pinned checkout' 0 '' --freerdp-src "$FREERDP_SRC"
     # gate r1 m-4: a RELATIVE --patch-dir must be normalised before `git -C <submodule> apply --check`
     # resolves it -- otherwise git looks for the patch inside the submodule (the documented pitfall).
-    REL_DIR="$REPO_ROOT/.build/patch-queue-test-rel"
-    rm -rf "$REL_DIR"; mkdir -p "$REL_DIR"
+    # Relative names are exercised from inside $TMP (never from the repo, never under .build/).
+    mkdir -p "$TMP/rel/queue"
     if compgen -G "$REPO_ROOT/ThirdParty/patches/*.patch" >/dev/null; then
-        cp "$REPO_ROOT"/ThirdParty/patches/*.patch "$REL_DIR/"
-        pushd "$REPO_ROOT" >/dev/null
-        check 'a relative --patch-dir is normalised before git apply --check' 0 'validated' --patch-dir .build/patch-queue-test-rel --freerdp-src ThirdParty/FreeRDP
+        cp "$REPO_ROOT"/ThirdParty/patches/*.patch "$TMP/rel/queue/"
+        pushd "$TMP/rel" >/dev/null
+        check 'a relative --patch-dir is normalised before git apply --check' 0 'validated' --patch-dir queue --freerdp-src "$FREERDP_SRC"
         popd >/dev/null
     else
         echo "  skip relative --patch-dir case: the real queue is empty (nothing that applies to copy)"
     fi
-    rm -rf "$REL_DIR"
 else
     echo "  FAIL rule 2 cases need the ThirdParty/FreeRDP submodule checkout (git submodule update --init)"; fail=$((fail + 2))
 fi
@@ -124,10 +147,11 @@ echo "== one implementation: every enforcement point calls lib.sh, none carries 
 callers=(Scripts/build-freerdp.sh Scripts/check-patch-queue.sh Scripts/gen-notices.sh)
 one_impl=0
 for f in "${callers[@]}"; do
-    grep -q 'crdp_patch_record_ok' "$REPO_ROOT/$f" || { one_impl=1; echo "  missing call in $f"; }
-    # a private VERDICT is `grep -q` on the link pattern; gen-notices.sh may still EXTRACT links
-    # (`grep -oE ... /[0-9]+`) to fill the SBOM's resolves[] -- that is data, not a verdict.
-    if grep -qE 'grep -qE? .*FreeRDP/\(issues\|pull\)' "$REPO_ROOT/$f"; then one_impl=1; echo "  private rule-1 verdict in $f"; fi
+    # a CALL line: the function name at the start of a statement (a comment mentioning it is not a call)
+    grep -qE '^[[:space:]]*(if[[:space:]]+)?(!?[[:space:]]*)?crdp_patch_record_ok[[:space:]]+"' "$REPO_ROOT/$f" || { one_impl=1; echo "  missing call in $f"; }
+    # a private VERDICT is any grep on the link pattern that is not the `-o` link EXTRACTION
+    # gen-notices.sh legitimately keeps for the SBOM's resolves[] (data, not a verdict)
+    if grep -E 'grep .*FreeRDP/\(issues\|pull\)' "$REPO_ROOT/$f" | grep -vE 'grep -oE' | grep -q .; then one_impl=1; echo "  private rule-1 verdict in $f"; fi
 done
 if grep -qE 'FreeRDP/\(issues\|pull\)' "$REPO_ROOT/.github/workflows/tier1.yml"; then one_impl=1; echo "  private rule-1 grep in tier1.yml"; fi
 if [ "$one_impl" -eq 0 ]; then pass=$((pass + 1)); echo "  ok   build-freerdp.sh, check-patch-queue.sh and gen-notices.sh all call crdp_patch_record_ok; no private copy of the grep"; else fail=$((fail + 1)); echo "  FAIL rule 1 has more than one implementation"; fi

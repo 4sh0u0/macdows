@@ -26,7 +26,11 @@ done
 pass=0; fail=0
 ok()   { pass=$((pass + 1)); echo "  ok   $1"; }
 bad()  { fail=$((fail + 1)); echo "  FAIL $1"; }
-snapshot() { find "$REPO_ROOT/.build/freerdp" -mindepth 1 -maxdepth 1 2>/dev/null | sort | tr '\n' ' '; }
+snapshot() {
+    # A fresh checkout (CI) has no .build/freerdp at all; that is "nothing there", not a failure.
+    [ -d "$REPO_ROOT/.build/freerdp" ] || { echo "<no .build/freerdp>"; return 0; }
+    find "$REPO_ROOT/.build/freerdp" -mindepth 1 -maxdepth 1 | sort | tr '\n' ' '
+}
 
 before="$(snapshot)"
 set +e
@@ -51,7 +55,7 @@ crdp_freerdp_build_publishes_current 0; p0=$?
 crdp_freerdp_build_publishes_current 1; p1=$?
 set -e
 if [ "$p0" -eq 0 ] && [ "$p1" -ne 0 ]; then ok "crdp_freerdp_build_publishes_current: product build publishes current, lab build (toggle 1) never does"; else bad "publishes_current predicate: toggle0=$p0 toggle1=$p1"; fi
-if [ "$(grep -c 'crdp_freerdp_build_publishes_current' "$BUILD_FREERDP")" -ge 2 ]; then ok "both current-link sites in build-freerdp.sh consult the predicate"; else bad "build-freerdp.sh does not consult the predicate at both current-link sites"; fi
+if [ "$(grep -cE '^[[:space:]]*if[[:space:]]+!?[[:space:]]*crdp_freerdp_build_publishes_current[[:space:]]+"' "$BUILD_FREERDP")" -ge 2 ]; then ok "both current-link sites in build-freerdp.sh consult the predicate (call-shaped lines, not mentions)"; else bad "build-freerdp.sh does not consult the predicate at both current-link sites"; fi
 
 echo; echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -63,56 +63,9 @@ esac
 LOCK_FILE="$CRDP_REPO_ROOT/deps/freerdp.lock"
 [ -f "$LOCK_FILE" ] || die "missing $LOCK_FILE"
 
-# --- ffmpeg (H264 decode) -------------------------------------------------------------
-# adr/0007: ffmpeg dynamically linked (LGPL §6; never static) + VideoToolbox hwaccel.
-# Phase 2 W8 replaced the previous Homebrew source with a pinned, self-built, LGPL-only
-# ffmpeg (Scripts/build-ffmpeg.sh) -- Homebrew's formula is --enable-gpl --enable-version3,
-# i.e. GPL-3.0, which is undistributable inside this Apache-2.0 app, and it links by
-# absolute /opt/homebrew path (adr/0006 §3 defect #1). See deps/freerdp.lock's "ffmpeg"
-# block for the full record.
-if [ "$CRDP_WITH_FFMPEG" = "1" ]; then
-	require_cmd pkg-config
-	[ -d "$CRDP_FFMPEG_PREFIX/lib/pkgconfig" ] \
-		|| die "self-built ffmpeg not found at $CRDP_FFMPEG_PREFIX -- run Scripts/build-ffmpeg.sh first (or set CRDP_WITH_FFMPEG=0 to build without H264 decode)."
-
-	# The stamp, not just the directory: Scripts/build-ffmpeg.sh writes it last, only after
-	# every one of its guards (component set, relocatability, LGPL posture) has passed on the
-	# staged tree. So a prefix with no stamp is a prefix that either failed those guards or
-	# was interrupted mid-promotion, and linking libfreerdp3 against it would quietly undo
-	# the entire point of W8. The version is in the stamp's name, so this also catches a
-	# stale prefix left over from a previous pin after deps/freerdp.lock is bumped.
-	LOCKED_FFMPEG_VERSION="$(jq -er '.ffmpeg.version' "$LOCK_FILE")" \
-		|| die "deps/freerdp.lock has no .ffmpeg.version field"
-	FFMPEG_STAMP="$CRDP_FFMPEG_PREFIX/.ffmpeg-${LOCKED_FFMPEG_VERSION}.stamp"
-	[ -f "$FFMPEG_STAMP" ] \
-		|| die "ffmpeg prefix at $CRDP_FFMPEG_PREFIX has no completed-build stamp for the pinned version $LOCKED_FFMPEG_VERSION (expected $FFMPEG_STAMP).
-It is either a failed/interrupted build or a leftover from a different pin -- refusing to link against it. Run Scripts/build-ffmpeg.sh (add --force to rebuild), or set CRDP_WITH_FFMPEG=0 to build without H264 decode."
-
-	# PKG_CONFIG_LIBDIR, not PKG_CONFIG_PATH: LIBDIR *replaces* pkg-config's default search
-	# path, PATH only prepends to it. That difference is load-bearing here.
-	# ThirdParty/FreeRDP/cmake/FindFFmpeg.cmake probes all eight ffmpeg components and links
-	# every one it finds; with PKG_CONFIG_PATH merely prepended, our prefix would satisfy
-	# avcodec/avutil/swresample/swscale while Homebrew's default pkgconfig dir would still
-	# satisfy avformat/avfilter/avdevice -- silently reintroducing three GPL, absolute-path
-	# Homebrew dylibs into the link line for libraries libfreerdp3 references zero symbols
-	# from. Replacing the search path makes the minimal link line structurally impossible to
-	# widen by accident.
-	#
-	# Safe for the rest of the configure: a CMakeCache audit of the pre-W8 build showed
-	# ffmpeg was the *only* dependency this config resolved through pkg-config at all (every
-	# other pkg_check_modules consumer in the tree is behind a flag this build turns off --
-	# KRB5/PCSC/soxr/opus/uriparser/JSON/WebP/SDL/Wayland/gstreamer). As a bonus this closes
-	# the same auto-detection landmine class that WITH_URIPARSER=OFF / WITH_JSON_DISABLED=ON
-	# had to be added for (see deps/freerdp.lock corrections_applied).
-	export PKG_CONFIG_LIBDIR="$CRDP_FFMPEG_PREFIX/lib/pkgconfig"
-	log "ffmpeg: $CRDP_FFMPEG_PREFIX (self-built, pinned, LGPL; dynamic link only; PKG_CONFIG_LIBDIR pinned to it for CMake's find_package(FFmpeg))"
-fi
-
 FREERDP_SRC="$CRDP_REPO_ROOT/ThirdParty/FreeRDP"
 # A submodule's .git is a *file* (a gitdir pointer), not a directory — hence -e, not -d.
 [ -e "$FREERDP_SRC/.git" ] || die "ThirdParty/FreeRDP submodule not initialized — run Scripts/bootstrap.sh first"
-
-[ -f "$CRDP_DEPS_PREFIX/lib/libssl.a" ] || die "static OpenSSL not found at $CRDP_DEPS_PREFIX — run Scripts/build-openssl.sh first"
 
 SUBMODULE_SHA="$(git -C "$FREERDP_SRC" rev-parse HEAD)"
 EXPECTED_SHA="$(jq -er '.commit' "$LOCK_FILE")" || die "deps/freerdp.lock has no .commit field"
@@ -183,16 +136,70 @@ BUILD_DIR="$CONFIG_ROOT/build"
 INSTALL_PREFIX="$CONFIG_ROOT/prefix"
 MANIFEST="$CONFIG_ROOT/build-manifest.json"
 CURRENT_LINK="$CRDP_BUILD_DIR/freerdp/current"
-# A lab build must land in its OWN prefix. If the toggle somehow resolved to the hash `current`
-# already points at (the fold into the hash lost, a stale link...), building would overwrite the
-# product prefix in place while the "NOT updating current" log line reassures -- refuse instead
-# (gate d1-lane r1 I-2). Read-only, so it also runs under --print-config-hash.
-if [ "$CRDP_LAB_SCALEDMAP_ADVERTISE" = "1" ] && [ -L "$CURRENT_LINK" ] && [ "$(readlink "$CURRENT_LINK")" = "$CONFIG_HASH" ]; then
-	die "CRDP_LAB_SCALEDMAP_ADVERTISE=1 resolved to config hash $CONFIG_HASH, which is what $CURRENT_LINK already points at -- the lab build is not separated from the product build; refusing to build into the product prefix"
-fi
 if [ "$PRINT_HASH" = "1" ]; then
 	printf '%s\n' "$CONFIG_HASH"
 	exit 0
+fi
+
+# --- Prerequisites that do not feed the hash (checked only when we are going to build) --------
+# The static OpenSSL prefix and the self-built ffmpeg prefix are inputs to CONFIGURE, not to the
+# config hash (the hash folds the lock's records of both), so they are checked here, AFTER the
+# --print-config-hash seam: Tier 1's ubuntu runner has neither prefix and runs the seam-based
+# Scripts/test-build-freerdp-toggle.sh (gate d1-lane r2 B-3).
+[ -f "$CRDP_DEPS_PREFIX/lib/libssl.a" ] || die "static OpenSSL not found at $CRDP_DEPS_PREFIX — run Scripts/build-openssl.sh first"
+# --- ffmpeg (H264 decode) -------------------------------------------------------------
+# adr/0007: ffmpeg dynamically linked (LGPL §6; never static) + VideoToolbox hwaccel.
+# Phase 2 W8 replaced the previous Homebrew source with a pinned, self-built, LGPL-only
+# ffmpeg (Scripts/build-ffmpeg.sh) -- Homebrew's formula is --enable-gpl --enable-version3,
+# i.e. GPL-3.0, which is undistributable inside this Apache-2.0 app, and it links by
+# absolute /opt/homebrew path (adr/0006 §3 defect #1). See deps/freerdp.lock's "ffmpeg"
+# block for the full record.
+if [ "$CRDP_WITH_FFMPEG" = "1" ]; then
+	require_cmd pkg-config
+	[ -d "$CRDP_FFMPEG_PREFIX/lib/pkgconfig" ] \
+		|| die "self-built ffmpeg not found at $CRDP_FFMPEG_PREFIX -- run Scripts/build-ffmpeg.sh first (or set CRDP_WITH_FFMPEG=0 to build without H264 decode)."
+
+	# The stamp, not just the directory: Scripts/build-ffmpeg.sh writes it last, only after
+	# every one of its guards (component set, relocatability, LGPL posture) has passed on the
+	# staged tree. So a prefix with no stamp is a prefix that either failed those guards or
+	# was interrupted mid-promotion, and linking libfreerdp3 against it would quietly undo
+	# the entire point of W8. The version is in the stamp's name, so this also catches a
+	# stale prefix left over from a previous pin after deps/freerdp.lock is bumped.
+	LOCKED_FFMPEG_VERSION="$(jq -er '.ffmpeg.version' "$LOCK_FILE")" \
+		|| die "deps/freerdp.lock has no .ffmpeg.version field"
+	FFMPEG_STAMP="$CRDP_FFMPEG_PREFIX/.ffmpeg-${LOCKED_FFMPEG_VERSION}.stamp"
+	[ -f "$FFMPEG_STAMP" ] \
+		|| die "ffmpeg prefix at $CRDP_FFMPEG_PREFIX has no completed-build stamp for the pinned version $LOCKED_FFMPEG_VERSION (expected $FFMPEG_STAMP).
+It is either a failed/interrupted build or a leftover from a different pin -- refusing to link against it. Run Scripts/build-ffmpeg.sh (add --force to rebuild), or set CRDP_WITH_FFMPEG=0 to build without H264 decode."
+
+	# PKG_CONFIG_LIBDIR, not PKG_CONFIG_PATH: LIBDIR *replaces* pkg-config's default search
+	# path, PATH only prepends to it. That difference is load-bearing here.
+	# ThirdParty/FreeRDP/cmake/FindFFmpeg.cmake probes all eight ffmpeg components and links
+	# every one it finds; with PKG_CONFIG_PATH merely prepended, our prefix would satisfy
+	# avcodec/avutil/swresample/swscale while Homebrew's default pkgconfig dir would still
+	# satisfy avformat/avfilter/avdevice -- silently reintroducing three GPL, absolute-path
+	# Homebrew dylibs into the link line for libraries libfreerdp3 references zero symbols
+	# from. Replacing the search path makes the minimal link line structurally impossible to
+	# widen by accident.
+	#
+	# Safe for the rest of the configure: a CMakeCache audit of the pre-W8 build showed
+	# ffmpeg was the *only* dependency this config resolved through pkg-config at all (every
+	# other pkg_check_modules consumer in the tree is behind a flag this build turns off --
+	# KRB5/PCSC/soxr/opus/uriparser/JSON/WebP/SDL/Wayland/gstreamer). As a bonus this closes
+	# the same auto-detection landmine class that WITH_URIPARSER=OFF / WITH_JSON_DISABLED=ON
+	# had to be added for (see deps/freerdp.lock corrections_applied).
+	export PKG_CONFIG_LIBDIR="$CRDP_FFMPEG_PREFIX/lib/pkgconfig"
+	log "ffmpeg: $CRDP_FFMPEG_PREFIX (self-built, pinned, LGPL; dynamic link only; PKG_CONFIG_LIBDIR pinned to it for CMake's find_package(FFmpeg))"
+fi
+
+# A lab build must land in its OWN prefix. If the toggle somehow resolved to the hash `current`
+# already points at (the fold into the hash lost, a stale link...), building would overwrite the
+# product prefix in place while the "NOT updating current" log line reassures -- refuse instead
+# (gate d1-lane r1 I-2; expressed through the same predicate the two `current` link sites use,
+# r2 m-11; compared by basename so an absolute link target cannot slip past, r2 m-7).
+if ! crdp_freerdp_build_publishes_current "$CRDP_LAB_SCALEDMAP_ADVERTISE" \
+	&& [ -L "$CURRENT_LINK" ] && [ "$(basename "$(readlink "$CURRENT_LINK")")" = "$CONFIG_HASH" ]; then
+	die "CRDP_LAB_SCALEDMAP_ADVERTISE=1 resolved to config hash $CONFIG_HASH, which is what $CURRENT_LINK already points at -- the lab build is not separated from the product build; refusing to build into the product prefix"
 fi
 
 if [ "$FORCE" -eq 0 ] && [ -f "$MANIFEST" ] && [ -f "$INSTALL_PREFIX/lib/libfreerdp3.dylib" ]; then
@@ -380,15 +387,15 @@ else
 	log "lab build (CRDP_LAB_SCALEDMAP_ADVERTISE=1): NOT updating $CURRENT_LINK; link Tools/rail-probe against $INSTALL_PREFIX explicitly (Scripts/probe.sh CRDP_FREERDP_PREFIX)"
 fi
 
-# --- Retention: keep only the 2 most recently built config-hash dirs -----------------
+# --- Retention: keep this build, `current`'s target, and the newest other config-hash dir ----
 # Each full FreeRDP build is ~100s of MB; old config-hash dirs from superseded lock/patch
-# states otherwise accumulate forever. Keep the current one plus one prior (covers "just
-# rolled back a bad change") and drop the rest, sorted by mtime.
-# Never prune what `current` points at: a lab build (never published as `current`) followed by
-# another build would otherwise leave `current` dangling (gate d1-lane r1 I-1, reproduced in a
-# sandbox). The product prefix is protected by name whatever this run built.
+# states otherwise accumulate forever. Keep the one just built, whatever `current` points at
+# (never pruned: a lab build is not published as `current`, and a later build must not leave the
+# link dangling -- gate d1-lane r1 I-1, reproduced in a sandbox), plus one more prior (covers
+# "just rolled back a bad change"), and drop the rest, sorted by mtime. Compared by basename
+# so an absolute link target is protected too (r2 m-7).
 CURRENT_TARGET=""
-[ -L "$CURRENT_LINK" ] && CURRENT_TARGET="$(readlink "$CURRENT_LINK")"
+[ -L "$CURRENT_LINK" ] && CURRENT_TARGET="$(basename "$(readlink "$CURRENT_LINK")")"
 mapfile -t OLD_CONFIGS < <(
 	find "$CRDP_BUILD_DIR/freerdp" -mindepth 1 -maxdepth 1 -type d ! -name "$CONFIG_HASH" ${CURRENT_TARGET:+! -name "$CURRENT_TARGET"} -print0 \
 		| xargs -0 -I{} stat -f '%m%t%N' {} 2>/dev/null \

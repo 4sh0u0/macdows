@@ -38,13 +38,18 @@ policy).
    ```
 
    The line is matched literally by `crdp_patch_record_ok` in `Scripts/lib.sh` (the one
-   implementation both `Scripts/build-freerdp.sh` and Tier 1's `Scripts/check-patch-queue.sh`
-   consult; `Scripts/test-patch-queue.sh` pins it): "default OFF" and the `docs/adr/` path are
-   mandatory, and the record must be in the patch *header* (before the first `diff --git`
-   line) -- a link that merely appears inside a hunk does not count. The exception does not
-   apply to bug fixes or behaviour changes: those still need an upstream record, because the
-   point of rule 1 is to stop this directory becoming an undocumented fork. Such a patch is
-   retired when its experiment closes, not carried.
+   implementation `Scripts/build-freerdp.sh`, Tier 1's `Scripts/check-patch-queue.sh` and the
+   release SBOM generator `Scripts/gen-notices.sh` all consult; `Scripts/test-patch-queue.sh`
+   pins it): "default OFF" and the `docs/adr/` path are mandatory, and the record must be in
+   the patch *header* -- the lines before the first real diff line (`diff --git `, `--- a/` or
+   `--- /dev/null`) -- so a link that merely appears inside a hunk does not count. The marker
+   is a claim, and the patch has to substantiate it mechanically: a hunk of a CMake file
+   (`*.cmake` or `CMakeLists.txt`) must ADD an `option(<NAME> "..." OFF)` line whose `<NAME>`
+   is not also on a removed line (a new knob -- not an existing option flipped `ON`→`OFF`, not
+   an option line placed in the header or in a non-CMake file). The exception does not apply
+   to bug fixes or behaviour changes: those still need an upstream record, because the point
+   of rule 1 is to stop this directory becoming an undocumented fork. Such a patch is retired
+   when its experiment closes, not carried.
 
 2. **`git apply` failure is a hard build failure.** `Scripts/build-freerdp.sh` applies
    every `*.patch` file in this directory with `git apply --check` first; if any patch
