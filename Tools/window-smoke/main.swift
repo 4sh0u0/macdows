@@ -739,7 +739,12 @@ enum SizeBand {
 ///    the wrong one of its two one-shot log lines -- live wiring, no offline seam.
 ///  * **the multi-window gate** counting a window that merely flashed after the exec, counting a
 ///    close target that never showed content, or re-adding pre-existing ids =>
-///    `multiWindowGateCountsVisibleOrHarnessClosedNewWindows`. **Not covered here** (live wiring,
+///    `multiWindowGateCountsVisibleOrHarnessClosedNewWindows`.
+///  * **the generic visible-window gate** losing its ever-visible half (back to "visible at finish"
+///    only, the A-prime r1 spurious red), losing its finish half, inverted, or demanding more than
+///    one => `visibleWindowGateJudgesEverVisible`. **Not covered here**: `finish()` passing
+///    something other than `firstFrameGateChecked.count` (live wiring, no offline seam).
+///    **Not covered here** (live wiring,
 ///    no offline seam): `finish()` passing an empty `closedByHarness`, or only one of its two
 ///    halves (the F0-H1 defect itself; review multiwindow-gate-r2 MF); the per-tick accumulator
 ///    dropping `hasDisplayedContent` or the band floor (a weaker accumulator survives every pin,
@@ -1257,6 +1262,20 @@ enum WindowSmokeGateSelfTest {
                 // exclusion also applies to a harness-closed window
                 && MultiWindowGate.newContentWindowIds(visibleAtFinish: [5], closedByHarness: [328166], everSeenContent: [5, 328166], before: [5], exclude: [328166]).isEmpty,
             "multiWindowGateExcludesBaseAppAboutWindows: an About-titled window of this run's own base app never counts as an extra-app content window, even when new, visible, or closed by us"
+        )
+
+        // --- the generic visible-window check judges "ever visible during the run" -------------
+        // (A-prime r1, 2026-09-07 00:15: `at least one visible RemoteWindow (got 0)` failed a run whose
+        // maximize and move-resize legs had closed both windows it created -- a clean finish -- and
+        // whose only leftover window sat in the isVisible/orderedWindows disagreement state;
+        // docs/upgrade-gate/2026-09-aprime-analytic-r1-live.md section 6 item 4. The session did
+        // produce windows; "still visible at finish" was never the property this check exists for.)
+        expect(
+            !VisibleWindowGate.passes(visibleAtFinish: 0, everVisible: 0)
+                && VisibleWindowGate.passes(visibleAtFinish: 0, everVisible: 1)
+                && VisibleWindowGate.passes(visibleAtFinish: 1, everVisible: 0)
+                && VisibleWindowGate.passes(visibleAtFinish: 3, everVisible: 5),
+            "visibleWindowGateJudgesEverVisible: a session passes if any RemoteWindow was visible at any point (a window first visible after the last drain tick still counts through the finish snapshot); a session that never showed one fails"
         )
 
         // --- move/resize legs also observe the post-remap content rect -------------------------
@@ -2777,6 +2796,25 @@ enum MoveResizeTarget {
 /// run-launched Notepad (as designed since 1f05aa4) and its close leg closed it before finish(),
 /// so a visible-at-finish count reported 0 new windows by construction (F0-H1,
 /// docs/upgrade-gate/2026-09-f0-control-live.md §3 item 1). `before` is `windowIdsBeforeExtraApps`.
+/// The generic "this session produced a window" check in `finish()`, judged on the whole run rather
+/// than on the finish snapshot alone. A-prime r1 (2026-09-07 00:15): `at least one visible
+/// RemoteWindow (got 0)` failed a run whose maximize and move-resize legs had closed BOTH windows it
+/// created (a clean finish, the direction C-m4 and Fix 2 push every scenario) while the only leftover
+/// window sat in the isVisible/orderedWindows disagreement state (docs/upgrade-gate/
+/// 2026-09-aprime-analytic-r1-live.md section 6 item 4). The property the check exists for is "the
+/// session showed at least one window", so it reads the first-frame gate's ever-visible set as well
+/// as the finish snapshot; either alone suffices. The tray and input-test exemptions in `finish()` are
+/// untouched. Pinned offline by `visibleWindowGateJudgesEverVisible`.
+enum VisibleWindowGate {
+    /// `visibleAtFinish`: RemoteWindows visible in the finish snapshot. `everVisible`: windowIds the
+    /// first-frame gate ever observed visible during the run (`firstFrameGateChecked`). A window that
+    /// first became visible after the last drain tick is in the former only; a window this run closed
+    /// is in the latter only.
+    static func passes(visibleAtFinish: Int, everVisible: Int) -> Bool {
+        return visibleAtFinish > 0 || everVisible > 0
+    }
+}
+
 enum MultiWindowGate {
     /// Counts a new window only if it is still a qualifying visible window at finish() OR this
     /// run's own close legs closed it (review multiwindow-gate-r1 I-1: "ever seen" alone would let
@@ -7117,7 +7155,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // the run for its subject behaving exactly as designed.
             print("[info] tray scenario with zero visible windows -- a windowless tray driver is legitimate; skipping the generic visible-RemoteWindow check")
         } else if inputTestMode == nil {
-            check(!visibleWindows.isEmpty, "at least one visible RemoteWindow (got \(visibleWindows.count))")
+            check(
+                VisibleWindowGate.passes(visibleAtFinish: visibleWindows.count, everVisible: firstFrameGateChecked.count),
+                "at least one RemoteWindow was visible during the run (at finish: \(visibleWindows.count), ever visible: \(firstFrameGateChecked.count))"
+            )
             // Phase 1 acceptance: with extra apps launched into the same session, N NEW content
             // windows (windowIds not present at exec time) must have appeared -- still visible
             // at finish, or closed by this run's own close legs -- and no ClientExecute may have
