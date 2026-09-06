@@ -81,9 +81,10 @@ everything the licences require.
   `retired_patches`).
   §4(b) ("modified files carry prominent notices") is discharged twice over: the modified
   source is never distributed — only the patch is — and its header records what changed, why,
-  and its retirement condition; and each modified site in the three files carries a one-line
-  `Macdows lab patch 0002` notice inside the patch, so a source tree with the queue applied
-  says so in the files themselves.
+  and its retirement condition; and each modified site in the three files carries a
+  `Macdows lab patch 0002` notice inside the patch -- a one-line comment at the six C / template
+  sites and the option's own description string in `cmake/ConfigOptions.cmake` -- so a source
+  tree with the queue applied says so in the files themselves.
   The Apache-2.0 obligations are met as before: the licence text and every upstream copyright
   header ship unaltered. §4(d) adds nothing here: FreeRDP 3.31.1 has no top-level `NOTICE`
   file, only `LICENSE`. (The one `NOTICE` anywhere in its tree,

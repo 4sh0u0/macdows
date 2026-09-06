@@ -44,10 +44,14 @@ require_cmd() {
 # The rules are a GRAMMAR of what a guarded default-OFF knob looks like, not a token test:
 #   1. exactly ONE new CMake `option(MACDOWS_LAB_<X> "..." OFF)` line, added in a hunk of a
 #      *.cmake / CMakeLists.txt file (the knob);
-#   2. every other ADDED line is one of: a one-line comment that is nothing else (C `/* ... */`
-#      alone on the line, `//`, or `#` in a CMake file without a `[[` / `]]` bracket-comment
-#      delimiter); or exactly `#cmakedefine MACDOWS_LAB_<X>`. No code line is admitted, whether
-#      or not it names the knob;
+#   2. every other ADDED line is one of: a one-line C comment that is nothing else (`/* ... */`
+#      alone on the line, or `//`); or exactly `#cmakedefine MACDOWS_LAB_<X>` in a `*.in` template.
+#      No code line is admitted, whether or not it names the knob, and NO added line at all is
+#      admitted in a CMake file besides the knob itself: a `#` line there is a comment only outside
+#      a multi-line quoted or bracket argument, which a hunk cannot prove (gate r6 B-9 -- the pinned
+#      tree embeds C++ test sources in CMake strings). Residual, stated: a C comment line added
+#      inside a C++ raw string literal (R"(...)") would be string content; the pinned tree's
+#      channels/ and libfreerdp/ are C, and the reviewer of a lab patch checks its sites;
 #   3. every REMOVED line is a `#if` / `#elif` line re-added in the same hunk as exactly the removed
 #      text followed by ` && !defined(MACDOWS_LAB_<X>)` -- a guard appended, nothing else;
 #   4. text hunks of existing files only: every `diff --git` block carries a `--- a/` / `+++ b/`
@@ -86,7 +90,7 @@ crdp_patch_record_ok() {
 			/^\+[[:space:]]*option\([[:space:]]*MACDOWS_LAB_[A-Za-z0-9_]+[[:space:]]+"[^"]*"[[:space:]]+OFF[[:space:]]*\)[[:space:]]*$/ && cmake {
 				name = $0; sub(/^\+[[:space:]]*option\([[:space:]]*/, "", name); sub(/[[:space:]].*/, "", name)
 				nopt++; knob = name; next }
-			/^\+/ { np[h]++; plus[h, np[h]] = substr($0, 2); pcm[h, np[h]] = cmake; next }
+			/^\+/ { np[h]++; plus[h, np[h]] = substr($0, 2); pcm[h, np[h]] = cmake; pin[h, np[h]] = (file ~ /\.in$/); next }
 			/^-/  { nm[h]++; minus[h, nm[h]] = substr($0, 2); next }
 			END {
 				if (bad || nopt != 1 || ndg != npp || hdr != "") exit 1
@@ -100,8 +104,8 @@ crdp_patch_record_ok() {
 						l = plus[k, i]
 						if (l ~ /^[[:space:]]*\/\*([^*]|\*+[^*\/])*\*+\/[[:space:]]*$/) continue
 						if (l ~ /^[[:space:]]*\/\//) continue
-						if (pcm[k, i] && l ~ /^[[:space:]]*#/ && l !~ /\[\[|\]\]/) continue
-						if (l ~ ("^[[:space:]]*#cmakedefine[[:space:]]+" knob "[[:space:]]*$")) continue
+						if (pcm[k, i]) exit 1
+						if (pin[k, i] && l ~ ("^[[:space:]]*#cmakedefine[[:space:]]+" knob "[[:space:]]*$")) continue
 						if (l ~ guardline) { ng++; continue }
 						exit 1
 					}

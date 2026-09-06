@@ -74,18 +74,14 @@ index 3dba68715..91ef24883 100644
  #endif
  		}
 diff --git a/cmake/ConfigOptions.cmake b/cmake/ConfigOptions.cmake
-index 1660d2ef8..ddf2f8ff6 100644
+index 1660d2ef8..228d5fdba 100644
 --- a/cmake/ConfigOptions.cmake
 +++ b/cmake/ConfigOptions.cmake
-@@ -161,6 +161,11 @@ endif()
+@@ -161,6 +161,7 @@ endif()
  
  option(WITH_CAIRO "Use CAIRO image library for screen resizing" OFF)
  option(WITH_SWSCALE "Use SWScale image library for screen resizing" ON)
-+# Macdows lab patch 0002 (ThirdParty/patches/, docs/adr/0016): omit RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE
-+# from the advertised RDPGFX capability sets even though no scaler is compiled in. Default OFF --
-+# the product build is unchanged. ON is a protocol-level false advertisement (MS-RDPEGFX 2.2.3.10)
-+# and is only for a non-rendering capture client (Tools/rail-probe) running the D1 contrast.
-+option(MACDOWS_LAB_SCALEDMAP_ADVERTISE "Lab-only: advertise scaled-map capability without a scaler (never for a rendering client)" OFF)
++option(MACDOWS_LAB_SCALEDMAP_ADVERTISE "Macdows lab patch 0002 (ThirdParty/patches/, docs/adr/0016), default OFF: advertise scaled-map capability without a scaler -- a protocol-level false advertisement for the non-rendering capture client Tools/rail-probe only, never for a rendering client" OFF)
  
  if(ANDROID)
    include(ConfigOptionsAndroid)

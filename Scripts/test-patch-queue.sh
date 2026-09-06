@@ -264,6 +264,19 @@ LONE_HUNK='diff --git a/libfreerdp/core/rdp.c b/libfreerdp/core/rdp.c
 { printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$LONE_HUNK"; } > "$TMP/g-lone/0001-lab.patch"
 check 'a guard-shaped added line with no removed twin refuses (bijection)'            1 'rule 1' --patch-dir "$TMP/g-lone" --no-apply
 
+echo "== a CMake '#' line is not provably a comment (it may sit inside a multi-line string), so none is admitted (gate r6 B-9)"
+mkdir -p "$TMP/g-hash" "$TMP/g-cmakedefine-c"
+{ printf '%s\n' "$MARKER"; printf '%s\n' "${OPTION_HUNK/@@ -1,1 +1,2 @@/@@ -1,1 +1,3 @@}" | sed 's|^+option(MACDOWS_LAB_FIXTURE|+# a comment-looking line in a CMake file\n+option(MACDOWS_LAB_FIXTURE|'; } > "$TMP/g-hash/0001-lab.patch"
+check 'an added "#" line in a CMake file refuses (could be inside a quoted argument)'   1 'rule 1' --patch-dir "$TMP/g-hash" --no-apply
+CMAKEDEFINE_C_HUNK='diff --git a/libfreerdp/core/rdp.c b/libfreerdp/core/rdp.c
+--- a/libfreerdp/core/rdp.c
++++ b/libfreerdp/core/rdp.c
+@@ -1,1 +1,2 @@
+ 	int x;
++#cmakedefine MACDOWS_LAB_FIXTURE'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$CMAKEDEFINE_C_HUNK"; } > "$TMP/g-cmakedefine-c/0001-lab.patch"
+check 'a #cmakedefine KNOB line outside a *.in template refuses'                        1 'rule 1' --patch-dir "$TMP/g-cmakedefine-c" --no-apply
+
 echo "== header boundary: only a real diff line ends the header (gate r1 m-3)"
 mkdir -p "$TMP/dashes"
 { printf '%s\n' '# a header comment'; printf '%s\n' '--- notes: this line starts with three dashes but is prose'; printf '%s\n' "$LINK"; printf '%s\n' "$BOGUS_HUNK"; } > "$TMP/dashes/0001-dashes.patch"

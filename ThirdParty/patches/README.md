@@ -45,10 +45,12 @@ policy).
    `--- /dev/null`) -- so a link that merely appears inside a hunk does not count. The marker
    is a claim, and the patch has to have the **lab-only shape**, a grammar checked
    mechanically over its whole diff body: (1) exactly one new `option(MACDOWS_LAB_<X> "..." OFF)`
-   line added in a hunk of a `*.cmake` / `CMakeLists.txt` file -- the knob; (2) every other
-   added line is a one-line comment that is nothing else (`/* ... */` alone, `//`, or `#` in a
-   CMake file without a `[[`/`]]` bracket delimiter) or exactly `#cmakedefine MACDOWS_LAB_<X>`
-   -- no code line is admitted, even one that names the knob; (3) every removed line is a
+   line added in a hunk of a `*.cmake` / `CMakeLists.txt` file -- the knob, and the ONLY line a
+   CMake file may gain (a `#` line there is a comment only outside a multi-line quoted or bracket
+   argument, which a hunk cannot prove, so none is admitted; the knob's description string
+   carries the notice); (2) every other added line is a one-line C comment that is nothing else
+   (`/* ... */` alone, `//`) or exactly `#cmakedefine MACDOWS_LAB_<X>` in a `*.in` template --
+   no code line is admitted, even one that names the knob; (3) every removed line is a
    `#if`/`#elif` line re-added in the same hunk as the removed text followed by
    ` && !defined(MACDOWS_LAB_<X>)` -- a guard appended, nothing else; (4) text hunks of
    existing files only: every `diff --git` block carries a `---`/`+++` pair naming the same file
@@ -87,7 +89,8 @@ policy).
   every preprocessed line as it was; ON is a protocol-level false advertisement used only by
   `Tools/rail-probe` for the D1 contrast experiment (`Scripts/build-freerdp.sh` with
   `CRDP_LAB_SCALEDMAP_ADVERTISE=1`, a separate config-hash prefix never made `current`). Each
-  modified site carries a one-line `Macdows lab patch 0002` notice (Apache-2.0 §4(b));
+  modified site carries a `Macdows lab patch 0002` notice -- a one-line comment at the six C /
+  template sites, the option's own description string in ConfigOptions.cmake (Apache-2.0 §4(b));
   `THIRD_PARTY_NOTICES.md`'s FreeRDP entry says "Modified: Yes" and names it. Retire when D1's
   record is filed -- and remove nothing else: `Scripts/build-freerdp.sh` records the option's
   cache value as an OPTIONAL manifest key precisely so retiring this patch is a one-file change.
