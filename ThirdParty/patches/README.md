@@ -43,14 +43,18 @@ policy).
    pins it): "default OFF" and the `docs/adr/` path are mandatory, and the record must be in
    the patch *header* -- the lines before the first real diff line (`diff --git `, `--- a/` or
    `--- /dev/null`) -- so a link that merely appears inside a hunk does not count. The marker
-   is a claim, and the patch has to substantiate it mechanically: a hunk of a CMake file
-   (`*.cmake` or `CMakeLists.txt`) must ADD an `option(<NAME> "..." OFF)` line whose `<NAME>`
-   is not also on a removed line of the same file (a new knob -- not an existing option flipped
-   `ON`→`OFF`, not an option line placed in the header or in a non-CMake file). The file a hunk
-   targets is the one its `+++` line names -- what `git apply` reads -- and a `diff --git` line
-   that disagrees with it is refused outright. The exception does not apply
-   to bug fixes or behaviour changes: those still need an upstream record, because the point
-   of rule 1 is to stop this directory becoming an undocumented fork. Such a patch is retired
+   is a claim, and the patch has to have the **lab-only shape**, checked mechanically over its
+   whole diff body: (1) exactly one new `option(MACDOWS_LAB_<X> "..." OFF)` line added in a
+   hunk of a `*.cmake` / `CMakeLists.txt` file -- the knob; (2) every other added line either
+   names that knob (whole token) or is a one-line comment (`/* ... */`, `//`, or `#` in CMake
+   files); (3) every removed line is re-added in the same hunk as a line that starts with the
+   removed text and names the knob (a guard appended, never a line changed or dropped);
+   (4) files are modified in place only -- no new or deleted files, no renames or copies, and
+   the file a hunk targets is what its `+++` line names (what `git apply` reads); a
+   `diff --git` line naming a different file is refused. A bug fix, a behaviour change, an
+   extra hunk riding along, or a knob named outside `MACDOWS_LAB_*` fails one of the four,
+   which is the point: rule 1 exists to stop this directory becoming an undocumented fork,
+   and the exception admits nothing but a guarded, default-OFF knob. Such a patch is retired
    when its experiment closes, not carried.
 
 2. **`git apply` failure is a hard build failure.** `Scripts/build-freerdp.sh` applies

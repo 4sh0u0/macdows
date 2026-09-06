@@ -67,7 +67,7 @@ check 'empty queue passes and says so'                       0 'No patches'     
 mk "$TMP/link"   0001-link.patch   "$LINK"
 check 'a GitHub issue/PR link in the header passes'          0 '1 patch(es) validated' --patch-dir "$TMP/link" --no-apply
 mkdir -p "$TMP/marker"
-{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$BOGUS_HUNK"; } > "$TMP/marker/0001-lab.patch"
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; } > "$TMP/marker/0001-lab.patch"
 check 'the lab-only marker (default OFF + ADR) with an added default-OFF option passes' 0 '1 patch(es) validated' --patch-dir "$TMP/marker" --no-apply
 mk "$TMP/none"   0001-none.patch   '# a patch with no record at all'
 check 'neither record refuses, naming rule 1 and the file'   1 'rule 1'              --patch-dir "$TMP/none" --no-apply
@@ -135,7 +135,8 @@ check 'a CRLF-terminated lab patch with an added default-OFF option passes' 0 '1
 # (c) CMake allows whitespace after the opening parenthesis (r3 N-3)
 { printf '%s\n' "$MARKER"; printf '%s\n' "${OPTION_HUNK/option(MACDOWS_LAB_FIXTURE/option( MACDOWS_LAB_FIXTURE}"; } > "$TMP/spaced/0001-lab.patch"
 check '"option( NAME ..." with a space after the parenthesis passes'  0 '1 patch(es) validated' --patch-dir "$TMP/spaced" --no-apply
-# (d) a removed option line in a DIFFERENT file is not a modification of the new knob (r3 N-4)
+# (d) a removed option line in a DIFFERENT file: not a flip of the new knob (r3 N-4), but under the
+#     shape rules below it is an unrelated removal with no guarded re-add, so the patch is refused.
 OTHER_REMOVE='diff --git a/client/CMakeLists.txt b/client/CMakeLists.txt
 --- a/client/CMakeLists.txt
 +++ b/client/CMakeLists.txt
@@ -143,7 +144,64 @@ OTHER_REMOVE='diff --git a/client/CMakeLists.txt b/client/CMakeLists.txt
  project(client)
 -option(MACDOWS_LAB_FIXTURE "an unrelated line in another file" ON)'
 { printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$OTHER_REMOVE"; } > "$TMP/xfile/0001-lab.patch"
-check 'a same-named removal in another file does not make the new option a flip' 0 '1 patch(es) validated' --patch-dir "$TMP/xfile" --no-apply
+check 'a same-named removal in another file is an unrelated change and refuses' 1 'rule 1' --patch-dir "$TMP/xfile" --no-apply
+
+echo "== the lab-only SHAPE: every other hunk may only insert the knob's guard or comments (gate r4 B-6)"
+# The real lab patch's shape: a source hunk that re-writes an #if line with one more !defined(<NAME>)
+# term and a one-line comment. Every added line names the knob or is a comment; every removed line
+# is re-added in the same hunk carrying the knob's name.
+GUARD_HUNK='diff --git a/channels/rdpgfx/client/rdpgfx_main.c b/channels/rdpgfx/client/rdpgfx_main.c
+--- a/channels/rdpgfx/client/rdpgfx_main.c
++++ b/channels/rdpgfx/client/rdpgfx_main.c
+@@ -1,3 +1,4 @@
+ 	capsSet->flags = caps10Flags;
+-#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE)
++/* Macdows lab patch: the lab-only option omits the flag. */
++#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE) && !defined(MACDOWS_LAB_FIXTURE)
+ 	capsSet->flags |= RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE;'
+UNRELATED_HUNK='diff --git a/libfreerdp/core/rdp.c b/libfreerdp/core/rdp.c
+--- a/libfreerdp/core/rdp.c
++++ b/libfreerdp/core/rdp.c
+@@ -1,2 +1,2 @@
+ 	int x;
+-	return TRUE;
++	return FALSE;'
+BARE_UNRELATED='--- a/libfreerdp/core/rdp.c
++++ b/libfreerdp/core/rdp.c
+@@ -1,2 +1,2 @@
+ 	int x;
+-	return TRUE;
++	return FALSE;'
+RENAME_HDR='diff --git a/libfreerdp/core/rdp.c b/libfreerdp/core/rdp2.c
+similarity index 100%
+rename from libfreerdp/core/rdp.c
+rename to libfreerdp/core/rdp2.c'
+NEWFILE_HUNK='diff --git a/libfreerdp/core/lab.c b/libfreerdp/core/lab.c
+new file mode 100644
+--- /dev/null
++++ b/libfreerdp/core/lab.c
+@@ -0,0 +1,1 @@
++/* MACDOWS_LAB_FIXTURE */'
+mkdir -p "$TMP/shape-ok" "$TMP/shape-unrel" "$TMP/shape-line" "$TMP/shape-rm" "$TMP/shape-bare" "$TMP/shape-rename" "$TMP/shape-new" "$TMP/shape-prefix"
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$GUARD_HUNK"; } > "$TMP/shape-ok/0001-lab.patch"
+check 'option hunk + a guard-insertion hunk (comment + re-written #if naming the knob) passes' 0 '1 patch(es) validated' --patch-dir "$TMP/shape-ok" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$UNRELATED_HUNK"; } > "$TMP/shape-unrel/0001-lab.patch"
+check 'option hunk + an honest unrelated hunk in another file refuses (B-6)'   1 'rule 1' --patch-dir "$TMP/shape-unrel" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${GUARD_HUNK/+\/\* Macdows lab patch: the lab-only option omits the flag. \*\//+	settings->foo = 1;}"; } > "$TMP/shape-line/0001-lab.patch"
+check 'an added source line that neither names the knob nor is a comment refuses'  1 'rule 1' --patch-dir "$TMP/shape-line" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${GUARD_HUNK/+#if !defined(WITH_CAIRO) && !defined(WITH_SWSCALE) && !defined(MACDOWS_LAB_FIXTURE)/+#if 0}"; } > "$TMP/shape-rm/0001-lab.patch"
+check 'a removed line not re-added with the knob name in the same hunk refuses'    1 'rule 1' --patch-dir "$TMP/shape-rm" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$BARE_UNRELATED"; } > "$TMP/shape-bare/0001-lab.patch"
+check 'a bare --- / +++ hunk (no diff --git line) is still judged, and refuses here' 1 'rule 1' --patch-dir "$TMP/shape-bare" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$RENAME_HDR"; } > "$TMP/shape-rename/0001-lab.patch"
+check 'a rename header refuses (lab patches modify files in place only)'           1 'rule 1' --patch-dir "$TMP/shape-rename" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$NEWFILE_HUNK"; } > "$TMP/shape-new/0001-lab.patch"
+check 'a new-file hunk refuses (even one naming the knob)'                        1 'rule 1' --patch-dir "$TMP/shape-new" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "${OPTION_HUNK//MACDOWS_LAB_FIXTURE/LAB_FIXTURE}"; } > "$TMP/shape-prefix/0001-lab.patch"
+check 'a knob not named MACDOWS_LAB_* refuses (the prefix is what the line rule keys on)' 1 'rule 1' --patch-dir "$TMP/shape-prefix" --no-apply
+mkdir -p "$TMP/shape-two"
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${OPTION_HUNK//MACDOWS_LAB_FIXTURE/MACDOWS_LAB_SECOND}"; } > "$TMP/shape-two/0001-lab.patch"
+check 'two new knobs in one patch refuses (exactly one knob per lab patch)'         1 'rule 1' --patch-dir "$TMP/shape-two" --no-apply
 
 echo "== header boundary: only a real diff line ends the header (gate r1 m-3)"
 mkdir -p "$TMP/dashes"
@@ -171,6 +229,8 @@ else
 fi
 
 echo "== one implementation: every enforcement point calls lib.sh, none carries its own grep (gate r1 B-1)"
+# Known limit (gate r4 N-1): this pin recognises the link PATTERN on a line; a deliberately
+# obfuscated private verdict (a case-glob, a pattern split across variables) is a review matter.
 callers=(Scripts/build-freerdp.sh Scripts/check-patch-queue.sh Scripts/gen-notices.sh)
 one_impl=0
 for f in "${callers[@]}"; do

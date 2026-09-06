@@ -35,19 +35,29 @@ require_cmd() {
 # the lab-only marker
 #     # Lab-only: default OFF; ADR: docs/adr/NNNN-<slug>.md
 # which is valid only for a default-OFF build knob backed by an Accepted ADR (the README's
-# rule 1 exception). The marker is a claim, so the patch must substantiate it: a hunk of a CMake
-# file (`*.cmake` / `CMakeLists.txt`) has to ADD an `option(<NAME> "..." OFF)` line whose <NAME>
-# is not also on a removed line -- i.e. a NEW knob, not an existing option flipped ON->OFF, not a
-# line smuggled into the header or into a non-CMake file (gate d1-lane r1 I-3, r2 I-7 -- a bug
-# fix wearing the marker adds no such line and is refused). "Header" means the lines before the first real diff line
-# (`diff --git `, `--- a/` or `--- /dev/null`; a prose line that merely starts with "--- " does
-# not end it, gate r1 m-3): a link that merely appears inside a hunk's context or additions
-# does not count.
+# rule 1 exception). "Header" means the lines before the first real diff line (`diff --git `,
+# `--- a/` or `--- /dev/null`; a prose line that merely starts with "--- " does not end it,
+# gate r1 m-3): a link that merely appears inside a hunk's context or additions does not count.
+#
+# The marker is a claim, so a marker-admitted patch must have the lab-only SHAPE, checked
+# mechanically over its whole diff body (gate d1-lane r1 I-3, r2 I-7, r3 B-4, r4 B-6):
+#   1. exactly ONE new CMake `option(MACDOWS_LAB_<X> "..." OFF)` line, added in a hunk of a
+#      *.cmake / CMakeLists.txt file (the knob; its name is the KEY every other change hangs on);
+#   2. every other ADDED line either names that knob as a whole token, or is a one-line comment
+#      (C `/* ... */` or `//` anywhere; `#` in CMake files) -- so the patch can insert guards and
+#      say what it did, and nothing else;
+#   3. every REMOVED line is re-added in the same hunk as a line that starts with the removed text
+#      and names the knob -- a guard appended to an existing line, never a line changed or dropped;
+#   4. files are modified in place only: no new/deleted files, no renames or copies, and the file a
+#      hunk targets is what its `+++ b/` line names (what `git apply` reads) -- a `diff --git` line
+#      naming a different file is refused; a bare `--- a/` / `+++ b/` hunk is judged like any other.
+#   CR is stripped first so a CRLF patch is judged on its content. A bug fix, a behaviour change,
+#   an extra hunk riding along, or a knob named outside MACDOWS_LAB_* all fail one of the four.
 #
 # This is the ONE implementation of the rule. Scripts/build-freerdp.sh consults it before
-# folding the queue into the config hash, and Scripts/check-patch-queue.sh (Tier 1's patch
-# validation step) consults it too -- keep it here so the build and CI can never disagree
-# about what the rule accepts. Scripts/test-patch-queue.sh pins the verdicts.
+# folding the queue into the config hash, Scripts/check-patch-queue.sh (Tier 1's patch
+# validation step) and Scripts/gen-notices.sh (the release SBOM) consult it too -- keep it here
+# so the build, CI and the release can never disagree. Scripts/test-patch-queue.sh pins the verdicts.
 #
 # Usage:  crdp_patch_record_ok "$patch_file"   (0 = record present, 1 = refuse)
 crdp_patch_record_ok() {
@@ -56,25 +66,42 @@ crdp_patch_record_ok() {
 	header="$(awk '/^(diff --git |--- (a\/|\/dev\/null))/ { exit } { print }' "$file")"
 	printf '%s\n' "$header" | grep -qE 'github\.com/FreeRDP/FreeRDP/(issues|pull)/[0-9]+' && return 0
 	if printf '%s\n' "$header" | grep -qE '^# Lab-only: default OFF; ADR: docs/adr/[0-9]{4}-[A-Za-z0-9._-]+\.md'; then
-		# Walk the diff body. The file a hunk targets is what `git apply` reads from the `--- a/` /
-		# `+++ b/` lines, NOT what the `diff --git` line claims (gate r3 B-4): a header naming a
-		# .cmake file above a hunk whose +++ names a C file is refused outright. Collect, per target
-		# file, the names of option(... OFF) lines ADDED inside CMake-file hunks and the names of
-		# option lines REMOVED; a name in both sets FOR THE SAME FILE is a modified option, not a new
-		# one (a same-named removal in another file is unrelated, r3 N-4). CR is stripped so a CRLF
-		# patch is judged on its content (r3 N-2); CMake allows blanks after "option(" (r3 N-3).
 		awk '
 			{ sub(/\r$/, "") }
-			/^diff --git / { hdr = $NF; sub(/^b\//, "", hdr); inbody = 1; file = ""; cmake = 0; next }
+			/^diff --git / { inbody = 1; hdr = $NF; sub(/^b\//, "", hdr); file = ""; cmake = 0; next }
+			/^--- (a\/|\/dev\/null)/ { inbody = 1; next }
 			!inbody { next }
-			/^\+\+\+ / { file = $2; if (file != "/dev/null") sub(/^b\//, "", file);
-			               if (file != "/dev/null" && file != hdr) { lie = 1 }
-			               cmake = (file ~ /(\.cmake|CMakeLists\.txt)$/); next }
-			/^\+[[:space:]]*option\([[:space:]]*[A-Za-z0-9_]+[[:space:]]+"[^"]*"[[:space:]]+OFF[[:space:]]*\)/ && cmake {
-				name = $0; sub(/^\+[[:space:]]*option\([[:space:]]*/, "", name); sub(/[[:space:]].*/, "", name); added[file SUBSEP name] = 1; next }
-			/^-[[:space:]]*option\([[:space:]]*[A-Za-z0-9_]+[[:space:]]/ {
-				name = $0; sub(/^-[[:space:]]*option\([[:space:]]*/, "", name); sub(/[[:space:]].*/, "", name); removed[file SUBSEP name] = 1; next }
-			END { if (lie) exit 1; for (k in added) if (!(k in removed)) { ok = 1 }; exit ok ? 0 : 1 }
+			/^(rename (from|to)|copy (from|to)|new file mode|deleted file mode|similarity index)/ { bad = 1; next }
+			/^\+\+\+ / { file = $2
+			             if (file == "/dev/null") { bad = 1; next }
+			             sub(/^b\//, "", file)
+			             if (hdr != "" && file != hdr) { bad = 1 }
+			             hdr = ""; cmake = (file ~ /(\.cmake|CMakeLists\.txt)$/); next }
+			/^@@ / { h++; next }
+			/^\+[[:space:]]*option\([[:space:]]*MACDOWS_LAB_[A-Za-z0-9_]+[[:space:]]+"[^"]*"[[:space:]]+OFF[[:space:]]*\)/ && cmake {
+				name = $0; sub(/^\+[[:space:]]*option\([[:space:]]*/, "", name); sub(/[[:space:]].*/, "", name)
+				nopt++; knob = name; next }
+			/^\+/ { np[h]++; plus[h, np[h]] = substr($0, 2); pcm[h, np[h]] = cmake; next }
+			/^-/  { nm[h]++; minus[h, nm[h]] = substr($0, 2); next }
+			END {
+				if (bad || nopt != 1) exit 1
+				tok = "(^|[^A-Za-z0-9_])" knob "([^A-Za-z0-9_]|$)"
+				for (k = 1; k <= h; k++) {
+					for (i = 1; i <= np[k]; i++) {
+						l = plus[k, i]
+						if (l ~ tok) continue
+						if (l ~ /^[[:space:]]*\/\*.*\*\/[[:space:]]*$/ || l ~ /^[[:space:]]*\/\//) continue
+						if (pcm[k, i] && l ~ /^[[:space:]]*#/) continue
+						exit 1
+					}
+					for (i = 1; i <= nm[k]; i++) {
+						r = minus[k, i]; found = 0
+						for (j = 1; j <= np[k]; j++) { l = plus[k, j]; if (index(l, r) == 1 && l ~ tok) { found = 1; break } }
+						if (!found) exit 1
+					}
+				}
+				exit 0
+			}
 		' "$file" && return 0
 	fi
 	return 1

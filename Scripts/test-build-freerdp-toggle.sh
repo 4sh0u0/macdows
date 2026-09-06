@@ -55,16 +55,17 @@ crdp_freerdp_build_publishes_current 0; p0=$?
 crdp_freerdp_build_publishes_current 1; p1=$?
 set -e
 if [ "$p0" -eq 0 ] && [ "$p1" -ne 0 ]; then ok "crdp_freerdp_build_publishes_current: product build publishes current, lab build (toggle 1) never does"; else bad "publishes_current predicate: toggle0=$p0 toggle1=$p1"; fi
-# gate r3 B-5: not a count of mentions -- every `ln -sfn "$CONFIG_HASH" "$CURRENT_LINK"` in the build
-# script must sit inside a POSITIVE `if crdp_freerdp_build_publishes_current ...` branch (within the
-# three preceding lines, no `!`), and there must be exactly the two publish sites. Reverting a site to
-# a bare ln, or inverting its predicate, changes one of those numbers.
+# gate r3 B-5 / r4: not a count of mentions -- a small state machine over build-freerdp.sh. Every
+# line that links `current` (any `ln -s...` whose arguments mention CURRENT_LINK, braces or not)
+# must execute inside the THEN branch of `if crdp_freerdp_build_publishes_current ...` (a `!` form,
+# an else branch, or no such if at all is a violation), and there must be exactly two such links.
 publish_sites="$(awk '
-    { line[NR] = $0 }
-    /ln -sfn "\$CONFIG_HASH" "\$CURRENT_LINK"/ {
-        total++
-        for (k = NR - 1; k >= NR - 3 && k >= 1; k--) if (line[k] ~ /^[[:space:]]*if[[:space:]]+crdp_freerdp_build_publishes_current[[:space:]]+"/) { guarded++; break }
-    }
+    /^[[:space:]]*if[[:space:]]+crdp_freerdp_build_publishes_current[[:space:]]+"/ { state = "then"; next }
+    /^[[:space:]]*if[[:space:]]+!/ && /crdp_freerdp_build_publishes_current/ { state = "neg"; next }
+    /^[[:space:]]*if[[:space:]]/ { state = "other"; next }
+    /^[[:space:]]*else([[:space:]]|$)/ { if (state == "then") state = "else"; else if (state == "neg") state = "then-of-neg"; next }
+    /^[[:space:]]*fi([[:space:]]|$)/ { state = ""; next }
+    /ln -s[a-zA-Z]*[[:space:]].*\$\{?CURRENT_LINK\}?/ { total++; if (state == "then") guarded++ }
     END { printf "%d/%d", guarded + 0, total + 0 }' "$BUILD_FREERDP")"
 if [ "$publish_sites" = "2/2" ]; then ok "exactly two current-publish sites in build-freerdp.sh, each inside a positive publishes_current branch ($publish_sites)"; else bad "current-publish sites guarded/total = $publish_sites (want 2/2)"; fi
 
