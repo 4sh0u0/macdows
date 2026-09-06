@@ -49,9 +49,13 @@ require_cmd() {
 #      No code line is admitted, whether or not it names the knob, and NO added line at all is
 #      admitted in a CMake file besides the knob itself: a `#` line there is a comment only outside
 #      a multi-line quoted or bracket argument, which a hunk cannot prove (gate r6 B-9 -- the pinned
-#      tree embeds C++ test sources in CMake strings). Residual, stated: a C comment line added
-#      inside a C++ raw string literal (R"(...)") would be string content; the pinned tree's
-#      channels/ and libfreerdp/ are C, and the reviewer of a lab patch checks its sites;
+#      tree embeds C++ test sources in CMake strings). No added line may contain a backslash or
+#      the sequence `??`: a comment ending in `\` (or in the `??/` trigraph under ISO modes) is
+#      spliced with the NEXT physical line before comments are even recognised (C translation
+#      phase 2 precedes phase 3), so it would swallow real code (gate r7 B-10, demonstrated
+#      against rdpgfx_main.c). Residual, stated: a C comment line added inside a C++ raw string
+#      literal (R"(...)") would be string content; the pinned tree's channels/ and libfreerdp/
+#      contain no raw string literal, and the reviewer of a lab patch checks its sites;
 #   3. every REMOVED line is a `#if` / `#elif` line re-added in the same hunk as exactly the removed
 #      text followed by ` && !defined(MACDOWS_LAB_<X>)` -- a guard appended, nothing else;
 #   4. text hunks of existing files only: every `diff --git` block carries a `--- a/` / `+++ b/`
@@ -102,6 +106,7 @@ crdp_patch_record_ok() {
 					ng = 0
 					for (i = 1; i <= np[k]; i++) {
 						l = plus[k, i]
+						if (l ~ /\\|\?\?/) exit 1
 						if (l ~ /^[[:space:]]*\/\*([^*]|\*+[^*\/])*\*+\/[[:space:]]*$/) continue
 						if (l ~ /^[[:space:]]*\/\//) continue
 						if (pcm[k, i]) exit 1

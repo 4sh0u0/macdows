@@ -277,6 +277,24 @@ CMAKEDEFINE_C_HUNK='diff --git a/libfreerdp/core/rdp.c b/libfreerdp/core/rdp.c
 { printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$CMAKEDEFINE_C_HUNK"; } > "$TMP/g-cmakedefine-c/0001-lab.patch"
 check 'a #cmakedefine KNOB line outside a *.in template refuses'                        1 'rule 1' --patch-dir "$TMP/g-cmakedefine-c" --no-apply
 
+echo "== a comment line must not splice: no trailing backslash, no trigraph (gate r7 B-10)"
+mkdir -p "$TMP/g-splice" "$TMP/g-splice2" "$TMP/g-trigraph" "$TMP/g-slashslash"
+SPLICE_HUNK='diff --git a/channels/rdpgfx/client/rdpgfx_main.c b/channels/rdpgfx/client/rdpgfx_main.c
+--- a/channels/rdpgfx/client/rdpgfx_main.c
++++ b/channels/rdpgfx/client/rdpgfx_main.c
+@@ -1,2 +1,3 @@
+ #include <freerdp/config.h>
++// Macdows lab patch: cosmetic note \
+ #include <winpr/assert.h>'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$SPLICE_HUNK"; } > "$TMP/g-splice/0001-lab.patch"
+check 'a // comment ending in a backslash (splices the next line) refuses (B-10)'      1 'rule 1' --patch-dir "$TMP/g-splice" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${SPLICE_HUNK/+\/\/ Macdows lab patch: cosmetic note \\/+\/* Macdows lab patch *\/ \\}"; } > "$TMP/g-splice2/0001-lab.patch"
+check 'a /* */ comment followed by a backslash refuses'                                 1 'rule 1' --patch-dir "$TMP/g-splice2" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${SPLICE_HUNK/+\/\/ Macdows lab patch: cosmetic note \\/+\/\/ Macdows lab patch: note ??\/}"; } > "$TMP/g-trigraph/0001-lab.patch"
+check 'a // comment ending in the ??/ trigraph (a backslash in ISO mode) refuses'       1 'rule 1' --patch-dir "$TMP/g-trigraph" --no-apply
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "${SPLICE_HUNK/+\/\/ Macdows lab patch: cosmetic note \\/+\/\/ Macdows lab patch: a plain note}"; } > "$TMP/g-slashslash/0001-lab.patch"
+check 'a plain // comment line passes'                                                   0 '1 patch(es) validated' --patch-dir "$TMP/g-slashslash" --no-apply
+
 echo "== header boundary: only a real diff line ends the header (gate r1 m-3)"
 mkdir -p "$TMP/dashes"
 { printf '%s\n' '# a header comment'; printf '%s\n' '--- notes: this line starts with three dashes but is prose'; printf '%s\n' "$LINK"; printf '%s\n' "$BOGUS_HUNK"; } > "$TMP/dashes/0001-dashes.patch"
