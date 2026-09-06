@@ -118,6 +118,33 @@ FLIP_HUNK='diff --git a/cmake/ConfigOptions.cmake b/cmake/ConfigOptions.cmake
 { printf '%s\n' "$MARKER"; printf '%s\n' "$FLIP_HUNK"; } > "$TMP/optflip/0001-lab.patch"
 check 'flipping an existing option ON->OFF is not an added knob'   1 'rule 1' --patch-dir "$TMP/optflip" --no-apply
 
+echo "== the file a hunk targets is what git apply reads (--- / +++), not what diff --git claims (gate r3 B-4)"
+mkdir -p "$TMP/lie" "$TMP/crlf" "$TMP/spaced" "$TMP/xfile"
+# (a) diff --git names a .cmake file but --- / +++ target a C file: git apply patches the C file.
+LIE_HUNK='diff --git a/cmake/ConfigOptions.cmake b/cmake/ConfigOptions.cmake
+--- a/libfreerdp/core/rdp.c
++++ b/libfreerdp/core/rdp.c
+@@ -1,1 +1,2 @@
+ #include <freerdp/config.h>
++option(MACDOWS_LAB_FIXTURE "the header lies about the file" OFF)'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$LIE_HUNK"; } > "$TMP/lie/0001-lab.patch"
+check 'a diff --git line that disagrees with --- / +++ refuses'      1 'rule 1' --patch-dir "$TMP/lie" --no-apply
+# (b) CRLF line endings must not turn a valid lab patch into a refusal (r3 N-2)
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; } | sed 's/$/\r/' > "$TMP/crlf/0001-lab.patch"
+check 'a CRLF-terminated lab patch with an added default-OFF option passes' 0 '1 patch(es) validated' --patch-dir "$TMP/crlf" --no-apply
+# (c) CMake allows whitespace after the opening parenthesis (r3 N-3)
+{ printf '%s\n' "$MARKER"; printf '%s\n' "${OPTION_HUNK/option(MACDOWS_LAB_FIXTURE/option( MACDOWS_LAB_FIXTURE}"; } > "$TMP/spaced/0001-lab.patch"
+check '"option( NAME ..." with a space after the parenthesis passes'  0 '1 patch(es) validated' --patch-dir "$TMP/spaced" --no-apply
+# (d) a removed option line in a DIFFERENT file is not a modification of the new knob (r3 N-4)
+OTHER_REMOVE='diff --git a/client/CMakeLists.txt b/client/CMakeLists.txt
+--- a/client/CMakeLists.txt
++++ b/client/CMakeLists.txt
+@@ -1,2 +1,1 @@
+ project(client)
+-option(MACDOWS_LAB_FIXTURE "an unrelated line in another file" ON)'
+{ printf '%s\n' "$MARKER"; printf '%s\n' "$OPTION_HUNK"; printf '%s\n' "$OTHER_REMOVE"; } > "$TMP/xfile/0001-lab.patch"
+check 'a same-named removal in another file does not make the new option a flip' 0 '1 patch(es) validated' --patch-dir "$TMP/xfile" --no-apply
+
 echo "== header boundary: only a real diff line ends the header (gate r1 m-3)"
 mkdir -p "$TMP/dashes"
 { printf '%s\n' '# a header comment'; printf '%s\n' '--- notes: this line starts with three dashes but is prose'; printf '%s\n' "$LINK"; printf '%s\n' "$BOGUS_HUNK"; } > "$TMP/dashes/0001-dashes.patch"
@@ -149,9 +176,10 @@ one_impl=0
 for f in "${callers[@]}"; do
     # a CALL line: the function name at the start of a statement (a comment mentioning it is not a call)
     grep -qE '^[[:space:]]*(if[[:space:]]+)?(!?[[:space:]]*)?crdp_patch_record_ok[[:space:]]+"' "$REPO_ROOT/$f" || { one_impl=1; echo "  missing call in $f"; }
-    # a private VERDICT is any grep on the link pattern that is not the `-o` link EXTRACTION
-    # gen-notices.sh legitimately keeps for the SBOM's resolves[] (data, not a verdict)
-    if grep -E 'grep .*FreeRDP/\(issues\|pull\)' "$REPO_ROOT/$f" | grep -vE 'grep -oE' | grep -q .; then one_impl=1; echo "  private rule-1 verdict in $f"; fi
+    # The link pattern itself may appear in these scripts ONLY as gen-notices.sh's `grep -oE`
+    # link EXTRACTION for the SBOM's resolves[] (data, not a verdict). Any other line carrying it
+    # -- a grep verdict, a `[[ =~ ]]`, a case pattern -- is a private rule-1 implementation (r3 N-1).
+    if grep -E 'FreeRDP/\(issues\|pull\)' "$REPO_ROOT/$f" | grep -vE '^[[:space:]]*#' | grep -vE 'grep -oE' | grep -q .; then one_impl=1; echo "  private rule-1 verdict in $f"; fi
 done
 if grep -qE 'FreeRDP/\(issues\|pull\)' "$REPO_ROOT/.github/workflows/tier1.yml"; then one_impl=1; echo "  private rule-1 grep in tier1.yml"; fi
 if [ "$one_impl" -eq 0 ]; then pass=$((pass + 1)); echo "  ok   build-freerdp.sh, check-patch-queue.sh and gen-notices.sh all call crdp_patch_record_ok; no private copy of the grep"; else fail=$((fail + 1)); echo "  FAIL rule 1 has more than one implementation"; fi

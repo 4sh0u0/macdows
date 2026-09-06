@@ -55,7 +55,18 @@ crdp_freerdp_build_publishes_current 0; p0=$?
 crdp_freerdp_build_publishes_current 1; p1=$?
 set -e
 if [ "$p0" -eq 0 ] && [ "$p1" -ne 0 ]; then ok "crdp_freerdp_build_publishes_current: product build publishes current, lab build (toggle 1) never does"; else bad "publishes_current predicate: toggle0=$p0 toggle1=$p1"; fi
-if [ "$(grep -cE '^[[:space:]]*if[[:space:]]+!?[[:space:]]*crdp_freerdp_build_publishes_current[[:space:]]+"' "$BUILD_FREERDP")" -ge 2 ]; then ok "both current-link sites in build-freerdp.sh consult the predicate (call-shaped lines, not mentions)"; else bad "build-freerdp.sh does not consult the predicate at both current-link sites"; fi
+# gate r3 B-5: not a count of mentions -- every `ln -sfn "$CONFIG_HASH" "$CURRENT_LINK"` in the build
+# script must sit inside a POSITIVE `if crdp_freerdp_build_publishes_current ...` branch (within the
+# three preceding lines, no `!`), and there must be exactly the two publish sites. Reverting a site to
+# a bare ln, or inverting its predicate, changes one of those numbers.
+publish_sites="$(awk '
+    { line[NR] = $0 }
+    /ln -sfn "\$CONFIG_HASH" "\$CURRENT_LINK"/ {
+        total++
+        for (k = NR - 1; k >= NR - 3 && k >= 1; k--) if (line[k] ~ /^[[:space:]]*if[[:space:]]+crdp_freerdp_build_publishes_current[[:space:]]+"/) { guarded++; break }
+    }
+    END { printf "%d/%d", guarded + 0, total + 0 }' "$BUILD_FREERDP")"
+if [ "$publish_sites" = "2/2" ]; then ok "exactly two current-publish sites in build-freerdp.sh, each inside a positive publishes_current branch ($publish_sites)"; else bad "current-publish sites guarded/total = $publish_sites (want 2/2)"; fi
 
 echo; echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

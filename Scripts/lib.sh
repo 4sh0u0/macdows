@@ -56,17 +56,25 @@ crdp_patch_record_ok() {
 	header="$(awk '/^(diff --git |--- (a\/|\/dev\/null))/ { exit } { print }' "$file")"
 	printf '%s\n' "$header" | grep -qE 'github\.com/FreeRDP/FreeRDP/(issues|pull)/[0-9]+' && return 0
 	if printf '%s\n' "$header" | grep -qE '^# Lab-only: default OFF; ADR: docs/adr/[0-9]{4}-[A-Za-z0-9._-]+\.md'; then
-		# Walk the diff body: remember which file each hunk belongs to; collect the names of
-		# option(... OFF) lines ADDED inside CMake-file hunks and the names of every option line
-		# REMOVED anywhere. A name in both sets is a modified option, not a new one.
+		# Walk the diff body. The file a hunk targets is what `git apply` reads from the `--- a/` /
+		# `+++ b/` lines, NOT what the `diff --git` line claims (gate r3 B-4): a header naming a
+		# .cmake file above a hunk whose +++ names a C file is refused outright. Collect, per target
+		# file, the names of option(... OFF) lines ADDED inside CMake-file hunks and the names of
+		# option lines REMOVED; a name in both sets FOR THE SAME FILE is a modified option, not a new
+		# one (a same-named removal in another file is unrelated, r3 N-4). CR is stripped so a CRLF
+		# patch is judged on its content (r3 N-2); CMake allows blanks after "option(" (r3 N-3).
 		awk '
-			/^diff --git / { file = $NF; cmake = (file ~ /(\.cmake|CMakeLists\.txt)$/); inbody = 1; next }
+			{ sub(/\r$/, "") }
+			/^diff --git / { hdr = $NF; sub(/^b\//, "", hdr); inbody = 1; file = ""; cmake = 0; next }
 			!inbody { next }
-			/^\+[[:space:]]*option\([A-Za-z0-9_]+[[:space:]]+"[^"]*"[[:space:]]+OFF\)/ && cmake {
-				name = $0; sub(/^\+[[:space:]]*option\(/, "", name); sub(/[[:space:]].*/, "", name); added[name] = 1; next }
-			/^-[[:space:]]*option\([A-Za-z0-9_]+[[:space:]]/ {
-				name = $0; sub(/^-[[:space:]]*option\(/, "", name); sub(/[[:space:]].*/, "", name); removed[name] = 1; next }
-			END { for (n in added) if (!(n in removed)) { ok = 1 }; exit ok ? 0 : 1 }
+			/^\+\+\+ / { file = $2; if (file != "/dev/null") sub(/^b\//, "", file);
+			               if (file != "/dev/null" && file != hdr) { lie = 1 }
+			               cmake = (file ~ /(\.cmake|CMakeLists\.txt)$/); next }
+			/^\+[[:space:]]*option\([[:space:]]*[A-Za-z0-9_]+[[:space:]]+"[^"]*"[[:space:]]+OFF[[:space:]]*\)/ && cmake {
+				name = $0; sub(/^\+[[:space:]]*option\([[:space:]]*/, "", name); sub(/[[:space:]].*/, "", name); added[file SUBSEP name] = 1; next }
+			/^-[[:space:]]*option\([[:space:]]*[A-Za-z0-9_]+[[:space:]]/ {
+				name = $0; sub(/^-[[:space:]]*option\([[:space:]]*/, "", name); sub(/[[:space:]].*/, "", name); removed[file SUBSEP name] = 1; next }
+			END { if (lie) exit 1; for (k in added) if (!(k in removed)) { ok = 1 }; exit ok ? 0 : 1 }
 		' "$file" && return 0
 	fi
 	return 1

@@ -45,8 +45,10 @@ policy).
    `--- /dev/null`) -- so a link that merely appears inside a hunk does not count. The marker
    is a claim, and the patch has to substantiate it mechanically: a hunk of a CMake file
    (`*.cmake` or `CMakeLists.txt`) must ADD an `option(<NAME> "..." OFF)` line whose `<NAME>`
-   is not also on a removed line (a new knob -- not an existing option flipped `ON`→`OFF`, not
-   an option line placed in the header or in a non-CMake file). The exception does not apply
+   is not also on a removed line of the same file (a new knob -- not an existing option flipped
+   `ON`→`OFF`, not an option line placed in the header or in a non-CMake file). The file a hunk
+   targets is the one its `+++` line names -- what `git apply` reads -- and a `diff --git` line
+   that disagrees with it is refused outright. The exception does not apply
    to bug fixes or behaviour changes: those still need an upstream record, because the point
    of rule 1 is to stop this directory becoming an undocumented fork. Such a patch is retired
    when its experiment closes, not carried.
