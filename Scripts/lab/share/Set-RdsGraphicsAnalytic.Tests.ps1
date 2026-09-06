@@ -160,6 +160,20 @@ Test-Case 'the readback line lists each channel with its enabled state, in order
     Assert-Equal 'READBACK: RdpCoreTS/Debug=False RdpLite/Debug=False RdpAvenc/Debug=False' $line
 }
 
+New-Section 'Format-AnalyticBackupRecordLine'
+
+# A-prime r1 (2026-09-07): after -Mode Restore the host printed "restored; backup record removed (...)"
+# and then "backup record: <the same path>" -- the trailing line was decided from the pre-action
+# existence check, so it named a file the script had just deleted. The trailing line must report
+# the record as it exists AFTER the action.
+Test-Case 'the trailing backup-record line names the file when it exists after the action' {
+    Assert-Equal 'backup record: C:\lab\rds.backup.txt' (Format-AnalyticBackupRecordLine -Exists $true -Path 'C:\lab\rds.backup.txt')
+}
+
+Test-Case 'the trailing backup-record line says none once the record no longer exists (Restore removed it)' {
+    Assert-Equal 'backup record: none' (Format-AnalyticBackupRecordLine -Exists $false -Path 'C:\lab\rds.backup.txt')
+}
+
 Write-Host ''
 Write-Host ("{0} test(s), {1} failed" -f $script:TestTotal, $script:TestFailed)
 if ($script:TestFailed -gt 0) { Write-Host ''; foreach ($f in $script:TestFailures) { Write-Host "  - $f" }; exit 1 }
