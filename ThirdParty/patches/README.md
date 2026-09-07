@@ -84,25 +84,24 @@ policy).
 
 ## Current state
 
-**One patch** against FreeRDP 3.31.1 (`63b948ca5cb94307fd5444ee6e73927a41ccdab4`):
-
-- `0002-rdpgfx-lab-scaledmap-advertise-option.patch` (2026-09-07, lab-only exception, ADR-0016)
-  -- adds the CMake option `MACDOWS_LAB_SCALEDMAP_ADVERTISE` (default **OFF**) that omits
-  `RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE` from the advertised RDPGFX capability sets. OFF leaves
-  every preprocessed line as it was; ON is a protocol-level false advertisement used only by
-  `Tools/rail-probe` for the D1 contrast experiment (`Scripts/build-freerdp.sh` with
-  `CRDP_LAB_SCALEDMAP_ADVERTISE=1`, a separate config-hash prefix never made `current`). Each
-  modified site carries a `Macdows lab patch 0002` notice -- a one-line comment at the six C /
-  template sites, the option's own description string in ConfigOptions.cmake (Apache-2.0 §4(b));
-  `THIRD_PARTY_NOTICES.md`'s FreeRDP entry says "Modified: Yes" and names it. Retire when D1's
-  record is filed -- and remove nothing else: `Scripts/build-freerdp.sh` records the option's
-  cache value as an OPTIONAL manifest key precisely so retiring this patch is a one-file change.
-
-Before it (2026-09-02 to 2026-09-07) the queue was empty on purpose: the one patch this project
-carried before was absorbed upstream and retired on the 3.31.1 pin bump.
+**No patches** against FreeRDP 3.31.1 (`63b948ca5cb94307fd5444ee6e73927a41ccdab4`). The queue is
+empty on purpose: both patches this project ever carried are retired -- `0001` absorbed upstream on
+the 3.31.1 pin bump (2026-09-02), `0002` retired by design when its lab experiment closed
+(2026-09-07). The rules above, including the lab-only exception, stay set with the directory empty.
 
 ### Retired
 
+- `0002-rdpgfx-lab-scaledmap-advertise-option.patch` (carried 2026-09-07 under the rule-1 lab-only
+  exception, ADR-0016) -- added the CMake option `MACDOWS_LAB_SCALEDMAP_ADVERTISE` (default OFF)
+  that omitted `RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE` from the advertised RDPGFX capability sets, so
+  `Tools/rail-probe` could run the D1 contrast (`Scripts/build-freerdp.sh` with
+  `CRDP_LAB_SCALEDMAP_ADVERTISE=1`). Retired the same day by owner ruling once the D1 record was
+  filed (result: the server sends the scaled map variant only when the flag is not advertised;
+  ADR-0016 section 3 row 1, n=2 per side). Not the rule-2 case -- it still applied cleanly at
+  retirement -- but the exception's own condition: retired when the experiment closes, not
+  carried. The toggle and the optional manifest key remain in `Scripts/build-freerdp.sh` and
+  fail closed without the patch (the toggle refuses when the applied tree defines no such
+  option). Record in `deps/freerdp.lock` (`retired_patches`).
 - `0001-core-capabilities-apply-input-caps-from-src.patch` (carried against 3.30.0) --
   `rdp_apply_input_capability_set()` read two received-capability values out of the
   destination `settings` instead of the parsed server answer `src`. Hunk 1 fixed upstream by
