@@ -543,13 +543,15 @@ if assert_eq "$(xfreerdp_calls)" "0" "xfreerdp invocations" && assert_has "$LOG"
 	pass "$CASE: /scale:150 (not one of 100|140|180) is refused as JOB-ENV-INVALID (65)"
 fi
 
+# 12d is a regression pin, not a must-red (it passed against the pre-change relay too, gate r1 m-1):
+# it guards the other tracked jobs' argv against a future default value or stray token.
 begin '12d XFREERDP_EXTRA absent leaves the argv unchanged'
 write_job 'C:\Windows\System32\notepad.exe'
 run_relay "$SBLAB/relay.command" "" exit0
 argv="$(xfreerdp_argv)"
 if assert_eq "$(xfreerdp_calls)" "1" "xfreerdp invocations" && assert_lacks "$LABTEST_TRACE" '/scale' && assert_lacks "$LABTEST_TRACE" '/dynamic-resolution' \
 	&& assert_argv_has "$argv" '/app:program:C:\Windows\System32\notepad.exe' && assert_eq "$(last_line)" "DONE exit=0" "last line"; then
-	pass "$CASE: without XFREERDP_EXTRA no extra switch appears"
+	pass "$CASE: without XFREERDP_EXTRA no extra switch appears (regression pin)"
 fi
 
 begin '12e CRLF XFREERDP_EXTRA'
@@ -636,6 +638,7 @@ fi
 #     redirect scenario must now reach xfreerdp with the /v: token -- i.e. 11b pins the allowlist.
 begin 'M4 extra-allowlist mutant'
 MUTANT_EXTRA="$SBLAB/labtest-mutant-extra.command"
+# shellcheck disable=SC2016  # deliberate literal `$XFREERDP_EXTRA` for sed
 if sed 's/if ! relay_extra_tokens_ok "\$XFREERDP_EXTRA"; then/if false; then/' "$SBLAB/relay.command" > "$MUTANT_EXTRA" \
 	&& ! cmp -s "$MUTANT_EXTRA" "$SBLAB/relay.command" && bash -n "$MUTANT_EXTRA"; then
 	printf 'PROGRAM=%q\nXFREERDP_EXTRA=%q\nTIMEOUT=5\n' 'C:\Windows\System32\notepad.exe' '/scale:180 /v:198.51.100.7' > "$SBRUNTIME/job.env"

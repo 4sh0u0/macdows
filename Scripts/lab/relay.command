@@ -43,10 +43,19 @@ RELAY_RC=0
 # refuses the whole job as JOB-ENV-INVALID before any connection. The shapes admit no space,
 # quote, glob or comma, so the validated value can be word-split into argv safely.
 relay_extra_tokens_ok() { # <XFREERDP_EXTRA value>
-    local tok
+    # The split happens with globbing off (and restored afterwards -- bash 3.2 has no
+    # function-local `set -f`), so a value such as `/*` is judged as the literal text it is,
+    # never as whatever the filesystem happens to expand it to (relay-extra gate r1 m-3).
+    local tok restore_glob=''
+    case $- in *f*) ;; *) restore_glob='set +f' ;; esac
+    set -f
     for tok in $1; do
-        printf '%s' "$tok" | grep -qE '^/(scale:(100|140|180)|scale-desktop:(1[0-9][0-9]|[2-4][0-9][0-9]|500)|scale-device:(100|140|180)|dynamic-resolution)$' || return 1
+        if ! printf '%s' "$tok" | grep -qE '^/(scale:(100|140|180)|scale-desktop:(1[0-9][0-9]|[2-4][0-9][0-9]|500)|scale-device:(100|140|180)|dynamic-resolution)$'; then
+            $restore_glob
+            return 1
+        fi
     done
+    $restore_glob
     return 0
 }
 
@@ -114,12 +123,18 @@ EOF_JOB_KEYS
                 APP_SPEC="${APP_SPEC},cmd:${CMDARGS}"
             fi
             echo "[relay] program=${PROGRAM} timeout=${TIMEOUT}s extra=${XFREERDP_EXTRA:-<none>}"
-            # XFREERDP_EXTRA is deliberately unquoted: every token has passed relay_extra_tokens_ok,
-            # whose shapes contain no whitespace, quote, glob or comma, so word-splitting yields
-            # exactly the validated tokens (or nothing) as separate argv elements.
+            # XFREERDP_EXTRA is word-split on purpose: every token has passed relay_extra_tokens_ok,
+            # whose shapes contain no whitespace, quote, glob or comma, so splitting yields exactly
+            # the validated tokens (or nothing) as separate argv elements. `set -f` around the split
+            # is defence in depth (relay-extra gate r1 m-3): even a token that somehow carried a glob
+            # character could not expand against the filesystem. The relay uses no positional
+            # parameters of its own, so `set --` is free to hold the tokens.
+            set -f
             # shellcheck disable=SC2086
+            set -- $XFREERDP_EXTRA
+            set +f
             xfreerdp "/v:${WIN_HOST}" "/u:${WIN_USER}" "/p:${WIN_PASS}" /cert:ignore \
-                $XFREERDP_EXTRA "$APP_SPEC" "/drive:lab,${SHARE}" /gfx:AVC420 &
+                "$@" "$APP_SPEC" "/drive:lab,${SHARE}" /gfx:AVC420 &
             XPID=$!
             SECS=0
             while kill -0 "$XPID" 2>/dev/null && [ "$SECS" -lt "$TIMEOUT" ]; do
