@@ -729,6 +729,7 @@ bool crdpq_icon_store_lookup(const crdpq_icon_store_t* s, uint32_t windowId, uin
  *  `TrayModel.delete`'s own tolerance on the Swift side. */
 bool crdpq_icon_store_remove(crdpq_icon_store_t* s, uint32_t windowId, uint32_t notifyIconId);
 
+
 /** Copies slot `slot`'s pixels out into caller-owned memory under the store's lock, so the
  *  consumer's copy has zero lifetime coupling to the slot (adr/0013 §3: the Swift layer owns
  *  its `NSData` outright and never observes a later overwrite of the same slot). Returns
@@ -781,7 +782,12 @@ typedef enum {
      *  `height` 1-bit AND-mask scanlines. */
     CRDPQ_ICON_ERR_BITS_MASK,
     /** `dst` is NULL or `dst_capacity` is under `width * height * 4`. A caller bug, not
-     *  server input — kept distinct from the wire-data rejections above for that reason. */
+     *  server input — kept distinct from the wire-data rejections above for that reason.
+     *  MAINTENANCE ANCHOR (W3 lane G): this must stay the LAST member -- crdpq_icon.c sizes
+     *  `refusal_counts[CRDPQ_ICON_ERR_DEST + 1]` by it and both range guards in
+     *  `crdpq_icon_store_note_convert_refusal` / `..._refusal_count` compare against it. A new
+     *  cause appended AFTER it would be silently excluded from the per-cause counters (not a
+     *  compile error); append new causes ABOVE this line. */
     CRDPQ_ICON_ERR_DEST,
 } crdpq_icon_convert_result_t;
 
@@ -843,6 +849,28 @@ crdpq_icon_convert_result_t crdpq_icon_convert(uint32_t bpp, uint32_t width, uin
                                                uint32_t cbBitsColor, const uint8_t* bitsColor,
                                                const uint8_t* colorTable, const uint8_t* bitsMask,
                                                uint8_t* dst, size_t dst_capacity);
+
+/** W3 lane G (ADR-0018 §2; the first step of U-6; drill-01 §8.1's cheapest path): records one
+ *  `crdpq_icon_convert` refusal by cause. `crdpq_icon_convert` already distinguishes its causes
+ *  by return code, but the bridge folds every non-OK code into the single `iconSkipped` bit, so
+ *  downstream an oversize (>`CRDPQ_ICON_MAX_DIM`) refusal and a bad-bpp refusal were the same
+ *  count -- and ADR-0015 §7 (b)'s trigger ("the oversize cause is separately countable") could
+ *  never fire. The caller (CRSession's notify-icon callback) invokes this exactly where it sets
+ *  `iconSkipped` for a conversion failure, passing the wire `width`/`height` so the oversize
+ *  counter can count ONLY the `CRDPQ_ICON_ERR_DIMENSIONS` refusals where an axis exceeds the cap
+ *  (a zero-sized icon is a DIMENSIONS refusal too, but not an oversize one). `CRDPQ_ICON_OK` and
+ *  a NULL store are ignored. Slot exhaustion keeps its own counter (`..._overflow_count`).
+ *  Cumulative for the store's lifetime -- survives `crdpq_icon_store_clear` -- same contract as
+ *  `overflow_count`. Values are never changed by this: adr/0013 §4's 48 px cap stays as is until
+ *  the 2x checkpoint has read these counters (ADR-0018 U-6). */
+void crdpq_icon_store_note_convert_refusal(crdpq_icon_store_t* s, crdpq_icon_convert_result_t rc,
+                                           uint32_t width, uint32_t height);
+/** Cumulative number of refusals recorded with exactly `rc`; 0 for `CRDPQ_ICON_OK`, an
+ *  out-of-range code, or a NULL store. */
+size_t crdpq_icon_store_refusal_count(const crdpq_icon_store_t* s, crdpq_icon_convert_result_t rc);
+/** Cumulative number of DIMENSIONS refusals whose `width` or `height` exceeded
+ *  `CRDPQ_ICON_MAX_DIM` -- the "oversize" evidence ADR-0015 §7 (b) asks for. */
+size_t crdpq_icon_store_oversize_count(const crdpq_icon_store_t* s);
 
 /* ==================================================================================== *
  * Frame lane (crdpq_frames) — GFX frames are state, not events: last-writer-wins per

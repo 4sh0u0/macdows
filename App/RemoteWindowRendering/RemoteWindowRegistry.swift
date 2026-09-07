@@ -739,6 +739,7 @@ final class RemoteWindowRegistry {
         // ignored; no consumer wants them yet).
         case .notifyIconCreate:
             trayStatusController.noteStoreOverflowCount(Int(session.iconStoreOverflowCount))
+            trayStatusController.noteStoreOversizeRefusalCount(Int(session.iconStoreOversizeRefusalCount))
             noteNotifyIconVersion(from: event)
             trayStatusController.handleNotifyIconCreate(
                 windowId: event.windowId, notifyIconId: event.notifyIconId,
@@ -747,6 +748,7 @@ final class RemoteWindowRegistry {
             )
         case .notifyIconUpdate:
             trayStatusController.noteStoreOverflowCount(Int(session.iconStoreOverflowCount))
+            trayStatusController.noteStoreOversizeRefusalCount(Int(session.iconStoreOversizeRefusalCount))
             noteNotifyIconVersion(from: event)
             trayStatusController.handleNotifyIconUpdate(
                 windowId: event.windowId, notifyIconId: event.notifyIconId,

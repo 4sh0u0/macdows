@@ -443,6 +443,11 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// way (a reconnect clears the slots but never this counter). Consumed by
 /// `TrayStatusController.Diagnostics.storeOverflowCount`.
 @property (nonatomic, readonly) uint64_t iconStoreOverflowCount;
+/// W3 lane G (ADR-0018 §2 / U-6 first step): passthrough of the side-store's cumulative count of
+/// notify-icon bitmaps refused because an axis exceeded `CRDPQ_ICON_MAX_DIM` (48) -- the ONE
+/// cause ADR-0015 §7 (b) wants countable on its own, separated from bad-bpp / bad-`cb*` refusals
+/// that share the `iconSkipped` bit. Same lifetime semantics as `iconStoreOverflowCount`.
+@property (nonatomic, readonly) uint64_t iconStoreOversizeRefusalCount;
 
 /// Cumulative count of OUTBOUND commands `crb_outbound_visitor` threw away because the RAIL
 /// channel wasn't connected when T_rdp drained them (W4a review M3 — it has counted and

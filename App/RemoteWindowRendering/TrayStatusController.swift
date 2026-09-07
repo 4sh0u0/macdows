@@ -98,6 +98,11 @@ final class TrayStatusController {
     /// reference) on every notify-icon order rather than pulled from here, keeping this type's
     /// dependency surface at "AppKit + values handed to it", exactly as before.
     private(set) var storeOverflowCount = 0
+    /// W3 lane G (ADR-0018 §2 / U-6 first step): latest observed value of
+    /// `CRSession.iconStoreOversizeRefusalCount` -- the side-store's count of bitmaps refused
+    /// because an axis exceeded `CRDPQ_ICON_MAX_DIM`, separated from the other `iconSkipped`
+    /// causes. Pushed in by `RemoteWindowRegistry` the same way as `storeOverflowCount`.
+    private(set) var storeOversizeRefusalCount = 0
     /// adr/0014 §1: left clicks this controller actually handed to `onLeftClick` -- one per
     /// CLICK, not per PDU (see `notifyEventsSent`). Cumulative, NOT reset by `removeAll()`,
     /// same post-shutdown-read reasoning as `createsSeen` above.
@@ -194,6 +199,9 @@ final class TrayStatusController {
         /// Cumulative; the C side-store's slot-exhaustion counter (adr/0013 §1), as last
         /// pushed in by `RemoteWindowRegistry`.
         let storeOverflowCount: Int
+        /// Cumulative; the C side-store's oversize-refusal counter (W3 lane G), as last pushed in
+        /// by `RemoteWindowRegistry`. Read at the 2x checkpoint (ADR-0018 U-6); no gate today.
+        let storeOversizeRefusalCount: Int
         /// Cumulative; see `clicksForwarded`'s own doc comment (adr/0014 §5).
         let clicksForwarded: Int
         /// Cumulative; see `clicksDroppedIconGone`'s own doc comment -- an acceptance gate
@@ -219,6 +227,7 @@ final class TrayStatusController {
             iconSkippedCount: iconSkippedCount, cachedIconCount: cachedIconCount,
             realIconMaxObserved: realIconMaxObserved,
             storeOverflowCount: storeOverflowCount,
+            storeOversizeRefusalCount: storeOversizeRefusalCount,
             clicksForwarded: clicksForwarded, clicksDroppedIconGone: clicksDroppedIconGone,
             notifyEventsSent: notifyEventsSent,
             observedNotifyIconVersions: observedNotifyIconVersions.sorted()
@@ -228,6 +237,10 @@ final class TrayStatusController {
     /// adr/0013 §1: latest `CRSession.iconStoreOverflowCount`, pushed in by
     /// `RemoteWindowRegistry` (the CRSession owner) on every notify-icon order. Monotonic on
     /// the C side, so this is a plain assignment rather than an accumulation.
+    func noteStoreOversizeRefusalCount(_ count: Int) {
+        storeOversizeRefusalCount = count
+    }
+
     func noteStoreOverflowCount(_ count: Int) {
         storeOverflowCount = count
     }

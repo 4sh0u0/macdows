@@ -70,10 +70,14 @@ struct TrayStatusControllerTests {
         controller.noteNotifyEventSent()
         controller.noteStoreOverflowCount(5)
         controller.noteStoreOverflowCount(3)
+        // W3 lane G: the oversize-refusal count is pushed in the same "latest value" way.
+        controller.noteStoreOversizeRefusalCount(4)
+        controller.noteStoreOversizeRefusalCount(2)
 
         let diagnostics = controller.diagnostics()
         #expect(diagnostics.notifyEventsSent == 3)
         #expect(diagnostics.storeOverflowCount == 3)
+        #expect(diagnostics.storeOversizeRefusalCount == 2)
     }
 
     /// A fresh controller's diagnostics are all-zero/empty -- the baseline every cumulative
@@ -89,6 +93,7 @@ struct TrayStatusControllerTests {
         #expect(diagnostics.cachedIconCount == 0)
         #expect(diagnostics.realIconMaxObserved == 0)
         #expect(diagnostics.storeOverflowCount == 0)
+        #expect(diagnostics.storeOversizeRefusalCount == 0)
         #expect(diagnostics.clicksForwarded == 0)
         #expect(diagnostics.clicksDroppedIconGone == 0)
         #expect(diagnostics.notifyEventsSent == 0)
