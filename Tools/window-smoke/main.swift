@@ -534,8 +534,9 @@ enum F1BackingVsMapped {
         let mappedWidthInRemotePixels: Double
         let mappedHeightInRemotePixels: Double
 
-        /// EXACT equality, both axes, is GREEN. At an implied backing scale of 1 (or unknown) any
-        /// disagreement is RED -- the odd-dimension mechanism exists only above 1x. Otherwise each
+        /// EXACT equality, both axes, is GREEN. Unless the implied backing scale is ABOVE 1 (so at
+        /// 1, below 1, or unknown) any disagreement is RED -- the odd-dimension mechanism exists only
+        /// above 1x (gate w3-lane-c r1 B, r2 tightening from `!= 1`). Otherwise each
         /// axis is classified on its own: `equal` / `oddOffByOne` (|backing − mapped| == 1 and the
         /// mapped dimension is an odd integer) / `other`. Any `other` axis is RED; else (at least
         /// one `oddOffByOne`) it is `.oddDimensionOffByOne`. No tolerance and no rounding anywhere
@@ -545,7 +546,7 @@ enum F1BackingVsMapped {
             let w = Self.axisClass(backing: backingWidthInBackingPixels, mapped: mappedWidthInRemotePixels)
             let h = Self.axisClass(backing: backingHeightInBackingPixels, mapped: mappedHeightInRemotePixels)
             if w == .equal && h == .equal { return .green }
-            guard let scale = impliedBackingScale, scale != 1 else { return .red }
+            guard let scale = impliedBackingScale, scale > 1 else { return .red }
             if w == .other || h == .other { return .red }
             return .oddDimensionOffByOne
         }
@@ -1115,6 +1116,13 @@ enum WindowSmokeGateSelfTest {
             f1(backing: (1016, 1014), content: (508, 507), mapped: (1016, 1013)).verdict == .oddDimensionOffByOne
                 && f1(backing: (1016, 1014), content: (508, 507), mapped: (1016, 1012)).verdict == .red,
             "f1OddNeedsNonUnitScale: the same 1 px gap against an odd mapped dimension is ODD1 at 2x and RED at 1x (previous case); a 2 px gap at 2x is RED"
+        )
+        // Below-unit scales have no physical source (AppKit backing scales are integers >= 1) but the
+        // type accepts any Double; the guard says "above 1x", so a 0.5x fixture with an odd ±1 must
+        // still be RED (gate w3-lane-c r2, non-blocking: `!= 1` was wider than the stated mechanism).
+        expect(
+            f1(backing: (254, 254), content: (508, 508), mapped: (254, 253)).verdict == .red,
+            "f1OddNeedsScaleAboveOne: an odd-dimension 1 px gap at an implied scale of 0.5 is RED, not ODD1"
         )
         // --- W3 lane C (ADR-0018 U-3 "先分类不裁量"): the odd-dimension off-by-one --------------
         // At 2x a content rect of integral points converts to an EVEN backing size on both axes;
