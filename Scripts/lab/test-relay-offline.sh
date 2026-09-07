@@ -487,7 +487,7 @@ if assert_eq "$(xfreerdp_calls)" '1' 'xfreerdp invocations' \
 	&& assert_argv_has "$argv" '/v:192.0.2.10' && assert_argv_has "$argv" '/u:labtest-placeholder' \
 	&& assert_argv_has "$argv" "/drive:lab,$SBRUNTIME/share" && assert_lacks "$LABTEST_TRACE" '198.51.100.7' \
 	&& assert_lacks "$LABTEST_TRACE" '/etc]' && assert_argv_has "$argv" '/app:program:C:\Windows\System32\notepad.exe'; then
-	pass "$CASE: WIN_HOST/WIN_USER/WIN_PASS/SHARE overrides in job.env never reach the argv (subshell read, three keys only)"
+	pass "$CASE: WIN_HOST/WIN_USER/WIN_PASS/SHARE overrides in job.env never reach the argv (subshell read, four keys only)"
 fi
 
 # 11. Across EVERY case above the refuse shims were never reached: the Terminal self-close
@@ -510,6 +510,58 @@ fi
 # ------------------------------------------------------------------------------------------
 # Mutation proofs: the pins above must FAIL against a relay with the guard removed.
 # ------------------------------------------------------------------------------------------
+
+# 12. XFREERDP_EXTRA (T6-prime RA3, 2026-09-07): a job may add xfreerdp switches from a closed
+#     allowlist -- /scale:<100|140|180>, /scale-desktop:<100-500>, /scale-device:<100|140|180>,
+#     /dynamic-resolution -- so a job can join the session as a client declaring a non-100 %
+#     scale. Anything else is refused as JOB-ENV-INVALID (65) before any connection: the key
+#     must not become a second way to redirect the connection (/v:, /u:, /p:, /drive:) or to
+#     smuggle arbitrary switches. Tokens are separate argv elements placed before the /app spec.
+begin '12a XFREERDP_EXTRA allowed tokens (tracked job)'
+cp "$LAB/jobs/other-client-scale180.env" "$SBRUNTIME/job.env" || exit 1
+run_relay "$SBLAB/relay.command" "" exit0
+argv="$(xfreerdp_argv)"
+if assert_eq "$(xfreerdp_calls)" "1" "xfreerdp invocations" && assert_argv_has "$argv" '/scale:180' && assert_argv_has "$argv" '/dynamic-resolution' \
+	&& assert_argv_has "$argv" '/app:program:C:\Windows\System32\winver.exe' \
+	&& [[ "${argv%%\[/app:program:*}" == *'[/scale:180]'* ]] && assert_eq "$(last_line)" "DONE exit=0" "last line"; then
+	pass "$CASE: /scale:180 and /dynamic-resolution reach xfreerdp as their own argv elements, before the /app spec; DONE exit=0"
+fi
+
+begin '12b XFREERDP_EXTRA cannot redirect the connection'
+printf 'PROGRAM=%q\nXFREERDP_EXTRA=%q\nTIMEOUT=5\n' 'C:\Windows\System32\notepad.exe' '/scale:180 /v:198.51.100.7' > "$SBRUNTIME/job.env"
+run_relay "$SBLAB/relay.command" "" exit0
+if assert_eq "$(xfreerdp_calls)" "0" "xfreerdp invocations" && assert_has "$LOG" 'JOB-ENV-INVALID' \
+	&& assert_eq "$(last_line)" "DONE exit=65" "last line" && assert_lacks "$LABTEST_TRACE" '198.51.100.7'; then
+	pass "$CASE: a /v: token in XFREERDP_EXTRA is refused as JOB-ENV-INVALID (65); xfreerdp never runs"
+fi
+
+begin '12c XFREERDP_EXTRA value outside the allowlist'
+printf 'PROGRAM=%q\nXFREERDP_EXTRA=%q\nTIMEOUT=5\n' 'C:\Windows\System32\notepad.exe' '/scale:150' > "$SBRUNTIME/job.env"
+run_relay "$SBLAB/relay.command" "" exit0
+if assert_eq "$(xfreerdp_calls)" "0" "xfreerdp invocations" && assert_has "$LOG" 'JOB-ENV-INVALID' \
+	&& assert_eq "$(last_line)" "DONE exit=65" "last line"; then
+	pass "$CASE: /scale:150 (not one of 100|140|180) is refused as JOB-ENV-INVALID (65)"
+fi
+
+# 12d is a regression pin, not a must-red (it passed against the pre-change relay too, gate r1 m-1):
+# it guards the other tracked jobs' argv against a future default value or stray token.
+begin '12d XFREERDP_EXTRA absent leaves the argv unchanged'
+write_job 'C:\Windows\System32\notepad.exe'
+run_relay "$SBLAB/relay.command" "" exit0
+argv="$(xfreerdp_argv)"
+if assert_eq "$(xfreerdp_calls)" "1" "xfreerdp invocations" && assert_lacks "$LABTEST_TRACE" '/scale' && assert_lacks "$LABTEST_TRACE" '/dynamic-resolution' \
+	&& assert_argv_has "$argv" '/app:program:C:\Windows\System32\notepad.exe' && assert_eq "$(last_line)" "DONE exit=0" "last line"; then
+	pass "$CASE: without XFREERDP_EXTRA no extra switch appears (regression pin)"
+fi
+
+begin '12e CRLF XFREERDP_EXTRA'
+printf 'PROGRAM=%q\r\nXFREERDP_EXTRA=%q\r\nTIMEOUT=5\r\n' 'C:\Windows\System32\notepad.exe' '/scale:140' > "$SBRUNTIME/job.env"
+run_relay "$SBLAB/relay.command" "" exit0
+argv="$(xfreerdp_argv)"
+if assert_eq "$(xfreerdp_calls)" "1" "xfreerdp invocations" && assert_argv_has "$argv" '/scale:140' && assert_lacks "$LABTEST_TRACE" "$(printf '\r')" \
+	&& assert_eq "$(last_line)" "DONE exit=0" "last line"; then
+	pass "$CASE: a trailing CR on XFREERDP_EXTRA is stripped; /scale:140 accepted; no CR reaches the argv"
+fi
 
 # M1. Boundary gate bypassed (`if ! crdp_assert_lab_boundary` -> `if false`): the refused
 #     scenario must now invoke xfreerdp, i.e. case 1's pin bites.
@@ -554,12 +606,12 @@ fi
 #     the isolation.
 begin 'M3 plain-source mutant'
 MUTANT_SOURCE="$SBLAB/labtest-mutant-source.command"
-# The JOB_KEYS subshell line becomes a plain `source` (the `read` block then reads three empty
-# lines from the here-doc, so the subsequent `${TIMEOUT:-25}` default and PROGRAM come from the
-# sourced variables -- exactly the pre-isolation behaviour).
+# The JOB_KEYS subshell line becomes a plain `source` (the `read` block then reads four empty
+# lines from the here-doc, so the subsequent `${TIMEOUT:-25}` default, PROGRAM and XFREERDP_EXTRA
+# come from the sourced variables -- exactly the pre-isolation behaviour).
 if awk '
 	/JOB_KEYS="\$\( \. "\$RUNTIME\/job\.env"/ {
-		if (!done) { print "        source \"$RUNTIME/job.env\"; JOB_KEYS=\"${PROGRAM:-}"; print "${CMDARGS:-}"; print "${TIMEOUT:-}"; print "END-OF-JOB-KEYS\""; done = 1 }
+		if (!done) { print "        source \"$RUNTIME/job.env\"; JOB_KEYS=\"${PROGRAM:-}"; print "${CMDARGS:-}"; print "${TIMEOUT:-}"; print "${XFREERDP_EXTRA:-}"; print "END-OF-JOB-KEYS\""; done = 1 }
 		next
 	}
 	{ print }
@@ -582,6 +634,24 @@ else
 	fail "$CASE: could not build the mutant (the subshell read lines moved?)"
 fi
 
+# M4. XFREERDP_EXTRA allowlist disabled (`if ! relay_extra_tokens_ok` -> `if false`): case 12b's
+#     redirect scenario must now reach xfreerdp with the /v: token -- i.e. 11b pins the allowlist.
+begin 'M4 extra-allowlist mutant'
+MUTANT_EXTRA="$SBLAB/labtest-mutant-extra.command"
+# shellcheck disable=SC2016  # deliberate literal `$XFREERDP_EXTRA` for sed
+if sed 's/if ! relay_extra_tokens_ok "\$XFREERDP_EXTRA"; then/if false; then/' "$SBLAB/relay.command" > "$MUTANT_EXTRA" \
+	&& ! cmp -s "$MUTANT_EXTRA" "$SBLAB/relay.command" && bash -n "$MUTANT_EXTRA"; then
+	printf 'PROGRAM=%q\nXFREERDP_EXTRA=%q\nTIMEOUT=5\n' 'C:\Windows\System32\notepad.exe' '/scale:180 /v:198.51.100.7' > "$SBRUNTIME/job.env"
+	run_relay "$MUTANT_EXTRA" "" exit0
+	if [ "$(xfreerdp_calls)" = "1" ] && grep -qF '198.51.100.7' "$LABTEST_TRACE"; then
+		pass "$CASE: detected -- the redirect token reaches xfreerdp (case 12b pins the allowlist)"
+	else
+		fail "$CASE: NOT detected -- case 12b would pass against a relay without the allowlist"
+	fi
+else
+	fail "$CASE: could not build the mutant (the allowlist guard line moved?)"
+fi
+
 # No sleeping shim recorded by THIS run may outlive the suite (the `exec sleep` shape plus
 # kill_recorded_shims). Checked against the pids this run recorded, not a machine-wide pgrep --
 # an unrelated `sleep 30` on the maintainer's Mac is not this suite's business.
@@ -602,9 +672,12 @@ fi
 
 # Every case must have reported (review r2 B1): a case that neither passed nor failed would
 # otherwise vanish from the tally with exit 0.
-EXPECTED_CASES=21
+EXPECTED_CASES=27
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi
+
+
+
 printf '\n%d passed, %d failed\n' "$PASSES" "$FAILURES"
 [ "$FAILURES" -eq 0 ]
