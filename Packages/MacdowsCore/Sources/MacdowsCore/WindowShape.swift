@@ -16,6 +16,9 @@ public enum WindowShape {
     /// UNIT (ADR-0015 §1 vocabulary, M1/L8 tagging pass): **remote px** — the RDP wire's own
     /// unit, the same one `WindowsRect` carries, and the reason `ContentSize` (mac pt) needed
     /// the unit contract spelled out on it: these two types meet inside `computeMask`.
+    /// (W3 lane B: the `rasterScale:` overload hands this SAME struct to the pt-only transform
+    /// already divided into mac pt -- the struct carries numbers; which unit they are in is the
+    /// receiving function's contract, stated on each entry point.)
     public struct WireRect: Sendable, Equatable {
         public var left: Double
         public var top: Double
@@ -117,6 +120,15 @@ public enum WindowShape {
     ///    that future conversion is the identity, which is what "no rendering behavior change"
     ///    means concretely for this wave.
     ///
+    ///    **W3 lane B (ADR-0018 §2; U-4 direction (i)) -- it fired, in the shape item 3 said:** the
+    ///    conversion is now explicit and lives in the `computeMask(..., rasterScale:)` overload at
+    ///    the end of this enum, which divides every wire-space input by `rasterScale` once and hands
+    ///    the pt-only transform inputs already in this type's unit. `RemoteWindowRegistry.
+    ///    computeMaskResult` is the caller that crosses the boundary (it passes the frozen
+    ///    topology's `rasterScale`); this type keeps meaning exactly "the layer's own bounds, in
+    ///    mac pt", and `LayerRect` stays mac pt. The divisor's VALUE is still the 2x checkpoint's
+    ///    to confirm (ADR-0018 §3); the merge of this lane waits for U-4.
+    ///
     /// AND THE OUTPUT IS `LayerRect`, NOT `MacRect`: this height is the mask's flip anchor, in
     /// the layer's OWN space. The primary screen's height (`DisplayFlipAnchor.
     /// primaryHeightInPoints`) is a different anchor for a different space and must never be
@@ -187,6 +199,10 @@ public enum WindowShape {
     ///    y-origin is `contentSize.height − local.bottom`.
     /// 3. Clip to `(0, 0, contentSize)`; a rect with an empty intersection is dropped, never
     ///    enlarged past what the server actually reported.
+    ///
+    /// UNIT-HOMOGENEOUS: every geometric input here must already be in `contentSize`'s unit
+    /// (mac pt). Wire-space callers go through the `rasterScale:` overload below, which divides
+    /// them into that unit first (W3 lane B); at 1x the two entry points coincide.
     public static func computeMask(
         visibilityRects: [WireRect],
         wireCount: UInt32,
@@ -246,5 +262,49 @@ public enum WindowShape {
             }
         }
         return .rects(transformed)
+    }
+
+    /// W3 lane B (ADR-0018 §2 / U-4 direction (i); ADR-0015 §7 (c) item 3 "what changes when it
+    /// fires"): the same transform with the unit boundary crossed HERE, explicitly, once. Every
+    /// geometric input except `contentSize` is wire space -- **remote px**: the `WireRect`s, the
+    /// RAIL `windowOffset` / `visibleOffset`, `correction.originX/Y`, `topInset` -- and each is
+    /// divided by `rasterScale` (remote px per mac pt, `DisplayTopology.rasterScale`) before it
+    /// meets the mac-pt `contentSize` in the unit-homogeneous transform above. At `rasterScale == 1`
+    /// this is the identity, i.e. exactly the behaviour every session so far has had
+    /// (`WindowShapeUnitBoundaryTests.identityAtOneX`). A non-positive or non-finite `rasterScale`
+    /// is "unit unknown" and fails open to `.none` -- adr/0010 §3's reading of every unknown: no
+    /// mask, never a wrong one. Whether the divisor is `rasterScale` for real is what the 2x
+    /// checkpoint measures (ADR-0018 §3; U-4 is the owner's), which is why the registry, not this
+    /// file, chooses to call this overload.
+    public static func computeMask(
+        visibilityRects: [WireRect],
+        wireCount: UInt32,
+        truncated: Bool,
+        windowOffset: (x: Double, y: Double),
+        visibleOffset: (x: Double, y: Double)?,
+        correction: WindowGeometryCorrection,
+        topInset: Double,
+        contentSize: ContentSize,
+        isMaximized: Bool,
+        rasterScale: Double
+    ) -> MaskResult {
+        guard rasterScale.isFinite, rasterScale > 0 else { return .none }
+        let s = rasterScale
+        return computeMask(
+            visibilityRects: visibilityRects.map {
+                WireRect(left: $0.left / s, top: $0.top / s, right: $0.right / s, bottom: $0.bottom / s)
+            },
+            wireCount: wireCount,
+            truncated: truncated,
+            windowOffset: (x: windowOffset.x / s, y: windowOffset.y / s),
+            visibleOffset: visibleOffset.map { (x: $0.x / s, y: $0.y / s) },
+            correction: WindowGeometryCorrection(
+                originX: correction.originX / s, originY: correction.originY / s,
+                width: correction.width, height: correction.height
+            ),
+            topInset: topInset / s,
+            contentSize: contentSize,
+            isMaximized: isMaximized
+        )
     }
 }
