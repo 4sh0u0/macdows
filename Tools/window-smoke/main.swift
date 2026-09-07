@@ -4109,10 +4109,17 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         } else {
             declaredDesktopAssigned = nil
             advertisedScaleAssigned = nil
+            // W3 lane E: unlike the desktop pair above (left as it was, by adr/0015 §5.A.6's own
+            // rule), the advertised-scale pair is ZEROED here. Cycle mode reuses this one CRSession
+            // across reconnects, so a pair left over from an earlier freeze would be read by the
+            // next -start while the evidence line says nothing was advertised (gate w3-lane-e r1 m-1).
+            session.advertisedDesktopScaleFactor = 0
+            session.advertisedDeviceScaleFactor = 0
             print(
                 "[topology] \(reason): no usable display -- desktopWidth/Height deliberately NOT set "
                     + "(adr/0015 §5.A.6: 0x0 falls back to FreeRDP's 1024x768 desktop, CRSession.h:285-286). "
                     + "Any previously negotiated size is now stale."
+                    + (advertisedScaleKnob == .unset ? "" : " Advertised-scale pair cleared (WINDOW_SMOKE_ADVERTISED_SCALE set, nothing to resolve against): NOT advertising.")
             )
         }
         return desktop

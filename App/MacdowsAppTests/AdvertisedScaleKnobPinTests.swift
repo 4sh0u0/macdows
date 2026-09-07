@@ -52,6 +52,11 @@ struct AdvertisedScaleKnobPinTests {
         let suffixCall = "AdvertisedScaleKnob.evidenceSuffix(knobSet: advertisedScaleKnob != .unset, assigned: advertisedScaleAssigned)"
         #expect(occurrences(of: suffixCall, in: src) >= 3)
         #expect(src.contains("AdvertisedScaleKnob.resolve(advertisedScaleKnob, rasterScale: displayTopology.sessionSnapshot?.rasterScale)"))
+        // Both "nothing to advertise" branches -- a knob that resolves to nothing, and no usable
+        // display -- zero the pair: cycle mode reuses one CRSession, so a pair left over from an
+        // earlier freeze would be read back by the next -start while the evidence says nothing was
+        // advertised (gate w3-lane-e r1 m-1).
+        #expect(occurrences(of: "session.advertisedDesktopScaleFactor = 0 session.advertisedDeviceScaleFactor = 0", in: src) == 2)
     }
 
     @Test("the App target never reads the knob (fixture-only)")
