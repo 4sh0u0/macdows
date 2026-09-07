@@ -306,16 +306,20 @@ if [ -e "$FREERDP_SRC/.git" ]; then
     check 'the real queue passes rule 1 and rule 2 against the pinned checkout' 0 '' --freerdp-src "$FREERDP_SRC"
     # gate r1 m-4: a RELATIVE --patch-dir must be normalised before `git -C <submodule> apply --check`
     # resolves it -- otherwise git looks for the patch inside the submodule (the documented pitfall).
-    # Relative names are exercised from inside $TMP (never from the repo, never under .build/).
+    # Relative names are exercised from inside $TMP (never from the repo, never under .build/), with a
+    # SYNTHETIC patch that applies to the pinned checkout -- built from the real first two lines of its
+    # README.md so the case never depends on the live queue being non-empty (retire-gate m-1).
     mkdir -p "$TMP/rel/queue"
-    if compgen -G "$REPO_ROOT/ThirdParty/patches/*.patch" >/dev/null; then
-        cp "$REPO_ROOT"/ThirdParty/patches/*.patch "$TMP/rel/queue/"
-        pushd "$TMP/rel" >/dev/null
-        check 'a relative --patch-dir is normalised before git apply --check' 0 'validated' --patch-dir queue --freerdp-src "$FREERDP_SRC"
-        popd >/dev/null
-    else
-        echo "  skip relative --patch-dir case: the real queue is empty (nothing that applies to copy)"
-    fi
+    {
+        printf '%s\n' "$LINK"
+        printf '%s\n' 'diff --git a/README.md b/README.md' '--- a/README.md' '+++ b/README.md' '@@ -1,2 +1,3 @@'
+        sed -n '1p' "$FREERDP_SRC/README.md" | sed 's/^/ /'
+        printf '%s\n' '+<!-- test-patch-queue fixture line (never applied; --check only) -->'
+        sed -n '2p' "$FREERDP_SRC/README.md" | sed 's/^/ /'
+    } > "$TMP/rel/queue/0001-synthetic.patch"
+    pushd "$TMP/rel" >/dev/null
+    check 'a relative --patch-dir is normalised before git apply --check' 0 'validated' --patch-dir queue --freerdp-src "$FREERDP_SRC"
+    popd >/dev/null
 else
     echo "  FAIL rule 2 cases need the ThirdParty/FreeRDP submodule checkout (git submodule update --init)"; fail=$((fail + 2))
 fi

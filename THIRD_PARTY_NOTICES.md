@@ -62,29 +62,20 @@ everything the licences require.
   headers untouched — see `ThirdParty/patches/README.md`). Shipped with the app as
   `Contents/Resources/licenses/LICENSE-FreeRDP-Apache-2.0.txt`, a byte-identical copy
   tracked at `ThirdParty/licenses/LICENSE-FreeRDP-Apache-2.0.txt`.
-- **Modified**: Yes — one patch, applied at build time from the external patch queue at
-  `ThirdParty/patches/` (the vendored checkout itself stays a verbatim copy of the pinned
-  tag; `Scripts/build-freerdp.sh` applies the queue before configuring and reverts it
-  afterwards). The entry is `0002-rdpgfx-lab-scaledmap-advertise-option.patch` (2026-09-07,
-  ADR-0016): it adds a CMake option `MACDOWS_LAB_SCALEDMAP_ADVERTISE`, default **OFF**, to
-  `cmake/ConfigOptions.cmake` and `include/config/config.h.in`, and one more `!defined(...)`
-  term at the five places `channels/rdpgfx/client/rdpgfx_main.c` ORs
-  `RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE` into an advertised capability set. With the option OFF
-  (every product build) the preprocessed source is identical to the pinned tag; ON is used only
-  by the non-rendering lab capture tool `Tools/rail-probe` for one contrast experiment and is
-  never part of the app. It is carried under the queue's lab-only exception to rule 1 (no
-  upstream record: the upstream behaviour is correct, this is a laboratory knob), so its
-  `sbom/macdows.cdx.json` `pedigree.patches` object has an empty `resolves` list; the SBOM
-  generator reads the queue directory, not this text. The previous entry,
-  `0001-core-capabilities-apply-input-caps-from-src.patch`, was absorbed upstream (PR #13287
-  and this project's PR #13313) and retired on the 3.31.1 pin (record in `deps/freerdp.lock`,
-  `retired_patches`).
-  §4(b) ("modified files carry prominent notices") is discharged twice over: the modified
-  source is never distributed — only the patch is — and its header records what changed, why,
-  and its retirement condition; and each modified site in the three files carries a
-  `Macdows lab patch 0002` notice inside the patch -- a one-line comment at the six C / template
-  sites and the option's own description string in `cmake/ConfigOptions.cmake` -- so a source
-  tree with the queue applied says so in the files themselves.
+- **Modified**: No — the external patch queue at `ThirdParty/patches/` is empty as of
+  2026-09-07. The vendored checkout is a verbatim copy of the pinned tag, and
+  `Scripts/build-freerdp.sh` still applies whatever the queue holds before configuring and
+  reverts it afterwards, so a future patch would re-enter this section the same way. Two
+  patches were carried and retired: `0001-core-capabilities-apply-input-caps-from-src.patch`
+  (against 3.30.0; absorbed upstream by PR #13287 and this project's PR #13313, retired on the
+  3.31.1 pin bump) and `0002-rdpgfx-lab-scaledmap-advertise-option.patch` (2026-09-07 only; a
+  default-OFF CMake option for one laboratory contrast experiment on the non-rendering capture
+  tool, carried under the queue's lab-only exception and retired by design the same day when
+  the experiment's record was filed -- no product build ever shipped with it ON, and with it
+  OFF the preprocessed source was identical to the pinned tag). Both retirement records with
+  their verification live in `deps/freerdp.lock` (`retired_patches`).
+  `sbom/macdows.cdx.json`'s `pedigree.patches` for this component is therefore empty; the
+  SBOM generator reads the queue directory, not this text.
   The Apache-2.0 obligations are met as before: the licence text and every upstream copyright
   header ship unaltered. §4(d) adds nothing here: FreeRDP 3.31.1 has no top-level `NOTICE`
   file, only `LICENSE`. (The one `NOTICE` anywhere in its tree,

@@ -5,16 +5,7 @@
   "tag": "3.31.1",
   "commit": "63b948ca5cb94307fd5444ee6e73927a41ccdab4",
   "upstream_url": "https://github.com/FreeRDP/FreeRDP.git",
-  "patches": [
-    {
-      "file": "0002-rdpgfx-lab-scaledmap-advertise-option.patch",
-      "targets": ["cmake/ConfigOptions.cmake", "include/config/config.h.in", "channels/rdpgfx/client/rdpgfx_main.c"],
-      "upstream": "none -- lab-only exception (ThirdParty/patches/README.md rule 1; owner ruling 2026-09-07), ADR docs/adr/0016-scaledmap-disable-configurable-d1.md",
-      "added_on": "2026-09-07",
-      "summary": "CMake option MACDOWS_LAB_SCALEDMAP_ADVERTISE, default OFF: omits RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE from the advertised RDPGFX capability sets (five sites in rdpgfx_main.c) for the D1 contrast experiment on Tools/rail-probe only. Each modified site carries a `Macdows lab patch 0002` notice -- a one-line comment at the six C / template sites, the option description in ConfigOptions.cmake (Apache-2.0 section 4(b)); the option is carried under the rule-1 lab-only exception, so the SBOM patch object has an empty resolves list. With the option OFF the preprocessed source is unchanged; the option is surfaced by Scripts/build-freerdp.sh as CRDP_LAB_SCALEDMAP_ADVERTISE=1, which builds a separate config-hash prefix that is never made `current`.",
-      "retire_when": "D1's record (docs/upgrade-gate/2026-09-d1-scaledmap-contrast.md) is filed, or the hunks stop applying on a pin bump."
-    }
-  ],
+  "patches": [],
   "_patches_note": "Inventory and rationale only — ThirdParty/patches/*.patch is the authoritative queue. Scripts/build-freerdp.sh discovers patches by globbing that directory (never from this field) and folds their file *contents* into the config hash, and Scripts/gen-notices.sh derives the SBOM's pedigree.patches from the same directory, so nothing mechanical reads this block and it cannot drift the build. It exists because this lock is the reviewable pin record: a reader must be able to see from here alone that the pinned checkout is not built verbatim. Per-hunk detail (defect, provenance, upstream status, retirement condition) lives in each patch file's own header; the queue's rules live in ThirdParty/patches/README.md.",
   "deployment_target": "14.0",
   "_deployment_target_note": "Single source for the minimum macOS version this repo targets. Scripts/build-openssl.sh reads this for -mmacosx-version-min; Scripts/build-freerdp.sh substitutes it into the -DCMAKE_OSX_DEPLOYMENT_TARGET flag below (the literal '14.0' in cmake_config.flags is a fallback/documentation value only — the running script always overrides it from this field, so the two can never drift silently).",
@@ -158,6 +149,15 @@
     ]
   },
   "retired_patches": [
+    {
+      "file": "0002-rdpgfx-lab-scaledmap-advertise-option.patch",
+      "target": "cmake/ConfigOptions.cmake, include/config/config.h.in, channels/rdpgfx/client/rdpgfx_main.c",
+      "upstream": "none -- lab-only exception (ThirdParty/patches/README.md rule 1; owner ruling 2026-09-07), ADR docs/adr/0016-scaledmap-disable-configurable-d1.md",
+      "absorbed_in": "n/a -- not an upstream defect; retired by design when its experiment closed (README rule 1 lab-only exception: retired when the experiment closes, not carried)",
+      "verification": "D1 record filed (docs/upgrade-gate/2026-09-d1-scaledmap-contrast.md, r1 + r2: ADR-0016 section 3 row 1 hit, n=2 per side). Owner ruling 2026-09-07 14:04 JST carried two items in one message -- (1) retire this patch, (2) rerun the pair once -- and the retirement was executed after r2 finished (record section 6.4 states the two-item ruling). The patch still applied cleanly to the 3.31.1 tree at retirement (this is not the rule-2 case). With the queue empty the product config hash rotates and the lab prefix built with CRDP_LAB_SCALEDMAP_ADVERTISE=1 is no longer reproducible: Scripts/build-freerdp.sh refuses the toggle when the applied tree defines no MACDOWS_LAB_SCALEDMAP_ADVERTISE option, and the manifest records the option as <absent>.",
+      "retired_on": "2026-09-07",
+      "summary_when_active": "CMake option MACDOWS_LAB_SCALEDMAP_ADVERTISE (default OFF) that omitted RDPGFX_CAPS_FLAG_SCALEDMAP_DISABLE from the advertised RDPGFX capability sets at five sites in rdpgfx_main.c, for the D1 contrast experiment on Tools/rail-probe only; each modified site carried a Macdows lab patch 0002 notice; carried 2026-09-07 04:50-14:xx under the rule-1 lab-only exception."
+    },
     {
       "file": "0001-core-capabilities-apply-input-caps-from-src.patch",
       "target": "libfreerdp/core/capabilities.c",
