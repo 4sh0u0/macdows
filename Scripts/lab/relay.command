@@ -36,6 +36,20 @@ mkdir -p "$SHARE"
 LOG="$RUNTIME/relay.log"
 : > "$LOG"
 RELAY_RC=0
+# XFREERDP_EXTRA (job.env, optional; T6-prime RA3 "other client", 2026-09-07): extra xfreerdp
+# switches from a CLOSED allowlist -- the scale declarations and /dynamic-resolution -- so a job
+# can join the retained session as a client that declares a non-100 % scale. Every token must
+# match one shape exactly; anything else (a /v:, /u:, /p:, /drive:, a path, a shell character)
+# refuses the whole job as JOB-ENV-INVALID before any connection. The shapes admit no space,
+# quote, glob or comma, so the validated value can be word-split into argv safely.
+relay_extra_tokens_ok() { # <XFREERDP_EXTRA value>
+    local tok
+    for tok in $1; do
+        printf '%s' "$tok" | grep -qE '^/(scale:(100|140|180)|scale-desktop:(1[0-9][0-9]|[2-4][0-9][0-9]|500)|scale-device:(100|140|180)|dynamic-resolution)$' || return 1
+    done
+    return 0
+}
+
 {
     # shellcheck source=/dev/null
     source "$HOME/.config/macdows/host.env"
@@ -66,7 +80,7 @@ RELAY_RC=0
         echo "[relay] JOB-ENV-MISSING -- $RUNTIME/job.env is not readable; no connection attempted"
         RELAY_RC=66
     else
-        # One subshell, three lines out plus a sentinel (the keys are single-line by contract;
+        # One subshell, four lines out plus a sentinel (the keys are single-line by contract;
         # `read -r` keeps CMDARGS' backslashes). job.env therefore runs exactly once. A value
         # carrying a newline would shift the following lines, so the fourth read must land on
         # the sentinel or the job is refused as multi-line. job.env is normally copied from
@@ -74,13 +88,13 @@ RELAY_RC=0
         # each value; it is stripped, not shipped to xfreerdp's argv or fed to the TIMEOUT check
         # (review relay-offline r5 minors, r6 I1).
         # shellcheck source=/dev/null
-        JOB_KEYS="$( . "$RUNTIME/job.env" >/dev/null 2>&1; printf '%s\n%s\n%s\n%s\n' "${PROGRAM:-}" "${CMDARGS:-}" "${TIMEOUT:-}" 'END-OF-JOB-KEYS' )"
-        PROGRAM=""; CMDARGS=""; TIMEOUT=""; JOB_KEYS_END=""
-        { IFS= read -r PROGRAM; IFS= read -r CMDARGS; IFS= read -r TIMEOUT; IFS= read -r JOB_KEYS_END; } <<EOF_JOB_KEYS
+        JOB_KEYS="$( . "$RUNTIME/job.env" >/dev/null 2>&1; printf '%s\n%s\n%s\n%s\n%s\n' "${PROGRAM:-}" "${CMDARGS:-}" "${TIMEOUT:-}" "${XFREERDP_EXTRA:-}" 'END-OF-JOB-KEYS' )"
+        PROGRAM=""; CMDARGS=""; TIMEOUT=""; XFREERDP_EXTRA=""; JOB_KEYS_END=""
+        { IFS= read -r PROGRAM; IFS= read -r CMDARGS; IFS= read -r TIMEOUT; IFS= read -r XFREERDP_EXTRA; IFS= read -r JOB_KEYS_END; } <<EOF_JOB_KEYS
 $JOB_KEYS
 EOF_JOB_KEYS
         CR=$(printf '\r')
-        PROGRAM="${PROGRAM%"$CR"}"; CMDARGS="${CMDARGS%"$CR"}"; TIMEOUT="${TIMEOUT%"$CR"}"; JOB_KEYS_END="${JOB_KEYS_END%"$CR"}"
+        PROGRAM="${PROGRAM%"$CR"}"; CMDARGS="${CMDARGS%"$CR"}"; TIMEOUT="${TIMEOUT%"$CR"}"; XFREERDP_EXTRA="${XFREERDP_EXTRA%"$CR"}"; JOB_KEYS_END="${JOB_KEYS_END%"$CR"}"
         TIMEOUT="${TIMEOUT:-25}"
         if [ "$JOB_KEYS_END" != "END-OF-JOB-KEYS" ]; then
             echo "[relay] JOB-ENV-INVALID -- a job.env value spans more than one line; no connection attempted"
@@ -91,14 +105,21 @@ EOF_JOB_KEYS
         elif ! printf '%s' "$TIMEOUT" | grep -qE '^[1-9][0-9]*$'; then
             echo "[relay] JOB-ENV-INVALID -- job.env TIMEOUT is not a positive integer; no connection attempted"
             RELAY_RC=65
+        elif ! relay_extra_tokens_ok "$XFREERDP_EXTRA"; then
+            echo "[relay] JOB-ENV-INVALID -- job.env XFREERDP_EXTRA carries a switch outside the allowlist (/scale:<100|140|180>, /scale-desktop:<100-500>, /scale-device:<100|140|180>, /dynamic-resolution); no connection attempted"
+            RELAY_RC=65
         else
             APP_SPEC="/app:program:${PROGRAM}"
             if [ -n "${CMDARGS:-}" ]; then
                 APP_SPEC="${APP_SPEC},cmd:${CMDARGS}"
             fi
-            echo "[relay] program=${PROGRAM} timeout=${TIMEOUT}s"
+            echo "[relay] program=${PROGRAM} timeout=${TIMEOUT}s extra=${XFREERDP_EXTRA:-<none>}"
+            # XFREERDP_EXTRA is deliberately unquoted: every token has passed relay_extra_tokens_ok,
+            # whose shapes contain no whitespace, quote, glob or comma, so word-splitting yields
+            # exactly the validated tokens (or nothing) as separate argv elements.
+            # shellcheck disable=SC2086
             xfreerdp "/v:${WIN_HOST}" "/u:${WIN_USER}" "/p:${WIN_PASS}" /cert:ignore \
-                "$APP_SPEC" "/drive:lab,${SHARE}" /gfx:AVC420 &
+                $XFREERDP_EXTRA "$APP_SPEC" "/drive:lab,${SHARE}" /gfx:AVC420 &
             XPID=$!
             SECS=0
             while kill -0 "$XPID" 2>/dev/null && [ "$SECS" -lt "$TIMEOUT" ]; do
