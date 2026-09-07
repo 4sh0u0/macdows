@@ -21,7 +21,9 @@
                                   decides which from the System log's clock-correction history
                                   (Kernel-General 1), and writes `unknown` when neither is
                                   trustworthy. Boot/sleep history (Kernel-Boot 27, Kernel-General
-                                  12/13, Kernel-Power 42/107) is printed alongside, and so is the
+                                  12/13, Kernel-Power 42/107) is printed alongside -- the clock
+                                  corrections read newest-ClockChangeCount (default 50), only the
+                                  ones that moved the clock printed -- and so is the
                                   session history: the newest SessionHistoryCount (default 60)
                                   LocalSessionManager/Operational events as UTC time / id / name /
                                   SessionID only (user and client address are never read).
@@ -75,6 +77,14 @@ param(
     # 60-row query. 60 is that window; the header prints whatever value was used.
     [ValidateRange(1, 2500)]
     [int] $SessionHistoryCount = 60,
+    # Newest Kernel-General 1 (system time changed) events READ for clock_jump_since_boot. It was a
+    # literal 5 until 2026-09-07: the T6-prime RA3 snapshot showed two fresh zero-delta time-sync
+    # events pushing the +28671 s correction out of that window, and the jump fell from 32400 s
+    # to 3729 s -- with LastBootUpTime still nine hours early that would have left the boot/tick
+    # gap "unexplained" and the label `unknown`. 50 covers weeks of hourly syncs; the sum runs over
+    # everything read since boot, while only the corrections that moved the clock are printed.
+    [ValidateRange(1, 2500)]
+    [int] $ClockChangeCount = 50,
     [switch] $NoRun
 )
 
@@ -343,6 +353,40 @@ function Get-SnapshotBootTypeFromXml {
     return $null
 }
 
+function Select-SnapshotClockEventsToPrint {
+    <#
+      Which clock-change events the report prints: the ones whose delta is non-zero or could not
+      be parsed (they are the corrections that matter to the jump), in the order given (newest
+      first), capped at Max; the zero-delta ones and the non-zero ones beyond the cap are counted
+      so the reader knows what was read but not shown. Pure: the sum is taken elsewhere over the
+      whole list.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyCollection()][object[]] $Events, [int] $Max = 10)
+    $shown = New-Object System.Collections.ArrayList
+    $omittedZero = 0
+    $omittedBeyondCap = 0
+    if ($null -ne $Events) {
+        foreach ($e in $Events) {
+            if ($null -eq $e) { continue }
+            $d = $e.Delta
+            $parsed = 0
+            $isZero = ($null -ne $d) -and [int]::TryParse([string]$d, [ref]$parsed) -and ($parsed -eq 0)
+            if ($isZero) { $omittedZero++; continue }
+            if ($shown.Count -ge $Max) { $omittedBeyondCap++; continue }
+            [void]$shown.Add($e)
+        }
+    }
+    return [pscustomobject]@{ Shown = @($shown.ToArray()); OmittedZero = $omittedZero; OmittedBeyondCap = $omittedBeyondCap }
+}
+
+function Format-SnapshotClockChangeHeader {
+    <# The clock-change block's header line; it names the window read and the print rule. #>
+    [CmdletBinding()]
+    param([int] $Count)
+    return "  clock changes (Kernel-General 1, System log, newest $Count read; corrections with delta != 0 shown, zero-delta ones counted):"
+}
+
 function Measure-SnapshotClockJump {
     <#
       Net clock correction since boot: the sum of the Kernel-General 1 deltas stamped at or after
@@ -574,7 +618,7 @@ function Add-SnapshotRegistrySection {
 
 function Invoke-SnapshotCollection {
     [CmdletBinding()]
-    param([string] $OutPath, [int] $MaxEventsPerChannel, [int] $SessionHistoryCount)
+    param([string] $OutPath, [int] $MaxEventsPerChannel, [int] $SessionHistoryCount, [int] $ClockChangeCount)
 
     $L = New-Object System.Collections.ArrayList
     function Write-Checkpoint([string] $Stage) {
@@ -634,13 +678,15 @@ function Invoke-SnapshotCollection {
     # clock was wrong (see Select-SnapshotHostFreshnessLabel) it is the truthful source.
     $tickSeconds = [int][math]::Floor([Environment]::TickCount / 1000)
     [void]$L.Add("  TickCountSeconds(32-bit, wraps 24.9d) = $tickSeconds")
-    # Clock corrections since boot: Kernel-General 1 (system time changed), newest 5, with the
-    # old->new jump computed from the EventData (ISO stamps; a parse failure leaves delta blank).
+    # Clock corrections since boot: Kernel-General 1 (system time changed), newest $ClockChangeCount
+    # read (see the parameter for why 5 was too few), with the old->new jump computed from the
+    # EventData (ISO stamps; a parse failure leaves delta <unparsed>). Every event read feeds the
+    # sum; only the ones that moved the clock are printed (Select-SnapshotClockEventsToPrint).
     $clockJump = $null
     $clockEvents = New-Object System.Collections.ArrayList
-    [void]$L.Add('  clock changes (Kernel-General 1, System log, newest first):')
+    [void]$L.Add((Format-SnapshotClockChangeHeader -Count $ClockChangeCount))
     try {
-        $tcs = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-General'; Id = 1 } -MaxEvents 5 -ErrorAction Stop)
+        $tcs = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-General'; Id = 1 } -MaxEvents $ClockChangeCount -ErrorAction Stop)
         foreach ($e in $tcs) {
             $x = $e.ToXml()
             $oldT = Get-SnapshotEventDataValue -Xml $x -Name 'OldTime'
@@ -655,8 +701,13 @@ function Invoke-SnapshotCollection {
             } catch { $delta = '<unparsed>' }
             $oldParsed = $null
             try { $oldParsed = [DateTime]::Parse($oldT, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToLocalTime() } catch { }
-            [void]$clockEvents.Add([pscustomobject]@{ Time = $e.TimeCreated; Old = $oldParsed; Delta = $delta })
-            [void]$L.Add(('    Kernel-General 1 {0} old={1} new={2} delta={3}s reason={4}' -f $e.TimeCreated.ToUniversalTime().ToString('o'), $oldT, $newT, $delta, $why))
+            $line = ('    Kernel-General 1 {0} old={1} new={2} delta={3}s reason={4}' -f $e.TimeCreated.ToUniversalTime().ToString('o'), $oldT, $newT, $delta, $why)
+            [void]$clockEvents.Add([pscustomobject]@{ Time = $e.TimeCreated; Old = $oldParsed; Delta = $delta; Line = $line })
+        }
+        $sel = Select-SnapshotClockEventsToPrint -Events @($clockEvents.ToArray()) -Max 10
+        foreach ($shownEvent in $sel.Shown) { [void]$L.Add($shownEvent.Line) }
+        if ($sel.OmittedZero -gt 0 -or $sel.OmittedBeyondCap -gt 0) {
+            [void]$L.Add(('    Kernel-General 1: {0} zero-delta correction(s) and {1} non-zero beyond the 10-line cap read but not shown (all feed the sum)' -f $sel.OmittedZero, $sel.OmittedBeyondCap))
         }
         $bootLocal = $null
         if ($null -ne $os) { $bootLocal = $os.LastBootUpTime }
@@ -873,5 +924,5 @@ function Invoke-SnapshotCollection {
 }
 
 if (-not $NoRun) {
-    Invoke-SnapshotCollection -OutPath $OutPath -MaxEventsPerChannel $MaxEventsPerChannel -SessionHistoryCount $SessionHistoryCount
+    Invoke-SnapshotCollection -OutPath $OutPath -MaxEventsPerChannel $MaxEventsPerChannel -SessionHistoryCount $SessionHistoryCount -ClockChangeCount $ClockChangeCount
 }

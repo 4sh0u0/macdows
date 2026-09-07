@@ -607,6 +607,88 @@ Test-Case 'a positive session-history window is accepted and a non-positive one 
 }
 
 # -------------------------------------------------------------------------------------------
+# Clock-change window (ClockChangeCount) and the print selection. The block used to read the
+# newest FIVE Kernel-General 1 events and print them all: on 2026-09-07 (T6-prime RA3 snapshot)
+# two fresh zero-delta time-sync events pushed the +28671 s correction out of that window and
+# clock_jump_since_boot fell from 32400 s to 3729 s. The window is now a parameter (default 50,
+# the sum still runs over everything read since boot), and only the corrections that moved the
+# clock (or could not be parsed) are printed, capped, with the omitted counts stated.
+# -------------------------------------------------------------------------------------------
+
+New-Section 'ClockChangeCount / Select-SnapshotClockEventsToPrint'
+
+Test-Case 'the clock-change window is a parameter with default 50' {
+    Assert-Equal 50 $ClockChangeCount
+}
+
+$clockPrintEvents = @(
+    [pscustomobject]@{ Time = [datetime]::new(2026, 9, 7, 17, 12, 15); Delta = 0;           Line = 'e1 zero' },
+    [pscustomobject]@{ Time = [datetime]::new(2026, 9, 7, 16, 43, 9);  Delta = 0;           Line = 'e2 zero' },
+    [pscustomobject]@{ Time = [datetime]::new(2026, 9, 7, 15, 9, 33);  Delta = 0;           Line = 'e3 zero' },
+    [pscustomobject]@{ Time = [datetime]::new(2026, 9, 6, 4, 45, 16);  Delta = 0;           Line = 'e4 zero' },
+    [pscustomobject]@{ Time = [datetime]::new(2026, 9, 6, 4, 45, 16);  Delta = 3729;        Line = 'e5 +3729' },
+    [pscustomobject]@{ Time = [datetime]::new(2026, 9, 6, 2, 43, 7);   Delta = 28671;       Line = 'e6 +28671' },
+    [pscustomobject]@{ Time = [datetime]::new(2026, 9, 3, 19, 31, 28); Delta = 0;           Line = 'e7 zero' },
+    [pscustomobject]@{ Time = [datetime]::new(2026, 9, 1, 23, 15, 22); Delta = '<unparsed>'; Line = 'e8 unparsed' }
+)
+
+Test-Case 'only corrections that moved the clock (or could not be parsed) are selected, in input order, and the zero-delta ones are counted' {
+    $sel = Select-SnapshotClockEventsToPrint -Events $clockPrintEvents -Max 10
+    Assert-Equal 3 @($sel.Shown).Count
+    Assert-Equal 'e5 +3729' $sel.Shown[0].Line
+    Assert-Equal 'e6 +28671' $sel.Shown[1].Line
+    Assert-Equal 'e8 unparsed' $sel.Shown[2].Line
+    Assert-Equal 5 $sel.OmittedZero
+    Assert-Equal 0 $sel.OmittedBeyondCap
+}
+
+Test-Case 'the print cap keeps the newest non-zero corrections and counts the rest' {
+    $sel = Select-SnapshotClockEventsToPrint -Events $clockPrintEvents -Max 1
+    Assert-Equal 1 @($sel.Shown).Count
+    Assert-Equal 'e5 +3729' $sel.Shown[0].Line
+    Assert-Equal 2 $sel.OmittedBeyondCap
+    Assert-Equal 5 $sel.OmittedZero
+}
+
+Test-Case 'an empty or null event list selects nothing and counts nothing' {
+    $sel = Select-SnapshotClockEventsToPrint -Events @() -Max 10
+    Assert-Equal 0 @($sel.Shown).Count
+    Assert-Equal 0 $sel.OmittedZero
+    Assert-Equal 0 $sel.OmittedBeyondCap
+    $sel2 = Select-SnapshotClockEventsToPrint -Events $null -Max 10
+    Assert-Equal 0 @($sel2.Shown).Count
+}
+
+Test-Case 'the jump is still summed over EVERY event read since boot, zero-delta ones included (a zero sum is 0, not null)' {
+    $boot = [datetime]::new(2026, 9, 5, 18, 40, 10)
+    Assert-Equal 32400 (Measure-SnapshotClockJump -Events $clockPrintEvents -BootTime $boot)
+    Assert-Equal 0 (Measure-SnapshotClockJump -Events @($clockPrintEvents[0], $clockPrintEvents[1]) -BootTime $boot)
+}
+
+Test-Case 'the Kernel-General 1 read, its header and the collector take the window from the parameter (static pin), and the block prints through the selector' {
+    $src = Get-Content (Join-Path $PSScriptRoot 'server-snapshot.ps1') -Raw
+    Assert-True ($src -match "Id = 1 \}\s+-MaxEvents\s+\`$ClockChangeCount\b") 'the Kernel-General 1 Get-WinEvent must pass -MaxEvents $ClockChangeCount'
+    Assert-True ($src -notmatch "Id = 1 \}\s+-MaxEvents\s+\d") 'no literal -MaxEvents on the Kernel-General 1 read'
+    Assert-True ($src -match 'Format-SnapshotClockChangeHeader\s+-Count\s+\$ClockChangeCount\b') 'the header must be rendered from the same parameter'
+    Assert-True ($src -match 'Select-SnapshotClockEventsToPrint\s+-Events') 'the live block must print through the selector'
+    Assert-True ($src -match 'Invoke-SnapshotCollection\s+-OutPath\s+\$OutPath\s+-MaxEventsPerChannel\s+\$MaxEventsPerChannel\s+-SessionHistoryCount\s+\$SessionHistoryCount\s+-ClockChangeCount\s+\$ClockChangeCount\b') 'the entry point must thread the parameter into the collector'
+}
+
+Test-Case 'the clock-change header names the window and the print rule' {
+    Assert-Equal '  clock changes (Kernel-General 1, System log, newest 50 read; corrections with delta != 0 shown, zero-delta ones counted):' (Format-SnapshotClockChangeHeader -Count 50)
+}
+
+Test-Case 'a positive clock-change window binds and a non-positive one is refused at the parameter' {
+    $path = Join-Path $PSScriptRoot 'server-snapshot.ps1'
+    $accepted = $true
+    try { & $path -NoRun -ClockChangeCount 7 } catch { $accepted = $false }
+    Assert-True $accepted 'ClockChangeCount 7 must bind'
+    $threw = $false
+    try { & $path -NoRun -ClockChangeCount 0 } catch { $threw = $true }
+    Assert-True $threw 'ClockChangeCount 0 must be rejected'
+}
+
+# -------------------------------------------------------------------------------------------
 # Summary
 # -------------------------------------------------------------------------------------------
 
