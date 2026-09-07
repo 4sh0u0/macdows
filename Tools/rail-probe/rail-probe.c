@@ -125,6 +125,10 @@ typedef struct
 	probeEventCount* event_counts;
 	size_t event_counts_count;
 	size_t event_counts_cap;
+	/* ADR-0017 §4 row A2: raised by probe_on_channel_connected's --decode branch when the
+	 * RDPGFX decode path is not installed; probe_main_loop turns it into a DecodePathRefused
+	 * event and a non-zero result (the channel handler itself can only abort, not report). */
+	BOOL decodePathRefused;
 } probeContext;
 
 /* Only the RDPGFX wrappers need this: gdi_graphics_pipeline_init() claims
@@ -935,8 +939,10 @@ static void probe_on_channel_connected(void* context, const ChannelConnectedEven
 			 * installed; gdi_graphics_pipeline_init_ex nulls both callbacks when
 			 * DeactivateClientDecoding is TRUE, and an upstream drift there would read as
 			 * "zero SurfaceCommand stats, zero errors". Explicit check + connection abort
-			 * (not WINPR_ASSERT, which is a no-op under NDEBUG), same shape as the probe's
-			 * AsyncUpdate refusal in post-connect. */
+			 * rather than WINPR_ASSERT (an assert kills the process instead of ending the
+			 * run, and is dropped by any NDEBUG build), same shape as the probe's
+			 * AsyncUpdate refusal in post-connect. This handler cannot return a status, so
+			 * it raises decodePathRefused for probe_main_loop to report (gate r1 B-1). */
 			if (gfx->SurfaceCommand == NULL || gfx->UpdateSurfaces == NULL)
 			{
 				fprintf(stderr,
@@ -944,6 +950,7 @@ static void probe_on_channel_connected(void* context, const ChannelConnectedEven
 				        "(SurfaceCommand %s, UpdateSurfaces %s) -- adr/0005 §2 invariant does not hold; "
 				        "refusing the session (ADR-0017 §4 A2)\n",
 				        gfx->SurfaceCommand ? "set" : "NULL", gfx->UpdateSurfaces ? "set" : "NULL");
+				p->decodePathRefused = TRUE;
 				freerdp_abort_connect_context(&p->common.context);
 				return;
 			}
@@ -1301,6 +1308,15 @@ static DWORD probe_main_loop(freerdp* instance, probeContext* p)
 
 disconnect:
 	freerdp_disconnect(instance);
+	/* ADR-0017 §4 A2 (gate r1 B-1): the refusal above exits the loop with a clean last error;
+	 * make it visible in the JSONL and in the exit code (main returns this result), so a run
+	 * whose decode path was missing can never read as a successful capture. */
+	if (p->decodePathRefused)
+	{
+		log_event(p, "DecodePathRefused", "\"reason\":\"RDPGFX decode path not installed (adr/0005 section 2, ADR-0017 section 4 A2)\"");
+		if (result == 0)
+			result = 1;
+	}
 	return result;
 }
 

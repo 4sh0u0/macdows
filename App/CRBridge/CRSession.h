@@ -7,9 +7,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// `RdpgfxClientContext::SurfaceCommand` and `::UpdateSurfaces` are installed.
 /// `gdi_graphics_pipeline_init_ex` nulls both when `FreeRDP_DeactivateClientDecoding` is TRUE,
 /// and the symptom of that drifting upstream is "black window, zero errors" -- so the bridge
-/// checks this explicitly when the channel comes up and refuses the session when it fails
-/// (formerly a `WINPR_ASSERT`, which compiles to nothing under NDEBUG). Pure predicate over the
-/// two callback pointers (passed as opaque pointers so this ObjC header stays free of FreeRDP
+/// checks this explicitly when the channel comes up, refuses the session and surfaces the
+/// refusal as a distinct `-lastConnectError`. It used to be a `WINPR_ASSERT` (libc `assert`):
+/// that aborts the whole process instead of refusing one session, vanishes under any build
+/// configuration that defines NDEBUG (this project's Release does not today -- verified by gate
+/// a2-gfx-invariant r1 -- but nothing pins that), and cannot be exercised headlessly. Pure
+/// predicate over the two callback pointers (opaque, so this ObjC header stays free of FreeRDP
 /// types); exposed so the App test bundle can pin its meaning.
 FOUNDATION_EXPORT BOOL CRBGfxDecodePathIntact(const void *_Nullable surfaceCommand,
                                               const void *_Nullable updateSurfaces);
