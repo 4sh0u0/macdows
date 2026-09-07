@@ -197,6 +197,13 @@ public enum RailEventKind: Sendable, Equatable {
     case waitFailed
     case checkEventHandlesFailed
     case durationElapsed(sinceConnectMs: UInt64)
+    /// ADR-0017 §4 row A2 (2026-09-08): rail-probe's `--decode` branch found the RDPGFX decode
+    /// path not installed, aborted the connection and, from `probe_main_loop`, logged this
+    /// before exiting non-zero. A new event TYPE (adr/0008 §5's three rules govern new FIELDS on
+    /// existing events; a new name would otherwise decode as `.unknown` and replay cleanly) --
+    /// registered here because EmitterContractTests round-trips every probe emit site through
+    /// this decoder and reds on `.unknown`.
+    case decodePathRefused(reason: String)
 
     /// Any `ev` name not listed above. Carries the raw name through rather than dropping
     /// the event — a probe built from a newer `rail-probe.c` (new event type added) must
@@ -302,6 +309,7 @@ public enum RailEventKind: Sendable, Equatable {
         case "WaitFailed": self = .waitFailed
         case "CheckEventHandlesFailed": self = .checkEventHandlesFailed
         case "DurationElapsed": self = .durationElapsed(sinceConnectMs: try DurationElapsedPayload(from: decoder).sinceConnectMs)
+        case "DecodePathRefused": self = .decodePathRefused(reason: try DecodePathRefusedPayload(from: decoder).reason)
 
         default:
             self = .unknown(ev)
@@ -454,3 +462,4 @@ struct ProgramPayload: Decodable { let program: String }
 struct SecondExecEndPayload: Decodable { let program: String; let rc: UInt32 }
 struct ConnectFailedPayload: Decodable { let error: UInt32; let errorString: String }
 struct DurationElapsedPayload: Decodable { let sinceConnectMs: UInt64 }
+struct DecodePathRefusedPayload: Decodable { let reason: String }

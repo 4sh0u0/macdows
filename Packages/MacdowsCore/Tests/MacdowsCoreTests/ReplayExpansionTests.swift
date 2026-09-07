@@ -182,8 +182,10 @@ struct ReplayExpansionTests {
                  .preConnect, .postConnect, .postDisconnect, .postFinalDisconnect,
                  .secondExecBegin, .secondExecEnd, .connectFailed, .connectSucceeded,
                  .eventHandlesFailed, .waitFailed, .checkEventHandlesFailed,
-                 .durationElapsed, .clientRailServerStartCmd,
+                 .durationElapsed, .decodePathRefused, .clientRailServerStartCmd,
                  .verifyCertificateEx, .logonErrorInfo, .unknown:
+                // `.decodePathRefused` (ADR-0017 §4 A2, 2026-09-08) is logged by probe_main_loop
+                // after the loop exits -- the probe's own emission, not producer-lane traffic.
                 continue
             }
         }
