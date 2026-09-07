@@ -501,6 +501,16 @@ enum F1BackingVsMapped {
     enum Verdict: String {
         case green = "GREEN"
         case red = "RED"
+        /// W3 lane C (ADR-0018 U-3 "先分类不裁量"): every axis is either equal, or off by EXACTLY one
+        /// backing pixel against an ODD remote-px mapped dimension -- and at least one axis is the
+        /// latter. Mechanism (C-2 2026-09-01, F round 3 2026-09-06): at 2x an integral-point content
+        /// rect converts to an EVEN backing size on both axes, while the server's mapped size can be
+        /// odd, so that axis can never be equal and its ±1 is structural. This is a CLASSIFICATION
+        /// of the measurement, not a tolerance and not a pass: the summary counts it apart from
+        /// GREEN and RED, the tally remembers it like a RED, and -- like every F1 verdict -- it does
+        /// not touch the exit code. Whether to tolerate it, align content to even sizes, or use
+        /// half-point granularity is U-3's decision after the 2x checkpoint has this distribution.
+        case oddDimensionOffByOne = "ODD1"
     }
 
     /// One window's pairing at present time. All four size fields are stored as `Double` because
@@ -518,11 +528,27 @@ enum F1BackingVsMapped {
         let mappedWidthInRemotePixels: Double
         let mappedHeightInRemotePixels: Double
 
-        /// EXACT equality, both axes. See the type's own note on why there is no tolerance and no
-        /// rounding.
+        /// EXACT equality, both axes, is GREEN. Otherwise each axis is classified on its own:
+        /// `equal` / `oddOffByOne` (|backing − mapped| == 1 and the mapped dimension is an odd
+        /// integer) / `other`. Any `other` axis is RED; else (at least one `oddOffByOne`) it is
+        /// `.oddDimensionOffByOne`. No tolerance and no rounding anywhere -- a half or a quarter
+        /// pixel is `other` (RED), an off-by-one against an EVEN mapped dimension is `other` (RED).
         var verdict: Verdict {
-            backingWidthInBackingPixels == mappedWidthInRemotePixels
-                && backingHeightInBackingPixels == mappedHeightInRemotePixels ? .green : .red
+            let w = Self.axisClass(backing: backingWidthInBackingPixels, mapped: mappedWidthInRemotePixels)
+            let h = Self.axisClass(backing: backingHeightInBackingPixels, mapped: mappedHeightInRemotePixels)
+            if w == .equal && h == .equal { return .green }
+            if w == .other || h == .other { return .red }
+            return .oddDimensionOffByOne
+        }
+
+        enum AxisClass: Equatable { case equal, oddOffByOne, other }
+
+        /// The one place the "odd remote-px dimension, off by exactly one" rule is spelled out.
+        static func axisClass(backing: Double, mapped: Double) -> AxisClass {
+            if backing == mapped { return .equal }
+            let mappedIsOddInteger = mapped == mapped.rounded() && Int(mapped) % 2 != 0
+            if abs(backing - mapped) == 1 && mappedIsOddInteger { return .oddOffByOne }
+            return .other
         }
 
         /// Derived from this window's own conversion rather than read from `NSScreen`/`NSWindow`:
@@ -564,13 +590,19 @@ struct F1BackingVsMappedTally {
     /// that flips mid-run is itself a finding, and a summary that only reported the final state
     /// would hide it.
     private(set) var everRedWindows: Set<UInt32> = []
+    /// Same memory for ODD1 (W3 lane C): the 2x checkpoint reads this distribution.
+    private(set) var everOddWindows: Set<UInt32> = []
 
     /// Records `observation` and returns it **only when it is worth printing** -- i.e. the first
     /// sample for that window, or one whose numbers changed since the last printed line. Returns
     /// `nil` for an unchanged repeat.
     mutating func record(_ observation: F1BackingVsMapped.Observation) -> F1BackingVsMapped.Observation? {
         samplesTaken += 1
-        if observation.verdict == .red { everRedWindows.insert(observation.windowId) }
+        switch observation.verdict {
+        case .red: everRedWindows.insert(observation.windowId)
+        case .oddDimensionOffByOne: everOddWindows.insert(observation.windowId)
+        case .green: break
+        }
         let previous = lastByWindow[observation.windowId]
         lastByWindow[observation.windowId] = observation
         return previous == observation ? nil : observation
@@ -589,15 +621,21 @@ struct F1BackingVsMappedTally {
                 + "was observed this run; samples=\(samplesTaken))" + tail
         }
         let green = lastByWindow.values.filter { $0.verdict == .green }.count
-        let red = lastByWindow.values.count - green
-        let redDetail = lastByWindow.values
-            .filter { $0.verdict == .red }
-            .sorted { $0.windowId < $1.windowId }
-            .map { "\($0.windowId): backing=\(F1BackingVsMapped.Observation.fmt($0.backingWidthInBackingPixels))x\(F1BackingVsMapped.Observation.fmt($0.backingHeightInBackingPixels)) vs mapped=\(F1BackingVsMapped.Observation.fmt($0.mappedWidthInRemotePixels))x\(F1BackingVsMapped.Observation.fmt($0.mappedHeightInRemotePixels))" }
-            .joined(separator: "; ")
-        return "[f1] summary: windows=\(lastByWindow.count) GREEN=\(green) RED=\(red)"
-            + " samples=\(samplesTaken) everRed=\(everRedWindows.count)"
-            + (redDetail.isEmpty ? "" : " red[\(redDetail)]") + tail
+        let odd = lastByWindow.values.filter { $0.verdict == .oddDimensionOffByOne }.count
+        let red = lastByWindow.values.count - green - odd
+        func detail(_ verdict: F1BackingVsMapped.Verdict) -> String {
+            lastByWindow.values
+                .filter { $0.verdict == verdict }
+                .sorted { $0.windowId < $1.windowId }
+                .map { "\($0.windowId): backing=\(F1BackingVsMapped.Observation.fmt($0.backingWidthInBackingPixels))x\(F1BackingVsMapped.Observation.fmt($0.backingHeightInBackingPixels)) vs mapped=\(F1BackingVsMapped.Observation.fmt($0.mappedWidthInRemotePixels))x\(F1BackingVsMapped.Observation.fmt($0.mappedHeightInRemotePixels))" }
+                .joined(separator: "; ")
+        }
+        let redDetail = detail(.red)
+        let oddDetail = detail(.oddDimensionOffByOne)
+        return "[f1] summary: windows=\(lastByWindow.count) GREEN=\(green) ODD1=\(odd) RED=\(red)"
+            + " samples=\(samplesTaken) everRed=\(everRedWindows.count) everOdd=\(everOddWindows.count)"
+            + (redDetail.isEmpty ? "" : " red[\(redDetail)]")
+            + (oddDetail.isEmpty ? "" : " odd1[\(oddDetail)]") + tail
     }
 }
 
@@ -1057,10 +1095,43 @@ enum WindowSmokeGateSelfTest {
         // expected in a live run. An assertion about a claim is still an assertion.
         expect(
             f1(backing: (509, 507), content: (509, 507), mapped: (508, 507)).verdict == .red
-                && f1(backing: (508, 508), content: (508, 508), mapped: (508, 507)).verdict == .red
+                && f1(backing: (508, 507), content: (508, 507), mapped: (508, 506)).verdict == .red
                 && f1(backing: (508.5, 507), content: (508.5, 507), mapped: (508, 507)).verdict == .red
                 && f1(backing: (508.25, 507), content: (508.25, 507), mapped: (508, 507)).verdict == .red,
-            "f1AdmitsOnlyExactEquality: 1 backing px on either axis -- and a half, and a quarter -- is RED"
+            "f1AdmitsOnlyExactEquality: 1 backing px against an EVEN remote-px dimension, a half, and a "
+                + "quarter are all RED (W3 lane C: only the odd-remote-px off-by-one is classified apart)"
+        )
+        // --- W3 lane C (ADR-0018 U-3 "先分类不裁量"): the odd-dimension off-by-one --------------
+        // At 2x a content rect of integral points converts to an EVEN backing size on both axes;
+        // the server's mapped size can be ODD (C-2: mapped 522x515 vs backing 522x516; F round 3:
+        // three windows red by exactly this). Such an axis can never be equal, so its ±1 is a
+        // classification of the measurement -- NOT a tolerance and NOT a pass: it is its own
+        // verdict, counted separately, and still does not touch the exit code. The tolerance /
+        // even-alignment decision is U-3's, after the 2x checkpoint has this distribution.
+        let f1OddC2 = f1(backing: (522, 516), content: (261, 258), mapped: (522, 515))
+        expect(
+            f1OddC2.verdict == .oddDimensionOffByOne && f1OddC2.line.contains("verdict=ODD1")
+                && f1OddC2.line.contains("delta=(0,1)"),
+            "f1OddDimensionOffByOne: the C-2 shape (even backing 516 vs odd mapped 515, other axis equal) is ODD1, not RED"
+        )
+        expect(
+            f1(backing: (522, 516), content: (261, 258), mapped: (521, 515)).verdict == .oddDimensionOffByOne,
+            "f1OddOnBothAxes: both axes off by one against odd mapped dimensions is still ODD1"
+        )
+        expect(
+            f1(backing: (522, 516), content: (261, 258), mapped: (522, 513)).verdict == .red
+                && f1(backing: (522, 516), content: (261, 258), mapped: (521, 514)).verdict == .red
+                && f1(backing: (522, 516), content: (261, 258), mapped: (522, 517)).verdict == .oddDimensionOffByOne,
+            "f1OddIsExactlyOne: a 3 px gap is RED, a 1 px gap against an EVEN mapped axis is RED (even if the other axis is odd-off-by-one), and +1 against an odd mapped axis is ODD1 either direction"
+        )
+        var f1OddTally = F1BackingVsMappedTally()
+        _ = f1OddTally.record(f1OddC2)
+        expect(
+            f1OddTally.everOddWindows.count == 1 && f1OddTally.everRedWindows.isEmpty
+                && f1OddTally.summaryLine.contains("windows=1 GREEN=0 ODD1=1 RED=0")
+                && f1OddTally.summaryLine.contains("everOdd=1")
+                && f1OddTally.summaryLine.contains("odd1[4242:"),
+            "f1TallyCountsOddApart: ODD1 is neither GREEN nor RED in the summary and is remembered like RED is"
         )
         // Direction-independent: the mapped side being the larger one is equally a disagreement.
         expect(
@@ -1081,7 +1152,7 @@ enum WindowSmokeGateSelfTest {
         let recovered = f1Tally.record(f1At1x)
         expect(
             recovered != nil && f1Tally.samplesTaken == 3 && f1Tally.everRedWindows.count == 1
-                && f1Tally.summaryLine.contains("windows=1 GREEN=1 RED=0")
+                && f1Tally.summaryLine.contains("windows=1 GREEN=1 ODD1=0 RED=0")
                 && f1Tally.summaryLine.contains("everRed=1"),
             "f1TallyKeepsTheLastStateAndRemembersAnEarlierRed: a verdict that flips is still visible"
         )
