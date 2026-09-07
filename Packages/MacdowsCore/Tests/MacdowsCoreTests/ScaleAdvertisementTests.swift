@@ -74,4 +74,26 @@ struct ScaleAdvertisementTests {
         #expect(ScaleAdvertisement.proposedDesktopOnly(rasterScale: 1.25)?.desktopScaleFactor == 125)
         #expect(ScaleAdvertisement.proposedDesktopOnly(rasterScale: 1.004)?.desktopScaleFactor == 100)
     }
+
+    @Test("an exact half rounds away from zero (1.125x -> 112.5 -> 113); 1.005x is 100.4999... in binary and rounds to 100, not 101")
+    func halfRoundsAwayFromZero() {
+        #expect(ScaleAdvertisement.proposedDesktopOnly(rasterScale: 1.125)?.desktopScaleFactor == 113)
+        #expect(ScaleAdvertisement.proposedDesktopOnly(rasterScale: 1.005)?.desktopScaleFactor == 100)
+    }
+
+    @Test("a tie between two allowed device values resolves to the LOWER one (1.2x -> 120: 100 not 140; 1.6x -> 160: 140 not 180)")
+    func tieResolvesToTheLowerDevice() {
+        #expect(ScaleAdvertisement.proposedBoth(rasterScale: 1.2)?.deviceScaleFactor == 100)
+        #expect(ScaleAdvertisement.proposedBoth(rasterScale: 1.6)?.deviceScaleFactor == 140)
+    }
+
+    @Test("NaN, +-infinity, zero and a negative rasterScale are refused (nil), never converted")
+    func nonFiniteAndNonPositiveAreRefused() {
+        #expect(ScaleAdvertisement.proposedDesktopOnly(rasterScale: .nan) == nil)
+        #expect(ScaleAdvertisement.proposedDesktopOnly(rasterScale: .infinity) == nil)
+        #expect(ScaleAdvertisement.proposedDesktopOnly(rasterScale: -.infinity) == nil)
+        #expect(ScaleAdvertisement.proposedDesktopOnly(rasterScale: 0) == nil)
+        #expect(ScaleAdvertisement.proposedDesktopOnly(rasterScale: -2) == nil)
+        #expect(ScaleAdvertisement.proposedBoth(rasterScale: .nan) == nil)
+    }
 }

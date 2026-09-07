@@ -56,7 +56,10 @@ public struct ScaleAdvertisement: Equatable, Sendable {
     /// The desktop percentage for a `rasterScale` (`DisplayTopology.rasterScale`, remote px per
     /// mac pt), rounded to the nearest whole percent; `nil` outside the wire domain.
     static func desktopPercent(rasterScale: Double) -> UInt32? {
-        guard rasterScale.isFinite, rasterScale > 0 else { return nil }
+        // One check, the wire domain itself: NaN compares false on both sides, and +-infinity, zero
+        // and every negative value land outside [100, 500] -- pinned by
+        // `nonFiniteAndNonPositiveAreRefused`. A separate `isFinite` / `> 0` guard here was
+        // redundant with that check and no test could tell the two apart (gate w3-lane-d r1 §2).
         let rounded = (rasterScale * 100).rounded()
         guard rounded >= Double(desktopScaleRange.lowerBound), rounded <= Double(desktopScaleRange.upperBound) else { return nil }
         return UInt32(rounded)
