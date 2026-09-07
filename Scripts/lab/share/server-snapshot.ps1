@@ -21,7 +21,10 @@
                                   decides which from the System log's clock-correction history
                                   (Kernel-General 1), and writes `unknown` when neither is
                                   trustworthy. Boot/sleep history (Kernel-Boot 27, Kernel-General
-                                  12/13, Kernel-Power 42/107) is printed alongside.
+                                  12/13, Kernel-Power 42/107) is printed alongside, and so is the
+                                  session history: the newest SessionHistoryCount (default 60)
+                                  LocalSessionManager/Operational events as UTC time / id / name /
+                                  SessionID only (user and client address are never read).
       E. configuration surface -- every value under the RDS-relevant registry keys listed in
                                   $script:SnapshotRegistryKeys (policy hive, Terminal Server,
                                   TSAppAllowList, the RDP-Tcp winstation, session DPI), rendered
@@ -64,6 +67,14 @@ param(
     # channel dry run 2 met (largest: RdpCoreTS/Operational, 1952 records), and the report
     # prints the covered time window per channel so a partial scan is visible as such.
     [int] $MaxEventsPerChannel = 2500,
+    # Newest LocalSessionManager/Operational events printed as the "session history" block. It was
+    # a literal 12 until 2026-09-07: one other-client connection (4 rows: 40,25 / 40,24) plus the
+    # lab's own rail-probe (7 rows: 41,40,40,25,42 / 40,24) and the relay session reading this
+    # snapshot (5 rows at read time) already fill 12, so in 4 of the 5 T6-prime forms the other
+    # client's 24/25 had been pushed out and clause (c) had to be judged from the owner's manual
+    # 60-row query. 60 is that window; the header prints whatever value was used.
+    [ValidateRange(1, 2500)]
+    [int] $SessionHistoryCount = 60,
     [switch] $NoRun
 )
 
@@ -465,6 +476,13 @@ function Format-SnapshotSessionEventLine {
     return "lsm: $t id=$Id ($name) session=$sid"
 }
 
+function Format-SnapshotSessionHistoryHeader {
+    <# The session-history block's header line; it names the window actually read. #>
+    [CmdletBinding()]
+    param([int] $Count)
+    return "  session history (LSM/Operational, newest $Count; user and address omitted by design):"
+}
+
 function ConvertTo-SnapshotValueText {
     <# One registry value as report text: <absent> for null, hex for binary, " | " for arrays. #>
     [CmdletBinding()]
@@ -556,7 +574,7 @@ function Add-SnapshotRegistrySection {
 
 function Invoke-SnapshotCollection {
     [CmdletBinding()]
-    param([string] $OutPath, [int] $MaxEventsPerChannel)
+    param([string] $OutPath, [int] $MaxEventsPerChannel, [int] $SessionHistoryCount)
 
     $L = New-Object System.Collections.ArrayList
     function Write-Checkpoint([string] $Stage) {
@@ -698,13 +716,14 @@ function Invoke-SnapshotCollection {
             }
         }
     }
-    # Session history (LocalSessionManager/Operational, newest 12): logon / shell-start / logoff /
-    # disconnect / reconnect with the SessionID datum only -- user and client address deliberately
-    # NOT read (red line). This is what turns the T6-prime clause (c) "same session" assumption into
-    # a measurement: a 24 (disconnect) followed by a 25 (reconnect) on the same SessionID.
-    [void]$L.Add('  session history (LSM/Operational, newest 12; user and address omitted by design):')
+    # Session history (LocalSessionManager/Operational, newest $SessionHistoryCount -- see the
+    # parameter for why 12 was too short): logon / shell-start / logoff / disconnect / reconnect
+    # with the SessionID datum only -- user and client address deliberately NOT read (red line).
+    # This is what turns the T6-prime clause (c) "same session" assumption into a measurement:
+    # a 24 (disconnect) followed by a 25 (reconnect) on the same SessionID.
+    [void]$L.Add((Format-SnapshotSessionHistoryHeader -Count $SessionHistoryCount))
     try {
-        $lsm = @(Get-WinEvent -LogName 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational' -MaxEvents 12 -ErrorAction Stop)
+        $lsm = @(Get-WinEvent -LogName 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational' -MaxEvents $SessionHistoryCount -ErrorAction Stop)
         foreach ($e in $lsm) {
             $tc = Get-SnapshotProp -Object $e -Name 'TimeCreated'
             $tcText = $null
@@ -854,5 +873,5 @@ function Invoke-SnapshotCollection {
 }
 
 if (-not $NoRun) {
-    Invoke-SnapshotCollection -OutPath $OutPath -MaxEventsPerChannel $MaxEventsPerChannel
+    Invoke-SnapshotCollection -OutPath $OutPath -MaxEventsPerChannel $MaxEventsPerChannel -SessionHistoryCount $SessionHistoryCount
 }
