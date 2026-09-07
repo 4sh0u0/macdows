@@ -3,6 +3,20 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/// ADR-0017 §4 row A2 / adr/0005 §2: the RDPGFX decode path is "intact" when both
+/// `RdpgfxClientContext::SurfaceCommand` and `::UpdateSurfaces` are installed.
+/// `gdi_graphics_pipeline_init_ex` nulls both when `FreeRDP_DeactivateClientDecoding` is TRUE,
+/// and the symptom of that drifting upstream is "black window, zero errors" -- so the bridge
+/// checks this explicitly when the channel comes up, refuses the session and surfaces the
+/// refusal as a distinct `-lastConnectError`. It used to be a `WINPR_ASSERT` (libc `assert`):
+/// that aborts the whole process instead of refusing one session, vanishes under any build
+/// configuration that defines NDEBUG (this project's Release does not today -- verified by gate
+/// a2-gfx-invariant r1 -- but nothing pins that), and cannot be exercised headlessly. Pure
+/// predicate over the two callback pointers (opaque, so this ObjC header stays free of FreeRDP
+/// types); exposed so the App test bundle can pin its meaning.
+FOUNDATION_EXPORT BOOL CRBGfxDecodePathIntact(const void *_Nullable surfaceCommand,
+                                              const void *_Nullable updateSurfaces);
+
 /// One control-lane event delivered by `-[CRSession drainEventsWithHandler:]`.
 ///
 /// Pure Objective-C, matching adr/0005 §5's "the bridge exposes only an ObjC header
@@ -488,10 +502,15 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 
 /// Set (non-nil) if the most recent `-start` call's connection attempt failed before any
 /// protocol traffic occurred (DNS/TCP/TLS/NLA/activation failure) — read this after
-/// observing no HandshakeFlags event within a reasonable timeout. Cleared at the start of
-/// each `-start` call. Deliberately not `nonatomic`: written from T_rdp
-/// (`crb_rdp_thread_main`'s connect-failure path), read from T_main — see the class
-/// extension's redeclaration in CRSession.mm for the cross-thread publish rationale.
+/// observing no HandshakeFlags event within a reasonable timeout — OR if the bridge itself
+/// refused the session once the RDPGFX channel came up without its decode path
+/// (ADR-0017 §4 A2, code -5): that refusal happens deep inside protocol traffic and is
+/// published from T_rdp's epilogue just before the DISCONNECTED sentinel, so a drain that
+/// checks this property first (as the App's does) reports it instead of a silent
+/// disconnect. Cleared at the start of each `-start` call. Deliberately not `nonatomic`:
+/// written from T_rdp (`crb_rdp_thread_main`'s connect-failure path and its epilogue),
+/// read from T_main — see the class extension's redeclaration in CRSession.mm for the
+/// cross-thread publish rationale.
 @property (readonly, nullable) NSError *lastConnectError;
 
 /// W4b frame pathway (adr/0005 §2). Call after observing a `CRDPEventKindFrameReady` event

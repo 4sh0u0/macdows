@@ -373,6 +373,13 @@ typedef struct
      * "never assume a NULL prior value" discipline as the rest of this struct. */
     pcRdpgfxUpdateWindowFromSurface orig_UpdateWindowFromSurface;
     pcRdpgfxUnmapWindowForSurface orig_UnmapWindowForSurface;
+
+    /* ADR-0017 §4 row A2: set by crb_on_channel_connected when the RDPGFX decode path is not
+     * installed (CRBGfxDecodePathIntact false). The channel handler is a void PubSub callback
+     * on the DVC bring-up path -- it can abort the connection but cannot report -- so T_rdp
+     * reads this flag when its loop exits and turns it into a distinct -lastConnectError
+     * (gate a2-gfx-invariant r1 B-1: abort alone reads as a silent disconnect to the App). */
+    BOOL decodePathRefused;
 } CRBridgeContext;
 
 /* Only the RDPGFX wrappers need this: gdi_graphics_pipeline_init() claims
@@ -462,8 +469,10 @@ typedef NS_ENUM(NSInteger, CRSessionState) {
 @property (nonatomic, copy) NSString *password;
 @property (nonatomic, copy) NSString *program;
 /* Deliberately NOT nonatomic (W4a review M5): written from T_rdp
- * (crb_rdp_thread_main's connect-failure path) and read from T_main (a caller polling
- * after -start), with no other synchronization between those two accesses. A plain
+ * (crb_rdp_thread_main's connect-failure path, and -- ADR-0017 §4 A2 -- its epilogue,
+ * where a decode-path refusal raised on the DVC bring-up path is published before the
+ * DISCONNECTED sentinel) and read from T_main (a caller polling after -start), with no
+ * other synchronization between those two accesses. A plain
  * `nonatomic` NSObject-typed property has no cross-thread publication guarantee -- the
  * pointer swap itself isn't guaranteed visible to another thread without one. Objective-C
  * `atomic` property synthesis (the default, this project just makes it explicit here)
@@ -1334,6 +1343,33 @@ static UINT crb_gfx_unmap_window_for_surface(RdpgfxClientContext *context, UINT6
 
 /* ==================================================================================== */
 
+/* ADR-0017 §4 row A2: the refusal raised by crb_on_channel_connected, as the NSError T_rdp
+ * publishes through -lastConnectError. nil when no refusal happened. Code -5 is this class's
+ * own domain (-1..-4 are the -start failures above); the description names the invariant and
+ * the ADR so the App's "Connect failed: ..." label is self-explanatory. */
+static NSError *_Nullable crb_decode_path_refusal_error(const CRBridgeContext *p)
+{
+    if (!p->decodePathRefused)
+        return nil;
+    return [NSError errorWithDomain:@"Macdows.CRSession"
+                               code:-5
+                           userInfo:@{
+                               NSLocalizedDescriptionKey :
+                                   @"RDPGFX decode path not installed (adr/0005 §2 invariant, ADR-0017 §4 A2): "
+                                   @"the session was refused before any frame could arrive. The vendored "
+                                   @"FreeRDP's gdi pipeline nulled SurfaceCommand/UpdateSurfaces -- check "
+                                   @"DeactivateClientDecoding and the upstream pin before retrying."
+                           }];
+}
+
+BOOL CRBGfxDecodePathIntact(const void *_Nullable surfaceCommand, const void *_Nullable updateSurfaces)
+{
+    /* ADR-0017 §4 A2: both decode callbacks must be installed; either missing means the
+     * gdi decode path was deactivated (gfx.c:2052-2057) and frames would silently never
+     * arrive. Pure and header-visible so the App test bundle can pin its meaning. */
+    return surfaceCommand != NULL && updateSurfaces != NULL;
+}
+
 static void crb_on_channel_connected(void *context, const ChannelConnectedEventArgs *e)
 {
     CRBridgeContext *p = (CRBridgeContext *)context;
@@ -1379,11 +1415,32 @@ static void crb_on_channel_connected(void *context, const ChannelConnectedEventA
 
         RdpgfxClientContext *gfx = (RdpgfxClientContext *)e->pInterface;
 
-        /* adr/0005 §2's startup invariant: a silent upstream change that nulls these
-         * (gfx.c:2052-2057, triggered by DeactivateClientDecoding=TRUE) means "black
-         * window, zero errors" -- assert loudly instead. */
-        WINPR_ASSERT(gfx->SurfaceCommand != NULL);
-        WINPR_ASSERT(gfx->UpdateSurfaces != NULL);
+        /* adr/0005 §2's startup invariant, ADR-0017 §4 row A2: a silent upstream change that
+         * nulls these (gfx.c:2052-2057, triggered by DeactivateClientDecoding=TRUE) means
+         * "black window, zero errors". Explicit check + connection abort, not WINPR_ASSERT:
+         * an assert aborts the whole process instead of refusing one session, is dropped by
+         * any build configuration that defines NDEBUG (this project's Release does not
+         * today -- gate a2-gfx-invariant r1 verified it -- but nothing pins that), and cannot
+         * be exercised headlessly. This handler is a void PubSub callback on the DVC bring-up
+         * path: it can only set the context's abort event (the T_rdp loop then exits through
+         * freerdp_check_event_handles) and cannot report, so it also raises decodePathRefused,
+         * which crb_rdp_thread_main turns into a distinct -lastConnectError before posting
+         * DISCONNECTED -- otherwise the App would see a silent disconnect and keep Connect
+         * disabled (gate r1 B-1). The bridge installs none of its hooks on a context it is
+         * about to tear down. reinterpret_cast of a function pointer to const void* is a
+         * conditionally-supported conversion clang accepts without diagnostics under this
+         * target's flags (gate r1 m-2). */
+        if (!CRBGfxDecodePathIntact(reinterpret_cast<const void *>(gfx->SurfaceCommand),
+                                    reinterpret_cast<const void *>(gfx->UpdateSurfaces)))
+        {
+            WLog_ERR(TAG, "RDPGFX decode path not installed (SurfaceCommand %s, UpdateSurfaces %s) -- "
+                          "adr/0005 §2 invariant (DeactivateClientDecoding must be FALSE) does not hold; "
+                          "refusing the session (ADR-0017 §4 A2)",
+                     gfx->SurfaceCommand ? "set" : "NULL", gfx->UpdateSurfaces ? "set" : "NULL");
+            p->decodePathRefused = TRUE;
+            freerdp_abort_connect_context(&p->common.context);
+            return;
+        }
 
         /* L2: enforce the single-session assumption g_crbGfxContext's own comment
          * documents, rather than silently letting a second live session clobber the
@@ -1861,6 +1918,8 @@ static void *crb_rdp_thread_main(void *arg)
 
     freerdp *instance = session->_instance;
 
+    CRBridgeContext *bridge = (CRBridgeContext *)instance->context;
+
     if (!freerdp_connect(instance))
     {
         UINT32 code = freerdp_get_last_error(instance->context);
@@ -1870,6 +1929,10 @@ static void *crb_rdp_thread_main(void *arg)
         session.lastConnectError = [NSError errorWithDomain:@"Macdows.CRSession"
                                                          code:(NSInteger)code
                                                      userInfo:@{NSLocalizedDescriptionKey : desc}];
+        /* ADR-0017 §4 A2: should the RDPGFX channel ever come up inside freerdp_connect, the
+         * refusal outranks the generic code -- name the invariant, not the abort's side effect. */
+        if (bridge->decodePathRefused)
+            session.lastConnectError = crb_decode_path_refusal_error(bridge);
         freerdp_disconnect(instance);
 
         /* H1 (W4a review): post DISCONNECTED even on a connect *failure*, not just a
@@ -1977,6 +2040,14 @@ static void *crb_rdp_thread_main(void *arg)
     }
 
     freerdp_disconnect(instance);
+
+    /* ADR-0017 §4 A2 (gate r1 B-1): the DVC bring-up -- and therefore the decode-path check --
+     * happens AFTER freerdp_connect returned TRUE, so a refusal exits the loop above through
+     * the "clean shutdown" branch with FREERDP_ERROR_SUCCESS. Publish the refusal here, before
+     * the DISCONNECTED sentinel, so the App's drain sees -lastConnectError set and re-enables
+     * Connect with the reason instead of reading a silent disconnect. */
+    if (bridge->decodePathRefused)
+        session.lastConnectError = crb_decode_path_refusal_error(bridge);
 
     CrdpEvent ev;
     memset(&ev, 0, sizeof(ev));
