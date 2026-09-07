@@ -240,7 +240,8 @@ struct crdpq_icon_store {
     pthread_mutex_t lock;
     size_t overflow_count;
     /* W3 lane G: per-cause conversion refusals (indexed by crdpq_icon_convert_result_t) and the
-     * oversize subset of the DIMENSIONS ones. Cumulative like overflow_count. */
+     * oversize subset of the DIMENSIONS ones. Cumulative like overflow_count. Sized by the enum's
+     * LAST member -- see the MAINTENANCE ANCHOR note on CRDPQ_ICON_ERR_DEST in crdpq.h. */
     size_t refusal_counts[CRDPQ_ICON_ERR_DEST + 1];
     size_t oversize_count;
     crdpq_icon_slot_t slots[CRDPQ_ICON_SLOTS];

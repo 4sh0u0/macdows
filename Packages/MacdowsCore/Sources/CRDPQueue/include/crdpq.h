@@ -782,7 +782,12 @@ typedef enum {
      *  `height` 1-bit AND-mask scanlines. */
     CRDPQ_ICON_ERR_BITS_MASK,
     /** `dst` is NULL or `dst_capacity` is under `width * height * 4`. A caller bug, not
-     *  server input — kept distinct from the wire-data rejections above for that reason. */
+     *  server input — kept distinct from the wire-data rejections above for that reason.
+     *  MAINTENANCE ANCHOR (W3 lane G): this must stay the LAST member -- crdpq_icon.c sizes
+     *  `refusal_counts[CRDPQ_ICON_ERR_DEST + 1]` by it and both range guards in
+     *  `crdpq_icon_store_note_convert_refusal` / `..._refusal_count` compare against it. A new
+     *  cause appended AFTER it would be silently excluded from the per-cause counters (not a
+     *  compile error); append new causes ABOVE this line. */
     CRDPQ_ICON_ERR_DEST,
 } crdpq_icon_convert_result_t;
 
