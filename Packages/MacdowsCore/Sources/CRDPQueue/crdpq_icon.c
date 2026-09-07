@@ -239,6 +239,10 @@ struct crdpq_icon_store {
      * the frames lane's lock-free design is deliberately NOT copied here. */
     pthread_mutex_t lock;
     size_t overflow_count;
+    /* W3 lane G: per-cause conversion refusals (indexed by crdpq_icon_convert_result_t) and the
+     * oversize subset of the DIMENSIONS ones. Cumulative like overflow_count. */
+    size_t refusal_counts[CRDPQ_ICON_ERR_DEST + 1];
+    size_t oversize_count;
     crdpq_icon_slot_t slots[CRDPQ_ICON_SLOTS];
 };
 
@@ -279,7 +283,8 @@ void crdpq_icon_store_clear(crdpq_icon_store_t* s) {
         s->slots[i].width = 0;
         s->slots[i].height = 0;
     }
-    /* overflow_count deliberately survives -- see this function's doc comment. */
+    /* overflow_count deliberately survives -- see this function's doc comment; so do the
+     * refusal counters (W3 lane G), by the same cumulative-for-the-lifetime contract. */
     pthread_mutex_unlock(&s->lock);
 }
 
@@ -384,6 +389,37 @@ size_t crdpq_icon_store_overflow_count(const crdpq_icon_store_t* s) {
     crdpq_icon_store_t* sw = (crdpq_icon_store_t*)s;
     pthread_mutex_lock(&sw->lock);
     const size_t count = sw->overflow_count;
+    pthread_mutex_unlock(&sw->lock);
+    return count;
+}
+
+void crdpq_icon_store_note_convert_refusal(crdpq_icon_store_t* s, crdpq_icon_convert_result_t rc,
+                                           uint32_t width, uint32_t height) {
+    if (!s) return;
+    if (rc == CRDPQ_ICON_OK || (int)rc < 0 || (int)rc > (int)CRDPQ_ICON_ERR_DEST) return;
+    pthread_mutex_lock(&s->lock);
+    s->refusal_counts[rc]++;
+    if (rc == CRDPQ_ICON_ERR_DIMENSIONS && (width > CRDPQ_ICON_MAX_DIM || height > CRDPQ_ICON_MAX_DIM)) {
+        s->oversize_count++;
+    }
+    pthread_mutex_unlock(&s->lock);
+}
+
+size_t crdpq_icon_store_refusal_count(const crdpq_icon_store_t* s, crdpq_icon_convert_result_t rc) {
+    if (!s) return 0;
+    if (rc == CRDPQ_ICON_OK || (int)rc < 0 || (int)rc > (int)CRDPQ_ICON_ERR_DEST) return 0;
+    crdpq_icon_store_t* sw = (crdpq_icon_store_t*)s;
+    pthread_mutex_lock(&sw->lock);
+    const size_t count = sw->refusal_counts[rc];
+    pthread_mutex_unlock(&sw->lock);
+    return count;
+}
+
+size_t crdpq_icon_store_oversize_count(const crdpq_icon_store_t* s) {
+    if (!s) return 0;
+    crdpq_icon_store_t* sw = (crdpq_icon_store_t*)s;
+    pthread_mutex_lock(&sw->lock);
+    const size_t count = sw->oversize_count;
     pthread_mutex_unlock(&sw->lock);
     return count;
 }

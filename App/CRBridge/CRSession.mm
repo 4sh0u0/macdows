@@ -729,7 +729,11 @@ static BOOL crb_notify_icon_common(rdpContext *context, const WINDOW_ORDER_INFO 
             /* Fail-open (adr/0008 §4 / adr/0013 §1): the consumer falls back to its
              * placeholder. Slot exhaustion is separately counted inside the store
              * (crdpq_icon_store_overflow_count); a conversion refusal is counted by the
-             * consumer via iconSkipped itself. */
+             * consumer via iconSkipped itself -- and, since W3 lane G, by cause inside the
+             * store too, so the 2x checkpoint can read "how many were OVERSIZE" instead of
+             * "how many were refused for one of three reasons" (ADR-0015 §7 (b) trigger). */
+            if (rc != CRDPQ_ICON_OK && icons)
+                crdpq_icon_store_note_convert_refusal(icons, rc, icon->width, icon->height);
             ev.payload.notifyIcon.iconSkipped = 1;
             WLog_WARN(TAG,
                       "NotifyIcon windowId=%" PRIu32 " notifyIconId=%" PRIu32
@@ -2505,6 +2509,11 @@ cleanup:
 - (uint64_t)droppedEventsCount
 {
     return _controlQueue ? crdpq_dropped_count(_controlQueue) : 0;
+}
+
+- (uint64_t)iconStoreOversizeRefusalCount
+{
+    return _iconStore ? (uint64_t)crdpq_icon_store_oversize_count(_iconStore) : 0;
 }
 
 - (uint64_t)iconStoreOverflowCount

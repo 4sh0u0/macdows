@@ -7035,7 +7035,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // before shutdown and a poll could miss a same-batch create+delete), a skip
         // (any of iconSkipped's three causes), or a store overflow (slot accounting broke).
         if trayScenarioEnabled {
-            print("[tray] realIconMaxObserved=\(trayDiag.realIconMaxObserved) iconSkipped=\(trayDiag.iconSkippedCount) cachedIcon=\(trayDiag.cachedIconCount) storeOverflow=\(trayDiag.storeOverflowCount)")
+            print("[tray] realIconMaxObserved=\(trayDiag.realIconMaxObserved) iconSkipped=\(trayDiag.iconSkippedCount) cachedIcon=\(trayDiag.cachedIconCount) storeOverflow=\(trayDiag.storeOverflowCount) storeOversizeRefusals=\(trayDiag.storeOversizeRefusalCount)")
             check(trayDiag.createsSeen >= 1, "tray scenario saw at least one NotifyIconCreate (got creates=\(trayDiag.createsSeen))")
             check(
                 trayDiag.realIconMaxObserved >= 1,
