@@ -570,6 +570,43 @@ Test-Case 'a missing SessionID datum renders as <n/a>; a null time as <no-time>'
 }
 
 # -------------------------------------------------------------------------------------------
+# Session-history window. The block used to be a literal "newest 12"; one other-client
+# connection (4 LSM rows) plus the lab's own rail-probe (7) and the relay session that reads
+# the snapshot (5 at read time) already fill 12 -- in 4 of the 5 T6-prime forms (2026-09-07)
+# the other client's 24/25 had been pushed out and clause (c) had to be judged from the
+# owner's manual 60-row query. The window is now a parameter with that 60-row default.
+# -------------------------------------------------------------------------------------------
+
+New-Section 'SessionHistoryCount (session-history window)'
+
+Test-Case 'the session-history window is a parameter; its default (60) is the window the owner''s manual LSM query used and covers one other-client connection plus the lab''s own probe + relay footprint several times over' {
+    Assert-Equal 60 $SessionHistoryCount
+}
+
+Test-Case 'the session-history header names the window that was actually read' {
+    Assert-Equal '  session history (LSM/Operational, newest 60; user and address omitted by design):' (Format-SnapshotSessionHistoryHeader -Count 60)
+    Assert-Equal '  session history (LSM/Operational, newest 12; user and address omitted by design):' (Format-SnapshotSessionHistoryHeader -Count 12)
+}
+
+Test-Case 'the LSM read and its header take the window from the parameter, not from a literal (static pin), and the parameter is threaded into the collector' {
+    $src = Get-Content (Join-Path $PSScriptRoot 'server-snapshot.ps1') -Raw
+    Assert-True ($src -match 'LocalSessionManager/Operational''\s+-MaxEvents\s+\$SessionHistoryCount\b') 'the LSM Get-WinEvent must pass -MaxEvents $SessionHistoryCount'
+    Assert-True ($src -notmatch 'LocalSessionManager/Operational''\s+-MaxEvents\s+\d') 'no literal -MaxEvents on the LSM read'
+    Assert-True ($src -match 'Format-SnapshotSessionHistoryHeader\s+-Count\s+\$SessionHistoryCount\b') 'the header must be rendered from the same parameter'
+    Assert-True ($src -match 'Invoke-SnapshotCollection\s+-OutPath\s+\$OutPath\s+-MaxEventsPerChannel\s+\$MaxEventsPerChannel\s+-SessionHistoryCount\s+\$SessionHistoryCount\b') 'the entry point must thread the parameter into the collector'
+}
+
+Test-Case 'a positive session-history window is accepted and a non-positive one is refused at the parameter' {
+    $path = Join-Path $PSScriptRoot 'server-snapshot.ps1'
+    $accepted = $true
+    try { & $path -NoRun -SessionHistoryCount 5 } catch { $accepted = $false }
+    Assert-True $accepted 'SessionHistoryCount 5 must bind (a binding error here means the parameter does not exist)'
+    $threw = $false
+    try { & $path -NoRun -SessionHistoryCount 0 } catch { $threw = $true }
+    Assert-True $threw 'SessionHistoryCount 0 must be rejected by parameter validation'
+}
+
+# -------------------------------------------------------------------------------------------
 # Summary
 # -------------------------------------------------------------------------------------------
 
