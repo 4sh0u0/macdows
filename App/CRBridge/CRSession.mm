@@ -469,8 +469,10 @@ typedef NS_ENUM(NSInteger, CRSessionState) {
 @property (nonatomic, copy) NSString *password;
 @property (nonatomic, copy) NSString *program;
 /* Deliberately NOT nonatomic (W4a review M5): written from T_rdp
- * (crb_rdp_thread_main's connect-failure path) and read from T_main (a caller polling
- * after -start), with no other synchronization between those two accesses. A plain
+ * (crb_rdp_thread_main's connect-failure path, and -- ADR-0017 §4 A2 -- its epilogue,
+ * where a decode-path refusal raised on the DVC bring-up path is published before the
+ * DISCONNECTED sentinel) and read from T_main (a caller polling after -start), with no
+ * other synchronization between those two accesses. A plain
  * `nonatomic` NSObject-typed property has no cross-thread publication guarantee -- the
  * pointer swap itself isn't guaranteed visible to another thread without one. Objective-C
  * `atomic` property synthesis (the default, this project just makes it explicit here)
