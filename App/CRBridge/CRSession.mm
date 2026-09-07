@@ -1635,6 +1635,15 @@ static BOOL crb_pre_connect(freerdp *instance)
             !freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, session.desktopHeight))
             return FALSE;
     }
+    /* W3 lane E (ADR-0018 §2): the advertised scale pair, fixture-only today (CRSession.h's
+     * advertisedDesktopScaleFactor doc). Both zero -- the product's value -- leaves both settings
+     * at FreeRDP's defaults; this block is the only place in the bridge that touches them. */
+    if (session.advertisedDesktopScaleFactor > 0 && session.advertisedDeviceScaleFactor > 0)
+    {
+        if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopScaleFactor, session.advertisedDesktopScaleFactor) ||
+            !freerdp_settings_set_uint32(settings, FreeRDP_DeviceScaleFactor, session.advertisedDeviceScaleFactor))
+            return FALSE;
+    }
     if (!freerdp_settings_set_string(settings, FreeRDP_RemoteApplicationProgram, session.program.UTF8String))
         return FALSE;
     /* Optional launch arguments (CRSession.h's programArguments contract): the RAIL
