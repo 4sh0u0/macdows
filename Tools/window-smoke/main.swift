@@ -501,15 +501,21 @@ enum F1BackingVsMapped {
     enum Verdict: String {
         case green = "GREEN"
         case red = "RED"
-        /// W3 lane C (ADR-0018 U-3 "先分类不裁量"): every axis is either equal, or off by EXACTLY one
-        /// backing pixel against an ODD remote-px mapped dimension -- and at least one axis is the
-        /// latter. Mechanism (C-2 2026-09-01, F round 3 2026-09-06): at 2x an integral-point content
-        /// rect converts to an EVEN backing size on both axes, while the server's mapped size can be
-        /// odd, so that axis can never be equal and its ±1 is structural. This is a CLASSIFICATION
-        /// of the measurement, not a tolerance and not a pass: the summary counts it apart from
-        /// GREEN and RED, the tally remembers it like a RED, and -- like every F1 verdict -- it does
-        /// not touch the exit code. Whether to tolerate it, align content to even sizes, or use
-        /// half-point granularity is U-3's decision after the 2x checkpoint has this distribution.
+        /// W3 lane C (ADR-0018 U-3 "先分类不裁量"): ONLY when the window's implied backing scale is
+        /// not 1 -- every axis is either equal, or off by EXACTLY one backing pixel against an ODD
+        /// remote-px mapped dimension, and at least one axis is the latter. Mechanism (C-2
+        /// 2026-09-01, F round 3 2026-09-06): at 2x `convertToBacking` yields an EVEN backing size
+        /// whenever the content dimension is a whole number of points (the common case; a half-point
+        /// content dimension gives an odd backing size and then an off-by-one against an odd mapped
+        /// dimension is `other` = RED, because two odd integers cannot differ by one -- the parity
+        /// test is self-sufficient), while the server's mapped size can be odd, so such an axis can
+        /// never be equal and its ±1 is structural. At 1x there is no such mechanism, so at 1x ANY
+        /// disagreement stays RED (gate w3-lane-c r1: without this gate a genuine 1x off-by-one
+        /// against an odd mapped dimension would have been relabelled). This is a CLASSIFICATION of
+        /// the measurement, not a tolerance and not a pass: the summary counts it apart from GREEN and
+        /// RED, the tally remembers it like a RED, and -- like every F1 verdict -- it does not touch
+        /// the exit code. Whether to tolerate it, align content to even sizes, or use half-point
+        /// granularity is U-3's decision after the 2x checkpoint has this distribution.
         case oddDimensionOffByOne = "ODD1"
     }
 
@@ -528,15 +534,18 @@ enum F1BackingVsMapped {
         let mappedWidthInRemotePixels: Double
         let mappedHeightInRemotePixels: Double
 
-        /// EXACT equality, both axes, is GREEN. Otherwise each axis is classified on its own:
-        /// `equal` / `oddOffByOne` (|backing − mapped| == 1 and the mapped dimension is an odd
-        /// integer) / `other`. Any `other` axis is RED; else (at least one `oddOffByOne`) it is
-        /// `.oddDimensionOffByOne`. No tolerance and no rounding anywhere -- a half or a quarter
-        /// pixel is `other` (RED), an off-by-one against an EVEN mapped dimension is `other` (RED).
+        /// EXACT equality, both axes, is GREEN. At an implied backing scale of 1 (or unknown) any
+        /// disagreement is RED -- the odd-dimension mechanism exists only above 1x. Otherwise each
+        /// axis is classified on its own: `equal` / `oddOffByOne` (|backing − mapped| == 1 and the
+        /// mapped dimension is an odd integer) / `other`. Any `other` axis is RED; else (at least
+        /// one `oddOffByOne`) it is `.oddDimensionOffByOne`. No tolerance and no rounding anywhere
+        /// -- a half or a quarter pixel is `other` (RED), an off-by-one against an EVEN mapped
+        /// dimension is `other` (RED).
         var verdict: Verdict {
             let w = Self.axisClass(backing: backingWidthInBackingPixels, mapped: mappedWidthInRemotePixels)
             let h = Self.axisClass(backing: backingHeightInBackingPixels, mapped: mappedHeightInRemotePixels)
             if w == .equal && h == .equal { return .green }
+            guard let scale = impliedBackingScale, scale != 1 else { return .red }
             if w == .other || h == .other { return .red }
             return .oddDimensionOffByOne
         }
@@ -1095,11 +1104,17 @@ enum WindowSmokeGateSelfTest {
         // expected in a live run. An assertion about a claim is still an assertion.
         expect(
             f1(backing: (509, 507), content: (509, 507), mapped: (508, 507)).verdict == .red
-                && f1(backing: (508, 507), content: (508, 507), mapped: (508, 506)).verdict == .red
+                && f1(backing: (508, 508), content: (508, 508), mapped: (508, 507)).verdict == .red
                 && f1(backing: (508.5, 507), content: (508.5, 507), mapped: (508, 507)).verdict == .red
                 && f1(backing: (508.25, 507), content: (508.25, 507), mapped: (508, 507)).verdict == .red,
-            "f1AdmitsOnlyExactEquality: 1 backing px against an EVEN remote-px dimension, a half, and a "
-                + "quarter are all RED (W3 lane C: only the odd-remote-px off-by-one is classified apart)"
+            "f1AdmitsOnlyExactEquality: at 1x, 1 backing px on either axis -- against an odd OR an even "
+                + "mapped dimension -- and a half, and a quarter, are all RED (the original M1 pin, kept "
+                + "verbatim: W3 lane C's ODD1 exists only above 1x, gate w3-lane-c r1)"
+        )
+        expect(
+            f1(backing: (1016, 1014), content: (508, 507), mapped: (1016, 1013)).verdict == .oddDimensionOffByOne
+                && f1(backing: (1016, 1014), content: (508, 507), mapped: (1016, 1012)).verdict == .red,
+            "f1OddNeedsNonUnitScale: the same 1 px gap against an odd mapped dimension is ODD1 at 2x and RED at 1x (previous case); a 2 px gap at 2x is RED"
         )
         // --- W3 lane C (ADR-0018 U-3 "先分类不裁量"): the odd-dimension off-by-one --------------
         // At 2x a content rect of integral points converts to an EVEN backing size on both axes;
