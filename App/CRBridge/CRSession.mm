@@ -1334,6 +1334,14 @@ static UINT crb_gfx_unmap_window_for_surface(RdpgfxClientContext *context, UINT6
 
 /* ==================================================================================== */
 
+BOOL CRBGfxDecodePathIntact(const void *_Nullable surfaceCommand, const void *_Nullable updateSurfaces)
+{
+    /* ADR-0017 §4 A2: both decode callbacks must be installed; either missing means the
+     * gdi decode path was deactivated (gfx.c:2052-2057) and frames would silently never
+     * arrive. Pure and header-visible so the App test bundle can pin its meaning. */
+    return surfaceCommand != NULL && updateSurfaces != NULL;
+}
+
 static void crb_on_channel_connected(void *context, const ChannelConnectedEventArgs *e)
 {
     CRBridgeContext *p = (CRBridgeContext *)context;
@@ -1379,11 +1387,25 @@ static void crb_on_channel_connected(void *context, const ChannelConnectedEventA
 
         RdpgfxClientContext *gfx = (RdpgfxClientContext *)e->pInterface;
 
-        /* adr/0005 §2's startup invariant: a silent upstream change that nulls these
-         * (gfx.c:2052-2057, triggered by DeactivateClientDecoding=TRUE) means "black
-         * window, zero errors" -- assert loudly instead. */
-        WINPR_ASSERT(gfx->SurfaceCommand != NULL);
-        WINPR_ASSERT(gfx->UpdateSurfaces != NULL);
+        /* adr/0005 §2's startup invariant, ADR-0017 §4 row A2: a silent upstream change that
+         * nulls these (gfx.c:2052-2057, triggered by DeactivateClientDecoding=TRUE) means
+         * "black window, zero errors". Explicit check + connection abort rather than
+         * WINPR_ASSERT, so the guard survives any build configuration that defines NDEBUG
+         * (the shipped Release binary had no guard at all until 2026-09-08). Abort here --
+         * we are inside the DVC bring-up on the channel thread with no BOOL to return --
+         * sets the context's abort event, which the connect loop in -start observes and
+         * reports as a connection failure with the last error; the bridge installs none of
+         * its hooks on a context it is about to tear down. */
+        if (!CRBGfxDecodePathIntact(reinterpret_cast<const void *>(gfx->SurfaceCommand),
+                                    reinterpret_cast<const void *>(gfx->UpdateSurfaces)))
+        {
+            WLog_ERR(TAG, "RDPGFX decode path not installed (SurfaceCommand %s, UpdateSurfaces %s) -- "
+                          "adr/0005 §2 invariant (DeactivateClientDecoding must be FALSE) does not hold; "
+                          "refusing the session (ADR-0017 §4 A2)",
+                     gfx->SurfaceCommand ? "set" : "NULL", gfx->UpdateSurfaces ? "set" : "NULL");
+            freerdp_abort_connect_context(&p->common.context);
+            return;
+        }
 
         /* L2: enforce the single-session assumption g_crbGfxContext's own comment
          * documents, rather than silently letting a second live session clobber the

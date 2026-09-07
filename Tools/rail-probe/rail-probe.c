@@ -931,6 +931,22 @@ static void probe_on_channel_connected(void* context, const ChannelConnectedEven
 
 		if (p->cfg.decode)
 		{
+			/* ADR-0017 §4 row A2 (adr/0005 §2): with --decode the full decode path must be
+			 * installed; gdi_graphics_pipeline_init_ex nulls both callbacks when
+			 * DeactivateClientDecoding is TRUE, and an upstream drift there would read as
+			 * "zero SurfaceCommand stats, zero errors". Explicit check + connection abort
+			 * (not WINPR_ASSERT, which is a no-op under NDEBUG), same shape as the probe's
+			 * AsyncUpdate refusal in post-connect. */
+			if (gfx->SurfaceCommand == NULL || gfx->UpdateSurfaces == NULL)
+			{
+				fprintf(stderr,
+				        "rail-probe: --decode requested but the RDPGFX decode path is not installed "
+				        "(SurfaceCommand %s, UpdateSurfaces %s) -- adr/0005 §2 invariant does not hold; "
+				        "refusing the session (ADR-0017 §4 A2)\n",
+				        gfx->SurfaceCommand ? "set" : "NULL", gfx->UpdateSurfaces ? "set" : "NULL");
+				freerdp_abort_connect_context(&p->common.context);
+				return;
+			}
 			p->orig_SurfaceCommand = gfx->SurfaceCommand;
 			gfx->SurfaceCommand = probe_gfx_surface_command;
 		}

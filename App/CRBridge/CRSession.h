@@ -3,6 +3,17 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/// ADR-0017 §4 row A2 / adr/0005 §2: the RDPGFX decode path is "intact" when both
+/// `RdpgfxClientContext::SurfaceCommand` and `::UpdateSurfaces` are installed.
+/// `gdi_graphics_pipeline_init_ex` nulls both when `FreeRDP_DeactivateClientDecoding` is TRUE,
+/// and the symptom of that drifting upstream is "black window, zero errors" -- so the bridge
+/// checks this explicitly when the channel comes up and refuses the session when it fails
+/// (formerly a `WINPR_ASSERT`, which compiles to nothing under NDEBUG). Pure predicate over the
+/// two callback pointers (passed as opaque pointers so this ObjC header stays free of FreeRDP
+/// types); exposed so the App test bundle can pin its meaning.
+FOUNDATION_EXPORT BOOL CRBGfxDecodePathIntact(const void *_Nullable surfaceCommand,
+                                              const void *_Nullable updateSurfaces);
+
 /// One control-lane event delivered by `-[CRSession drainEventsWithHandler:]`.
 ///
 /// Pure Objective-C, matching adr/0005 §5's "the bridge exposes only an ObjC header
