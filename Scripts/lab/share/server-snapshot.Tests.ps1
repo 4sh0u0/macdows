@@ -659,7 +659,7 @@ Test-Case 'an empty or null event list selects nothing and counts nothing' {
     Assert-Equal 0 @($sel2.Shown).Count
 }
 
-Test-Case 'the jump is still summed over EVERY event read since boot, zero-delta ones included (a zero sum is 0, not null)' {
+Test-Case 'the jump is still summed over EVERY event read since boot, zero-delta ones included (a zero sum is 0, not null) (regression pin: unchanged function)' {
     $boot = [datetime]::new(2026, 9, 5, 18, 40, 10)
     Assert-Equal 32400 (Measure-SnapshotClockJump -Events $clockPrintEvents -BootTime $boot)
     Assert-Equal 0 (Measure-SnapshotClockJump -Events @($clockPrintEvents[0], $clockPrintEvents[1]) -BootTime $boot)
@@ -675,7 +675,7 @@ Test-Case 'the Kernel-General 1 read, its header and the collector take the wind
 }
 
 Test-Case 'the clock-change header names the window and the print rule' {
-    Assert-Equal '  clock changes (Kernel-General 1, System log, newest 50 read; corrections with delta != 0 shown, zero-delta ones counted):' (Format-SnapshotClockChangeHeader -Count 50)
+    Assert-Equal '  clock changes (Kernel-General 1, System log, newest 50 read; corrections with delta != 0 or unparsed shown, zero-delta ones counted):' (Format-SnapshotClockChangeHeader -Count 50)
 }
 
 Test-Case 'a positive clock-change window binds and a non-positive one is refused at the parameter' {

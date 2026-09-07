@@ -81,8 +81,10 @@ param(
     # literal 5 until 2026-09-07: the T6-prime RA3 snapshot showed two fresh zero-delta time-sync
     # events pushing the +28671 s correction out of that window, and the jump fell from 32400 s
     # to 3729 s -- with LastBootUpTime still nine hours early that would have left the boot/tick
-    # gap "unexplained" and the label `unknown`. 50 covers weeks of hourly syncs; the sum runs over
-    # everything read since boot, while only the corrections that moved the clock are printed.
+    # gap "unexplained" and the label `unknown`. On this host the System log held about eight
+    # Kernel-General 1 events for 09-01..09-07 (intervals from 30 min to 55 h), so 50 reaches back
+    # well over a month at that rate; the sum runs over everything read since boot, while only the
+    # corrections that moved the clock (or could not be parsed) are printed.
     [ValidateRange(1, 2500)]
     [int] $ClockChangeCount = 50,
     [switch] $NoRun
@@ -384,7 +386,7 @@ function Format-SnapshotClockChangeHeader {
     <# The clock-change block's header line; it names the window read and the print rule. #>
     [CmdletBinding()]
     param([int] $Count)
-    return "  clock changes (Kernel-General 1, System log, newest $Count read; corrections with delta != 0 shown, zero-delta ones counted):"
+    return "  clock changes (Kernel-General 1, System log, newest $Count read; corrections with delta != 0 or unparsed shown, zero-delta ones counted):"
 }
 
 function Measure-SnapshotClockJump {
