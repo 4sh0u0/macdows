@@ -229,11 +229,23 @@ jobs:
         # It also runs the lane's two python unit suites (test_wdp_etw, test_etw_summarize), which
         # cover the capture client's own wire behaviour against a fake portal on loopback and the
         # summariser's redaction. Those, and nothing else, are why this step opens a socket at all:
-        # 127.0.0.1 only. `openssl` and `open` are PATH-shimmed and the shims open nothing;
-        # `python3` deliberately is NOT shimmed, because Scripts/lib.sh's boundary gate evaluates
-        # the allowed segments with it -- both are already relied on by earlier steps in this job.
-        # HOME is redirected to a sandbox whose host.env carries an RFC 5737 documentation address
-        # and placeholder credentials, and TERM_PROGRAM is cleared so no Terminal hop is attempted.
+        # 127.0.0.1 only. Inside the sandbox `openssl`, `open`, `osascript` and `mktemp` are
+        # PATH-shimmed (the openssl shim opens no socket and the mktemp shim only records before
+        # running the real one); the ONE place the real openssl runs is test_wdp_etw's `make_cert`,
+        # which builds the throw-away certificate its loopback portal serves -- no socket there
+        # either. `python3` deliberately is NOT shimmed, because Scripts/lib.sh's boundary gate
+        # evaluates the allowed segments with it -- and both binaries are already relied on by
+        # earlier steps in this job. HOME is redirected to a sandbox whose host.env carries an
+        # RFC 5737 documentation address and placeholder credentials, and TERM_PROGRAM is cleared
+        # so no Terminal hop is attempted.
+        #
+        # PYTHONDONTWRITEBYTECODE (and `python3 -B` inside the suite): a .pyc is validated against
+        # its source's mtime and size, so a same-second, same-size edit can leave a PREVIOUS
+        # module's bytecode looking valid -- measured on this lane, where restored sources and a
+        # red suite disagreed until Scripts/lab/__pycache__ was deleted. No cache may decide a
+        # Tier 1 verdict, and the runner's checkout stays clean.
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
         run: ./Scripts/lab/test-wdp-etw-offline.sh
 
       - name: Build-script prefix freshness suite

@@ -9,20 +9,32 @@
 # only their idioms, not a line of code.
 #
 # Safe in CI, by construction rather than by promise:
-#   1. `osascript`, `open` and `openssl` are PATH-shimmed, and the suite ASSERTS before the first
-#      case that PATH resolves each of them to the shim. The openssl shim opens no socket; it
-#      records its argv and answers `x509` with a fixed fingerprint line.
+#   1. `osascript`, `open`, `openssl` and `mktemp` are PATH-shimmed, and the suite ASSERTS before
+#      the first case that PATH resolves each of them to the shim. The openssl shim opens no
+#      socket; it records its argv and answers `x509` with a fixed fingerprint line. The mktemp
+#      shim records its argv and then execs the real binary, which is what turns "no credential
+#      file survives the run" into the stronger "no credential file was ever created".
+#      (The one place the REAL openssl runs is case 23's python suite: test_wdp_etw.make_cert
+#      builds a throw-away certificate for its loopback fake portal. It opens no socket either.)
 #   2. `python3` is deliberately NOT shimmed -- Scripts/lib.sh's boundary gate evaluates the
 #      segments with the REAL python3, and a shim there would replace the thing under test. The
 #      capture client is stubbed at its own path instead: the sandbox's Scripts/lab/wdp_etw.py is
-#      written by this suite and records the WDP_* environment, the credential file's mode and
-#      contents and its argv, then exits with LABTEST_CLIENT_RC. It opens no socket either.
+#      written by this suite and records the WDP_* environment, the NAMES of its whole environment
+#      (so "what did the wrapper let through" is answerable without printing a value), the
+#      credential file's mode and contents and its argv, then exits with LABTEST_CLIENT_RC. With
+#      LABTEST_CLIENT_STDERR=1 it also prints a traceback-like line naming its own module path and
+#      a refusal quoting the credential file, which is what case 18 masks. It opens no socket.
 #   3. HOME is redirected into the sandbox. Its host.env carries an RFC 5737 documentation
 #      address and placeholder account strings (never a real host, never a real credential), and
 #      the placeholder password is greppable because one case asserts it never reaches the log.
-#   4. wdp-etw.command is copied into a sandbox tree at the same depth as the real one, so its own
-#      `$LAB_DIR/../..` derivation lands REPO_ROOT (and therefore .build/lab-runtime/wdp,
-#      etw-job.env and etw.log) inside the sandbox. The real runtime is never touched.
+#      Four cases swap that file for a variant -- an IPv6 documentation address, a DNS name, the
+#      `export WIN_PASS=...` style -- and each restores it before the next case begins.
+#   4. wdp-etw.command is copied into a sandbox tree at the same depth as the real one AND under
+#      the sandbox HOME, exactly as the real checkout sits on the lab Mac. Its own
+#      `$LAB_DIR/../..` derivation therefore lands REPO_ROOT (and with it .build/lab-runtime/wdp,
+#      etw-job.env and etw.log) inside the sandbox, and every path the wrapper logs is a path
+#      under $HOME -- which is the value the log mask's <HOME> rule exists for. The real runtime
+#      is never touched.
 #   5. TMPDIR is redirected into the sandbox, so the credential file the wrapper mktemps is
 #      created, counted and (on every passing path) found gone inside $SB.
 #   6. TERM_PROGRAM is cleared, so the Terminal self-close branch is never taken; the osascript
@@ -66,11 +78,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-SBROOT="$SB/root"
+SBHOME="$SB/home"
+# The sandbox checkout lives UNDER the sandbox HOME, exactly as the real one does on the lab Mac.
+# That is not decoration: the client's module path is then a path under $HOME, and a client
+# traceback -- stderr is piped into the wrapper's log too -- prints it. On the real machine that
+# path carries the maintainer's local account name, which is why the mask has a <HOME> rule and
+# why case 18 can measure it.
+SBROOT="$SBHOME/checkout"
 SBLAB="$SBROOT/Scripts/lab"
 SBRUNTIME="$SBROOT/.build/lab-runtime"
 SBWDP="$SBRUNTIME/wdp"
-SBHOME="$SB/home"
 SBTMP="$SB/tmp"
 LOG="$SBRUNTIME/etw.log"
 JOB="$SBRUNTIME/etw-job.env"
@@ -94,7 +111,8 @@ cp "$REPO_ROOT/Scripts/lib.sh" "$SBROOT/Scripts/lib.sh" || exit 1
 # (case 0 pins that explicitly).
 
 # RFC 5737 TEST-NET-1 address and placeholder strings: never a real host, never a real credential.
-cat > "$SBHOME/.config/macdows/host.env" <<'HOSTENV' || exit 1
+HOSTENV_FILE="$SBHOME/.config/macdows/host.env"
+cat > "$HOSTENV_FILE" <<'HOSTENV' || exit 1
 WIN_HOST=192.0.2.10
 WIN_USER=labtest-placeholder
 WIN_PASS=LABTEST-PLACEHOLDER-SECRET-3f9a
@@ -123,15 +141,32 @@ for key in sorted(os.environ):
     if key.startswith("WDP_"):
         lines.append("client-env %s=%s" % (key, os.environ[key]))
 cred = os.environ.get("WDP_CRED_FILE", "")
+cred_body = ""
 if cred and os.path.exists(cred):
     lines.append("client-cred-mode %04o" % (os.stat(cred).st_mode & 0o7777))
     with open(cred) as handle:
-        lines.append("client-cred-body %s" % handle.read().strip())
+        cred_body = handle.read().strip()
+    lines.append("client-cred-body %s" % cred_body)
 else:
     lines.append("client-cred-absent %s" % cred)
+# Names only, never values: what this line answers is "which variables did the wrapper let
+# through", and the one it must NOT let through is the portal password.
+lines.append("client-env-names " + " ".join(sorted(os.environ)))
 lines.append("client-argv " + " ".join("[%s]" % arg for arg in sys.argv))
 with open(os.environ["LABTEST_TRACE"], "a") as handle:
     handle.write("\n".join(lines) + "\n")
+if os.environ.get("LABTEST_CLIENT_STDERR") == "1":
+    # Stand-in for the real client's Python traceback. The wrapper pipes the client's stderr into
+    # its log along with stdout, and a traceback names the module's own file -- a path under $HOME
+    # on the lab Mac, i.e. the local account name. Written to stderr on purpose: the wrapper's
+    # `2>&1` into the masking sink is the thing under test.
+    sys.stderr.write("Traceback (most recent call last):\n")
+    sys.stderr.write('  File "%s", line 1, in <module>\n' % (os.path.abspath(__file__),))
+    sys.stderr.write("RuntimeError: LABTEST stand-in traceback\n")
+    # ... and a client that quotes what it read back at the operator. The real client deliberately
+    # never echoes the credential file's contents, but the wrapper's mask is what makes "the
+    # password cannot reach etw.log" true of ANY client it runs, so the suite exercises it.
+    sys.stderr.write("LABTEST stand-in refusal, quoting what it read: %s\n" % (cred_body,))
 sys.exit(int(os.environ.get("LABTEST_CLIENT_RC", "0")))
 STUB_CLIENT
 
@@ -170,6 +205,13 @@ set -u
 line='openssl'
 for a in "\$@"; do line="\$line [\$a]"; done
 printf '%s\n' "\$line" >> "\$LABTEST_TRACE"
+# Which of host.env's variables reached THIS process. The recorder needs none of them (the host is
+# already on its command line) and the password least of all.
+leaked=''
+if [ -n "\${WIN_HOST+x}" ]; then leaked="\$leaked WIN_HOST"; fi
+if [ -n "\${WIN_USER+x}" ]; then leaked="\$leaked WIN_USER"; fi
+if [ -n "\${WIN_PASS+x}" ]; then leaked="\$leaked WIN_PASS"; fi
+printf 'openssl-hostenv%s\n' "\${leaked:- <none>}" >> "\$LABTEST_TRACE"
 case "\${1:-}" in
 s_client) printf 'LABTEST-STAND-IN-CERTIFICATE\n' ;;
 x509) printf 'SHA256 Fingerprint=%s\n' '$FAKE_FP' ;;
@@ -185,6 +227,20 @@ line='open'
 for a in "$@"; do line="$line [$a]"; done
 printf '%s\n' "$line" >> "$LABTEST_TRACE"
 SHIM_OPEN
+cat > "$SB/bin/mktemp" <<'SHIM_MKTEMP' || exit 1
+#!/usr/bin/env bash
+# OFFLINE TEST SHIM for mktemp(1): records argv and then RUNS THE REAL mktemp, so the credential
+# file is still created exactly as it would be live. It exists because "no credential file was
+# ever created" is a statement about CREATION, and a `find` after the run cannot tell a wrapper
+# that never made one from a wrapper that made one before the gate and cleaned it up afterwards.
+# The real binary is resolved by absolute path, never through PATH: a PATH lookup from inside a
+# PATH shim finds the shim again and recurses until the process table gives up.
+set -u
+line='mktemp'
+for a in "$@"; do line="$line [$a]"; done
+printf '%s\n' "$line" >> "$LABTEST_TRACE"
+exec /usr/bin/mktemp "$@"
+SHIM_MKTEMP
 cat > "$SB/bin/osascript" <<'SHIM_OSA' || exit 1
 #!/usr/bin/env bash
 # OFFLINE TEST SHIM: must never be reached (run-long trace, never reset).
@@ -198,7 +254,7 @@ done
 # The load-bearing safety assertion: with the sandbox PATH in force, each shimmed name MUST
 # resolve to the shim -- otherwise a case would run the maintainer's real openssl against the
 # placeholder address, or open a Terminal window. Checked before any case runs.
-for tool in openssl open osascript; do
+for tool in openssl open osascript mktemp; do
 	resolved="$(PATH="$SB/bin:$PATH" command -v "$tool" || true)"
 	if [ "$resolved" != "$SB/bin/$tool" ]; then
 		printf 'ABORT: %s resolves to %s, not the shim\n' "$tool" "${resolved:-<nothing>}"
@@ -244,6 +300,11 @@ done_lines() { grep -c '^DONE exit=' "$LOG" 2>/dev/null || true; }
 client_calls() { grep -c '^client-run$' "$LABTEST_TRACE" 2>/dev/null || true; }
 client_env() { grep -c "^client-env $1\$" "$LABTEST_TRACE" 2>/dev/null || true; }
 openssl_calls() { grep -c '^openssl ' "$LABTEST_TRACE" 2>/dev/null || true; }
+# How many times the wrapper asked for a temporary file. The credential file is the ONLY thing
+# this wrapper mktemps, so on a refusal path this must be 0: not "no credential file survives"
+# (an EXIT trap satisfies that even when the password was written to disk before the gate ran)
+# but "no credential file was ever created".
+mktemp_calls() { grep -c '^mktemp ' "$LABTEST_TRACE" 2>/dev/null || true; }
 # How many credential files exist under the sandbox TMPDIR right now. On every path the wrapper
 # takes this must be 0 after the run: either it never made one, or it removed the one it made.
 cred_files() { find "$SBTMP" -name 'macdows-etw-cred.*' -type f 2>/dev/null | wc -l | tr -d ' '; }
@@ -266,7 +327,7 @@ GOOD_PROVIDERS='1139c61b-b549-4251-8ed3-27250a1edec8:5;c76baa63-ae81-421c-b425-3
 # `${MACDOWS_LAB_BOUNDARY_FILE:-…}` treats exactly like unset: the wrapper resolves the DEFAULT
 # path under the sandbox HOME, as it does live. (A plain variable, not an array -- `"${arr[@]}"`
 # on an empty array is an unbound-variable error under bash 3.2 + `set -u`.)
-run_etw() { # <wrapper-path> <boundary-file|""> [client-rc]
+run_etw() { # <wrapper-path> <boundary-file|""> [client-rc] [client-stderr 0|1]
 	env -i \
 		HOME="$SBHOME" \
 		PATH="$SB/bin:$PATH" \
@@ -275,6 +336,7 @@ run_etw() { # <wrapper-path> <boundary-file|""> [client-rc]
 		LABTEST_TRACE="$LABTEST_TRACE" \
 		LABTEST_REFUSED_TRACE="$LABTEST_REFUSED_TRACE" \
 		LABTEST_CLIENT_RC="${3:-0}" \
+		LABTEST_CLIENT_STDERR="${4:-0}" \
 		MACDOWS_LAB_BOUNDARY_FILE="$2" \
 		bash "$1" >/dev/null 2>&1
 }
@@ -309,8 +371,9 @@ run_etw "$SBLAB/wdp-etw.command" "$DENY_FILE"
 if assert_has "$LOG" 'BOUNDARY-REFUSED' && assert_eq "$(last_line)" 'DONE exit=78' 'last log line' \
 	&& assert_eq "$(client_calls)" '0' 'client invocations' && assert_eq "$(openssl_calls)" '0' 'openssl invocations' \
 	&& assert_eq "$(cred_files)" '0' 'credential files under TMPDIR' \
+	&& assert_eq "$(mktemp_calls)" '0' 'mktemp calls (no credential file was EVER created)' \
 	&& assert_lacks "$LOG" 'LABTEST-PLACEHOLDER-SECRET-3f9a'; then
-	pass "$CASE: BOUNDARY-REFUSED logged, DONE exit=78, no client, no openssl, no credential file, no credential in the log"
+	pass "$CASE: BOUNDARY-REFUSED logged, DONE exit=78, no client, no openssl, no credential file ever created, no credential in the log"
 fi
 
 # 2. Boundary file missing at the DEFAULT location (HOME has no lab-boundary.env): fail-closed,
@@ -321,8 +384,9 @@ write_job smoke 30 "$GOOD_PROVIDERS" 0
 run_etw "$SBLAB/wdp-etw.command" ""
 mv "$ALLOW_FILE.away" "$ALLOW_FILE" || exit 1
 if assert_has "$LOG" 'BOUNDARY-REFUSED' && assert_eq "$(last_line)" 'DONE exit=78' 'last log line' \
-	&& assert_eq "$(client_calls)" '0' 'client invocations' && assert_eq "$(cred_files)" '0' 'credential files under TMPDIR'; then
-	pass "$CASE: fail-closed refusal through the default boundary path, no client, no credential file"
+	&& assert_eq "$(client_calls)" '0' 'client invocations' && assert_eq "$(cred_files)" '0' 'credential files under TMPDIR' \
+	&& assert_eq "$(mktemp_calls)" '0' 'mktemp calls (no credential file was EVER created)'; then
+	pass "$CASE: fail-closed refusal through the default boundary path, no client, no credential file ever created"
 fi
 
 # 3. etw-job.env missing: the wrapper must still report -- a DONE line with a distinct sysexits
@@ -331,8 +395,9 @@ fi
 begin '3 etw-job.env missing'
 run_etw "$SBLAB/wdp-etw.command" ""
 if assert_has "$LOG" 'JOB-ENV-MISSING' && assert_eq "$(last_line)" 'DONE exit=66' 'last log line' \
-	&& assert_eq "$(client_calls)" '0' 'client invocations' && assert_eq "$(cred_files)" '0' 'credential files under TMPDIR'; then
-	pass "$CASE: JOB-ENV-MISSING logged, DONE exit=66, no client, no credential file"
+	&& assert_eq "$(client_calls)" '0' 'client invocations' && assert_eq "$(cred_files)" '0' 'credential files under TMPDIR' \
+	&& assert_eq "$(mktemp_calls)" '0' 'mktemp calls (no credential file was EVER created)'; then
+	pass "$CASE: JOB-ENV-MISSING logged, DONE exit=66, no client, no credential file ever created"
 fi
 
 # 4-12. Every etw-job.env key is validated before anything host-facing happens, and every
@@ -348,8 +413,9 @@ case_invalid() { # <case label> <job-file body> <expected reason fragment> <pass
 		&& assert_eq "$(last_line)" 'DONE exit=65' 'last log line' \
 		&& assert_eq "$(client_calls)" '0' 'client invocations' \
 		&& assert_eq "$(openssl_calls)" '0' 'openssl invocations' \
-		&& assert_eq "$(cred_files)" '0' 'credential files under TMPDIR'; then
-		pass "$CASE: $4 -- JOB-ENV-INVALID, DONE exit=65, no client, no openssl, no credential file"
+		&& assert_eq "$(cred_files)" '0' 'credential files under TMPDIR' \
+		&& assert_eq "$(mktemp_calls)" '0' 'mktemp calls (no credential file was EVER created)'; then
+		pass "$CASE: $4 -- JOB-ENV-INVALID, DONE exit=65, no client, no openssl, no credential file ever created"
 	fi
 }
 
@@ -402,6 +468,16 @@ PROVIDERS='$GOOD_PROVIDERS'
 PIN_RECORD=2
 " 'JOB-ENV-INVALID -- PIN_RECORD' 'PIN_RECORD is a 0/1 switch'
 
+# 12b. A TAG that tries to climb out of .build/. TAG names two files (etw-<TAG>.jsonl and the log
+#      copy), so it is the one job value that becomes a path. The `etw-` prefix already makes
+#      traversal impossible on its own -- `etw-../..` is not a directory -- but that is the
+#      accident, not the rule; the rule is the character class, and this case is what makes case
+#      25's tracked-tree census bite if the character class is ever loosened.
+case_invalid '12b TAG with a traversal' \
+	"TAG=../../../Scripts/lab/pwned
+PROVIDERS='$GOOD_PROVIDERS'
+" 'JOB-ENV-INVALID -- TAG' 'a TAG that is a relative path is not a name'
+
 # 13. A value that spans lines shifts every following key, so the sentinel line is what proves the
 #     read stayed aligned. Refused as JOB-ENV-INVALID rather than acted on with keys that silently
 #     hold the wrong values (same failure the relay's sentinel closes).
@@ -424,20 +500,43 @@ if assert_has "$LOG" 'PIN-MISSING' && assert_has "$LOG" 'PIN_RECORD=1' \
 	&& assert_eq "$(client_calls)" '0' 'client invocations' \
 	&& assert_eq "$(openssl_calls)" '0' 'openssl invocations' \
 	&& assert_eq "$(cred_files)" '0' 'credential files under TMPDIR' \
+	&& assert_eq "$(mktemp_calls)" '0' 'mktemp calls (no credential file was EVER created)' \
 	&& [ ! -f "$PINFILE" ]; then
-	pass "$CASE: PIN-MISSING logged with the way out, DONE exit=79, no client, no credential file, no pin invented"
+	pass "$CASE: PIN-MISSING logged with the way out, DONE exit=79, no client, no credential file ever created, no pin invented"
+fi
+
+# 14b. A pin file that does not hold a SHA-256 fingerprint is refused HERE, by the same regex the
+#      recorder applies before writing one. Without that, a hand-edited or half-written pin file is
+#      handed to the client as WDP_CERT_SHA256 -- so the wrapper creates the 0600 credential file
+#      for a run that can only end at the client's own CERT-PIN-MISSING, one layer away from the
+#      file that actually needs fixing. The file is left ALONE: an existing pin is never
+#      overwritten, and deciding to delete this one is the operator's call, not the wrapper's.
+begin '14b pin file that is not a fingerprint'
+mkdir -p "$SBWDP" || exit 1
+printf 'not-a-fingerprint\n' > "$PINFILE"
+write_job smoke 30 "$GOOD_PROVIDERS" 0
+run_etw "$SBLAB/wdp-etw.command" ""
+if assert_has "$LOG" 'PIN-INVALID' && assert_eq "$(last_line)" 'DONE exit=79' 'last log line' \
+	&& assert_eq "$(client_calls)" '0' 'client invocations' \
+	&& assert_eq "$(openssl_calls)" '0' 'openssl invocations' \
+	&& assert_eq "$(mktemp_calls)" '0' 'mktemp calls (no credential file was EVER created)' \
+	&& assert_eq "$(cred_files)" '0' 'credential files under TMPDIR' \
+	&& assert_eq "$(cat "$PINFILE" 2>/dev/null)" 'not-a-fingerprint' 'pin file after the run'; then
+	pass "$CASE: PIN-INVALID logged, DONE exit=79, no client, no credential file ever created, the pin file left for the operator"
 fi
 
 # 15. Pin missing and PIN_RECORD=1: the wrapper records it ONCE, with the documented openssl
 #     pipeline, and only then proceeds. The argv is pinned literally because it is the whole
-#     recording: `-servername` is what makes the portal present the certificate the capture will
-#     later be pinned against, and it is invoked only AFTER the boundary gate approved the host.
+#     recording. WIN_HOST is an IP literal here, so NO `-servername` is sent: the client omits SNI
+#     for a literal (wdp_etw.py `_sni_for`), and a pin recorded under handshake conditions the
+#     capture will not repeat is a pin against a certificate the capture may never be shown.
+#     openssl is invoked only AFTER the boundary gate approved the host.
 begin '15 pin missing, PIN_RECORD=1 records it'
 write_job smoke 30 "$GOOD_PROVIDERS" 1
 run_etw "$SBLAB/wdp-etw.command" ""
 sclient="$(grep '^openssl \[s_client\]' "$LABTEST_TRACE" | head -n 1)"
 x509="$(grep '^openssl \[x509\]' "$LABTEST_TRACE" | head -n 1)"
-if assert_eq "$sclient" 'openssl [s_client] [-connect] [192.0.2.10:50443] [-servername] [192.0.2.10]' 's_client argv' \
+if assert_eq "$sclient" 'openssl [s_client] [-connect] [192.0.2.10:50443]' 's_client argv' \
 	&& assert_eq "$x509" 'openssl [x509] [-noout] [-fingerprint] [-sha256]' 'x509 argv' \
 	&& assert_eq "$(cat "$PINFILE" 2>/dev/null)" "$FAKE_FP" 'recorded pin file' \
 	&& assert_has "$LOG" "pin recorded sha256=$FAKE_FP" \
@@ -445,6 +544,54 @@ if assert_eq "$sclient" 'openssl [s_client] [-connect] [192.0.2.10:50443] [-serv
 	&& assert_eq "$(client_env "WDP_CERT_SHA256=$FAKE_FP")" '1' 'WDP_CERT_SHA256 handed to the client' \
 	&& assert_eq "$(last_line)" 'DONE exit=0' 'last log line'; then
 	pass "$CASE: openssl s_client|x509 with the documented argv, the fingerprint written to the pin file and handed to the client, DONE exit=0"
+fi
+
+# 15b. The same recorder against an IPv6 lab host -- a shape the owner's boundary file now admits.
+#      `-connect` must BRACKET the address: OpenSSL's BIO parser calls an unbracketed `host:port`
+#      with colons in it ambiguous and refuses outright, so without brackets an IPv6 host could
+#      never record a pin at all and PIN-MISSING would name a way out that does not work. No SNI,
+#      for the same reason as case 15.
+begin '15b pin recorder for an IPv6 lab host'
+cp "$HOSTENV_FILE" "$HOSTENV_FILE.away" || exit 1
+cat > "$HOSTENV_FILE" <<'HOSTENV6' || exit 1
+WIN_HOST=2001:db8::10
+WIN_USER=labtest-placeholder
+WIN_PASS=LABTEST-PLACEHOLDER-SECRET-3f9a
+HOSTENV6
+V6_ALLOW="$SB/allow-v6.env"
+printf 'MACDOWS_LAB_ALLOWED_NETS="2001:db8::/32"\n' > "$V6_ALLOW" || exit 1
+write_job smoke 30 "$GOOD_PROVIDERS" 1
+run_etw "$SBLAB/wdp-etw.command" "$V6_ALLOW"
+mv "$HOSTENV_FILE.away" "$HOSTENV_FILE" || exit 1
+sclient="$(grep '^openssl \[s_client\]' "$LABTEST_TRACE" | head -n 1)"
+if assert_eq "$sclient" 'openssl [s_client] [-connect] [[2001:db8::10]:50443]' 's_client argv' \
+	&& assert_eq "$(grep -c -- '\[-servername\]' "$LABTEST_TRACE" 2>/dev/null || true)" '0' 'SNI arguments for an IP literal' \
+	&& assert_eq "$(cat "$PINFILE" 2>/dev/null)" "$FAKE_FP" 'recorded pin file' \
+	&& assert_eq "$(client_env 'WDP_HOST=2001:db8::10')" '1' 'the client dials the address the pin was recorded against' \
+	&& assert_eq "$(last_line)" 'DONE exit=0' 'last log line'; then
+	pass "$CASE: the IPv6 literal is bracketed in -connect, no SNI is sent, and the pin is recorded and handed to the client"
+fi
+
+# 15c. A DNS name is the other side of the same rule: SNI is exactly what a name-based portal needs
+#      to serve the certificate the capture will be shown, so it must still be sent. `localhost`
+#      resolves from /etc/hosts (no DNS traffic, no socket -- the openssl shim answers).
+begin '15c pin recorder for a DNS name keeps SNI'
+cp "$HOSTENV_FILE" "$HOSTENV_FILE.away" || exit 1
+cat > "$HOSTENV_FILE" <<'HOSTENVDNS' || exit 1
+WIN_HOST=localhost
+WIN_USER=labtest-placeholder
+WIN_PASS=LABTEST-PLACEHOLDER-SECRET-3f9a
+HOSTENVDNS
+LOOPBACK_ALLOW="$SB/allow-loopback.env"
+printf 'MACDOWS_LAB_ALLOWED_NETS="127.0.0.0/8 ::1/128"\n' > "$LOOPBACK_ALLOW" || exit 1
+write_job smoke 30 "$GOOD_PROVIDERS" 1
+run_etw "$SBLAB/wdp-etw.command" "$LOOPBACK_ALLOW"
+mv "$HOSTENV_FILE.away" "$HOSTENV_FILE" || exit 1
+sclient="$(grep '^openssl \[s_client\]' "$LABTEST_TRACE" | head -n 1)"
+if assert_eq "$sclient" 'openssl [s_client] [-connect] [localhost:50443] [-servername] [localhost]' 's_client argv' \
+	&& assert_eq "$(cat "$PINFILE" 2>/dev/null)" "$FAKE_FP" 'recorded pin file' \
+	&& assert_eq "$(last_line)" 'DONE exit=0' 'last log line'; then
+	pass "$CASE: a DNS name is dialled unbracketed and WITH -servername, the way the client will dial it"
 fi
 
 # 16. A pin that already exists is NEVER re-recorded, even when the job asks for it: re-recording
@@ -487,7 +634,10 @@ reasons=''
 case "$credpath" in "$SBTMP"/macdows-etw-cred.*) ;; *) reasons="$reasons cred-path=[$credpath];" ;; esac
 grep -qF 'client-cred-mode 0600' "$LABTEST_TRACE" || reasons="$reasons cred-mode=[$(sed -n 's/^client-cred-mode //p' "$LABTEST_TRACE")];"
 grep -qF 'client-cred-body labtest-placeholder:LABTEST-PLACEHOLDER-SECRET-3f9a' "$LABTEST_TRACE" || reasons="$reasons cred-body;"
-grep -qF "client-argv [$SBLAB/wdp_etw.py]" "$LABTEST_TRACE" || reasons="$reasons client-argv=[$(grep '^client-argv' "$LABTEST_TRACE")];"
+# -x, not a substring match: the rule the client's whole environment-not-argv design exists for
+# is "nothing BUT the module path is ever on the command line" (argv is world-readable through
+# `ps`), and an unanchored match is satisfied by any number of extra arguments after it.
+grep -qxF "client-argv [$SBLAB/wdp_etw.py]" "$LABTEST_TRACE" || reasons="$reasons client-argv=[$(grep '^client-argv' "$LABTEST_TRACE")];"
 [ "$(cred_files)" = '0' ] || reasons="$reasons credential-file-survived-the-run;"
 [ "$(last_line)" = 'DONE exit=0' ] || reasons="$reasons last-line=[$(last_line)];"
 [ -f "$SBWDP/etw-smoke.log" ] || reasons="$reasons no-per-tag-log-copy;"
@@ -497,20 +647,68 @@ else
 	fail "$CASE:$reasons"; note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
 fi
 
-# 18. etw.log is what a human pastes into a report, so the address and the account appear only in
-#     their masked form and the password not at all. The masked forms have to BE there: an empty
-#     mask would satisfy a "does not contain" assertion on its own.
+# 17b. The same happy path with host.env written in the `export` style, which Scripts/probe.sh:70
+#      says exists in the wild. The wrapper's children must not inherit the portal password just
+#      because the operator's host.env exports it: argv is world-readable through `ps` and an
+#      environment is world-readable through a crash dump, and the credential FILE (0600, removed
+#      on every path) is the one channel this design allows. WIN_USER and WIN_HOST go the same way
+#      -- neither child needs them, the client takes WDP_HOST and the recorder takes the host on
+#      its command line -- while the WDP_* values must still arrive and the credential file must
+#      still be written from values the WRAPPER still holds. PIN_RECORD=1 with no pin on file, so
+#      both children (the openssl recorder and the client) run in one case.
+begin '17b host.env in the export style keeps its values out of the children'
+cp "$HOSTENV_FILE" "$HOSTENV_FILE.away" || exit 1
+cat > "$HOSTENV_FILE" <<'HOSTENVEXPORT' || exit 1
+export WIN_HOST=192.0.2.10
+export WIN_USER=labtest-placeholder
+export WIN_PASS=LABTEST-PLACEHOLDER-SECRET-3f9a
+HOSTENVEXPORT
+write_job smoke 30 "$GOOD_PROVIDERS" 1
+run_etw "$SBLAB/wdp-etw.command" ""
+mv "$HOSTENV_FILE.away" "$HOSTENV_FILE" || exit 1
+envnames=" $(sed -n 's/^client-env-names //p' "$LABTEST_TRACE" | head -n 1) "
+reasons=''
+[ "$(client_calls)" = '1' ] || reasons="$reasons client-calls=$(client_calls);"
+for leaked in WIN_PASS WIN_USER WIN_HOST; do
+	case "$envnames" in *" $leaked "*) reasons="$reasons $leaked-reached-the-client;" ;; esac
+done
+for needed in WDP_HOST WDP_CRED_FILE WDP_CERT_SHA256; do
+	case "$envnames" in *" $needed "*) ;; *) reasons="$reasons $needed-missing;" ;; esac
+done
+if grep -q '^openssl-hostenv .*WIN_' "$LABTEST_TRACE"; then
+	reasons="$reasons host.env-reached-openssl=[$(grep '^openssl-hostenv' "$LABTEST_TRACE" | head -n 1)];"
+fi
+[ "$(grep -c '^openssl-hostenv <none>$' "$LABTEST_TRACE" 2>/dev/null || true)" -ge 1 ] || reasons="$reasons no-openssl-environment-recorded;"
+grep -qF 'client-cred-body labtest-placeholder:LABTEST-PLACEHOLDER-SECRET-3f9a' "$LABTEST_TRACE" || reasons="$reasons cred-body;"
+[ "$(last_line)" = 'DONE exit=0' ] || reasons="$reasons last-line=[$(last_line)];"
+if [ -z "$reasons" ]; then
+	pass "$CASE: an exporting host.env reaches neither the pin recorder nor the client; the WDP_* values and the 0600 credential file are unaffected"
+else
+	fail "$CASE:$reasons"; note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
+fi
+
+# 18. etw.log is what a human pastes into a report, so the address, the account and the local
+#     account name appear only in their masked form and the password not at all. The masked forms
+#     have to BE there: an empty mask would satisfy a "does not contain" assertion on its own.
+#     The client runs with LABTEST_CLIENT_STDERR=1, so it prints two lines of the class that
+#     reaches the log from the CLIENT rather than from the wrapper's own printf: a traceback naming
+#     its own module path (which carries $HOME) and a refusal quoting the credential file it read
+#     (which carries the account and the password). Both must arrive masked.
 begin '18 log mask'
 mkdir -p "$SBWDP" || exit 1
 printf '%s\n' "$FAKE_FP" > "$PINFILE"
 write_job smoke 30 "$GOOD_PROVIDERS" 0
-run_etw "$SBLAB/wdp-etw.command" ""
+run_etw "$SBLAB/wdp-etw.command" "" 0 1
 if assert_has "$LOG" '<WIN_HOST>' && assert_has "$LOG" '<WIN_USER>' \
+	&& assert_has "$LOG" 'RuntimeError: LABTEST stand-in traceback' \
+	&& assert_has "$LOG" '<HOME>' && assert_lacks "$LOG" "$SBHOME" \
+	&& assert_has "$LOG" '<WIN_USER>:<WIN_PASS>' \
 	&& assert_lacks "$LOG" '192.0.2.10' && assert_lacks "$LOG" 'labtest-placeholder' \
 	&& assert_lacks "$LOG" 'LABTEST-PLACEHOLDER-SECRET-3f9a' \
 	&& [ -f "$SBWDP/etw-smoke.log" ] && assert_lacks "$SBWDP/etw-smoke.log" '192.0.2.10' \
+	&& assert_lacks "$SBWDP/etw-smoke.log" "$SBHOME" \
 	&& assert_has "$SBWDP/etw-smoke.log" '<WIN_HOST>'; then
-	pass "$CASE: etw.log and its per-TAG copy carry <WIN_HOST>/<WIN_USER> and neither the address, the account nor the password"
+	pass "$CASE: etw.log and its per-TAG copy carry <WIN_HOST>/<WIN_USER>/<HOME> and neither the address, the account, the password nor the home path a client traceback printed"
 fi
 
 # 19. A hand-edited CRLF job.env must not ship a bare CR into a file name, into a regex or into the
@@ -620,6 +818,11 @@ fi
 #     portal and nothing else), so this suite is the single command that says whether the whole
 #     ETW lane is sound. A missing module is a FAILURE here, never a silent skip -- a skipped
 #     suite reads as coverage that is not there.
+#     `-B`: no bytecode. A cached .pyc is keyed on the source's mtime and SIZE, so an edit that
+#     restores a file to a byte-identical state within the same second leaves the PREVIOUS
+#     module's bytecode valid -- measured during this lane's review, where a restored source and
+#     a red suite disagreed until Scripts/lab/__pycache__ was removed. Nothing may decide a Tier 1
+#     verdict except the sources in the tree.
 begin '23 the python unit suites pass'
 missing=''
 for module in test_wdp_etw.py test_etw_summarize.py; do
@@ -627,7 +830,7 @@ for module in test_wdp_etw.py test_etw_summarize.py; do
 done
 if [ -n "$missing" ]; then
 	fail "$CASE: Scripts/lab is missing:$missing -- the ETW lane's python suites cannot run"
-elif (cd "$LAB" && python3 -m unittest test_wdp_etw test_etw_summarize) > "$SB/unittest.txt" 2>&1; then
+elif (cd "$LAB" && python3 -B -m unittest test_wdp_etw test_etw_summarize) > "$SB/unittest.txt" 2>&1; then
 	pass "$CASE: $(tail -n 1 "$SB/unittest.txt") -- test_wdp_etw + test_etw_summarize green"
 else
 	fail "$CASE: the python unit suites are red"; note "$(tail -n 25 "$SB/unittest.txt")"
@@ -714,9 +917,9 @@ if sed 's/etw_mask >> "\$LOG"/cat >> "$LOG"/' "$SBLAB/wdp-etw.command" > "$MUTAN
 	mkdir -p "$SBWDP" || exit 1
 	printf '%s\n' "$FAKE_FP" > "$PINFILE"
 	write_job smoke 30 "$GOOD_PROVIDERS" 0
-	run_etw "$MUTANT_MASK" ""
-	if grep -qF '192.0.2.10' "$LOG" && grep -qF 'labtest-placeholder' "$LOG"; then
-		pass "$CASE: detected -- the raw address and account reach etw.log (case 18 pins the mask)"
+	run_etw "$MUTANT_MASK" "" 0 1
+	if grep -qF '192.0.2.10' "$LOG" && grep -qF 'labtest-placeholder' "$LOG" && grep -qF "$SBHOME" "$LOG"; then
+		pass "$CASE: detected -- the raw address, the account and the home path from the client's traceback all reach etw.log (case 18 pins the mask)"
 	else
 		fail "$CASE: NOT detected -- case 18 would pass against a wrapper with no mask"
 		note "log: $(tr '\n' ';' < "$LOG")"
@@ -727,7 +930,7 @@ fi
 
 # Every case must have reported: a case that neither passed nor failed would otherwise vanish
 # from the tally with exit 0. Placed after the LAST case on purpose.
-EXPECTED_CASES=30
+EXPECTED_CASES=35
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi

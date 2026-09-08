@@ -54,7 +54,8 @@ them may carry a credential or an address):
     CONNECT-FAILED <ExcClass> errno=<n>              class and errno only: the exception
                                                      text quotes the address
     HANDSHAKE-FAILED <status line>[ | <detail>]
-    OUT-UNWRITABLE <ExcClass> errno=<n>              WDP_OUT could not be created
+    OUT-UNWRITABLE <ExcClass> errno=<n>              WDP_OUT could not be created, or a
+                                                     write/close to it failed mid-capture
 
 Usage (every value comes from the environment, nothing from argv):
 
@@ -539,10 +540,12 @@ def main(environ: Optional[Dict[str, str]] = None, stdout: Optional[TextIO] = No
 
     started = time.monotonic()
     deadline = started + duration
+    seconds = 0.0  # hoisted so it is always bound, however the block below ends
     frames = 0
     events = 0
     ending = "timeout"
     pending = bytearray()
+    sink_error = None  # an OSError from the sink is reported below, never raised out of main()
     sock.settimeout(RECV_TIMEOUT)
     try:
         while True:
@@ -573,10 +576,17 @@ def main(environ: Optional[Dict[str, str]] = None, stdout: Optional[TextIO] = No
             if fin:
                 obj, count = parse_batch(bytes(pending).decode("utf-8", "replace"))
                 pending = bytearray()
-                sink.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                try:
+                    sink.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                except OSError as exc:
+                    # A full disk or similar sink failure ends the capture exactly like an
+                    # unwritable WDP_OUT: reported below, never raised out of main(). The
+                    # providers this session already turned on still have to be turned off,
+                    # which is why this only breaks the loop -- the finally block does that.
+                    sink_error = exc
+                    break
                 frames += 1
                 events += count
-        seconds = time.monotonic() - started
     finally:
         # In a finally block because a realtime ETW session left enabled keeps costing the
         # host: however this loop ends, the providers are turned off again. Each _send here
@@ -586,7 +596,18 @@ def main(environ: Optional[Dict[str, str]] = None, stdout: Optional[TextIO] = No
         _send(sock, OP_CLOSE, struct.pack(">H", 1000))
         _drain_close(sock, reader)
         _close_quietly(sock)
-        sink.close()  # last, so a failed flush is still reported rather than swallowed
+        try:
+            sink.close()  # a failed close is reported too, unless a write already failed
+        except OSError as exc:
+            if sink_error is None:
+                sink_error = exc
+        # Measured after the drain above (m-11b), so the reported wall time is not
+        # under-counted by up to DRAIN_TIMEOUT -- the drain is real time the capture ran.
+        seconds = time.monotonic() - started
+
+    if sink_error is not None:
+        say("OUT-UNWRITABLE %s errno=%s" % (type(sink_error).__name__, _errno_of(sink_error)))
+        return EX_USAGE
 
     say("SUMMARY frames=%d events=%d seconds=%.1f end=%s" % (frames, events, seconds, ending))
     return EX_OK

@@ -13,10 +13,12 @@ leaves the machine.
 Run:  cd Scripts/lab && python3 -m unittest -v test_wdp_etw
 """
 import base64
+import builtins
 import hashlib
 import io
 import json
 import os
+import re
 import socket
 import ssl
 import struct
@@ -24,7 +26,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wdp_etw  # noqa: E402
@@ -294,6 +298,8 @@ class FakePortal(threading.Thread):
             elif step == "await-pong":
                 while not self.pongs:
                     self._read_client_frame(rd)
+            elif step == "silence":
+                time.sleep(arg)  # stay connected, read nothing, send nothing
             elif step == "await-close":
                 while not self.closed:
                     try:
@@ -495,6 +501,62 @@ class EndToEndTests(unittest.TestCase):
         rc, out = self.run_main(env)
         self.assertEqual(rc, wdp_etw.EX_USAGE, out)
         self.assertIn("ENV-MISSING WDP_OUT", out)
+
+    def test_sink_write_failure_after_ws_open_is_reported_not_raised(self):
+        """m-1: once the capture is running (providers already enabled), an OSError from the
+        JSONL sink must not escape main() -- it is reported as OUT-UNWRITABLE/EX_USAGE, and
+        the providers this session turned on are still turned off (the finally block runs)."""
+        batch1 = json.dumps({"Frequency": 10000000, "Events": [{"ID": 1}]}).encode()
+        script = [("await-commands", 2), ("send", server_frame(0x1, batch1)), ("await-close", None)]
+        portal = FakePortal(self.cert, self.key, self.USER, self.PW, script=script)
+        portal.start()
+        env = self.env(portal, WDP_DURATION="30")
+        out_path = env["WDP_OUT"]
+
+        class FailingSink:
+            def write(self, data):
+                raise OSError(28, "No space left on device")
+
+            def close(self):
+                pass
+
+        real_open = builtins.open
+
+        def fake_open(path, *args, **kwargs):
+            if path == out_path:
+                return FailingSink()
+            return real_open(path, *args, **kwargs)
+
+        with unittest.mock.patch.object(wdp_etw, "open", fake_open, create=True):
+            rc, out = self.run_main(env)
+        portal.join(10)
+        self.assertEqual(rc, wdp_etw.EX_USAGE, out)
+        self.assertIn("OUT-UNWRITABLE", out)
+        self.assertNotIn("Traceback", out)
+        self.assertEqual(portal.commands[:2], [f"provider {GUID_A} enable 5", f"provider {GUID_B} enable 4"])
+        self.assertEqual(portal.commands[2:], [f"provider {GUID_A} disable", f"provider {GUID_B} disable"])
+        self.assertTrue(portal.closed, "client did not send a close frame after the sink failed")
+        self.assertFalse(os.path.exists(out_path))
+
+    def test_summary_seconds_are_measured_after_the_close_drain(self):
+        """m-11(b): the wait for the portal's own closing frame must count toward the wall
+        time SUMMARY reports, not be silently absorbed after the measurement is taken. The
+        portal never answers the client's close frame, so the client must burn the full
+        DRAIN_TIMEOUT before giving up -- a gap only the fixed code folds into `seconds`."""
+        portal = FakePortal(self.cert, self.key, self.USER, self.PW,
+                            script=[("await-commands", 2), ("silence", 2.0)], deadline=8.0)
+        portal.start()
+        env = self.env(portal, WDP_DURATION="1.0")
+        started = time.monotonic()
+        rc, out = self.run_main(env)
+        wall = time.monotonic() - started
+        portal.join(10)
+        self.assertEqual(rc, 0, out)
+        match = re.search(r"seconds=(\d+\.\d)", out)
+        self.assertIsNotNone(match, out)
+        seconds = float(match.group(1))
+        self.assertGreaterEqual(seconds, 1.0, out)
+        self.assertAlmostEqual(seconds, wall, delta=0.2, msg=out)
 
 
 if __name__ == "__main__":

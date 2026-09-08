@@ -158,13 +158,23 @@ def filetime_to_epoch(timestamp, frequency):
 
 def format_filetime(timestamp, frequency):
     """FILETIME -> UTC ISO 8601 with microseconds, by integer arithmetic so the printed instant
-    is exact rather than rounded through a float."""
+    is exact rather than rounded through a float.
+
+    Returns ABSENT ("?") instead of raising when `timestamp` is out of range for a `datetime`
+    (a corrupt or hostile portal payload can carry a Timestamp far outside any real FILETIME):
+    both `datetime.timedelta`'s C-int magnitude check and its +/-999999999-day range raise
+    OverflowError for such values, and ValueError/OSError are the same kind of "not a real
+    instant" failure on other platforms/builds.
+    """
     freq = int(frequency) if frequency else DEFAULT_FREQUENCY
     if freq <= 0:
         freq = DEFAULT_FREQUENCY
-    seconds, remainder = divmod(int(timestamp), freq)
-    micros = remainder * 1000000 // freq
-    moment = FILETIME_EPOCH + datetime.timedelta(seconds=seconds, microseconds=micros)
+    try:
+        seconds, remainder = divmod(int(timestamp), freq)
+        micros = remainder * 1000000 // freq
+        moment = FILETIME_EPOCH + datetime.timedelta(seconds=seconds, microseconds=micros)
+    except (OverflowError, ValueError, OSError):
+        return ABSENT
     return moment.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 

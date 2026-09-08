@@ -24,16 +24,34 @@
 # says: the one-line way to defeat a pin is to re-record it against the wrong peer.
 #
 # LOG MASK. etw.log is the artefact a human pastes into a report, so every line written to it
-# goes through etw_sink, which rewrites the host address to <WIN_HOST> and the account to
-# <WIN_USER>. The password never reaches any output at all -- it goes from host.env into the
-# 0600 credential file and nowhere else. host.env's OWN output is deliberately not routed into
-# the log: the mask is built from host.env, so nothing read before it could be masked.
+# goes through etw_sink, which rewrites the four classes of value that can reach it: $HOME to
+# <HOME> (the client's stderr is piped into the log, and a Python traceback names this checkout's
+# path, which on the lab Mac carries the local account name), the host address to <WIN_HOST>, the
+# account to <WIN_USER> and -- belt and braces -- the password to <WIN_PASS>. The password is not
+# supposed to reach any output at all: it goes from host.env into the 0600 credential file and
+# nowhere else, and this rule is what makes that true rather than merely intended. host.env's OWN
+# output is deliberately not routed into the log: the mask is built from host.env, so nothing read
+# before it could be masked.
 #
 # etw-job.env keys (all single-line; the file is read once, in a subshell -- see below):
 #   TAG         capture name, ^[A-Za-z0-9_-]{1,32}$; names etw-<TAG>.jsonl and etw-<TAG>.log
 #   DURATION    capture seconds, positive integer (default 60)
 #   PROVIDERS   <guid>:<level>[;<guid>:<level>...], level 0-5 -- passed to the client verbatim
 #   PIN_RECORD  0|1 (default 0); 1 records the certificate pin ONCE if none exists yet
+#
+# DONE exit=<rc> is the run's whole verdict (the window's own status is meaningless -- see the
+# bottom of this file). The wrapper's own codes and the client's share one space:
+#   0   the capture completed
+#   64  the client refused its own configuration (a missing or malformed WDP_* value, a credential
+#       file others can read) OR could not create/write WDP_OUT: `OUT-UNWRITABLE <class> errno=<n>`.
+#       WDP_OUT is opened only after the WebSocket is up -- deliberately, so a refused pin cannot
+#       leave a file behind -- so that second form arrives mid-run rather than at startup
+#   65  etw-job.env failed validation           JOB-ENV-INVALID
+#   66  etw-job.env is not readable             JOB-ENV-MISSING
+#   69  the connection or the TLS handshake failed
+#   76  the portal refused the WebSocket upgrade
+#   78  the target is outside the lab segments  BOUNDARY-REFUSED
+#   79  no usable pin here (PIN-MISSING, PIN-INVALID) or a mismatch at the client
 set -u
 LAB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$LAB_DIR/../.." && pwd)"
@@ -46,10 +64,17 @@ LOG="$RUNTIME/etw.log"
 # time out, never last run's DONE exit=0.
 : > "$LOG"
 PINFILE="$WDP/portal-cert-sha256.txt"
+# What a SHA-256 fingerprint looks like, in ONE place: `openssl x509 -fingerprint`'s colon-separated
+# form or bare hex. The recorder checks it before writing the pin file and the reader checks it
+# again before using one -- same rule both ways, so a pin file can never be trusted on a shape the
+# recorder would have refused to produce.
+PIN_RE='^([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}$|^[0-9A-Fa-f]{64}$'
 ETW_RC=0
 CRED=''
+HOME_RE=''
 HOST_RE=''
 USER_RE=''
+PASS_RE=''
 TAG=''
 TAG_OK=0
 
@@ -60,15 +85,26 @@ etw_re_escape() { # <literal>
     printf '%s' "$1" | sed 's|[][\.*^$/]|\\&|g'
 }
 
-# The mask. Both patterns are applied only when they are non-empty: an empty sed pattern (`s//x/`)
-# re-uses the LAST regex, which would substitute something arbitrary rather than nothing.
+# The mask. Four classes of value can reach etw.log, and each contributes one rule:
+#   $HOME     -> <HOME>       a client traceback prints the module's own path, and the checkout
+#                             lives under the maintainer's home directory
+#   WIN_HOST  -> <WIN_HOST>   the target address, which the gate's REFUSED line quotes by design
+#   WIN_USER  -> <WIN_USER>   the portal account
+#   WIN_PASS  -> <WIN_PASS>   belt and braces: nothing echoes it today, and after this nothing can
+# $HOME goes FIRST, so that a host or account value occurring inside a path is not rewritten out
+# from under the path rule, leaving a half-redacted path behind. A rule joins the script only when
+# its value is non-empty: an empty sed pattern (`s//x/`) re-uses the LAST regex, which would
+# substitute something arbitrary rather than nothing -- and when no rule survives that test the
+# sink is a plain `cat`. Over-masking is the safe direction: a pathologically short WIN_PASS would
+# rewrite unrelated text, which costs a reader a puzzled moment; under-masking costs a credential.
 etw_mask() {
-    if [ -n "$HOST_RE" ] && [ -n "$USER_RE" ]; then
-        sed -e "s/$HOST_RE/<WIN_HOST>/g" -e "s/$USER_RE/<WIN_USER>/g"
-    elif [ -n "$HOST_RE" ]; then
-        sed -e "s/$HOST_RE/<WIN_HOST>/g"
-    elif [ -n "$USER_RE" ]; then
-        sed -e "s/$USER_RE/<WIN_USER>/g"
+    local script=''
+    if [ -n "$HOME_RE" ]; then script="${script}s/$HOME_RE/<HOME>/g;"; fi
+    if [ -n "$HOST_RE" ]; then script="${script}s/$HOST_RE/<WIN_HOST>/g;"; fi
+    if [ -n "$USER_RE" ]; then script="${script}s/$USER_RE/<WIN_USER>/g;"; fi
+    if [ -n "$PASS_RE" ]; then script="${script}s/$PASS_RE/<WIN_PASS>/g;"; fi
+    if [ -n "$script" ]; then
+        sed -e "$script"
     else
         cat
     fi
@@ -82,6 +118,20 @@ etw_sink() {
 
 etw_log() { # <text...>
     printf '%s\n' "$*" | etw_sink
+}
+
+# The pin recorder's network call in one place: the SNI decision below changes the ARGUMENTS, not
+# the pipeline that turns whatever certificate was served into a fingerprint.
+#
+# `env -u` strips host.env's values from BOTH members of the pipeline -- each is its own process
+# and neither needs them (the host is on the command line). It matters because a host.env written
+# in the `export WIN_PASS=...` style, which Scripts/probe.sh notes exists in the wild, would
+# otherwise hand the portal password to every child this script starts; the 0600 credential file
+# is the ONE channel this design allows for it.
+etw_record_fp() { # <openssl s_client argument...>
+    env -u WIN_PASS -u WIN_USER -u WIN_HOST openssl s_client "$@" </dev/null 2>/dev/null \
+        | env -u WIN_PASS -u WIN_USER -u WIN_HOST openssl x509 -noout -fingerprint -sha256 2>/dev/null \
+        | sed 's/^.*=//' | tr -d '[:space:]'
 }
 
 # The credential file's whole lifecycle in one function, called both inline (as soon as the client
@@ -103,8 +153,15 @@ source "$REPO_ROOT/Scripts/lib.sh"
 # refusal below is an expected outcome that must still reach the DONE line, and pipefail because
 # the client's exit code is read from PIPESTATUS, not from the mask it is piped into.
 set +e +o pipefail
+# HOME is masked alongside host.env's values because this checkout sits under it: the client
+# module a traceback names, and every path this wrapper logs, start with it. A HOME of "/" is
+# left alone -- rewriting every slash would destroy the log rather than redact it.
+if [ -n "${HOME:-}" ] && [ "${HOME:-}" != '/' ]; then
+    HOME_RE="$(etw_re_escape "$HOME")"
+fi
 HOST_RE="$(etw_re_escape "${WIN_HOST:-}")"
 USER_RE="$(etw_re_escape "${WIN_USER:-}")"
+PASS_RE="$(etw_re_escape "${WIN_PASS:-}")"
 
 # The gate judges host.env alone and runs before the job file is even looked at. Its output is
 # captured rather than piped so that its exit status stays readable in THIS shell (a pipe would
@@ -134,6 +191,13 @@ else
     # key and the run proceeds with keys that are silently wrong. A hand-edited CRLF file leaves a
     # trailing CR on each value; it is stripped rather than shipped into a file name, a regex or
     # the client's environment.
+    #
+    # What the subshell does NOT do is hide THIS shell's variables from the job: it inherits them,
+    # so a job line could read WIN_PASS as easily as it reads its own keys. That is deliberate and
+    # is relay.command's posture too -- jobs/*.env are tracked files in this repo, i.e. code that
+    # is reviewed like any other, and a job that wanted the credential could equally read the
+    # host.env this wrapper reads. The isolation above is against a job that CHANGES the run
+    # (redirecting the target past an approved gate), not against one that reads it.
     # shellcheck source=/dev/null
     JOB_KEYS="$( . "$RUNTIME/etw-job.env" >/dev/null 2>&1; printf '%s\n%s\n%s\n%s\n%s\n' "${TAG:-}" "${DURATION:-}" "${PROVIDERS:-}" "${PIN_RECORD:-}" 'END-OF-JOB-KEYS' )"
     TAG=""; DURATION=""; PROVIDERS=""; PIN_RECORD=""; JOB_KEYS_END=""
@@ -174,24 +238,57 @@ EOF_JOB_KEYS
         # would otherwise reach the client as a malformed pin and be refused there, one layer away
         # from the file that actually needs fixing.
         PIN=""
+        PIN_BAD=0
         if [ -r "$PINFILE" ]; then
             PIN="$(tr -d '[:space:]' < "$PINFILE")"
+            # Validated on the way IN with the same regex the recorder applies on the way out. An
+            # unchecked pin file -- hand-edited, truncated by a full disk, half-written by a
+            # killed recorder -- would otherwise be handed to the client, which means this wrapper
+            # would create the 0600 credential file for a run that can only end at the client's
+            # own CERT-PIN-MISSING, one layer away from the file that actually needs fixing.
+            if [ -n "$PIN" ] && ! printf '%s' "$PIN" | grep -qE "$PIN_RE"; then
+                PIN_BAD=1
+                PIN=""
+            fi
         fi
         if [ -n "$PIN" ] && [ "$PIN_RECORD" = "1" ]; then
             etw_log "[etw] PIN_RECORD=1 ignored -- a pin is already on file and is never overwritten"
         fi
-        if [ -z "$PIN" ] && [ "$PIN_RECORD" = "1" ]; then
+        # PIN_BAD is checked here as well as below: the pin file EXISTS, so recording over it is
+        # exactly the "never overwrite a pin" rule -- the operator decides whether that file is
+        # junk, and the reason line says so.
+        if [ "$PIN_BAD" -eq 0 ] && [ -z "$PIN" ] && [ "$PIN_RECORD" = "1" ]; then
             # The gate has already approved WIN_HOST, so this is the first and only moment the
             # wrapper is allowed to touch the network before the capture itself. The fingerprint of
             # a certificate is a public value: logging it is what lets the operator compare it
             # against what the host shows, which is the only check that makes a
             # trust-on-first-use pin worth anything.
             etw_log "[etw] recording the portal certificate pin (PIN_RECORD=1)"
-            FP="$(openssl s_client -connect "$WIN_HOST:50443" -servername "$WIN_HOST" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//' | tr -d '[:space:]')"
+            # The recorder must be shown the SAME certificate the capture will later be pinned
+            # against, so it follows the client's two address rules exactly (wdp_etw.py
+            # `_host_header` and `_sni_for`):
+            #   * an address containing ':' -- an IPv6 literal -- is BRACKETED in -connect. OpenSSL
+            #     calls an unbracketed `host:port` with colons in it ambiguous and refuses before
+            #     it dials, so without this an IPv6 lab host (the owner's boundary file admits one)
+            #     could never record a pin and PIN-MISSING would name a way out that does not work.
+            #   * an IP literal is dialled WITHOUT -servername. SNI carries names only; the client
+            #     omits it for a literal, and a portal that answers a name with a different
+            #     certificate would leave a pin the capture is never shown.
+            # The literal test is the same pair of classes the client's `_sni_for` distinguishes:
+            # a dotted quad, or anything containing a colon.
+            case "$WIN_HOST" in
+                *:*) CONNECT_TO="[$WIN_HOST]:50443" ;;
+                *) CONNECT_TO="$WIN_HOST:50443" ;;
+            esac
+            if printf '%s' "$WIN_HOST" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$|:'; then
+                FP="$(etw_record_fp -connect "$CONNECT_TO")"
+            else
+                FP="$(etw_record_fp -connect "$CONNECT_TO" -servername "$WIN_HOST")"
+            fi
             # The shape is checked BEFORE the file is written: a portal that did not answer yields
             # an empty fingerprint, and writing that would create a pin file that can never be
             # recorded again (an existing pin is never overwritten) and refuses every future run.
-            if printf '%s' "$FP" | grep -qE '^([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}$|^[0-9A-Fa-f]{64}$'; then
+            if printf '%s' "$FP" | grep -qE "$PIN_RE"; then
                 printf '%s\n' "$FP" > "$PINFILE"
                 PIN="$FP"
                 etw_log "[etw] pin recorded sha256=$FP"
@@ -199,7 +296,10 @@ EOF_JOB_KEYS
                 etw_log "[etw] PIN-RECORD-FAILED -- the portal returned no SHA-256 fingerprint; nothing written to the pin file"
             fi
         fi
-        if [ -z "$PIN" ]; then
+        if [ "$PIN_BAD" -eq 1 ]; then
+            etw_log "[etw] PIN-INVALID -- the pin file does not hold a SHA-256 fingerprint; delete it and re-record with PIN_RECORD=1; no capture attempted"
+            ETW_RC=79
+        elif [ -z "$PIN" ]; then
             etw_log "[etw] PIN-MISSING -- record it once with PIN_RECORD=1; no capture attempted"
             ETW_RC=79
         else
@@ -217,7 +317,12 @@ EOF_JOB_KEYS
             # portal password. The client's stdout/stderr is piped into the log so the capture's
             # progress is visible live to whoever is polling it -- hence PIPESTATUS rather than $?,
             # which would be the mask's status.
-            WDP_HOST="$WIN_HOST" \
+            # `env -u` for the same reason as the pin recorder: with an exporting host.env the
+            # client would otherwise inherit the portal password it is being handed a FILE for,
+            # and WIN_USER/WIN_HOST besides. WDP_HOST carries the (gate-approved) address the
+            # client is meant to dial; nothing else from host.env crosses.
+            env -u WIN_PASS -u WIN_USER -u WIN_HOST \
+                WDP_HOST="$WIN_HOST" \
                 WDP_PORT=50443 \
                 WDP_CRED_FILE="$CRED" \
                 WDP_CERT_SHA256="$PIN" \

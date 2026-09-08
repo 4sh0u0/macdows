@@ -283,6 +283,27 @@ class HeaderTest(SummarizerTestCase):
         self.assertEqual(rc, 0, err)
         self.assertIn("files=2 frames=4 raw_frames=1 events=28", out)
 
+    def test_filetime_overflow_from_a_huge_int_timestamp_is_absent_not_a_crash(self):
+        """m-2: `Timestamp: 10**30` measured to raise OverflowError out of format_filetime;
+        the tool must degrade to the ABSENT marker instead, exactly as an unknown timestamp
+        does, and still produce the rest of the summary."""
+        event = ev(ST, "EmptyTask", 0, 4, 10 ** 30)
+        path = write_lines(self.dir, "overflow-int.jsonl", [batch([event])])
+        rc, out, err = self.run_tool([path])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("etw-summary: files=1 frames=1 raw_frames=0 events=1 span=0.000s "
+                      "first=? last=?", out)
+
+    def test_filetime_overflow_from_a_huge_string_timestamp_is_absent_not_a_crash(self):
+        """m-2, second measured value: a Timestamp so large that timedelta's day range is
+        exceeded (stringified, as a real capture can carry meta ints as strings)."""
+        event = ev(ST, "EmptyTask", 0, 4, "999999999999999999999")
+        path = write_lines(self.dir, "overflow-str.jsonl", [batch([event])])
+        rc, out, err = self.run_tool([path])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("etw-summary: files=1 frames=1 raw_frames=0 events=1 span=0.000s "
+                      "first=? last=?", out)
+
     def test_empty_file(self):
         empty = write_lines(self.dir, "empty.jsonl", [])
         rc, out, err = self.run_tool([empty])
@@ -547,6 +568,14 @@ class PrimitivesTest(unittest.TestCase):
         # A non-default Frequency is used as the divisor.
         self.assertEqual(etw_summarize.format_filetime((BASE_EPOCH + 11644473600) * 1000, 1000),
                          FIRST_UTC)
+
+    def test_filetime_conversion_returns_absent_on_overflow(self):
+        """m-2: values measured to raise inside format_filetime (a timedelta whose day range
+        or C-int magnitude is exceeded) must return ABSENT instead of propagating."""
+        self.assertEqual(etw_summarize.format_filetime(10 ** 30, 10000000), etw_summarize.ABSENT)
+        self.assertEqual(
+            etw_summarize.format_filetime(int("999999999999999999999"), 10000000),
+            etw_summarize.ABSENT)
 
     def test_strip_quotes(self):
         self.assertEqual(etw_summarize.strip_quotes('"hello"'), "hello")
