@@ -689,6 +689,270 @@ Test-Case 'a positive clock-change window binds and a non-positive one is refuse
 }
 
 # -------------------------------------------------------------------------------------------
+# Connection digest (RdpCoreTS/Operational grouped by ActivityId). Host digest v1/v2 of
+# 2026-09-08 showed every connection's events share one ActivityId (110 events for one
+# connection) and that the useful EventData fields are: 66 SessionID, 168 MonitorNum/Width/
+# Height/X/Y, 162 Version/ClientMode/AvcEnabled/ProfileIdNum, 135 TransportType, 257 (no data,
+# presence = advanced RemoteApp graphics), and the end signature 226/107/102/144. ServerName
+# (162/168/169), ConnectionName (66), ChannelName (132/148) and the client address (131) are
+# red-line items and are never read. Fixture host name and address are documentation values.
+# -------------------------------------------------------------------------------------------
+
+New-Section 'Group-SnapshotConnectionEvents / Format-SnapshotConnectionLine (RdpCoreTS connection digest)'
+
+function New-ConnFixtureEvent {
+    param([AllowNull()][string] $Activity, [int] $Id, [AllowNull()][string] $TimeUtc, [string] $Data = '')
+    return [pscustomobject]@{ ActivityId = $Activity; Id = $Id; TimeUtc = $TimeUtc; Xml = "<Event><EventData>$Data</EventData></Event>" }
+}
+function New-ConnDatum { param([string] $Name, [string] $Value) return "<Data Name='$Name'>$Value</Data>" }
+
+# ConnA is the NEWER connection and sorts FIRST as text, ConnB the older and sorts LAST as text:
+# an implementation ordering groups by ActivityId text instead of by time gets B first here
+# (gate r1 I-1: the previous fixture ids happened to order the same way as time).
+$script:ConnA = '0a1b2c3d-0000-4000-8000-00000000000a'
+$script:ConnB = 'ffffffff-1111-4222-8333-00000000000b'
+function New-ConnFixtureFull {
+    # One complete connection in the order the host emits it; the red-line data are present in
+    # the XML exactly where the provider puts them, so a line that leaks them fails the test.
+    $a = $script:ConnA
+    return @(
+        (New-ConnFixtureEvent $a 131 '2026-09-07T08:54:04.7560000Z' ((New-ConnDatum 'ClientIP' '203.0.113.7') + (New-ConnDatum 'ClientPort' '49957'))),
+        (New-ConnFixtureEvent $a 65  '2026-09-07T08:54:04.7600000Z' (New-ConnDatum 'ConnectionName' 'RDP-Tcp#0')),
+        (New-ConnFixtureEvent $a 135 '2026-09-07T08:54:04.8170000Z' ((New-ConnDatum 'TunnelID' '1') + (New-ConnDatum 'TransportType' 'TCP: Reason Code: 3 (No UDP Packets Received)'))),
+        (New-ConnFixtureEvent $a 162 '2026-09-07T08:54:04.8890000Z' ((New-ConnDatum 'Version' '0x80105') + (New-ConnDatum 'ClientMode' '2') + (New-ConnDatum 'AvcEnabled' '0') + (New-ConnDatum 'ProfileIdNum' '2') + (New-ConnDatum 'ServerName' 'EXAMPLE-HOST'))),
+        (New-ConnFixtureEvent $a 257 '2026-09-07T08:54:05.1340000Z' '<Data></Data>'),
+        (New-ConnFixtureEvent $a 168 '2026-09-07T08:54:05.6210000Z' ((New-ConnDatum 'MonitorNum' '0') + (New-ConnDatum 'MonitorWidth' '2560') + (New-ConnDatum 'MonitorHeight' '1410') + (New-ConnDatum 'MonitorX' '0') + (New-ConnDatum 'MonitorY' '0') + (New-ConnDatum 'ServerName' 'EXAMPLE-HOST'))),
+        (New-ConnFixtureEvent $a 66  '2026-09-07T08:54:06.1130000Z' ((New-ConnDatum 'ConnectionName' 'RDP-Tcp#0') + (New-ConnDatum 'SessionID' '2'))),
+        (New-ConnFixtureEvent $a 132 '2026-09-07T08:54:08.2610000Z' ((New-ConnDatum 'ChannelName' 'Microsoft::Windows::RDS::Geometry::v08.01') + (New-ConnDatum 'TunnelID' '0'))),
+        (New-ConnFixtureEvent $a 226 '2026-09-07T08:58:07.4000000Z' ''),
+        (New-ConnFixtureEvent $a 107 '2026-09-07T08:58:07.4420000Z' '')
+    )
+}
+
+Test-Case 'the connection-digest window is a parameter with default 6 (the 2x checkpoint''s four runs plus the relay reads that follow them)' {
+    Assert-Equal 6 $ConnectionDigestCount
+}
+
+Test-Case 'events are grouped by ActivityId; each group oldest-first, groups newest-first by their first event' {
+    $events = @(
+        (New-ConnFixtureEvent $script:ConnB 131 '2026-09-07T07:00:00.0000000Z'),
+        (New-ConnFixtureEvent $script:ConnA 65  '2026-09-07T08:54:04.7600000Z'),
+        (New-ConnFixtureEvent $script:ConnB 65  '2026-09-07T07:00:10.0000000Z'),
+        (New-ConnFixtureEvent $script:ConnA 131 '2026-09-07T08:54:04.7560000Z'),
+        (New-ConnFixtureEvent $script:ConnA 107 '2026-09-07T08:58:07.4420000Z')
+    )
+    $r = Group-SnapshotConnectionEvents -Events $events -Count 6
+    Assert-Equal 2 @($r.Groups).Count 'two connections'
+    Assert-Equal $script:ConnA $r.Groups[0].ActivityId 'the newer connection first'
+    Assert-Equal 131 $r.Groups[0].Events[0].Id 'oldest event first inside a group'
+    Assert-Equal 107 $r.Groups[0].Events[2].Id
+    Assert-Equal $script:ConnB $r.Groups[1].ActivityId
+    Assert-Equal 0 $r.Ungrouped
+    Assert-Equal 5 $r.Scanned
+}
+
+Test-Case 'the window keeps the newest N connections only' {
+    $events = @(
+        (New-ConnFixtureEvent $script:ConnB 131 '2026-09-07T07:00:00.0000000Z'),
+        (New-ConnFixtureEvent $script:ConnA 131 '2026-09-07T08:54:04.7560000Z')
+    )
+    $r = Group-SnapshotConnectionEvents -Events $events -Count 1
+    Assert-Equal 1 @($r.Groups).Count
+    Assert-Equal $script:ConnA $r.Groups[0].ActivityId
+    Assert-Equal 2 $r.Scanned 'scanned counts every event, not only the kept ones'
+}
+
+Test-Case 'events without an ActivityId are not grouped and are counted as ungrouped' {
+    $events = @(
+        (New-ConnFixtureEvent '' 72 '2026-09-07T08:54:04.7560000Z'),
+        (New-ConnFixtureEvent $null 72 '2026-09-07T08:54:04.7570000Z'),
+        (New-ConnFixtureEvent $script:ConnA 131 '2026-09-07T08:54:04.7580000Z')
+    )
+    $r = Group-SnapshotConnectionEvents -Events $events -Count 6
+    Assert-Equal 1 @($r.Groups).Count
+    Assert-Equal 2 $r.Ungrouped
+    Assert-Equal 3 $r.Scanned
+}
+
+Test-Case 'no events -> no groups, zero counts, not a null' {
+    $r = Group-SnapshotConnectionEvents -Events @() -Count 6
+    Assert-Equal 0 @($r.Groups).Count
+    Assert-Equal 0 $r.Ungrouped
+    Assert-Equal 0 $r.Scanned
+}
+
+Test-Case 'a connection line is first/last time, event count, SessionID (66), monitors (168), gfx (162), advanced RemoteApp gfx (257), transport (135) and the end ids' {
+    $r = Group-SnapshotConnectionEvents -Events (New-ConnFixtureFull) -Count 6
+    $line = Format-SnapshotConnectionLine -Group $r.Groups[0]
+    $expected = 'conn: first=2026-09-07T08:54:04.7560000Z last=2026-09-07T08:58:07.4420000Z events=10 session=2 monitors=[0:2560x1410@0,0] gfx=version=0x80105,mode=2,avc=0,profile=2 remoteapp_adv_gfx=yes transport="TCP: Reason Code: 3 (No UDP Packets Received)" end=226,107 window=edge'
+    Assert-Equal $expected $line
+}
+
+Test-Case 'red line: the server name, connection name, channel name and client address present in the XML never reach the line' {
+    $r = Group-SnapshotConnectionEvents -Events (New-ConnFixtureFull) -Count 6
+    $line = Format-SnapshotConnectionLine -Group $r.Groups[0]
+    Assert-True ($line -notlike '*EXAMPLE-HOST*') 'ServerName must not appear'
+    Assert-True ($line -notlike '*RDP-Tcp#0*') 'ConnectionName must not appear'
+    Assert-True ($line -notlike '*203.0.113.7*') 'the client address must not appear'
+    Assert-True ($line -notlike '*49957*') 'the client port must not appear'
+    Assert-True ($line -notlike '*Geometry*') 'ChannelName must not appear'
+}
+
+Test-Case 'missing data render as placeholders: session <n/a>, monitors <none>, gfx <n/a>, transport <n/a>, end <none>, advanced gfx no' {
+    $events = @(
+        (New-ConnFixtureEvent $script:ConnA 131 '2026-09-07T08:54:04.7560000Z'),
+        (New-ConnFixtureEvent $script:ConnA 65  '2026-09-07T08:54:04.7600000Z')
+    )
+    $r = Group-SnapshotConnectionEvents -Events $events -Count 6
+    $line = Format-SnapshotConnectionLine -Group $r.Groups[0]
+    Assert-Equal 'conn: first=2026-09-07T08:54:04.7560000Z last=2026-09-07T08:54:04.7600000Z events=2 session=<n/a> monitors=<none> gfx=<n/a> remoteapp_adv_gfx=no transport=<n/a> end=<none> window=edge' $line
+}
+
+Test-Case 'several monitors render in event order; repeated SessionIDs collapse to distinct values in order' {
+    $a = $script:ConnA
+    $events = @(
+        (New-ConnFixtureEvent $a 168 '2026-09-07T08:54:05.6210000Z' ((New-ConnDatum 'MonitorNum' '0') + (New-ConnDatum 'MonitorWidth' '2560') + (New-ConnDatum 'MonitorHeight' '1410') + (New-ConnDatum 'MonitorX' '0') + (New-ConnDatum 'MonitorY' '0'))),
+        (New-ConnFixtureEvent $a 168 '2026-09-07T08:54:05.6220000Z' ((New-ConnDatum 'MonitorNum' '1') + (New-ConnDatum 'MonitorWidth' '1920') + (New-ConnDatum 'MonitorHeight' '1080') + (New-ConnDatum 'MonitorX' '2560') + (New-ConnDatum 'MonitorY' '0'))),
+        (New-ConnFixtureEvent $a 66  '2026-09-07T08:54:06.1130000Z' (New-ConnDatum 'SessionID' '2')),
+        (New-ConnFixtureEvent $a 66  '2026-09-07T08:54:06.2000000Z' (New-ConnDatum 'SessionID' '2')),
+        (New-ConnFixtureEvent $a 66  '2026-09-07T08:54:06.3000000Z' (New-ConnDatum 'SessionID' '3'))
+    )
+    $r = Group-SnapshotConnectionEvents -Events $events -Count 6
+    $line = Format-SnapshotConnectionLine -Group $r.Groups[0]
+    # .Contains, not -like: [ ] and ? are wildcard metacharacters and would match almost anything.
+    Assert-True ($line.Contains('monitors=[0:2560x1410@0,0;1:1920x1080@2560,0]')) "monitors in order: $line"
+    Assert-True ($line.Contains('session=2|3')) "distinct sessions in order: $line"
+}
+
+Test-Case 'a 168 with a missing datum renders ? for that datum, never a fabricated number' {
+    $a = $script:ConnA
+    $events = @((New-ConnFixtureEvent $a 168 '2026-09-07T08:54:05.6210000Z' ((New-ConnDatum 'MonitorNum' '0') + (New-ConnDatum 'MonitorWidth' '2560'))))
+    $r = Group-SnapshotConnectionEvents -Events $events -Count 6
+    $line = Format-SnapshotConnectionLine -Group $r.Groups[0]
+    Assert-True ($line.Contains('monitors=[0:2560x?@?,?]')) $line
+}
+
+Test-Case 'the end signature lists only 226/107/102/144, distinct, in time order' {
+    $a = $script:ConnA
+    $events = @(
+        (New-ConnFixtureEvent $a 131 '2026-09-07T08:54:04.7560000Z'),
+        (New-ConnFixtureEvent $a 102 '2026-09-07T08:58:07.3000000Z'),
+        (New-ConnFixtureEvent $a 144 '2026-09-07T08:58:07.3500000Z'),
+        (New-ConnFixtureEvent $a 226 '2026-09-07T08:58:07.4000000Z'),
+        (New-ConnFixtureEvent $a 226 '2026-09-07T08:58:07.4100000Z'),
+        (New-ConnFixtureEvent $a 72  '2026-09-07T08:58:07.4200000Z')
+    )
+    $r = Group-SnapshotConnectionEvents -Events $events -Count 6
+    $line = Format-SnapshotConnectionLine -Group $r.Groups[0]
+    Assert-True ($line -like '*end=102,144,226 window=*') $line
+}
+
+Test-Case 'an IPv4 literal inside a TransportType datum is masked (defensive red line; the datum has never carried one)' {
+    $a = $script:ConnA
+    $events = @((New-ConnFixtureEvent $a 135 '2026-09-07T08:54:04.8170000Z' (New-ConnDatum 'TransportType' 'UDP: 203.0.113.7 reachable')))
+    $r = Group-SnapshotConnectionEvents -Events $events -Count 6
+    $line = Format-SnapshotConnectionLine -Group $r.Groups[0]
+    Assert-True ($line -like '*transport="UDP: <ip> reachable"*') $line
+}
+
+Test-Case 'a group whose only event has no time renders <no-time> for first and last' {
+    $events = @((New-ConnFixtureEvent $script:ConnA 131 $null))
+    $r = Group-SnapshotConnectionEvents -Events $events -Count 6
+    $line = Format-SnapshotConnectionLine -Group $r.Groups[0]
+    Assert-True ($line -like 'conn: first=<no-time> last=<no-time> events=1 *') $line
+    Assert-True ($line -like '* window=unknown') "no time means the window position is unknown: $line"
+}
+
+Test-Case 'group order follows the first event time, never the ActivityId text (gate r1 I-1: the fixture ids sort the other way round)' {
+    Assert-True ([string]::CompareOrdinal($script:ConnA, $script:ConnB) -lt 0) 'fixture precondition: the newer id must sort first as text'
+    $events = @(
+        (New-ConnFixtureEvent $script:ConnA 131 '2026-09-07T08:54:04.7560000Z'),
+        (New-ConnFixtureEvent $script:ConnB 131 '2026-09-07T07:00:00.0000000Z')
+    )
+    $r = Group-SnapshotConnectionEvents -Events $events -Count 6
+    Assert-Equal $script:ConnA $r.Groups[0].ActivityId 'newest by time first'
+    Assert-Equal $script:ConnB $r.Groups[1].ActivityId
+}
+
+Test-Case 'the group that holds the oldest event read is marked window=edge (its earlier events may lie beyond the read window); the others window=inside (gate r1 I-2)' {
+    $events = @(
+        (New-ConnFixtureEvent $script:ConnB 131 '2026-09-07T07:00:00.0000000Z'),
+        (New-ConnFixtureEvent $script:ConnB 65  '2026-09-07T07:00:10.0000000Z'),
+        (New-ConnFixtureEvent $script:ConnA 131 '2026-09-07T08:54:04.7560000Z'),
+        (New-ConnFixtureEvent '' 72 '2026-09-07T07:30:00.0000000Z')
+    )
+    $r = Group-SnapshotConnectionEvents -Events $events -Count 6
+    Assert-Equal $false $r.Groups[0].AtWindowEdge 'the newer connection is inside the window'
+    Assert-Equal $true $r.Groups[1].AtWindowEdge 'the connection holding the oldest event read touches the edge'
+    Assert-True ((Format-SnapshotConnectionLine -Group $r.Groups[0]) -like '* window=inside') 'inside marker'
+    Assert-True ((Format-SnapshotConnectionLine -Group $r.Groups[1]) -like '* window=edge') 'edge marker'
+    Assert-Equal '2026-09-07T07:00:00.0000000Z' $r.Oldest
+    Assert-Equal '2026-09-07T08:54:04.7560000Z' $r.Newest
+}
+
+Test-Case 'when the oldest event read is ungrouped, no group is marked edge, but the window line still shows the true window' {
+    $events = @(
+        (New-ConnFixtureEvent '' 72 '2026-09-07T06:00:00.0000000Z'),
+        (New-ConnFixtureEvent $script:ConnB 131 '2026-09-07T07:00:00.0000000Z')
+    )
+    $r = Group-SnapshotConnectionEvents -Events $events -Count 6
+    Assert-Equal $false $r.Groups[0].AtWindowEdge
+    Assert-Equal '2026-09-07T06:00:00.0000000Z' $r.Oldest
+}
+
+Test-Case 'the window line names the oldest/newest event read, the scanned count and the ungrouped count; <none> when nothing was read' {
+    $events = @(
+        (New-ConnFixtureEvent '' 72 '2026-09-07T06:00:00.0000000Z'),
+        (New-ConnFixtureEvent $script:ConnB 131 '2026-09-07T07:00:00.0000000Z')
+    )
+    $r = Group-SnapshotConnectionEvents -Events $events -Count 6
+    Assert-Equal 'conn-window: oldest=2026-09-07T06:00:00.0000000Z newest=2026-09-07T07:00:00.0000000Z scanned=2 ungrouped=1' (Format-SnapshotConnectionWindowLine -Digest $r)
+    $empty = Group-SnapshotConnectionEvents -Events @() -Count 6
+    Assert-Equal 'conn-window: oldest=<none> newest=<none> scanned=0 ungrouped=0' (Format-SnapshotConnectionWindowLine -Digest $empty)
+}
+
+Test-Case 'a Windows build string inside TransportType is not mistaken for an address (octet-bounded mask; gate r1 m-2)' {
+    $a = $script:ConnA
+    $events = @((New-ConnFixtureEvent $a 135 '2026-09-07T08:54:04.8170000Z' (New-ConnDatum 'TransportType' 'TCP build 10.0.26200.9278 via 203.0.113.7')))
+    $r = Group-SnapshotConnectionEvents -Events $events -Count 6
+    $line = Format-SnapshotConnectionLine -Group $r.Groups[0]
+    Assert-True ($line.Contains('transport="TCP build 10.0.26200.9278 via <ip>"')) $line
+}
+
+Test-Case 'the digest header names the connection window and the number of events actually read' {
+    Assert-Equal '  connection digest (RdpCoreTS/Operational, newest 6 connections by ActivityId over the newest 1931 events read; addresses, server and channel names omitted by design):' (Format-SnapshotConnectionDigestHeader -Count 6 -Scanned 1931)
+    Assert-Equal '  connection digest (RdpCoreTS/Operational, newest 2 connections by ActivityId over the newest 0 events read; addresses, server and channel names omitted by design):' (Format-SnapshotConnectionDigestHeader -Count 2 -Scanned 0)
+}
+
+Test-Case 'static pins: the RdpCoreTS read takes -MaxEvents from MaxEventsPerChannel, the header from ConnectionDigestCount, the collector threads the parameter, and the line reads only the allowed datum names' {
+    $src = Get-Content (Join-Path $PSScriptRoot 'server-snapshot.ps1') -Raw
+    Assert-True ($src -match 'RdpCoreTS/Operational''\s+-MaxEvents\s+\$MaxEventsPerChannel\b') 'the RdpCoreTS Get-WinEvent must pass -MaxEvents $MaxEventsPerChannel'
+    Assert-True ($src -match 'Format-SnapshotConnectionDigestHeader\s+-Count\s+\$ConnectionDigestCount\b') 'the header must be rendered from the parameter'
+    Assert-True ($src -match 'Group-SnapshotConnectionEvents\s+-Events\s+\S+\s+-Count\s+\$ConnectionDigestCount\b') 'the grouping must take its window from the parameter'
+    Assert-True ($src -match 'Format-SnapshotConnectionWindowLine\s+-Digest\s+\$digest\b') 'the live block must print the window line'
+    Assert-True ($src -match 'Invoke-SnapshotCollection\s+-OutPath\s+\$OutPath\s+-MaxEventsPerChannel\s+\$MaxEventsPerChannel\s+-SessionHistoryCount\s+\$SessionHistoryCount\s+-ClockChangeCount\s+\$ClockChangeCount\s+-ConnectionDigestCount\s+\$ConnectionDigestCount\b') 'the collector call must thread ConnectionDigestCount'
+    $m = [regex]::Match($src, 'function Format-SnapshotConnectionLine \{(.*?)\r?\n\}', 'Singleline')
+    Assert-True $m.Success 'Format-SnapshotConnectionLine must exist'
+    $allowed = @('SessionID', 'MonitorNum', 'MonitorWidth', 'MonitorHeight', 'MonitorX', 'MonitorY', 'Version', 'ClientMode', 'AvcEnabled', 'ProfileIdNum', 'TransportType')
+    # Call shapes, not bare names: only the EventData reads count (Get-SnapshotProp -Name 'Events'/'Id'/'Xml'/'TimeUtc' are object fields).
+    $names = @([regex]::Matches($m.Groups[1].Value, "Get-SnapshotEventDataValue\s+-Xml\s+\`$xml\s+-Name\s+'([A-Za-z]+)'") | ForEach-Object { $_.Groups[1].Value })
+    Assert-True ($names.Count -ge 11) "the line must read the eleven allowed data ($($names.Count) found)"
+    foreach ($n in $names) { Assert-True ($allowed -contains $n) "datum '$n' is not in the allowed set" }
+}
+
+Test-Case 'a positive connection window binds and 0 or more than 50 is refused at the parameter' {
+    $path = Join-Path $PSScriptRoot 'server-snapshot.ps1'
+    $accepted = $true
+    try { & $path -NoRun -ConnectionDigestCount 7 } catch { $accepted = $false }
+    Assert-True $accepted 'ConnectionDigestCount 7 must bind'
+    foreach ($bad in 0, 51) {
+        $threw = $false
+        try { & $path -NoRun -ConnectionDigestCount $bad } catch { $threw = $true }
+        Assert-True $threw "ConnectionDigestCount $bad must be rejected"
+    }
+}
+
+# -------------------------------------------------------------------------------------------
 # Summary
 # -------------------------------------------------------------------------------------------
 
