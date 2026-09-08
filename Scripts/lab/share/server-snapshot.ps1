@@ -38,9 +38,13 @@
                                   transport verdict (135) and the end signature (226/107/102/
                                   144). Only those EventData names are read; ServerName,
                                   ConnectionName, ChannelName and the client address (131)
-                                  are red-line items and never touched. This is the host-side
-                                  record of the desktop size a client declared (2x checkpoint
-                                  clause v2) and of the session it landed in (v6).
+                                  are red-line items and never touched. The group holding the
+                                  oldest event read is marked window=edge (its earlier events may
+                                  lie beyond the read window; gate r1 I-2), the others
+                                  window=inside, and a conn-window line states the oldest/newest
+                                  event read plus the scanned and ungrouped counts. This is the
+                                  host-side record of the desktop size a client declared (2x
+                                  checkpoint clause v2) and of the session it landed in (v6).
       E. configuration surface -- every value under the RDS-relevant registry keys listed in
                                   $script:SnapshotRegistryKeys (policy hive, Terminal Server,
                                   TSAppAllowList, the RDP-Tcp winstation, session DPI), rendered
@@ -571,10 +575,17 @@ function Group-SnapshotConnectionEvents {
     $byId = [ordered]@{}
     $ungrouped = 0
     $scanned = 0
+    $oldest = ''
+    $newest = ''
     if ($null -ne $Events) {
         foreach ($e in $Events) {
             if ($null -eq $e) { continue }
             $scanned++
+            $t = [string](Get-SnapshotProp -Object $e -Name 'TimeUtc')
+            if ($t.Length -gt 0) {
+                if ($oldest.Length -eq 0 -or [string]::CompareOrdinal($t, $oldest) -lt 0) { $oldest = $t }
+                if ($newest.Length -eq 0 -or [string]::CompareOrdinal($t, $newest) -gt 0) { $newest = $t }
+            }
             $aid = [string](Get-SnapshotProp -Object $e -Name 'ActivityId')
             if ([string]::IsNullOrEmpty($aid)) { $ungrouped++; continue }
             if (-not $byId.Contains($aid)) { $byId[$aid] = New-Object System.Collections.ArrayList }
@@ -584,15 +595,31 @@ function Group-SnapshotConnectionEvents {
     $groups = New-Object System.Collections.ArrayList
     foreach ($aid in @($byId.Keys)) {
         $sorted = @($byId[$aid].ToArray() | Sort-Object -Property @{ Expression = { [string](Get-SnapshotProp -Object $_ -Name 'TimeUtc') } })
+        $firstTime = [string](Get-SnapshotProp -Object $sorted[0] -Name 'TimeUtc')
+        # The group whose first event IS the oldest event read touches the window boundary: its
+        # earlier events, if any, were not read (gate r1 I-2). Only an exact match is claimed.
+        $atEdge = ($firstTime.Length -gt 0 -and $firstTime -eq $oldest)
         [void]$groups.Add([pscustomobject]@{
-            ActivityId = $aid
-            Events     = $sorted
-            FirstTime  = [string](Get-SnapshotProp -Object $sorted[0] -Name 'TimeUtc')
+            ActivityId   = $aid
+            Events       = $sorted
+            FirstTime    = $firstTime
+            AtWindowEdge = $atEdge
         })
     }
     $ordered = @($groups.ToArray() | Sort-Object -Property FirstTime -Descending)
     if ($ordered.Count -gt $Count) { $ordered = @($ordered[0..($Count - 1)]) }
-    return [pscustomobject]@{ Groups = $ordered; Ungrouped = $ungrouped; Scanned = $scanned }
+    return [pscustomobject]@{ Groups = $ordered; Ungrouped = $ungrouped; Scanned = $scanned; Oldest = $oldest; Newest = $newest }
+}
+
+function Format-SnapshotConnectionWindowLine {
+    <# The trailer of the connection digest: the window actually read and what fell outside any group. #>
+    [CmdletBinding()]
+    param($Digest)
+    $oldest = [string](Get-SnapshotProp -Object $Digest -Name 'Oldest')
+    $newest = [string](Get-SnapshotProp -Object $Digest -Name 'Newest')
+    if ($oldest.Length -eq 0) { $oldest = '<none>' }
+    if ($newest.Length -eq 0) { $newest = '<none>' }
+    return "conn-window: oldest=$oldest newest=$newest scanned=$([string](Get-SnapshotProp -Object $Digest -Name 'Scanned')) ungrouped=$([string](Get-SnapshotProp -Object $Digest -Name 'Ungrouped'))"
 }
 
 function ConvertTo-SnapshotDatumText {
@@ -610,7 +637,8 @@ function Format-SnapshotConnectionLine {
       ProfileIdNum (162), TransportType (135); 257 counts by presence, 226/107/102/144 by id. The
       test suite pins that list against the function body. ServerName, ConnectionName,
       ChannelName and the client address are never read; an IPv4 literal inside TransportType
-      would be masked (defensive -- the datum has never carried one).
+      would be masked (defensive -- the datum has never carried one). The trailing window= token
+      is inside / edge (the group holds the oldest event read) / unknown (no timed event).
     #>
     [CmdletBinding()]
     param($Group)
@@ -674,7 +702,10 @@ function Format-SnapshotConnectionLine {
     if ($transports.Count -gt 0) { $trText = '"' + ($transports.ToArray() -join '|') + '"' }
     $endText = '<none>'
     if ($ends.Count -gt 0) { $endText = ($ends.ToArray() -join ',') }
-    return "conn: first=$first last=$last events=$($events.Count) session=$sessionText monitors=$monText gfx=$gfx remoteapp_adv_gfx=$advGfx transport=$trText end=$endText"
+    $window = 'inside'
+    if ($first -eq '<no-time>') { $window = 'unknown' }
+    elseif ((Get-SnapshotProp -Object $Group -Name 'AtWindowEdge') -eq $true) { $window = 'edge' }
+    return "conn: first=$first last=$last events=$($events.Count) session=$sessionText monitors=$monText gfx=$gfx remoteapp_adv_gfx=$advGfx transport=$trText end=$endText window=$window"
 }
 
 function ConvertTo-SnapshotValueText {
@@ -965,7 +996,7 @@ function Invoke-SnapshotCollection {
         [void]$L.Add((Format-SnapshotConnectionDigestHeader -Count $ConnectionDigestCount -Scanned $digest.Scanned))
         foreach ($g in @($digest.Groups)) { [void]$L.Add('    ' + (Format-SnapshotConnectionLine -Group $g)) }
         if (@($digest.Groups).Count -eq 0) { [void]$L.Add('    conn: none') }
-        [void]$L.Add('    conn: ungrouped=' + $digest.Ungrouped)
+        [void]$L.Add('    ' + (Format-SnapshotConnectionWindowLine -Digest $digest))
     } catch {
         [void]$L.Add((Format-SnapshotConnectionDigestHeader -Count $ConnectionDigestCount -Scanned 0))
         if ($_.FullyQualifiedErrorId -match 'NoMatchingEventsFound') {
