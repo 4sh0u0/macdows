@@ -26,7 +26,21 @@
                                   ones that moved the clock printed -- and so is the
                                   session history: the newest SessionHistoryCount (default 60)
                                   LocalSessionManager/Operational events as UTC time / id / name /
-                                  SessionID only (user and client address are never read).
+                                  SessionID only (user and client address are never read);
+                                  and the connection digest: the newest ConnectionDigestCount
+                                  (default 6) RDP connections found in RdpCoreTS/Operational
+                                  (newest MaxEventsPerChannel events, grouped by ActivityId --
+                                  one connection = one ActivityId, ~110 events), one line each:
+                                  first/last UTC, event count, SessionID (event 66), the
+                                  client's requested monitors (168: number, WxH, origin), the
+                                  graphics capability line (162: version, mode, AVC, profile),
+                                  whether advanced RemoteApp graphics was used (257), the
+                                  transport verdict (135) and the end signature (226/107/102/
+                                  144). Only those EventData names are read; ServerName,
+                                  ConnectionName, ChannelName and the client address (131)
+                                  are red-line items and never touched. This is the host-side
+                                  record of the desktop size a client declared (2x checkpoint
+                                  clause v2) and of the session it landed in (v6).
       E. configuration surface -- every value under the RDS-relevant registry keys listed in
                                   $script:SnapshotRegistryKeys (policy hive, Terminal Server,
                                   TSAppAllowList, the RDP-Tcp winstation, session DPI), rendered
@@ -87,6 +101,14 @@ param(
     # corrections that moved the clock (or could not be parsed) are printed.
     [ValidateRange(1, 2500)]
     [int] $ClockChangeCount = 50,
+    # Newest RDP connections (distinct RdpCoreTS ActivityIds) printed as the "connection digest"
+    # block. The 2x checkpoint (docs/upgrade-gate/2026-09-w3-2x-checkpoint-prereg.md) is four
+    # window-smoke runs, each followed by a relay read of this snapshot, so the run under
+    # judgement is at most the second newest connection at read time; 6 leaves room for a
+    # retried run and a stray client. Host digest v1 (2026-09-08) counted 18 connections in the
+    # ~25 h the circular log held, so the window is a small slice of what is available.
+    [ValidateRange(1, 50)]
+    [int] $ConnectionDigestCount = 6,
     [switch] $NoRun
 )
 
@@ -529,6 +551,132 @@ function Format-SnapshotSessionHistoryHeader {
     return "  session history (LSM/Operational, newest $Count; user and address omitted by design):"
 }
 
+function Format-SnapshotConnectionDigestHeader {
+    <# The connection-digest block's header line; it names the window and the events actually read. #>
+    [CmdletBinding()]
+    param([int] $Count, [int] $Scanned)
+    return "  connection digest (RdpCoreTS/Operational, newest $Count connections by ActivityId over the newest $Scanned events read; addresses, server and channel names omitted by design):"
+}
+
+function Group-SnapshotConnectionEvents {
+    <#
+      Groups RdpCoreTS events (objects with ActivityId, Id, TimeUtc, Xml) into connections: one
+      group per ActivityId, events oldest-first inside a group, groups newest-first by their
+      first event, capped at Count. Events without an ActivityId are not grouped and are
+      counted (Ungrouped); Scanned counts every event seen. TimeUtc is the ISO 8601 'o'
+      rendering, fixed width, so ordinal string order is time order; a null time sorts oldest.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyCollection()][object[]] $Events, [int] $Count)
+    $byId = [ordered]@{}
+    $ungrouped = 0
+    $scanned = 0
+    if ($null -ne $Events) {
+        foreach ($e in $Events) {
+            if ($null -eq $e) { continue }
+            $scanned++
+            $aid = [string](Get-SnapshotProp -Object $e -Name 'ActivityId')
+            if ([string]::IsNullOrEmpty($aid)) { $ungrouped++; continue }
+            if (-not $byId.Contains($aid)) { $byId[$aid] = New-Object System.Collections.ArrayList }
+            [void]$byId[$aid].Add($e)
+        }
+    }
+    $groups = New-Object System.Collections.ArrayList
+    foreach ($aid in @($byId.Keys)) {
+        $sorted = @($byId[$aid].ToArray() | Sort-Object -Property @{ Expression = { [string](Get-SnapshotProp -Object $_ -Name 'TimeUtc') } })
+        [void]$groups.Add([pscustomobject]@{
+            ActivityId = $aid
+            Events     = $sorted
+            FirstTime  = [string](Get-SnapshotProp -Object $sorted[0] -Name 'TimeUtc')
+        })
+    }
+    $ordered = @($groups.ToArray() | Sort-Object -Property FirstTime -Descending)
+    if ($ordered.Count -gt $Count) { $ordered = @($ordered[0..($Count - 1)]) }
+    return [pscustomobject]@{ Groups = $ordered; Ungrouped = $ungrouped; Scanned = $scanned }
+}
+
+function ConvertTo-SnapshotDatumText {
+    <# A datum for the connection line: the value, or ? when the event lacks it (never a fabricated number). #>
+    [CmdletBinding()]
+    param([AllowNull()] $Value)
+    if ($null -eq $Value -or ([string]$Value).Length -eq 0) { return '?' }
+    return [string]$Value
+}
+
+function Format-SnapshotConnectionLine {
+    <#
+      One connection as one line. Reads ONLY these EventData names: SessionID (66), MonitorNum /
+      MonitorWidth / MonitorHeight / MonitorX / MonitorY (168), Version / ClientMode / AvcEnabled /
+      ProfileIdNum (162), TransportType (135); 257 counts by presence, 226/107/102/144 by id. The
+      test suite pins that list against the function body. ServerName, ConnectionName,
+      ChannelName and the client address are never read; an IPv4 literal inside TransportType
+      would be masked (defensive -- the datum has never carried one).
+    #>
+    [CmdletBinding()]
+    param($Group)
+    $events = @(Get-SnapshotProp -Object $Group -Name 'Events')
+    $first = '<no-time>'
+    $last = '<no-time>'
+    if ($events.Count -gt 0) {
+        $t0 = [string](Get-SnapshotProp -Object $events[0] -Name 'TimeUtc')
+        $t1 = [string](Get-SnapshotProp -Object $events[$events.Count - 1] -Name 'TimeUtc')
+        if ($t0.Length -gt 0) { $first = $t0 }
+        if ($t1.Length -gt 0) { $last = $t1 }
+    }
+    $sessions = New-Object System.Collections.ArrayList
+    $monitors = New-Object System.Collections.ArrayList
+    $transports = New-Object System.Collections.ArrayList
+    $ends = New-Object System.Collections.ArrayList
+    $gfx = '<n/a>'
+    $advGfx = 'no'
+    $ipv4 = '\b(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}\b'
+    foreach ($e in $events) {
+        $idText = [string](Get-SnapshotProp -Object $e -Name 'Id')
+        $xml = [string](Get-SnapshotProp -Object $e -Name 'Xml')
+        switch ($idText) {
+            '66' {
+                $sid = Get-SnapshotEventDataValue -Xml $xml -Name 'SessionID'
+                if (-not [string]::IsNullOrEmpty($sid) -and -not $sessions.Contains($sid)) { [void]$sessions.Add($sid) }
+            }
+            '168' {
+                [void]$monitors.Add(('{0}:{1}x{2}@{3},{4}' -f
+                    (ConvertTo-SnapshotDatumText (Get-SnapshotEventDataValue -Xml $xml -Name 'MonitorNum')),
+                    (ConvertTo-SnapshotDatumText (Get-SnapshotEventDataValue -Xml $xml -Name 'MonitorWidth')),
+                    (ConvertTo-SnapshotDatumText (Get-SnapshotEventDataValue -Xml $xml -Name 'MonitorHeight')),
+                    (ConvertTo-SnapshotDatumText (Get-SnapshotEventDataValue -Xml $xml -Name 'MonitorX')),
+                    (ConvertTo-SnapshotDatumText (Get-SnapshotEventDataValue -Xml $xml -Name 'MonitorY'))))
+            }
+            '162' {
+                $gfx = 'version={0},mode={1},avc={2},profile={3}' -f
+                    (ConvertTo-SnapshotDatumText (Get-SnapshotEventDataValue -Xml $xml -Name 'Version')),
+                    (ConvertTo-SnapshotDatumText (Get-SnapshotEventDataValue -Xml $xml -Name 'ClientMode')),
+                    (ConvertTo-SnapshotDatumText (Get-SnapshotEventDataValue -Xml $xml -Name 'AvcEnabled')),
+                    (ConvertTo-SnapshotDatumText (Get-SnapshotEventDataValue -Xml $xml -Name 'ProfileIdNum'))
+            }
+            '257' { $advGfx = 'yes' }
+            '135' {
+                $tt = Get-SnapshotEventDataValue -Xml $xml -Name 'TransportType'
+                if (-not [string]::IsNullOrEmpty($tt)) {
+                    $tt = [string]$tt -replace $ipv4, '<ip>'
+                    if (-not $transports.Contains($tt)) { [void]$transports.Add($tt) }
+                }
+            }
+            { @('226', '107', '102', '144') -contains $_ } {
+                if (-not $ends.Contains($idText)) { [void]$ends.Add($idText) }
+            }
+        }
+    }
+    $sessionText = '<n/a>'
+    if ($sessions.Count -gt 0) { $sessionText = ($sessions.ToArray() -join '|') }
+    $monText = '<none>'
+    if ($monitors.Count -gt 0) { $monText = '[' + ($monitors.ToArray() -join ';') + ']' }
+    $trText = '<n/a>'
+    if ($transports.Count -gt 0) { $trText = '"' + ($transports.ToArray() -join '|') + '"' }
+    $endText = '<none>'
+    if ($ends.Count -gt 0) { $endText = ($ends.ToArray() -join ',') }
+    return "conn: first=$first last=$last events=$($events.Count) session=$sessionText monitors=$monText gfx=$gfx remoteapp_adv_gfx=$advGfx transport=$trText end=$endText"
+}
+
 function ConvertTo-SnapshotValueText {
     <# One registry value as report text: <absent> for null, hex for binary, " | " for arrays. #>
     [CmdletBinding()]
@@ -620,7 +768,7 @@ function Add-SnapshotRegistrySection {
 
 function Invoke-SnapshotCollection {
     [CmdletBinding()]
-    param([string] $OutPath, [int] $MaxEventsPerChannel, [int] $SessionHistoryCount, [int] $ClockChangeCount)
+    param([string] $OutPath, [int] $MaxEventsPerChannel, [int] $SessionHistoryCount, [int] $ClockChangeCount, [int] $ConnectionDigestCount)
 
     $L = New-Object System.Collections.ArrayList
     function Write-Checkpoint([string] $Stage) {
@@ -792,6 +940,40 @@ function Invoke-SnapshotCollection {
             [void]$L.Add('    lsm: unreadable ' + $_.Exception.GetType().Name + ' (' + $_.FullyQualifiedErrorId + ')')
         }
     }
+    # Connection digest (RdpCoreTS/Operational grouped by ActivityId -- see the parameter). The
+    # host-side record of what a client declared: the requested monitor sizes (168), the graphics
+    # capability line (162) and the session the connection was assigned to (66). Only the
+    # pre-registered EventData names are read (Format-SnapshotConnectionLine); the client
+    # address, ServerName, ConnectionName and ChannelName never are.
+    try {
+        $core = @(Get-WinEvent -LogName 'Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational' -MaxEvents $MaxEventsPerChannel -ErrorAction Stop)
+        $items = New-Object System.Collections.ArrayList
+        foreach ($e in $core) {
+            $tc = Get-SnapshotProp -Object $e -Name 'TimeCreated'
+            $tcText = $null
+            if ($null -ne $tc) { $tcText = $tc.ToUniversalTime().ToString('o') }
+            $x = $null
+            try { $x = $e.ToXml() } catch { $x = $null }
+            [void]$items.Add([pscustomobject]@{
+                ActivityId = [string](Get-SnapshotProp -Object $e -Name 'ActivityId')
+                Id         = (Get-SnapshotProp -Object $e -Name 'Id')
+                TimeUtc    = $tcText
+                Xml        = $x
+            })
+        }
+        $digest = Group-SnapshotConnectionEvents -Events @($items.ToArray()) -Count $ConnectionDigestCount
+        [void]$L.Add((Format-SnapshotConnectionDigestHeader -Count $ConnectionDigestCount -Scanned $digest.Scanned))
+        foreach ($g in @($digest.Groups)) { [void]$L.Add('    ' + (Format-SnapshotConnectionLine -Group $g)) }
+        if (@($digest.Groups).Count -eq 0) { [void]$L.Add('    conn: none') }
+        [void]$L.Add('    conn: ungrouped=' + $digest.Ungrouped)
+    } catch {
+        [void]$L.Add((Format-SnapshotConnectionDigestHeader -Count $ConnectionDigestCount -Scanned 0))
+        if ($_.FullyQualifiedErrorId -match 'NoMatchingEventsFound') {
+            [void]$L.Add('    conn: none')
+        } else {
+            [void]$L.Add('    conn: unreadable ' + $_.Exception.GetType().Name + ' (' + $_.FullyQualifiedErrorId + ')')
+        }
+    }
     Write-Checkpoint 'winver+freshness'
 
     # --- E. registry ---------------------------------------------------------------------------
@@ -926,5 +1108,5 @@ function Invoke-SnapshotCollection {
 }
 
 if (-not $NoRun) {
-    Invoke-SnapshotCollection -OutPath $OutPath -MaxEventsPerChannel $MaxEventsPerChannel -SessionHistoryCount $SessionHistoryCount -ClockChangeCount $ClockChangeCount
+    Invoke-SnapshotCollection -OutPath $OutPath -MaxEventsPerChannel $MaxEventsPerChannel -SessionHistoryCount $SessionHistoryCount -ClockChangeCount $ClockChangeCount -ConnectionDigestCount $ConnectionDigestCount
 }
