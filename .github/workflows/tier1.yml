@@ -214,6 +214,28 @@ jobs:
         # one mutation proof (gate bypassed) keeps the refusal pin honest.
         run: ./Scripts/lab/test-probe-offline.sh
 
+      - name: Lab ETW capture offline suite
+        # wdp-etw.command is the one script in this repo that writes the test host's Device Portal
+        # password into a file, so it is the one whose guards are worth the most: the boundary gate
+        # runs BEFORE any credential exists (a run aimed outside the lab segments must not merely
+        # fail to connect -- it must never create the file), the credential file is 0600 and is
+        # removed by a single function shared between the inline call and the EXIT trap, an
+        # existing certificate pin is never re-recorded, and every line reaching etw.log passes a
+        # mask so the log stays paste-safe. This suite drives the REAL wrapper, the REAL
+        # run-scenario.sh etw mode and the REAL jobs/etw-smoke.env in a mktemp sandbox, with three
+        # mutation proofs (gate bypassed / credential removal disabled / mask disabled) that
+        # require the pins to go red against a wrapper with the guard taken out.
+        #
+        # It also runs the lane's two python unit suites (test_wdp_etw, test_etw_summarize), which
+        # cover the capture client's own wire behaviour against a fake portal on loopback and the
+        # summariser's redaction. Those, and nothing else, are why this step opens a socket at all:
+        # 127.0.0.1 only. `openssl` and `open` are PATH-shimmed and the shims open nothing;
+        # `python3` deliberately is NOT shimmed, because Scripts/lib.sh's boundary gate evaluates
+        # the allowed segments with it -- both are already relied on by earlier steps in this job.
+        # HOME is redirected to a sandbox whose host.env carries an RFC 5737 documentation address
+        # and placeholder credentials, and TERM_PROGRAM is cleared so no Terminal hop is attempted.
+        run: ./Scripts/lab/test-wdp-etw-offline.sh
+
       - name: Build-script prefix freshness suite
         # Scripts/build-ffmpeg.sh's idempotent skip is gated on a freshness verdict
         # (`--check-prefix`), not on the version stamp alone: a prefix built before a

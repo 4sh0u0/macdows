@@ -8,6 +8,10 @@ DerivedData/
 .build/
 .swiftpm/
 
+# Python bytecode caches (Scripts/lab/*.py unit suites run under unittest)
+__pycache__/
+*.pyc
+
 # CMake (future FreeRDP vendored build)
 build/
 build-asan/

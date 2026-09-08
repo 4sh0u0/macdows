@@ -4,6 +4,8 @@
 #                                             the runtime job.env, open relay.command
 #   run-scenario.sh smoke <log> KEY=V ...  -- bake env into the runtime smoke-job.command,
 #                                             open it
+#   run-scenario.sh etw <job-template>     -- copy jobs/etw-<t>.env to the runtime etw-job.env,
+#                                             open wdp-etw.command (Device Portal ETW capture)
 #
 # TRACKED vs RUNTIME -- see the block at the top of run-matrix.sh for the whole story. In
 # short: jobs/*.env and share/*.ps1 next to this file are tracked DEFINITIONS and are never
@@ -72,6 +74,16 @@ relay)
     rm -f "$RUNTIME/relay.log"
     open -a Terminal "$LAB/relay.command"
     echo "relay $1 launched"
+    ;;
+etw)
+    # No staging: the ETW capture opens no RDP session, so it never mounts the redirected drive,
+    # and filling a share for it would only widen what the host can reach during a run that has
+    # no business touching it. The previous log is removed for the same reason the relay's is --
+    # a caller polling for the DONE line must not be able to read the last run's verdict.
+    cp "$LAB/jobs/etw-$1.env" "$RUNTIME/etw-job.env"
+    rm -f "$RUNTIME/etw.log"
+    open -a Terminal "$LAB/wdp-etw.command"
+    echo "etw $1 launched"
     ;;
 smoke)
     LOG="$1"; shift
