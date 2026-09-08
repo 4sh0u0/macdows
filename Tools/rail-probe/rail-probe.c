@@ -524,14 +524,22 @@ static BOOL probe_window_common(rdpContext* context, const WINDOW_ORDER_INFO* or
 	}
 
 	const bool isNew = (orderInfo->fieldFlags & WINDOW_ORDER_STATE_NEW) != 0;
+	/* ADR-0018 U-5 step 1: the line ends with the four RAIL resize margins (remote px), valid
+	 * when fieldFlags carries RESIZE_MARGIN_X 0x80 / RESIZE_MARGIN_Y 0x08000000; logged always so
+	 * a 2x recording can say whether THICKFRAME margins scale with DPI. Decoded by MacdowsCore's
+	 * WindowOrderPayload (absent in older recordings = 0); the key list is pinned verbatim by
+	 * EmitterContractTests, so a change here is a contract change, made deliberately. */
 	log_event(p, isNew ? "WindowCreate" : "WindowUpdate",
 	          "\"windowId\":%u,\"fieldFlags\":%u,\"windowOffsetX\":%d,\"windowOffsetY\":%d,"
 	          "\"windowWidth\":%u,\"windowHeight\":%u,\"numVisibilityRects\":%u,"
-	          "\"style\":%u,\"styleEx\":%u,\"show\":%u,\"title\":\"%s\"",
+	          "\"style\":%u,\"styleEx\":%u,\"show\":%u,\"title\":\"%s\","
+	          "\"resizeMarginLeft\":%u,\"resizeMarginTop\":%u,\"resizeMarginRight\":%u,\"resizeMarginBottom\":%u",
 	          orderInfo->windowId, orderInfo->fieldFlags, windowState->windowOffsetX,
 	          windowState->windowOffsetY, windowState->windowWidth, windowState->windowHeight,
 	          windowState->numVisibilityRects, windowState->style, windowState->extendedStyle,
-	          windowState->showState, titleEsc);
+	          windowState->showState, titleEsc, windowState->resizeMarginLeft,
+	          windowState->resizeMarginTop, windowState->resizeMarginRight,
+	          windowState->resizeMarginBottom);
 
 	if (isNew)
 		track_window_id(&p->created_ids, &p->created_count, &p->created_cap, orderInfo->windowId);

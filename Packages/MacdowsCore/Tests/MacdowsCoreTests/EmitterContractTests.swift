@@ -241,9 +241,12 @@ struct EmitterContractTests {
         // format string. If this line moves, the emitter contract moved with it — update
         // deliberately, alongside the consumers named in the file header.
         let windowOrder = try #require(sites.first { $0.names.contains("WindowCreate") }?.format)
+        // ADR-0018 U-5 step 1 (2026-09-08) appended the four resize margins -- consumers:
+        // WindowOrderPayload (decodeIfPresent, absent = 0) and ResizeMarginPayloadTests.
         #expect(windowOrder == "\"windowId\":%u,\"fieldFlags\":%u,\"windowOffsetX\":%d,\"windowOffsetY\":%d,"
             + "\"windowWidth\":%u,\"windowHeight\":%u,\"numVisibilityRects\":%u,"
-            + "\"style\":%u,\"styleEx\":%u,\"show\":%u,\"title\":\"%s\"")
+            + "\"style\":%u,\"styleEx\":%u,\"show\":%u,\"title\":\"%s\","
+            + "\"resizeMarginLeft\":%u,\"resizeMarginTop\":%u,\"resizeMarginRight\":%u,\"resizeMarginBottom\":%u")
 
         var lines: [String] = []
         var lineEvents: [String] = []

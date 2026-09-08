@@ -354,11 +354,22 @@ public struct WindowOrderPayload: Decodable, Sendable, Equatable {
     /// value normally.
     public let visibleOffsetX: Int32
     public let visibleOffsetY: Int32
+    /// ADR-0018 U-5 step 1 (ADR-0015 §7 (d)): the RAIL resize margins, **remote px**, as
+    /// `WINDOW_STATE_ORDER.resizeMarginLeft/Top/Right/Bottom` -- meaningful only when
+    /// `fieldFlags` carries RESIZE_MARGIN_X (0x80) / RESIZE_MARGIN_Y (0x0800_0000); consumers
+    /// gate on those bits, never on "margin != 0". Recordings made before this step (the frozen
+    /// corpus included) carry no such keys and decode as 0, which is why the census in
+    /// `ResizeMarginCorpusPinTests` counts flag bits and not these values.
+    public let resizeMarginLeft: UInt32
+    public let resizeMarginTop: UInt32
+    public let resizeMarginRight: UInt32
+    public let resizeMarginBottom: UInt32
 
     private enum CodingKeys: String, CodingKey {
         case windowId, fieldFlags, windowOffsetX, windowOffsetY, windowWidth, windowHeight
         case numVisibilityRects, style, styleEx, show, title, ownerWindowId
         case visibleOffsetX, visibleOffsetY
+        case resizeMarginLeft, resizeMarginTop, resizeMarginRight, resizeMarginBottom
     }
 
     public init(from decoder: Decoder) throws {
@@ -377,6 +388,10 @@ public struct WindowOrderPayload: Decodable, Sendable, Equatable {
         ownerWindowId = try container.decodeIfPresent(UInt32.self, forKey: .ownerWindowId) ?? 0
         visibleOffsetX = try container.decodeIfPresent(Int32.self, forKey: .visibleOffsetX) ?? 0
         visibleOffsetY = try container.decodeIfPresent(Int32.self, forKey: .visibleOffsetY) ?? 0
+        resizeMarginLeft = try container.decodeIfPresent(UInt32.self, forKey: .resizeMarginLeft) ?? 0
+        resizeMarginTop = try container.decodeIfPresent(UInt32.self, forKey: .resizeMarginTop) ?? 0
+        resizeMarginRight = try container.decodeIfPresent(UInt32.self, forKey: .resizeMarginRight) ?? 0
+        resizeMarginBottom = try container.decodeIfPresent(UInt32.self, forKey: .resizeMarginBottom) ?? 0
     }
 
     /// Explicit memberwise init — a custom `init(from:)` above suppresses Swift's
@@ -387,7 +402,9 @@ public struct WindowOrderPayload: Decodable, Sendable, Equatable {
         windowId: UInt32, fieldFlags: UInt32, windowOffsetX: Int32, windowOffsetY: Int32,
         windowWidth: UInt32, windowHeight: UInt32, numVisibilityRects: UInt32, style: UInt32,
         styleEx: UInt32, show: UInt32, title: String, ownerWindowId: UInt32 = 0,
-        visibleOffsetX: Int32 = 0, visibleOffsetY: Int32 = 0
+        visibleOffsetX: Int32 = 0, visibleOffsetY: Int32 = 0,
+        resizeMarginLeft: UInt32 = 0, resizeMarginTop: UInt32 = 0,
+        resizeMarginRight: UInt32 = 0, resizeMarginBottom: UInt32 = 0
     ) {
         self.windowId = windowId
         self.fieldFlags = fieldFlags
@@ -403,6 +420,10 @@ public struct WindowOrderPayload: Decodable, Sendable, Equatable {
         self.ownerWindowId = ownerWindowId
         self.visibleOffsetX = visibleOffsetX
         self.visibleOffsetY = visibleOffsetY
+        self.resizeMarginLeft = resizeMarginLeft
+        self.resizeMarginTop = resizeMarginTop
+        self.resizeMarginRight = resizeMarginRight
+        self.resizeMarginBottom = resizeMarginBottom
     }
 }
 
