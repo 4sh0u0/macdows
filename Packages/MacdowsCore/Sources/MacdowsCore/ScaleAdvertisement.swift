@@ -3,8 +3,9 @@ import Foundation
 /// W3 lane D (ADR-0018 §2; the pure half of U-1). What the client WOULD declare in
 /// TS_UD_CS_CORE's `desktopScaleFactor` / `deviceScaleFactor` for a given topology
 /// `rasterScale`, as values only -- nothing here touches `CRSession` or FreeRDP settings.
-/// Wiring (and whether the product advertises at all) is the owner's U-1 ruling; until then the
-/// product stays at `.notAdvertising` and only the window-smoke fixture knob (lane E) will use these.
+/// Wiring is the owner's U-1 ruling: **D by default** (2026-09-08 13:28 JST), expressed once as
+/// `productDefault(rasterScale:)` below and consumed by the App's session setup and by window-smoke's
+/// knob-unset path (lane H); the fixture knob (lane E) can force `none` or try DD for comparison.
 ///
 /// Facts this type encodes (ADR-0018 §0 (f), verified on the vendored FreeRDP 3.31.1):
 /// - both fields are UINT32 percentages written unconditionally by `gcc_write_client_core_data`;
@@ -69,6 +70,15 @@ public struct ScaleAdvertisement: Equatable, Sendable {
     public static func proposedDesktopOnly(rasterScale: Double) -> ScaleAdvertisement? {
         guard let desktop = desktopPercent(rasterScale: rasterScale) else { return nil }
         return ScaleAdvertisement(desktopScaleFactor: desktop, deviceScaleFactor: 100)
+    }
+
+    /// ADR-0018 U-1 **ruling** (owner, 2026-09-08 13:28 JST): the product advertises option D by
+    /// default -- desktop = round(rasterScale × 100), device stays 100 -- revocable by ADR addendum.
+    /// The ONE place that says so: the App's session setup (`AppDelegate`) and window-smoke's
+    /// knob-unset path both call it, so what the product ships and what the fixture measures cannot
+    /// drift apart. At 1x it is `notAdvertising` (100/100), wire-identical to the pre-ruling default.
+    public static func productDefault(rasterScale: Double) -> ScaleAdvertisement? {
+        proposedDesktopOnly(rasterScale: rasterScale)
     }
 
     /// ADR-0018 U-1 option DD: declare both; device = the allowed value nearest to the desktop

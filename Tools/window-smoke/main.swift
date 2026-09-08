@@ -1973,7 +1973,7 @@ enum WindowSmokeGateSelfTest {
         let twoHundredBoth = ScaleAdvertisement(desktopScaleFactor: 200, deviceScaleFactor: 180)!
         expect(
             AdvertisedScaleKnob.parse(nil) == .unset && AdvertisedScaleKnob.parse("") == .unset
-                && AdvertisedScaleKnob.parse("none") == .unset
+                && AdvertisedScaleKnob.parse("none") == .forcedNone
                 && AdvertisedScaleKnob.parse("D") == .proposal(.desktopOnly)
                 && AdvertisedScaleKnob.parse(" DD\n") == .proposal(.both)
                 && AdvertisedScaleKnob.parse("200") == .explicit(twoHundredOnly)
@@ -1985,10 +1985,13 @@ enum WindowSmokeGateSelfTest {
                 && AdvertisedScaleKnob.parse("600") == .invalid("600")
                 && AdvertisedScaleKnob.parse("200,") == .invalid("200,")
                 && AdvertisedScaleKnob.parse("2x") == .invalid("2x"),
-            "advertisedScaleKnobParsesOnlyTheThreeForms: unset/empty/none = unset; D / DD = the ADR-0018 U-1 proposals; <desktop> or <desktop>,<device> = an explicit pair inside the wire domains; anything else -- lowercase, whitespace-only, an out-of-domain device or desktop, a trailing comma -- is invalid, never silently ignored"
+            "advertisedScaleKnobParsesOnlyTheThreeForms: unset/empty = unset (product default); none = the explicit OFF switch; D / DD = the ADR-0018 U-1 proposals; <desktop> or <desktop>,<device> = an explicit pair inside the wire domains; anything else -- lowercase, whitespace-only, an out-of-domain device or desktop, a trailing comma -- is invalid, never silently ignored"
         )
         expect(
-            AdvertisedScaleKnob.resolve(.unset, rasterScale: 2) == nil
+            AdvertisedScaleKnob.resolve(.unset, rasterScale: 2) == twoHundredOnly
+                && AdvertisedScaleKnob.resolve(.unset, rasterScale: 1) == .notAdvertising
+                && AdvertisedScaleKnob.resolve(.unset, rasterScale: nil) == nil
+                && AdvertisedScaleKnob.resolve(.forcedNone, rasterScale: 2) == nil
                 && AdvertisedScaleKnob.resolve(.proposal(.desktopOnly), rasterScale: 2) == twoHundredOnly
                 && AdvertisedScaleKnob.resolve(.proposal(.both), rasterScale: 2) == twoHundredBoth
                 && AdvertisedScaleKnob.resolve(.proposal(.both), rasterScale: 1.5) == ScaleAdvertisement(desktopScaleFactor: 150, deviceScaleFactor: 140)
@@ -1997,17 +2000,21 @@ enum WindowSmokeGateSelfTest {
                 && AdvertisedScaleKnob.resolve(.proposal(.desktopOnly), rasterScale: nil) == nil
                 && AdvertisedScaleKnob.resolve(.explicit(twoHundredBoth), rasterScale: 1) == twoHundredBoth
                 && AdvertisedScaleKnob.resolve(.explicit(twoHundredBoth), rasterScale: nil) == twoHundredBoth,
-            "advertisedScaleKnobResolvesProposalsAgainstTheFrozenRasterScale: D = ScaleAdvertisement.proposedDesktopOnly and DD = proposedBoth, both against the session's frozen rasterScale (no topology or an out-of-domain scale = nothing to advertise); an explicit pair ignores the scale; unset = nothing"
+            "advertisedScaleKnobResolvesProposalsAgainstTheFrozenRasterScale: unset = the PRODUCT DEFAULT (ScaleAdvertisement.productDefault, ADR-0018 U-1 = D: 2x -> 200/100, 1x -> 100/100); none = forced off; D / DD = the two proposals, all against the session's frozen rasterScale (no topology or an out-of-domain scale = nothing to advertise); an explicit pair ignores the scale"
         )
         expect(
-            AdvertisedScaleKnob.evidenceSuffix(knobSet: false, assigned: nil) == ""
-                && AdvertisedScaleKnob.evidenceSuffix(knobSet: false, assigned: twoHundredBoth) == ""
-                && AdvertisedScaleKnob.evidenceSuffix(knobSet: true, assigned: nil) == ""
-                && AdvertisedScaleKnob.evidenceSuffix(knobSet: true, assigned: twoHundredBoth)
+            AdvertisedScaleKnob.evidenceSuffix(knob: .unset, assigned: nil) == ""
+                && AdvertisedScaleKnob.evidenceSuffix(knob: .forcedNone, assigned: nil) == ""
+                && AdvertisedScaleKnob.evidenceSuffix(knob: .proposal(.both), assigned: nil) == ""
+                && AdvertisedScaleKnob.evidenceSuffix(knob: .unset, assigned: twoHundredOnly)
+                    == " -- ADVERTISED TO SERVER DesktopScaleFactor=200 DeviceScaleFactor=100 (product default D, ADR-0018 U-1; matrix advertised_scale=DesktopScaleFactor=200)"
+                && AdvertisedScaleKnob.evidenceSuffix(knob: .unset, assigned: .notAdvertising)
+                    == " -- ADVERTISED TO SERVER DesktopScaleFactor=100 DeviceScaleFactor=100 (product default D, ADR-0018 U-1; matrix advertised_scale=none)"
+                && AdvertisedScaleKnob.evidenceSuffix(knob: .proposal(.both), assigned: twoHundredBoth)
                     == " -- ADVERTISED TO SERVER DesktopScaleFactor=200 DeviceScaleFactor=180 (WINDOW_SMOKE_ADVERTISED_SCALE, fixture-only; matrix advertised_scale=DesktopScaleFactor=200,DeviceScaleFactor=180)"
-                && AdvertisedScaleKnob.evidenceSuffix(knobSet: true, assigned: twoHundredOnly)
+                && AdvertisedScaleKnob.evidenceSuffix(knob: .explicit(twoHundredOnly), assigned: twoHundredOnly)
                     == " -- ADVERTISED TO SERVER DesktopScaleFactor=200 DeviceScaleFactor=100 (WINDOW_SMOKE_ADVERTISED_SCALE, fixture-only; matrix advertised_scale=DesktopScaleFactor=200)",
-            "advertisedScaleEvidenceSuffixSaysOnlyWhatWasAssigned: no knob or nothing assigned = no suffix; otherwise both wire fields as ASSIGNED plus the matrix advertised_scale value, in the one ADVERTISED TO SERVER form all three [topology] lines share"
+            "advertisedScaleEvidenceSuffixSaysOnlyWhatWasAssigned: nothing assigned = no suffix (unset, none, or a knob that resolved to nothing); otherwise both wire fields as ASSIGNED plus the matrix advertised_scale value, labelled by SOURCE -- product default D when the knob is unset, the knob otherwise -- in the one ADVERTISED TO SERVER form all three [topology] lines share"
         )
 
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
@@ -2159,23 +2166,29 @@ let declaredDesktopOverride: DeclaredDesktopOverride.Size? = {
 /// init is the validator, so nothing here re-states the domains). Same three load-bearing rules as
 /// `DeclaredDesktopOverride`: (1) a malformed or out-of-domain value is fatal at startup (exit 4) --
 /// a run that believes it advertised but did not is the false negative; (2) the knob changes only
-/// `session.advertisedDesktopScaleFactor/DeviceScaleFactor`, and when it is unset those stay 0 and
-/// CRSession sets NEITHER scale setting (CRSession.h's contract for the pair); (3) the evidence
+/// `session.advertisedDesktopScaleFactor/DeviceScaleFactor`; when it is UNSET the pair follows the
+/// PRODUCT DEFAULT through the same `ScaleAdvertisement.productDefault` the App uses (ADR-0018 U-1 =
+/// D, lane H), and `none` is the explicit OFF switch that zeroes the pair so CRSession sets NEITHER
+/// scale setting (CRSession.h's contract for the pair); (3) the evidence
 /// suffix the three `[topology]` lines append says what was ASSIGNED (read back from the session),
-/// never what the knob asked for. `none` is accepted as an explicit "unset" so a three-run script can
-/// always pass the knob. A proposal that resolves to nothing (no usable display, or a rasterScale
+/// never what the knob asked for, labelled by SOURCE (product default vs knob). A proposal -- or the
+/// product default -- that resolves to nothing (no usable display, or a rasterScale
 /// whose percentage leaves the wire domain) advertises nothing and is logged as such at the freeze.
 enum AdvertisedScaleKnob {
     enum Proposal: Equatable { case desktopOnly, both }
 
     enum Parsed: Equatable {
+        /// Knob absent: follow the PRODUCT DEFAULT (`ScaleAdvertisement.productDefault`, ADR-0018 U-1 = D).
         case unset
+        /// `none`: the explicit OFF switch -- zero the pair so CRSession sets neither setting.
+        case forcedNone
         case invalid(String)
         case proposal(Proposal)
         case explicit(ScaleAdvertisement)
     }
 
-    /// `nil`/empty/`none` = unset. `D` / `DD` = the two ADR-0018 U-1 proposals. Otherwise
+    /// `nil`/empty = unset (product default). `none` = forced off. `D` / `DD` = the two ADR-0018 U-1
+    /// proposals. Otherwise
     /// `<desktop>` or `<desktop>,<device>` (surrounding whitespace/newlines trimmed) accepted only if
     /// `ScaleAdvertisement` accepts the pair; anything else -- lowercase `d`, whitespace-only, a
     /// trailing comma, an out-of-domain value -- is `.invalid` carrying the RAW text.
@@ -2183,7 +2196,7 @@ enum AdvertisedScaleKnob {
         guard let raw, !raw.isEmpty else { return .unset }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         switch trimmed {
-        case "none": return .unset
+        case "none": return .forcedNone
         case "D": return .proposal(.desktopOnly)
         case "DD": return .proposal(.both)
         default: break
@@ -2197,12 +2210,16 @@ enum AdvertisedScaleKnob {
         return .explicit(pair)
     }
 
-    /// What to assign, given the session's frozen `rasterScale` (`nil` = no usable display). The
-    /// proposals are `ScaleAdvertisement`'s own functions, so their domain refusals (`nil`) are
-    /// inherited, not re-implemented; an explicit pair is already validated and ignores the scale.
+    /// What to assign, given the session's frozen `rasterScale` (`nil` = no usable display). Unset
+    /// follows `ScaleAdvertisement.productDefault` (the App's own path, lane H); the proposals are
+    /// `ScaleAdvertisement`'s own functions, so their domain refusals (`nil`) are inherited, not
+    /// re-implemented; an explicit pair is already validated and ignores the scale; `none` is nil.
     static func resolve(_ parsed: Parsed, rasterScale: Double?) -> ScaleAdvertisement? {
         switch parsed {
-        case .unset, .invalid:
+        case .unset:
+            guard let rasterScale else { return nil }
+            return ScaleAdvertisement.productDefault(rasterScale: rasterScale)
+        case .forcedNone, .invalid:
             return nil
         case .explicit(let pair):
             return pair
@@ -2218,14 +2235,16 @@ enum AdvertisedScaleKnob {
     /// The one evidence suffix all three `[topology]` lines append (connect line, `finish()` and
     /// `finishCycles()` summaries; one regex, `ADVERTISED TO SERVER DesktopScaleFactor=(\d+)
     /// DeviceScaleFactor=(\d+)`, reads all three). Derived from what was ASSIGNED, never from the
-    /// knob: no knob => nothing; knob set but nothing assigned => nothing (the line must not claim
-    /// an advertisement that never happened); otherwise both wire fields plus the matrix
+    /// knob: nothing assigned => nothing (the line must not claim an advertisement that never
+    /// happened); otherwise both wire fields, the SOURCE (product default D when the knob is unset,
+    /// the knob otherwise) plus the matrix
     /// `advertised_scale` value (docs/matrix/format.md) so the env row is copied, not re-derived.
-    static func evidenceSuffix(knobSet: Bool, assigned: ScaleAdvertisement?) -> String {
-        guard knobSet, let assigned else { return "" }
+    static func evidenceSuffix(knob: Parsed, assigned: ScaleAdvertisement?) -> String {
+        guard let assigned else { return "" }
+        let source = knob == .unset ? "product default D, ADR-0018 U-1" : "WINDOW_SMOKE_ADVERTISED_SCALE, fixture-only"
         return " -- ADVERTISED TO SERVER DesktopScaleFactor=\(assigned.desktopScaleFactor)"
             + " DeviceScaleFactor=\(assigned.deviceScaleFactor)"
-            + " (WINDOW_SMOKE_ADVERTISED_SCALE, fixture-only; matrix advertised_scale=\(assigned.matrixFieldValue))"
+            + " (\(source); matrix advertised_scale=\(assigned.matrixFieldValue))"
     }
 }
 
@@ -4092,19 +4111,24 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             if let advertised = AdvertisedScaleKnob.resolve(advertisedScaleKnob, rasterScale: displayTopology.sessionSnapshot?.rasterScale) {
                 session.advertisedDesktopScaleFactor = advertised.desktopScaleFactor
                 session.advertisedDeviceScaleFactor = advertised.deviceScaleFactor
-            } else if advertisedScaleKnob != .unset {
+            } else {
                 session.advertisedDesktopScaleFactor = 0
                 session.advertisedDeviceScaleFactor = 0
-                print("[config] WINDOW_SMOKE_ADVERTISED_SCALE is set but resolves to nothing at rasterScale="
-                    + (displayTopology.sessionSnapshot.map { "\($0.rasterScale)" } ?? "<no topology>")
-                    + " -- NOT advertising (ADR-0018 §2 lane E)")
+                let scaleText = displayTopology.sessionSnapshot.map { "\($0.rasterScale)" } ?? "<no topology>"
+                if advertisedScaleKnob == .forcedNone {
+                    print("[config] WINDOW_SMOKE_ADVERTISED_SCALE=none: advertised scale forced off (product default D suppressed) at rasterScale=\(scaleText)")
+                } else if advertisedScaleKnob == .unset {
+                    print("[config] product default advertised scale (ADR-0018 U-1 = D) resolves to nothing at rasterScale=\(scaleText) -- NOT advertising")
+                } else {
+                    print("[config] WINDOW_SMOKE_ADVERTISED_SCALE is set but resolves to nothing at rasterScale=\(scaleText) -- NOT advertising (ADR-0018 §2 lane E)")
+                }
             }
-            advertisedScaleAssigned = advertisedScaleKnob == .unset ? nil : ScaleAdvertisement(desktopScaleFactor: session.advertisedDesktopScaleFactor, deviceScaleFactor: session.advertisedDeviceScaleFactor)
+            advertisedScaleAssigned = ScaleAdvertisement(desktopScaleFactor: session.advertisedDesktopScaleFactor, deviceScaleFactor: session.advertisedDeviceScaleFactor)
             print(
                 "[topology] \(reason): desktop size frozen at \(desktop.width)x\(desktop.height) remote px "
                     + "(adr/0015 §3 rule 3, union of the local screens; anchor and size from one read, §5.A.4)"
                     + DeclaredDesktopOverride.evidenceSuffix(overrideSet: declaredDesktopOverride != nil, assigned: declaredDesktopAssigned)
-            + AdvertisedScaleKnob.evidenceSuffix(knobSet: advertisedScaleKnob != .unset, assigned: advertisedScaleAssigned)
+            + AdvertisedScaleKnob.evidenceSuffix(knob: advertisedScaleKnob, assigned: advertisedScaleAssigned)
             )
         } else {
             declaredDesktopAssigned = nil
@@ -5079,7 +5103,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             + (sessionDesktopSizeInRemotePixels.map { "\($0.width)x\($0.height) remote px" }
                 ?? "<not set -- no usable display at the last freeze, adr/0015 §5.A.6>")
             + DeclaredDesktopOverride.evidenceSuffix(overrideSet: declaredDesktopOverride != nil, assigned: declaredDesktopAssigned)
-            + AdvertisedScaleKnob.evidenceSuffix(knobSet: advertisedScaleKnob != .unset, assigned: advertisedScaleAssigned))
+            + AdvertisedScaleKnob.evidenceSuffix(knob: advertisedScaleKnob, assigned: advertisedScaleAssigned))
         // adr/0015 §5's reconnect re-take, pinned against the soak that actually ran: one freeze
         // at connect plus one per finished cycle (`finishCycle` calls `freezeAndApplyDesktopSize`
         // then `prepareForReconnect()`). This is the assertion the registry's own doc comment
@@ -7250,7 +7274,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             + (sessionDesktopSizeInRemotePixels.map { "\($0.width)x\($0.height) remote px" }
                 ?? "<never set -- no usable display at connect, adr/0015 §5.A.6>")
             + DeclaredDesktopOverride.evidenceSuffix(overrideSet: declaredDesktopOverride != nil, assigned: declaredDesktopAssigned)
-            + AdvertisedScaleKnob.evidenceSuffix(knobSet: advertisedScaleKnob != .unset, assigned: advertisedScaleAssigned))
+            + AdvertisedScaleKnob.evidenceSuffix(knob: advertisedScaleKnob, assigned: advertisedScaleAssigned))
         let freezePin = topologyFreezeCountCheck(expectedReconnects: 0)
         check(freezePin.passed, freezePin.message)
 

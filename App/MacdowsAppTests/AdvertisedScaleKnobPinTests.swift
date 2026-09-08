@@ -46,10 +46,11 @@ struct AdvertisedScaleKnobPinTests {
     @Test("window-smoke reads the evidence BACK from the session and appends it to all three [topology] lines")
     func smokeEvidenceIsReadBack() throws {
         let src = try source("Tools/window-smoke/main.swift")
-        let readBack = "advertisedScaleAssigned = advertisedScaleKnob == .unset ? nil : "
-            + "ScaleAdvertisement(desktopScaleFactor: session.advertisedDesktopScaleFactor, deviceScaleFactor: session.advertisedDeviceScaleFactor)"
+        // Lane H: the readback no longer depends on the knob -- the product default is assigned when
+        // the knob is unset, so the evidence must read back in that case too (nil only when 0/0).
+        let readBack = "advertisedScaleAssigned = ScaleAdvertisement(desktopScaleFactor: session.advertisedDesktopScaleFactor, deviceScaleFactor: session.advertisedDeviceScaleFactor)"
         #expect(occurrences(of: readBack, in: src) == 1)
-        let suffixCall = "AdvertisedScaleKnob.evidenceSuffix(knobSet: advertisedScaleKnob != .unset, assigned: advertisedScaleAssigned)"
+        let suffixCall = "AdvertisedScaleKnob.evidenceSuffix(knob: advertisedScaleKnob, assigned: advertisedScaleAssigned)"
         #expect(occurrences(of: suffixCall, in: src) >= 3)
         #expect(src.contains("AdvertisedScaleKnob.resolve(advertisedScaleKnob, rasterScale: displayTopology.sessionSnapshot?.rasterScale)"))
         // Both "nothing to advertise" branches -- a knob that resolves to nothing, and no usable
