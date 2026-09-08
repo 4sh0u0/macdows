@@ -140,7 +140,12 @@ PLAN
 		# usage() prints to stdout (as it always has); the refusal itself names the option on stderr.
 		grep -q 'Usage:' "$TEST_DIR/stdout.txt" || OK=1
 		grep -q -- "${bad%% *}" "$TEST_DIR/stderr.txt" || OK=1
-		printf 'rc=%s\n--- stdout ---\n' "$RC" >"$TEST_DIR/bad.txt"; cat "$TEST_DIR/stdout.txt" >>"$TEST_DIR/bad.txt"; printf -- '--- stderr ---\n' >>"$TEST_DIR/bad.txt"; head -3 "$TEST_DIR/stderr.txt" >>"$TEST_DIR/bad.txt"
+		{
+			printf 'rc=%s\n--- stdout ---\n' "$RC"
+			cat "$TEST_DIR/stdout.txt"
+			printf -- '--- stderr ---\n'
+			head -3 "$TEST_DIR/stderr.txt"
+		} >"$TEST_DIR/bad.txt"
 		check "$OK" "refuses $bad" "exit 2, option named on stderr, usage on stdout, no plan line" "$TEST_DIR/bad.txt"
 	done
 fi
