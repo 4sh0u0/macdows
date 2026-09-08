@@ -1567,13 +1567,17 @@ final class RemoteWindowRegistry {
     ///     they share the wire's unit with `offsetX/Y` and `windowWidth/Height` -- Windows
     ///     space, before any flip, no `rasterScale` term.
     ///   * The paragraph above states adr/0008 §0's `fieldFlags` inconsistency as a settled
-    ///     finding. It is not settled: `docs/plans/phase3.md:232` (§8.14) records that very
-    ///     conclusion as still pending re-verification. That distinction is the whole
-    ///     content of F6 (d) -- a closed road and an unverified road look identical from here,
-    ///     and only one of them is worth re-walking.
-    ///   * W3 TRIGGER and TRIGGERED SHAPE (ADR §7 (d)): the trigger is the §8.14 re-verification
-    ///     itself, which must happen BEFORE anything is wired -- W3 does not get to skip it on
-    ///     the strength of a 2x measurement. If it passes, wire the field and let it replace the
+    ///     finding. The §8.14 re-verification (`docs/plans/phase3.md:232`) has since been DONE:
+    ///     W3 lane A's corpus census (`ResizeMarginCorpusPinTests`, ADR-0018 §0 (e), ADR-0015 §7
+    ///     (d) addendum, 2026-09-08) found the margin bits arriving through `WindowUpdate` on the
+    ///     THICKFRAME window (64/6 across the six scenarios), not an inconsistency -- the road is
+    ///     open, not closed. ADR-0018 U-5 keeps it open under a three-step terminating condition:
+    ///     (1) rail-probe records the values (done, U-5 step 1 -- `WindowOrderPayload.
+    ///     resizeMargin*`, two independent validity bits RESIZE_MARGIN_X / _Y), (2) a 2x recording
+    ///     reads them, (3) wire only if they match the per-style border below.
+    ///   * W3 TRIGGER and TRIGGERED SHAPE (ADR §7 (d)): the trigger is now step (2)/(3) above --
+    ///     the values at 2x -- and U-5 is the owner's ruling, not a lane's. If they match, wire
+    ///     the field and let it replace the
     ///     hardcoded left border -- which since the 2026-09-05 per-style lane (F-R1, found
     ///     2026-09-02) is no longer a single constant here but a two-row per-style table,
     ///     `MacdowsCore.WindowGeometry.clientWindowMoveLeftBorder(forStyle:)` (F6 (a), below).

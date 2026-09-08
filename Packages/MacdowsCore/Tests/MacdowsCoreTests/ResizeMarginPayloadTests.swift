@@ -4,7 +4,8 @@ import Testing
 
 /// W3 / ADR-0018 U-5 step 1 (ADR-0015 §7 (d)): rail-probe's WindowCreate / WindowUpdate lines now
 /// carry the four RAIL resize margins (`WINDOW_STATE_ORDER.resizeMarginLeft/Top/Right/Bottom`,
-/// remote px; meaningful when `fieldFlags` has RESIZE_MARGIN_X 0x80 / RESIZE_MARGIN_Y 0x08000000),
+/// remote px; Left/Right are meaningful when `fieldFlags` has RESIZE_MARGIN_X 0x80, Top/Bottom when
+/// it has RESIZE_MARGIN_Y 0x08000000 -- two independent bits, as window.c reads them),
 /// so a 2x recording can answer whether the THICKFRAME margins scale with DPI (the census in
 /// ResizeMarginCorpusPinTests only counts the flag bits -- the VALUES were never recorded). Old
 /// recordings, the frozen corpus included, lack the keys and decode as 0 -- a value, not an

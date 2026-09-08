@@ -355,9 +355,11 @@ public struct WindowOrderPayload: Decodable, Sendable, Equatable {
     public let visibleOffsetX: Int32
     public let visibleOffsetY: Int32
     /// ADR-0018 U-5 step 1 (ADR-0015 §7 (d)): the RAIL resize margins, **remote px**, as
-    /// `WINDOW_STATE_ORDER.resizeMarginLeft/Top/Right/Bottom` -- meaningful only when
-    /// `fieldFlags` carries RESIZE_MARGIN_X (0x80) / RESIZE_MARGIN_Y (0x0800_0000); consumers
-    /// gate on those bits, never on "margin != 0". Recordings made before this step (the frozen
+    /// `WINDOW_STATE_ORDER.resizeMarginLeft/Top/Right/Bottom`. Two INDEPENDENT validity bits,
+    /// exactly as libfreerdp/core/window.c reads them: `resizeMarginLeft/Right` are meaningful
+    /// when `fieldFlags` carries RESIZE_MARGIN_X (0x80), `resizeMarginTop/Bottom` when it carries
+    /// RESIZE_MARGIN_Y (0x0800_0000); consumers gate each pair on its own bit, never on
+    /// "margin != 0" (gate w3-u5-step1 r1 I-1). Recordings made before this step (the frozen
     /// corpus included) carry no such keys and decode as 0, which is why the census in
     /// `ResizeMarginCorpusPinTests` counts flag bits and not these values.
     public let resizeMarginLeft: UInt32

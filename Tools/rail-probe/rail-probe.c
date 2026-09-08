@@ -524,9 +524,11 @@ static BOOL probe_window_common(rdpContext* context, const WINDOW_ORDER_INFO* or
 	}
 
 	const bool isNew = (orderInfo->fieldFlags & WINDOW_ORDER_STATE_NEW) != 0;
-	/* ADR-0018 U-5 step 1: the line ends with the four RAIL resize margins (remote px), valid
-	 * when fieldFlags carries RESIZE_MARGIN_X 0x80 / RESIZE_MARGIN_Y 0x08000000; logged always so
-	 * a 2x recording can say whether THICKFRAME margins scale with DPI. Decoded by MacdowsCore's
+	/* ADR-0018 U-5 step 1: the line ends with the four RAIL resize margins (remote px). Two
+	 * INDEPENDENT validity bits, exactly as libfreerdp/core/window.c reads them: Left/Right are
+	 * valid when fieldFlags carries RESIZE_MARGIN_X 0x80, Top/Bottom when it carries
+	 * RESIZE_MARGIN_Y 0x08000000 (gate w3-u5-step1 r1 I-1). Logged always so a 2x recording can
+	 * say whether THICKFRAME margins scale with DPI. Decoded by MacdowsCore's
 	 * WindowOrderPayload (absent in older recordings = 0); the key list is pinned verbatim by
 	 * EmitterContractTests, so a change here is a contract change, made deliberately. */
 	log_event(p, isNew ? "WindowCreate" : "WindowUpdate",
