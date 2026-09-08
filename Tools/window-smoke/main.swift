@@ -1964,6 +1964,52 @@ enum WindowSmokeGateSelfTest {
             "declaredDesktopEvidenceSuffixSaysOnlyWhatWasAssigned: no override or nothing assigned = no suffix; otherwise the assigned WxH in the one DECLARED TO SERVER form all three [topology] lines share"
         )
 
+        // --- W3 lane E (ADR-0018 §2): WINDOW_SMOKE_ADVERTISED_SCALE, the fixture knob for the -------
+        // advertised DesktopScaleFactor / DeviceScaleFactor (values = MacdowsCore's ScaleAdvertisement,
+        // lane D). Same three load-bearing facts as the declared-desktop knob above: a malformed value
+        // is refused, never silently "not advertising"; the knob changes ONLY what is sent; and the
+        // evidence suffix says what was ASSIGNED (read back from the session), never what was asked.
+        let twoHundredOnly = ScaleAdvertisement(desktopScaleFactor: 200, deviceScaleFactor: 100)!
+        let twoHundredBoth = ScaleAdvertisement(desktopScaleFactor: 200, deviceScaleFactor: 180)!
+        expect(
+            AdvertisedScaleKnob.parse(nil) == .unset && AdvertisedScaleKnob.parse("") == .unset
+                && AdvertisedScaleKnob.parse("none") == .unset
+                && AdvertisedScaleKnob.parse("D") == .proposal(.desktopOnly)
+                && AdvertisedScaleKnob.parse(" DD\n") == .proposal(.both)
+                && AdvertisedScaleKnob.parse("200") == .explicit(twoHundredOnly)
+                && AdvertisedScaleKnob.parse("200,180") == .explicit(twoHundredBoth)
+                && AdvertisedScaleKnob.parse("d") == .invalid("d")
+                && AdvertisedScaleKnob.parse("dd") == .invalid("dd")
+                && AdvertisedScaleKnob.parse(" ") == .invalid(" ")
+                && AdvertisedScaleKnob.parse("200,150") == .invalid("200,150")
+                && AdvertisedScaleKnob.parse("600") == .invalid("600")
+                && AdvertisedScaleKnob.parse("200,") == .invalid("200,")
+                && AdvertisedScaleKnob.parse("2x") == .invalid("2x"),
+            "advertisedScaleKnobParsesOnlyTheThreeForms: unset/empty/none = unset; D / DD = the ADR-0018 U-1 proposals; <desktop> or <desktop>,<device> = an explicit pair inside the wire domains; anything else -- lowercase, whitespace-only, an out-of-domain device or desktop, a trailing comma -- is invalid, never silently ignored"
+        )
+        expect(
+            AdvertisedScaleKnob.resolve(.unset, rasterScale: 2) == nil
+                && AdvertisedScaleKnob.resolve(.proposal(.desktopOnly), rasterScale: 2) == twoHundredOnly
+                && AdvertisedScaleKnob.resolve(.proposal(.both), rasterScale: 2) == twoHundredBoth
+                && AdvertisedScaleKnob.resolve(.proposal(.both), rasterScale: 1.5) == ScaleAdvertisement(desktopScaleFactor: 150, deviceScaleFactor: 140)
+                && AdvertisedScaleKnob.resolve(.proposal(.desktopOnly), rasterScale: 1) == .notAdvertising
+                && AdvertisedScaleKnob.resolve(.proposal(.desktopOnly), rasterScale: 0.5) == nil
+                && AdvertisedScaleKnob.resolve(.proposal(.desktopOnly), rasterScale: nil) == nil
+                && AdvertisedScaleKnob.resolve(.explicit(twoHundredBoth), rasterScale: 1) == twoHundredBoth
+                && AdvertisedScaleKnob.resolve(.explicit(twoHundredBoth), rasterScale: nil) == twoHundredBoth,
+            "advertisedScaleKnobResolvesProposalsAgainstTheFrozenRasterScale: D = ScaleAdvertisement.proposedDesktopOnly and DD = proposedBoth, both against the session's frozen rasterScale (no topology or an out-of-domain scale = nothing to advertise); an explicit pair ignores the scale; unset = nothing"
+        )
+        expect(
+            AdvertisedScaleKnob.evidenceSuffix(knobSet: false, assigned: nil) == ""
+                && AdvertisedScaleKnob.evidenceSuffix(knobSet: false, assigned: twoHundredBoth) == ""
+                && AdvertisedScaleKnob.evidenceSuffix(knobSet: true, assigned: nil) == ""
+                && AdvertisedScaleKnob.evidenceSuffix(knobSet: true, assigned: twoHundredBoth)
+                    == " -- ADVERTISED TO SERVER DesktopScaleFactor=200 DeviceScaleFactor=180 (WINDOW_SMOKE_ADVERTISED_SCALE, fixture-only; matrix advertised_scale=DesktopScaleFactor=200,DeviceScaleFactor=180)"
+                && AdvertisedScaleKnob.evidenceSuffix(knobSet: true, assigned: twoHundredOnly)
+                    == " -- ADVERTISED TO SERVER DesktopScaleFactor=200 DeviceScaleFactor=100 (WINDOW_SMOKE_ADVERTISED_SCALE, fixture-only; matrix advertised_scale=DesktopScaleFactor=200)",
+            "advertisedScaleEvidenceSuffixSaysOnlyWhatWasAssigned: no knob or nothing assigned = no suffix; otherwise both wire fields as ASSIGNED plus the matrix advertised_scale value, in the one ADVERTISED TO SERVER form all three [topology] lines share"
+        )
+
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
         // rev-L9 M-4: `Scripts/run-window-smoke.command:192-193` records `DONE exit=<rc>` via `launcher_done` and its callers
         // read that line as the whole verdict. A `WINDOW_SMOKE_SELFTEST=1` leaked into the
@@ -2101,6 +2147,102 @@ let declaredDesktopOverride: DeclaredDesktopOverride.Size? = {
             + "refusing to run rather than silently declaring the real desktop")
         exit(3)
     }
+}()
+
+/// WINDOW_SMOKE_ADVERTISED_SCALE (ADR-0018 §2 lane E; fixture-only, the App target never reads it):
+/// what this run advertises in TS_UD_CS_CORE's `DesktopScaleFactor` / `DeviceScaleFactor` -- the
+/// knob the 2x checkpoint's three runs turn (not advertising / D / DD, ADR-0018 §3). Values are
+/// MacdowsCore's `ScaleAdvertisement` (lane D): `D` = `proposedDesktopOnly`, `DD` = `proposedBoth`,
+/// both resolved against the SESSION'S FROZEN `rasterScale` (the same freeze the desktop size
+/// comes from, `DisplayTopologyProvider.sessionSnapshot`), or an explicit `<desktop>[,<device>]`
+/// pair inside the wire domains (desktop 100...500, device 100/140/180; the pair's own failable
+/// init is the validator, so nothing here re-states the domains). Same three load-bearing rules as
+/// `DeclaredDesktopOverride`: (1) a malformed or out-of-domain value is fatal at startup (exit 4) --
+/// a run that believes it advertised but did not is the false negative; (2) the knob changes only
+/// `session.advertisedDesktopScaleFactor/DeviceScaleFactor`, and when it is unset those stay 0 and
+/// CRSession sets NEITHER scale setting (CRSession.h's contract for the pair); (3) the evidence
+/// suffix the three `[topology]` lines append says what was ASSIGNED (read back from the session),
+/// never what the knob asked for. `none` is accepted as an explicit "unset" so a three-run script can
+/// always pass the knob. A proposal that resolves to nothing (no usable display, or a rasterScale
+/// whose percentage leaves the wire domain) advertises nothing and is logged as such at the freeze.
+enum AdvertisedScaleKnob {
+    enum Proposal: Equatable { case desktopOnly, both }
+
+    enum Parsed: Equatable {
+        case unset
+        case invalid(String)
+        case proposal(Proposal)
+        case explicit(ScaleAdvertisement)
+    }
+
+    /// `nil`/empty/`none` = unset. `D` / `DD` = the two ADR-0018 U-1 proposals. Otherwise
+    /// `<desktop>` or `<desktop>,<device>` (surrounding whitespace/newlines trimmed) accepted only if
+    /// `ScaleAdvertisement` accepts the pair; anything else -- lowercase `d`, whitespace-only, a
+    /// trailing comma, an out-of-domain value -- is `.invalid` carrying the RAW text.
+    static func parse(_ raw: String?) -> Parsed {
+        guard let raw, !raw.isEmpty else { return .unset }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch trimmed {
+        case "none": return .unset
+        case "D": return .proposal(.desktopOnly)
+        case "DD": return .proposal(.both)
+        default: break
+        }
+        let parts = trimmed.split(separator: ",", omittingEmptySubsequences: false)
+        guard (1...2).contains(parts.count), let desktop = UInt32(parts[0]) else { return .invalid(raw) }
+        let device: UInt32? = parts.count == 2 ? UInt32(parts[1]) : 100
+        guard let device, let pair = ScaleAdvertisement(desktopScaleFactor: desktop, deviceScaleFactor: device) else {
+            return .invalid(raw)
+        }
+        return .explicit(pair)
+    }
+
+    /// What to assign, given the session's frozen `rasterScale` (`nil` = no usable display). The
+    /// proposals are `ScaleAdvertisement`'s own functions, so their domain refusals (`nil`) are
+    /// inherited, not re-implemented; an explicit pair is already validated and ignores the scale.
+    static func resolve(_ parsed: Parsed, rasterScale: Double?) -> ScaleAdvertisement? {
+        switch parsed {
+        case .unset, .invalid:
+            return nil
+        case .explicit(let pair):
+            return pair
+        case .proposal(let which):
+            guard let rasterScale else { return nil }
+            switch which {
+            case .desktopOnly: return ScaleAdvertisement.proposedDesktopOnly(rasterScale: rasterScale)
+            case .both: return ScaleAdvertisement.proposedBoth(rasterScale: rasterScale)
+            }
+        }
+    }
+
+    /// The one evidence suffix all three `[topology]` lines append (connect line, `finish()` and
+    /// `finishCycles()` summaries; one regex, `ADVERTISED TO SERVER DesktopScaleFactor=(\d+)
+    /// DeviceScaleFactor=(\d+)`, reads all three). Derived from what was ASSIGNED, never from the
+    /// knob: no knob => nothing; knob set but nothing assigned => nothing (the line must not claim
+    /// an advertisement that never happened); otherwise both wire fields plus the matrix
+    /// `advertised_scale` value (docs/matrix/format.md) so the env row is copied, not re-derived.
+    static func evidenceSuffix(knobSet: Bool, assigned: ScaleAdvertisement?) -> String {
+        guard knobSet, let assigned else { return "" }
+        return " -- ADVERTISED TO SERVER DesktopScaleFactor=\(assigned.desktopScaleFactor)"
+            + " DeviceScaleFactor=\(assigned.deviceScaleFactor)"
+            + " (WINDOW_SMOKE_ADVERTISED_SCALE, fixture-only; matrix advertised_scale=\(assigned.matrixFieldValue))"
+    }
+}
+
+/// See `AdvertisedScaleKnob`. Fatal on a malformed value, evaluated HERE like the declared-desktop
+/// knob: before the boundary gate and before anything touches host.env or a socket. Exit code 4 is
+/// this refusal's own (2 = missing credentials, 3 = declared-desktop knob, 78 = boundary gate) so
+/// `DONE exit=<rc>` keeps one meaning per code.
+let advertisedScaleKnob: AdvertisedScaleKnob.Parsed = {
+    let parsed = AdvertisedScaleKnob.parse(ProcessInfo.processInfo.environment["WINDOW_SMOKE_ADVERTISED_SCALE"])
+    if case .invalid(let raw) = parsed {
+        let shown = raw.replacingOccurrences(of: "\r", with: "\\r").replacingOccurrences(of: "\n", with: "\\n")
+        print("[config] FAIL: WINDOW_SMOKE_ADVERTISED_SCALE=\"\(shown)\" must be none | D | DD | <desktop> | <desktop>,<device> "
+            + "with desktop in 100...500 and device one of 100/140/180 (e.g. DD, or 200,180); "
+            + "refusing to run rather than silently not advertising")
+        exit(4)
+    }
+    return parsed
 }()
 
 // Three MacdowsCore rules and no local copy of any of them: MacdowsPaths says WHERE host.env
@@ -3067,6 +3209,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// assigned (no usable display). Feeds `DeclaredDesktopOverride.evidenceSuffix` for all three
     /// `[topology]` lines (review declared-desktop-r1 B-1/I-1).
     private var declaredDesktopAssigned: DeclaredDesktopOverride.Size?
+    /// W3 lane E: what `freezeAndApplyDesktopSize` last READ BACK from
+    /// `session.advertisedDesktopScaleFactor/DeviceScaleFactor` after assigning the resolved knob --
+    /// `nil` when the knob is unset or nothing was assigned. Same readback rule as
+    /// `declaredDesktopAssigned`, for the same reason (the evidence must not repeat the knob).
+    private var advertisedScaleAssigned: ScaleAdvertisement?
 
     /// F2's measurement (`docs/plans/phase3.md:132`): every SURFACE_MAPPED event's target hint,
     /// aggregated for the one `[gfx] target=` line every run prints at summary time.
@@ -3936,17 +4083,43 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             declaredDesktopAssigned = declaredDesktopOverride == nil
                 ? nil
                 : DeclaredDesktopOverride.Size(width: Int(session.desktopWidth), height: Int(session.desktopHeight))
+            // --- W3 lane E (ADR-0018 §2): the advertised scale, resolved against THIS freeze's ------
+            // topology (the same `sessionSnapshot` the desktop above came from), assigned to the pair
+            // CRSession's connect path reads once, and -- like the desktop above -- READ BACK for the
+            // evidence suffix rather than copied from the knob or from the resolved proposal. A knob
+            // that resolves to nothing (no topology, or a percentage outside the wire domain) zeroes
+            // the pair so CRSession sets neither setting, and says so.
+            if let advertised = AdvertisedScaleKnob.resolve(advertisedScaleKnob, rasterScale: displayTopology.sessionSnapshot?.rasterScale) {
+                session.advertisedDesktopScaleFactor = advertised.desktopScaleFactor
+                session.advertisedDeviceScaleFactor = advertised.deviceScaleFactor
+            } else if advertisedScaleKnob != .unset {
+                session.advertisedDesktopScaleFactor = 0
+                session.advertisedDeviceScaleFactor = 0
+                print("[config] WINDOW_SMOKE_ADVERTISED_SCALE is set but resolves to nothing at rasterScale="
+                    + (displayTopology.sessionSnapshot.map { "\($0.rasterScale)" } ?? "<no topology>")
+                    + " -- NOT advertising (ADR-0018 §2 lane E)")
+            }
+            advertisedScaleAssigned = advertisedScaleKnob == .unset ? nil : ScaleAdvertisement(desktopScaleFactor: session.advertisedDesktopScaleFactor, deviceScaleFactor: session.advertisedDeviceScaleFactor)
             print(
                 "[topology] \(reason): desktop size frozen at \(desktop.width)x\(desktop.height) remote px "
                     + "(adr/0015 §3 rule 3, union of the local screens; anchor and size from one read, §5.A.4)"
                     + DeclaredDesktopOverride.evidenceSuffix(overrideSet: declaredDesktopOverride != nil, assigned: declaredDesktopAssigned)
+            + AdvertisedScaleKnob.evidenceSuffix(knobSet: advertisedScaleKnob != .unset, assigned: advertisedScaleAssigned)
             )
         } else {
             declaredDesktopAssigned = nil
+            advertisedScaleAssigned = nil
+            // W3 lane E: unlike the desktop pair above (left as it was, by adr/0015 §5.A.6's own
+            // rule), the advertised-scale pair is ZEROED here. Cycle mode reuses this one CRSession
+            // across reconnects, so a pair left over from an earlier freeze would be read by the
+            // next -start while the evidence line says nothing was advertised (gate w3-lane-e r1 m-1).
+            session.advertisedDesktopScaleFactor = 0
+            session.advertisedDeviceScaleFactor = 0
             print(
                 "[topology] \(reason): no usable display -- desktopWidth/Height deliberately NOT set "
                     + "(adr/0015 §5.A.6: 0x0 falls back to FreeRDP's 1024x768 desktop, CRSession.h:285-286). "
                     + "Any previously negotiated size is now stale."
+                    + (advertisedScaleKnob == .unset ? "" : " Advertised-scale pair cleared (WINDOW_SMOKE_ADVERTISED_SCALE set, nothing to resolve against): NOT advertising.")
             )
         }
         return desktop
@@ -4905,7 +5078,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         print("[topology] session desktop size after \(cycleResults.count) cycle(s): "
             + (sessionDesktopSizeInRemotePixels.map { "\($0.width)x\($0.height) remote px" }
                 ?? "<not set -- no usable display at the last freeze, adr/0015 §5.A.6>")
-            + DeclaredDesktopOverride.evidenceSuffix(overrideSet: declaredDesktopOverride != nil, assigned: declaredDesktopAssigned))
+            + DeclaredDesktopOverride.evidenceSuffix(overrideSet: declaredDesktopOverride != nil, assigned: declaredDesktopAssigned)
+            + AdvertisedScaleKnob.evidenceSuffix(knobSet: advertisedScaleKnob != .unset, assigned: advertisedScaleAssigned))
         // adr/0015 §5's reconnect re-take, pinned against the soak that actually ran: one freeze
         // at connect plus one per finished cycle (`finishCycle` calls `freezeAndApplyDesktopSize`
         // then `prepareForReconnect()`). This is the assertion the registry's own doc comment
@@ -7075,7 +7249,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         print("[topology] session desktop size: "
             + (sessionDesktopSizeInRemotePixels.map { "\($0.width)x\($0.height) remote px" }
                 ?? "<never set -- no usable display at connect, adr/0015 §5.A.6>")
-            + DeclaredDesktopOverride.evidenceSuffix(overrideSet: declaredDesktopOverride != nil, assigned: declaredDesktopAssigned))
+            + DeclaredDesktopOverride.evidenceSuffix(overrideSet: declaredDesktopOverride != nil, assigned: declaredDesktopAssigned)
+            + AdvertisedScaleKnob.evidenceSuffix(knobSet: advertisedScaleKnob != .unset, assigned: advertisedScaleAssigned))
         let freezePin = topologyFreezeCountCheck(expectedReconnects: 0)
         check(freezePin.passed, freezePin.message)
 
