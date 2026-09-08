@@ -265,6 +265,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			newSession.desktopWidth = UInt32(clamping: desktop.width)
 			newSession.desktopHeight = UInt32(clamping: desktop.height)
 		}
+		// ADR-0018 U-1 (owner ruled D, 2026-09-08 13:28 JST; W3 lane H): advertise the product default
+		// from the SAME frozen topology the desktop size came from. `productDefault` is MacdowsCore's one
+		// statement of the ruling (2x -> DesktopScaleFactor 200 / DeviceScaleFactor 100; 1x -> 100/100,
+		// wire-identical to the old behaviour); window-smoke's knob-unset path resolves through the same
+		// function, so the fixture measures what ships. Both fields are assigned together -- CRSession
+		// sets neither setting unless both are non-zero. No usable display -> nothing assigned.
+		if let scale = displayTopology.sessionSnapshot?.rasterScale,
+		   let advertised = ScaleAdvertisement.productDefault(rasterScale: scale) {
+			newSession.advertisedDesktopScaleFactor = advertised.desktopScaleFactor
+			newSession.advertisedDeviceScaleFactor = advertised.deviceScaleFactor
+		}
 		// A staleness verdict belongs to the session it was computed against, and the line above
 		// just started a new one against a fresh snapshot.
 		lastDisplayChangeNote = nil

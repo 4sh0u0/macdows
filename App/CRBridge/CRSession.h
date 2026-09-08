@@ -365,11 +365,13 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// `DeviceScaleFactor` settings, written unconditionally by `gcc_write_client_core_data`).
 /// Same contract as `desktopWidth`: set BOTH before `-start` (read once by the connect path on
 /// T_rdp; unsynchronized afterwards). 0 (the default) means "leave FreeRDP's own defaults untouched"
-/// -- the connect path sets NEITHER setting unless both are non-zero, so the product, which never
-/// assigns this pair, keeps advertising exactly what it advertised before the pair existed
-/// (FreeRDP's 100/100). Validation (desktop 100...500, device one of 100/140/180 -- MacdowsCore's
-/// `ScaleAdvertisement`) is the caller's; today only window-smoke's fixture knob assigns them, and
-/// whether the product ever does is ADR-0018 U-1's decision.
+/// -- the connect path sets NEITHER setting unless both are non-zero, so a caller that leaves the
+/// pair at 0 gets FreeRDP's own defaults (100/100). Validation (desktop 100...500, device one of
+/// 100/140/180 -- MacdowsCore's `ScaleAdvertisement`) is the caller's. Since ADR-0018 U-1 was
+/// ruled D (2026-09-08), the App's session setup assigns the pair from
+/// `ScaleAdvertisement.productDefault(rasterScale:)` right after freezing the topology (2x ->
+/// 200/100; 1x -> 100/100, wire-identical to the pre-ruling default), and window-smoke's knob-unset
+/// path does the same through the same function; the fixture knob can force `none` or try DD.
 @property (nonatomic) uint32_t advertisedDesktopScaleFactor;
 @property (nonatomic) uint32_t advertisedDeviceScaleFactor;
 

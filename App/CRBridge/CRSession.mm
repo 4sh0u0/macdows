@@ -1635,9 +1635,11 @@ static BOOL crb_pre_connect(freerdp *instance)
             !freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, session.desktopHeight))
             return FALSE;
     }
-    /* W3 lane E (ADR-0018 §2): the advertised scale pair, fixture-only today (CRSession.h's
-     * advertisedDesktopScaleFactor doc). Both zero -- the product's value -- leaves both settings
-     * at FreeRDP's defaults; this block is the only place in the bridge that touches them. */
+    /* W3 lanes E + H (ADR-0018 §2; U-1 ruled D 2026-09-08): the advertised scale pair. The App
+     * assigns it from ScaleAdvertisement.productDefault after the topology freeze (2x -> 200/100;
+     * 1x -> 100/100, wire-identical to FreeRDP's defaults); window-smoke's knob can force it off
+     * (both zero) or try other values. Both zero leaves both settings at FreeRDP's defaults; this
+     * block is the only place in the bridge that touches them (CRSession.h's doc for the pair). */
     if (session.advertisedDesktopScaleFactor > 0 && session.advertisedDeviceScaleFactor > 0)
     {
         if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopScaleFactor, session.advertisedDesktopScaleFactor) ||

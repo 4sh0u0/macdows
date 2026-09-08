@@ -3,8 +3,10 @@ import Testing
 
 // W3 lane E (ADR-0018 §2): the advertised-scale fixture knob is only honest if (1) CRSession sets
 // the two TS_UD_CS_CORE scale settings in exactly one place, behind a guard that leaves them
-// untouched whenever the App (which never assigns the pair) or an unset knob leaves the properties
-// at 0 -- "knob unset => no setting is set" is the row's first must-red; (2) window-smoke's
+// untouched whenever the properties are left at 0 -- since lane H (ADR-0018 U-1 = D) the App assigns
+// the pair from ScaleAdvertisement.productDefault and window-smoke's unset knob follows the same
+// default, so 0/0 now means "no usable display" or the explicit `none` switch; "pair zero => no
+// setting is set" is still the row's first must-red; (2) window-smoke's
 // evidence suffix is built from the values READ BACK from the session, not from the knob or the
 // resolved proposal -- "print the derived value" is the row's second must-red; (3) the App target
 // never reads the knob. Source pins over those hops, same technique as the A2 / lane G pins
@@ -46,10 +48,11 @@ struct AdvertisedScaleKnobPinTests {
     @Test("window-smoke reads the evidence BACK from the session and appends it to all three [topology] lines")
     func smokeEvidenceIsReadBack() throws {
         let src = try source("Tools/window-smoke/main.swift")
-        let readBack = "advertisedScaleAssigned = advertisedScaleKnob == .unset ? nil : "
-            + "ScaleAdvertisement(desktopScaleFactor: session.advertisedDesktopScaleFactor, deviceScaleFactor: session.advertisedDeviceScaleFactor)"
+        // Lane H: the readback no longer depends on the knob -- the product default is assigned when
+        // the knob is unset, so the evidence must read back in that case too (nil only when 0/0).
+        let readBack = "advertisedScaleAssigned = ScaleAdvertisement(desktopScaleFactor: session.advertisedDesktopScaleFactor, deviceScaleFactor: session.advertisedDeviceScaleFactor)"
         #expect(occurrences(of: readBack, in: src) == 1)
-        let suffixCall = "AdvertisedScaleKnob.evidenceSuffix(knobSet: advertisedScaleKnob != .unset, assigned: advertisedScaleAssigned)"
+        let suffixCall = "AdvertisedScaleKnob.evidenceSuffix(knob: advertisedScaleKnob, assigned: advertisedScaleAssigned)"
         #expect(occurrences(of: suffixCall, in: src) >= 3)
         #expect(src.contains("AdvertisedScaleKnob.resolve(advertisedScaleKnob, rasterScale: displayTopology.sessionSnapshot?.rasterScale)"))
         // Both "nothing to advertise" branches -- a knob that resolves to nothing, and no usable
