@@ -26,7 +26,9 @@ public struct ScaleAdvertisement: Equatable, Sendable {
     public static let desktopScaleRange: ClosedRange<UInt32> = 100...500
     public static let deviceScaleValues: [UInt32] = [100, 140, 180]
 
-    /// Not advertising: both fields at their wire defaults. The product's value today.
+    /// Not advertising: both fields at their wire defaults -- what `productDefault` yields at 1x, and
+    /// what the fixture knob `none` forces (ADR-0018 U-1 ruled D on 2026-09-08, so at 2x the product
+    /// advertises 200/100 instead).
     public static let notAdvertising = ScaleAdvertisement(uncheckedDesktop: 100, uncheckedDevice: 100)
 
     /// Fails (returns `nil`) when either value is outside its wire domain.

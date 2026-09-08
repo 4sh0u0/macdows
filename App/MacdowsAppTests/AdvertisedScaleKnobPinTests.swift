@@ -3,8 +3,10 @@ import Testing
 
 // W3 lane E (ADR-0018 §2): the advertised-scale fixture knob is only honest if (1) CRSession sets
 // the two TS_UD_CS_CORE scale settings in exactly one place, behind a guard that leaves them
-// untouched whenever the App (which never assigns the pair) or an unset knob leaves the properties
-// at 0 -- "knob unset => no setting is set" is the row's first must-red; (2) window-smoke's
+// untouched whenever the properties are left at 0 -- since lane H (ADR-0018 U-1 = D) the App assigns
+// the pair from ScaleAdvertisement.productDefault and window-smoke's unset knob follows the same
+// default, so 0/0 now means "no usable display" or the explicit `none` switch; "pair zero => no
+// setting is set" is still the row's first must-red; (2) window-smoke's
 // evidence suffix is built from the values READ BACK from the session, not from the knob or the
 // resolved proposal -- "print the derived value" is the row's second must-red; (3) the App target
 // never reads the knob. Source pins over those hops, same technique as the A2 / lane G pins
