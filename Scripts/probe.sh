@@ -18,6 +18,9 @@
 # builds cannot be usefully run behind this script's back (see the handshake comment below).
 #
 # Usage: Scripts/probe.sh [rail-probe args, e.g. --app 'C:\Windows\System32\winver.exe' --duration 25 --out runs/s1.jsonl]
+#        W3 lane F knobs (ADR-0018 §2 lane F): --desktop <w>x<h>, --scale <d>[,<v>]; both absent =
+#        today's settings sequence, verbatim. `rail-probe --print-plan ...` prints that sequence
+#        without connecting (Scripts/test-rail-probe-plan.sh pins it).
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=Scripts/lib.sh
