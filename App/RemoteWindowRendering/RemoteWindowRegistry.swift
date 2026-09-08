@@ -363,14 +363,6 @@ final class RemoteWindowRegistry {
     /// count is not lost either, since `sessionTopologyFreezeCount` is what a harness asserts on.
     private static var warnedSessionTopologyDesktopDivergence = false
 
-    /// One-shot record for the MASK UNIT BOUNDARY (ADR-0015 §7 (c); U5 = record-only,
-    /// `m1-wave1-rulings.md:4`). Set the first time
-    /// `maskContentSize(fromContentRectInPoints:rasterScale:)` is asked to cross the mac-point →
-    /// wire-unit boundary at a `rasterScale` other than 1 — which is exactly the condition that
-    /// makes today's identity crossing wrong. Recorded, never acted on: M1 is a measurement
-    /// batch and the factor itself is W3's to decide from a real 2x session.
-    private static var warnedMaskUnitScaleGap = false
-
     /// Builds the registry for one `CRSession` and freezes that session's display topology.
     ///
     /// - Parameter topologyProvider: the display-topology seam
@@ -1321,11 +1313,14 @@ final class RemoteWindowRegistry {
     ///     pins it to remote px), `topInset` (adr/0010 §6's placeholder, always 0).
     ///   * **mac pt** — `contentSize`, which arrives from `macContentRect(for:windowId:in:)`,
     ///     i.e. from the far side of a `WindowGeometry.macRect` conversion.
-    /// `WindowShape.computeMask` uses that second column as the BOUNDS it clips the first column
-    /// against (`WindowShape.swift:161-189`), so the two must be one unit — and today they are,
-    /// only because `rasterScale == 1`. `maskContentSize(fromContentRectInPoints:rasterScale:)`
-    /// below is the named crossing that makes that dependency visible instead of implicit; see
-    /// its own doc comment for why M1 deliberately applies no factor there.
+    /// `WindowShape.computeMask` clips the first column against the second, so the two must be
+    /// one unit. W3 lane B (ADR-0018 §2 / U-4 direction (i)) makes that so by construction: this
+    /// call passes `rasterScale: topology.rasterScale` (remote px per mac pt, from the frozen
+    /// snapshot) and MacdowsCore's `computeMask(..., rasterScale:)` overload divides every
+    /// remote-px column entry by it, once, before the pt-only transform runs. `maskContentSize`
+    /// below is the pt column's retyping and nothing more (M1's record-only "identity crossing"
+    /// note, and its one-shot warning, are gone -- see its doc comment). At 1x the overload is
+    /// the identity, which is why every session so far rendered correctly.
     ///
     /// The named crossing is NOT `WindowGeometry.macRect`, and that is a standing ban rather
     /// than a stylistic choice: adr/0010 §2 forbids reusing it in this pipeline
@@ -1355,60 +1350,28 @@ final class RemoteWindowRegistry {
                 : nil,
             correction: correction, // remote px (WindowGeometryCorrection's own unit note)
             topInset: 0, // remote px (adr/0010 §6 placeholder, always 0)
-            contentSize: Self.maskContentSize(
-                fromContentRectInPoints: contentSize, // mac pt, from macContentRect
-                rasterScale: topology.rasterScale
-            ),
-            isMaximized: state.isMaximized
+            contentSize: Self.maskContentSize(fromContentRectInPoints: contentSize), // mac pt, from macContentRect
+            isMaximized: state.isMaximized,
+            // remote px per mac pt, from the session's FROZEN topology: the unit boundary is crossed
+            // inside MacdowsCore's `rasterScale:` overload, once, on every wire-space input above
+            // (W3 lane B, ADR-0018 §2 / U-4 direction (i)). At 1x this is the identity.
+            rasterScale: topology.rasterScale
         )
     }
 
-    /// THE MASK PIPELINE'S NAMED UNIT CROSSING — ADR-0015 §7 (c), under U5's record-only ruling
-    /// (`m1-wave1-rulings.md:4`).
-    ///
-    /// CURRENT UNIT: in **mac pt** (`macContentRect`'s `NSRect.size`), out a
-    /// `WindowShape.ContentSize` that `computeMask` uses as the clip bounds for **remote px**
-    /// wire rects. The crossing is therefore real, and today it is the identity — every display
-    /// this project has ever run on has `remotePixelsPerPoint == 1`, because we advertise no
-    /// `DesktopScaleFactor` (ADR §0a/§0c; `docs/plans/phase3.md:219`).
-    ///
-    /// WHY NO MULTIPLICATION HERE, stated plainly because writing `× rasterScale` would look
-    /// more finished and cost one character: it is not this milestone's call, and doing it would
-    /// be actively wrong today. ADR §7 (c) reserves "whether the conversion really multiplies by
-    /// `rasterScale`" for W3, and ADR §9's L8 row forbids introducing any scale multiplication
-    /// into the mask path in this wave. The substantive reason is that scaling here would move
-    /// only half the pipeline: `computeMask` returns `LayerRect`s that `RemoteWindow` compares
-    /// against `contentView.bounds.size` in POINTS (`RemoteWindow.swift:925`, with `:951-952` the
-    /// mask application; L8's own file reaches the same conclusion independently at `:918-924`),
-    /// so multiplying the bounds without dividing the output would change rendered
-    /// pixels — which M1 must not do (§9's L8 row spells out that "zero rendering change" means
-    /// bit-identical output on today's hardware). What M1 owes is the crossing's *point and
-    /// type*, plus a record of the moment it stops being harmless.
-    ///
-    /// W3 TRIGGER: any session where `rasterScale != 1`. Observed rather than asserted, and
-    /// recorded rather than corrected — M1 is a measurement batch, so the handling is the same
-    /// one ADR §2 rule 4 fixes for mixed-scale topologies: record once, do not degrade, do not
-    /// refuse, do not change behavior. The `!= 1` comparison is exact on purpose: `rasterScale`
-    /// is a whole display ratio the collector fills in (1 or 2 today), never an accumulated
-    /// computation, so there is no epsilon to reason about.
-    ///
-    /// TRIGGERED SHAPE (the values, and the choice between the two forms, are W3's — from a real
-    /// 2x measurement, not guessed here): convert BOTH ends coherently. Either hand `computeMask`
-    /// remote-pixel bounds and divide its `LayerRect`s back to points at the AppKit boundary, or
-    /// keep the bounds in points and divide the wire rects on the way in. Which one is a
-    /// `WindowShape` API question — it is decided by `WindowShape.ContentSize`'s unit contract —
-    /// and cannot be settled by this call site alone.
-    private static func maskContentSize(
-        fromContentRectInPoints contentSize: NSSize,
-        rasterScale: Double
-    ) -> WindowShape.ContentSize {
-        if rasterScale != 1, !warnedMaskUnitScaleGap {
-            warnedMaskUnitScaleGap = true
-            logger.warning(
-                "mask unit boundary (ADR-0015 §7 (c)): content bounds are mac points but WindowShape.computeMask clips remote-pixel wire rects against them, and rasterScale=\(rasterScale, privacy: .public) != 1 -- recorded, not corrected; the factor is W3's after a real 2x measurement"
-            )
-        }
-        return WindowShape.ContentSize(width: Double(contentSize.width), height: Double(contentSize.height))
+    /// THE MASK PIPELINE'S NAMED UNIT CROSSING — ADR-0015 §7 (c). M1 recorded the crossing here
+    /// (U5, record-only: this function used to warn once when `rasterScale != 1` and hand
+    /// `computeMask` mac-pt bounds to clip remote-px rects against). W3 lane B (ADR-0018 §2, U-4
+    /// direction (i)) made it real in the shape ADR-0015 §7 (c) item 3 named: the bounds stay
+    /// **mac pt** (this function is now nothing but the `NSSize` → `WindowShape.ContentSize`
+    /// retyping, in points) and the WIRE inputs are divided into points on the way in -- by
+    /// `WindowShape.computeMask(..., rasterScale:)`, which `computeMaskResult` above calls with
+    /// the frozen topology's `rasterScale`. Both ends therefore move together: `LayerRect` is
+    /// still mac pt, and `RemoteWindow.applyMaskNow`'s identity `CGRect(layerPoints:)` conversion
+    /// is still correct. Whether the divisor's VALUE is right is the 2x checkpoint's to confirm
+    /// (ADR-0018 §3); this lane's merge waits for U-4.
+    private static func maskContentSize(fromContentRectInPoints contentSize: NSSize) -> WindowShape.ContentSize {
+        WindowShape.ContentSize(width: Double(contentSize.width), height: Double(contentSize.height))
     }
 
     /// adr/0010 §4: resolves/updates `windowId`'s real `NSWindow.addChildWindow` attachment
