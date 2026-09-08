@@ -1,0 +1,18 @@
+Usage: rail-probe --host <host> --user <user> --app <exe-path> --out <file.jsonl> [options]
+
+  --host <host>            RDP host (default: $WIN_HOST)
+  --user <user>            RDP username (default: $WIN_USER)
+                           Password is $WIN_PASS only — deliberately no --pass
+                           flag, so it never appears in shell history or a
+                           process listing (ps/argv is world-readable).
+  --app <exe-path>         RemoteApp program to launch, e.g. 'C:\\Windows\\System32\\winver.exe'
+  --second-exec <exe-path> Launch a second RemoteApp after --second-delay seconds
+  --second-delay <secs>    Delay before launching --second-exec (default: 8)
+  --duration <secs>        Total session duration before clean disconnect (default: 25)
+  --no-hidef               Disable HiDefRemoteApp (FreeRDP_HiDefRemoteApp=FALSE)
+  --decode                 Keep FreeRDP_DeactivateClientDecoding=FALSE (full GFX decode path) and log per-codecId SurfaceCommand stats (CodecStats event every 50 frames, codecCounts in the summary). Without this flag, decoding stays disabled as before.
+  --desktop <w>x<h>        Declare a remote desktop size (FreeRDP_DesktopWidth/Height, each 1..65535). Without it FreeRDP's own default is left untouched, as before.
+  --scale <d>[,<v>]        Advertise DesktopScaleFactor d (100..500) and DeviceScaleFactor v (100|140|180, default 100) in TS_UD_CS_CORE. Without it neither setting is touched, as before.
+  --print-plan             Print the pre-connect settings sequence this configuration would apply -- one 'set <FreeRDP_Key> = <value>' line each, in order -- and exit 0 without connecting. The usual required arguments still apply; --out is never opened.
+  --out <file.jsonl>       JSON Lines event log output path
+  --help                   Show this help and exit

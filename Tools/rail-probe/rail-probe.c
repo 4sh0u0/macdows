@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <time.h>
 
 #include <freerdp/freerdp.h>
@@ -70,6 +71,16 @@ typedef struct
 	int duration;
 	bool no_hidef;
 	bool decode;
+	/* W3 lane F (ADR-0018 §2 lane F): the two knobs the 2x baseline recording turns. Zero =
+	 * knob absent = the corresponding settings are never touched (today's behaviour, verbatim;
+	 * Scripts/test-rail-probe-plan.sh pins the sequence). Values are validated in parse_args
+	 * against the same wire domains MacdowsCore's ScaleAdvertisement uses. */
+	uint32_t desktop_w;
+	uint32_t desktop_h;
+	uint32_t scale_desktop;
+	uint32_t scale_device;
+	/* --print-plan: print the pre-connect settings sequence and exit before any context exists. */
+	bool print_plan;
 	char out_path[1024];
 } probeConfig;
 
@@ -394,9 +405,71 @@ static void usage(const char* prog)
 	       "decode path) and log per-codecId SurfaceCommand stats (CodecStats event every 50 "
 	       "frames, codecCounts in the summary). Without this flag, decoding stays disabled "
 	       "as before.\n"
+	       "  --desktop <w>x<h>        Declare a remote desktop size (FreeRDP_DesktopWidth/Height, each "
+	       "1..65535). Without it FreeRDP's own default is left untouched, as before.\n"
+	       "  --scale <d>[,<v>]        Advertise DesktopScaleFactor d (100..500) and DeviceScaleFactor v "
+	       "(100|140|180, default 100) in TS_UD_CS_CORE. Without it neither setting is touched, as "
+	       "before.\n"
+	       "  --print-plan             Print the pre-connect settings sequence this configuration would "
+	       "apply -- one 'set <FreeRDP_Key> = <value>' line each, in order -- and exit 0 without "
+	       "connecting. The usual required arguments still apply; --out is never opened.\n"
 	       "  --out <file.jsonl>       JSON Lines event log output path\n"
 	       "  --help                   Show this help and exit\n",
 	       prog);
+}
+
+/* Strict "<w>x<h>": two decimal integers in 1..65535 joined by a lowercase x, nothing else.
+ * Accepted-and-normalised spelling, documented rather than refused (same as window-smoke's
+ * WINDOW_SMOKE_DECLARED_DESKTOP): leading zeros ("01024x0768") parse as the plain integers; the
+ * plan prints the normalised value, so a run log copies that, not the knob's spelling. A sign
+ * ("+1024"), whitespace, hex ("0x400") and exponents are refused by the digit-first rule. */
+static bool parse_desktop_knob(const char* text, uint32_t* w, uint32_t* h)
+{
+	char* end = NULL;
+	unsigned long a = 0;
+	unsigned long b = 0;
+	if (!text || !isdigit((unsigned char)text[0]))
+		return false;
+	a = strtoul(text, &end, 10);
+	if (*end != 'x' || !isdigit((unsigned char)end[1]))
+		return false;
+	b = strtoul(end + 1, &end, 10);
+	if (*end != '\0')
+		return false;
+	if (a < 1 || a > 65535 || b < 1 || b > 65535)
+		return false;
+	*w = (uint32_t)a;
+	*h = (uint32_t)b;
+	return true;
+}
+
+/* Strict "<d>[,<v>]": d in 100..500, v one of 100/140/180 (default 100) -- the wire domains
+ * upstream's /scale-desktop and /scale-device accept, the same ones MacdowsCore's
+ * ScaleAdvertisement pins (ADR-0018 §0 (f)). A trailing comma or any other junk is refused.
+ * Leading zeros normalise as in parse_desktop_knob ("0200" is 200; the plan prints 200). */
+static bool parse_scale_knob(const char* text, uint32_t* desktop, uint32_t* device)
+{
+	char* end = NULL;
+	unsigned long d = 0;
+	unsigned long v = 100;
+	if (!text || !isdigit((unsigned char)text[0]))
+		return false;
+	d = strtoul(text, &end, 10);
+	if (*end == ',')
+	{
+		if (!isdigit((unsigned char)end[1]))
+			return false;
+		v = strtoul(end + 1, &end, 10);
+	}
+	if (*end != '\0')
+		return false;
+	if (d < 100 || d > 500)
+		return false;
+	if (v != 100 && v != 140 && v != 180)
+		return false;
+	*desktop = (uint32_t)d;
+	*device = (uint32_t)v;
+	return true;
 }
 
 static bool parse_args(int argc, char** argv, probeConfig* cfg)
@@ -468,6 +541,32 @@ static bool parse_args(int argc, char** argv, probeConfig* cfg)
 		else if (strcmp(a, "--decode") == 0)
 		{
 			cfg->decode = true;
+		}
+		else if (strcmp(a, "--desktop") == 0)
+		{
+			if (++i >= argc)
+				goto missing;
+			if (!parse_desktop_knob(argv[i], &cfg->desktop_w, &cfg->desktop_h))
+			{
+				fprintf(stderr, "Invalid value for --desktop: '%s' (want <w>x<h>, each 1..65535)\n", argv[i]);
+				usage(argv[0]);
+				return false;
+			}
+		}
+		else if (strcmp(a, "--scale") == 0)
+		{
+			if (++i >= argc)
+				goto missing;
+			if (!parse_scale_knob(argv[i], &cfg->scale_desktop, &cfg->scale_device))
+			{
+				fprintf(stderr, "Invalid value for --scale: '%s' (want <d>[,<v>], d 100..500, v 100|140|180)\n", argv[i]);
+				usage(argv[0]);
+				return false;
+			}
+		}
+		else if (strcmp(a, "--print-plan") == 0)
+		{
+			cfg->print_plan = true;
 		}
 		else if (strcmp(a, "--out") == 0)
 		{
@@ -1083,6 +1182,127 @@ static BOOL probe_keyboard_set_ime_status(rdpContext* context, UINT16 imeId, UIN
 /* Connect lifecycle                                                                     */
 /* ------------------------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------------------------ */
+/* The pre-connect settings PLAN (W3 lane F, ADR-0018 §2 lane F)                         */
+/*                                                                                        */
+/* One implementation, two consumers. probe_settings_plan enumerates, in order, every    */
+/* setting this probe applies before connecting; probe_pre_connect feeds it the apply    */
+/* sink (freerdp_settings_set_*), --print-plan feeds it the print sink. Because both     */
+/* read the same list, the printed plan IS the connect path's settings sequence -- and   */
+/* Scripts/test-rail-probe-plan.sh pins that sequence (no knobs: unchanged from before   */
+/* the knobs existed; each knob: exactly its own two lines appended). A settings write   */
+/* anywhere else in this file would make the plan a lie, which is why that script also   */
+/* counts the freerdp_settings_set_ call sites. NLA note kept from the original block:   */
+/* NLA allowed; TlsSecurity/RdpSecurity stay at their (also TRUE) defaults so the client */
+/* still negotiates a fallback if the server can't do NLA.                                */
+/* ------------------------------------------------------------------------------------ */
+
+typedef enum
+{
+	PROBE_PLAN_BOOL,
+	PROBE_PLAN_UINT32,
+	PROBE_PLAN_STRING
+} probePlanKind;
+
+typedef struct
+{
+	const char* name;
+	probePlanKind kind;
+	size_t key;
+	BOOL boolValue;
+	UINT32 uint32Value;
+	const char* stringValue;
+} probePlanItem;
+
+typedef BOOL (*probePlanSink)(void* ctx, const probePlanItem* item);
+
+static BOOL probe_settings_plan(const probeConfig* cfg, probePlanSink sink, void* ctx)
+{
+#define PLAN_BOOL(KEY, VALUE)                                                        \
+	do                                                                               \
+	{                                                                                \
+		probePlanItem item = { #KEY, PROBE_PLAN_BOOL, (size_t)(KEY), (VALUE), 0, NULL }; \
+		if (!sink(ctx, &item))                                                       \
+			return FALSE;                                                            \
+	} while (0)
+#define PLAN_UINT32(KEY, VALUE)                                                      \
+	do                                                                               \
+	{                                                                                \
+		probePlanItem item = { #KEY, PROBE_PLAN_UINT32, (size_t)(KEY), FALSE, (VALUE), NULL }; \
+		if (!sink(ctx, &item))                                                       \
+			return FALSE;                                                            \
+	} while (0)
+#define PLAN_STRING(KEY, VALUE)                                                      \
+	do                                                                               \
+	{                                                                                \
+		probePlanItem item = { #KEY, PROBE_PLAN_STRING, (size_t)(KEY), FALSE, 0, (VALUE) }; \
+		if (!sink(ctx, &item))                                                       \
+			return FALSE;                                                            \
+	} while (0)
+
+	PLAN_BOOL(FreeRDP_CertificateCallbackPreferPEM, TRUE);
+	PLAN_UINT32(FreeRDP_OsMajorType, OSMAJORTYPE_UNIX);
+	PLAN_UINT32(FreeRDP_OsMinorType, OSMINORTYPE_NATIVE_XSERVER);
+	PLAN_BOOL(FreeRDP_RemoteApplicationMode, TRUE);
+	PLAN_STRING(FreeRDP_RemoteApplicationProgram, cfg->app);
+	PLAN_BOOL(FreeRDP_SupportGraphicsPipeline, TRUE);
+	PLAN_BOOL(FreeRDP_HiDefRemoteApp, cfg->no_hidef ? FALSE : TRUE);
+	PLAN_BOOL(FreeRDP_NlaSecurity, TRUE);
+	/* The knobs, appended after today's sequence so that without them the plan is byte-identical
+	 * to what this probe has always applied. Both fields of a pair are written together. */
+	if (cfg->desktop_w > 0 && cfg->desktop_h > 0)
+	{
+		PLAN_UINT32(FreeRDP_DesktopWidth, cfg->desktop_w);
+		PLAN_UINT32(FreeRDP_DesktopHeight, cfg->desktop_h);
+	}
+	if (cfg->scale_desktop > 0 && cfg->scale_device > 0)
+	{
+		PLAN_UINT32(FreeRDP_DesktopScaleFactor, cfg->scale_desktop);
+		PLAN_UINT32(FreeRDP_DeviceScaleFactor, cfg->scale_device);
+	}
+#undef PLAN_BOOL
+#undef PLAN_UINT32
+#undef PLAN_STRING
+	return TRUE;
+}
+
+/* The apply sink: the only three freerdp_settings_set_* calls the plan ever turns into. */
+static BOOL probe_plan_apply(void* ctx, const probePlanItem* item)
+{
+	rdpSettings* settings = (rdpSettings*)ctx;
+	switch (item->kind)
+	{
+		case PROBE_PLAN_BOOL:
+			return freerdp_settings_set_bool(settings, (FreeRDP_Settings_Keys_Bool)item->key,
+			                                 item->boolValue);
+		case PROBE_PLAN_UINT32:
+			return freerdp_settings_set_uint32(settings, (FreeRDP_Settings_Keys_UInt32)item->key,
+			                                   item->uint32Value);
+		case PROBE_PLAN_STRING:
+			return freerdp_settings_set_string(settings, (FreeRDP_Settings_Keys_String)item->key,
+			                                   item->stringValue);
+		default:
+			return FALSE;
+	}
+}
+
+/* The print sink (--print-plan): one line per setting, in plan order. */
+static BOOL probe_plan_print(void* ctx, const probePlanItem* item)
+{
+	FILE* out = (FILE*)ctx;
+	switch (item->kind)
+	{
+		case PROBE_PLAN_BOOL:
+			return fprintf(out, "set %s = %s\n", item->name, item->boolValue ? "TRUE" : "FALSE") > 0;
+		case PROBE_PLAN_UINT32:
+			return fprintf(out, "set %s = %u\n", item->name, (unsigned)item->uint32Value) > 0;
+		case PROBE_PLAN_STRING:
+			return fprintf(out, "set %s = \"%s\"\n", item->name, item->stringValue ? item->stringValue : "") > 0;
+		default:
+			return FALSE;
+	}
+}
+
 static BOOL probe_pre_connect(freerdp* instance)
 {
 	probeContext* p = (probeContext*)instance->context;
@@ -1090,24 +1310,8 @@ static BOOL probe_pre_connect(freerdp* instance)
 
 	log_event(p, "PreConnect", NULL);
 
-	if (!freerdp_settings_set_bool(settings, FreeRDP_CertificateCallbackPreferPEM, TRUE))
-		return FALSE;
-	if (!freerdp_settings_set_uint32(settings, FreeRDP_OsMajorType, OSMAJORTYPE_UNIX))
-		return FALSE;
-	if (!freerdp_settings_set_uint32(settings, FreeRDP_OsMinorType, OSMINORTYPE_NATIVE_XSERVER))
-		return FALSE;
-
-	if (!freerdp_settings_set_bool(settings, FreeRDP_RemoteApplicationMode, TRUE))
-		return FALSE;
-	if (!freerdp_settings_set_string(settings, FreeRDP_RemoteApplicationProgram, p->cfg.app))
-		return FALSE;
-	if (!freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE))
-		return FALSE;
-	if (!freerdp_settings_set_bool(settings, FreeRDP_HiDefRemoteApp, p->cfg.no_hidef ? FALSE : TRUE))
-		return FALSE;
-	/* NLA allowed; leave TlsSecurity/RdpSecurity at their (also TRUE) defaults so the
-	 * client still negotiates a fallback if the server can't do NLA. */
-	if (!freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, TRUE))
+	/* Every pre-connect setting comes from the plan above -- see its header comment. */
+	if (!probe_settings_plan(&p->cfg, probe_plan_apply, settings))
 		return FALSE;
 
 	if (PubSub_SubscribeChannelConnected(instance->context->pubSub, probe_on_channel_connected) <
@@ -1472,6 +1676,11 @@ int main(int argc, char** argv)
 	probeConfig cfg;
 	if (!parse_args(argc, argv, &cfg))
 		return 2;
+	/* --print-plan (W3 lane F): describe, never dial. Sits after the handshake guard on purpose
+	 * -- the guard is main's first act and stays so -- and before freerdp_client_context_new, so
+	 * no FreeRDP context, file or socket is ever created on this path. */
+	if (cfg.print_plan)
+		return probe_settings_plan(&cfg, probe_plan_print, stdout) ? 0 : 1;
 
 	RDP_CLIENT_ENTRY_POINTS entryPoints = { 0 };
 	entryPoints.Size = sizeof(RDP_CLIENT_ENTRY_POINTS_V1);
