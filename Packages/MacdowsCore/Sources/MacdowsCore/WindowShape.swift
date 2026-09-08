@@ -298,9 +298,12 @@ public enum WindowShape {
             truncated: truncated,
             windowOffset: (x: windowOffset.x / s, y: windowOffset.y / s),
             visibleOffset: visibleOffset.map { (x: $0.x / s, y: $0.y / s) },
+            // The whole correction, not only the two fields this transform reads: the type's own
+            // unit note says all four components share one unit, and a half-converted value would
+            // break that the day anything downstream reads width/height (gate w3-lane-b r1 m).
             correction: WindowGeometryCorrection(
                 originX: correction.originX / s, originY: correction.originY / s,
-                width: correction.width, height: correction.height
+                width: correction.width / s, height: correction.height / s
             ),
             topInset: topInset / s,
             contentSize: contentSize,

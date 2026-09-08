@@ -1313,11 +1313,14 @@ final class RemoteWindowRegistry {
     ///     pins it to remote px), `topInset` (adr/0010 §6's placeholder, always 0).
     ///   * **mac pt** — `contentSize`, which arrives from `macContentRect(for:windowId:in:)`,
     ///     i.e. from the far side of a `WindowGeometry.macRect` conversion.
-    /// `WindowShape.computeMask` uses that second column as the BOUNDS it clips the first column
-    /// against (`WindowShape.swift:161-189`), so the two must be one unit — and today they are,
-    /// only because `rasterScale == 1`. `maskContentSize(fromContentRectInPoints:rasterScale:)`
-    /// below is the named crossing that makes that dependency visible instead of implicit; see
-    /// its own doc comment for why M1 deliberately applies no factor there.
+    /// `WindowShape.computeMask` clips the first column against the second, so the two must be
+    /// one unit. W3 lane B (ADR-0018 §2 / U-4 direction (i)) makes that so by construction: this
+    /// call passes `rasterScale: topology.rasterScale` (remote px per mac pt, from the frozen
+    /// snapshot) and MacdowsCore's `computeMask(..., rasterScale:)` overload divides every
+    /// remote-px column entry by it, once, before the pt-only transform runs. `maskContentSize`
+    /// below is the pt column's retyping and nothing more (M1's record-only "identity crossing"
+    /// note, and its one-shot warning, are gone -- see its doc comment). At 1x the overload is
+    /// the identity, which is why every session so far rendered correctly.
     ///
     /// The named crossing is NOT `WindowGeometry.macRect`, and that is a standing ban rather
     /// than a stylistic choice: adr/0010 §2 forbids reusing it in this pipeline
