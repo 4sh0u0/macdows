@@ -412,13 +412,17 @@ static void usage(const char* prog)
 	       "before.\n"
 	       "  --print-plan             Print the pre-connect settings sequence this configuration would "
 	       "apply -- one 'set <FreeRDP_Key> = <value>' line each, in order -- and exit 0 without "
-	       "connecting.\n"
+	       "connecting. The usual required arguments still apply; --out is never opened.\n"
 	       "  --out <file.jsonl>       JSON Lines event log output path\n"
 	       "  --help                   Show this help and exit\n",
 	       prog);
 }
 
-/* Strict "<w>x<h>": two decimal integers in 1..65535 joined by a lowercase x, nothing else. */
+/* Strict "<w>x<h>": two decimal integers in 1..65535 joined by a lowercase x, nothing else.
+ * Accepted-and-normalised spelling, documented rather than refused (same as window-smoke's
+ * WINDOW_SMOKE_DECLARED_DESKTOP): leading zeros ("01024x0768") parse as the plain integers; the
+ * plan prints the normalised value, so a run log copies that, not the knob's spelling. A sign
+ * ("+1024"), whitespace, hex ("0x400") and exponents are refused by the digit-first rule. */
 static bool parse_desktop_knob(const char* text, uint32_t* w, uint32_t* h)
 {
 	char* end = NULL;
@@ -441,7 +445,8 @@ static bool parse_desktop_knob(const char* text, uint32_t* w, uint32_t* h)
 
 /* Strict "<d>[,<v>]": d in 100..500, v one of 100/140/180 (default 100) -- the wire domains
  * upstream's /scale-desktop and /scale-device accept, the same ones MacdowsCore's
- * ScaleAdvertisement pins (ADR-0018 §0 (f)). A trailing comma or any other junk is refused. */
+ * ScaleAdvertisement pins (ADR-0018 §0 (f)). A trailing comma or any other junk is refused.
+ * Leading zeros normalise as in parse_desktop_knob ("0200" is 200; the plan prints 200). */
 static bool parse_scale_knob(const char* text, uint32_t* desktop, uint32_t* device)
 {
 	char* end = NULL;
