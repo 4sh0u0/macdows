@@ -649,6 +649,83 @@ struct F1BackingVsMappedTally {
     }
 }
 
+/// O-A (ADR-0018 §5.1 增补 2026-09-10 14:27 item ①, `WINDOW_SMOKE_EDGE_PROFILE=1`): the one place
+/// the `[edge]` line's text is built. MEASUREMENT ONLY -- it never returns a verdict, never
+/// touches the exit code and is never consulted by any assertion, because the judgement it feeds
+/// is made by a human reading a run record against the survey's 1x baseline (all four edge ratios
+/// > 0.9, all four corner counts non-zero), not by this harness.
+///
+/// The line names the sub-rect that was profiled (`mapped=`) next to the allocation it sits in
+/// (`alloc=`) so a reader can tell a 64-alignment difference from a real one, and carries `at=`
+/// because the SAME window is sampled twice per run -- once right after its first frame, once at
+/// finish -- and two identically-shaped lines with no discriminator would be unreadable.
+/// A window with nothing displayed reports that fact rather than being silently skipped: an
+/// absent line is indistinguishable from a knob that never fired, and the window that most needs
+/// reporting is precisely the one that drew nothing (the 2026-09-01 C-2' run 2 About window spent
+/// its entire run with `layer.contents == nil`, which is the state its own record calls U-1).
+///
+/// `firstDark=` is what makes an INSET frame readable. The four ratios are row 0 / row H-1 /
+/// column 0 / column W-1 and nothing else, so a frame inset by k and no frame at all report the
+/// same near-zero ratio; `firstDark=` states, per edge, how many rows/columns in the first
+/// frame-like one sits (`-` = none within `RemoteWindow.firstDarkScanDepth`). Without it the
+/// interpretation table's empty-band row is not on the observable surface at all.
+enum EdgeProfile {
+    enum Phase: String {
+        case firstFrame = "first-frame"
+        case finish = "finish"
+    }
+
+    /// Why this window has no profile at this sample. `no-displayed-surface` is exactly
+    /// `contentLayer.contents == nil` -- the window has presented nothing at all. `surface-not-
+    /// readable` is the OTHER half of `RemoteWindow.edgeBorderProfile()`'s `nil`: a surface is
+    /// displayed, but its mapped sub-rect was empty, its read-only lock was refused, or its
+    /// elements are not 4 bytes wide. Two tokens rather than one because the pre-registration
+    /// reads the first of them as "this window drew nothing"; folding the unreadable cases into
+    /// the same token would make that reading false in a case nobody would ever notice.
+    enum Unavailable: String {
+        case noDisplayedSurface = "no-displayed-surface"
+        case surfaceNotReadable = "surface-not-readable"
+    }
+
+    static func line(
+        windowId: UInt32, profile: RemoteWindow.EdgeBorderProfile?, hasDisplayedContent: Bool,
+        isVisible: Bool, at phase: Phase
+    ) -> String {
+        guard let profile else {
+            // The window's own `hasDisplayedContent` is what separates the two reasons: the
+            // profile function returns one `nil` and does not (and should not) carry a reason
+            // across the registry boundary.
+            let reason: Unavailable = hasDisplayedContent ? .surfaceNotReadable : .noDisplayedSurface
+            // `visible=` only on this shape: a profiled line identifies its window through
+            // `mapped=`, and this one has no numbers at all. Since every window in the registry
+            // gets a line, a reader needs some way to tell the dialog under study from a 1x1
+            // bookkeeping window that will never draw anything. (The RULE for finding the window
+            // under study is still id-matching against `[f1]`; this is the cheap first cut.)
+            return "[edge] id=\(windowId) unavailable=\(reason.rawValue)"
+                + " visible=\(isVisible ? 1 : 0) at=\(phase.rawValue)"
+        }
+        return "[edge] id=\(windowId)"
+            + " mapped=\(profile.mappedWidth)x\(profile.mappedHeight)"
+            + " alloc=\(profile.allocWidth)x\(profile.allocHeight)"
+            + " top=\(fmt(profile.topDarkRatio)) bottom=\(fmt(profile.bottomDarkRatio))"
+            + " left=\(fmt(profile.leftDarkRatio)) right=\(fmt(profile.rightDarkRatio))"
+            + " corners=\(profile.topLeftDarkCount),\(profile.topRightDarkCount),"
+            + "\(profile.bottomLeftDarkCount),\(profile.bottomRightDarkCount)"
+            + " firstDark=\(fmtOffset(profile.firstDarkRowFromTop)),\(fmtOffset(profile.firstDarkRowFromBottom)),"
+            + "\(fmtOffset(profile.firstDarkColumnFromLeft)),\(fmtOffset(profile.firstDarkColumnFromRight))"
+            + " at=\(phase.rawValue)"
+    }
+
+    /// Three places, fixed -- an edge of a few hundred pixels resolves to better than 0.005, and a
+    /// fixed width keeps the columns readable when a record diffs two runs side by side.
+    static func fmt(_ ratio: Double) -> String { String(format: "%.3f", ratio) }
+
+    /// `-` for "no frame-like row/column within the scanned depth of that edge". A token rather
+    /// than a sentinel number, because 0 is a REAL answer here (the outermost row IS the frame)
+    /// and any numeric stand-in for absence is one a reader could average with the real ones.
+    static func fmtOffset(_ offset: Int?) -> String { offset.map(String.init) ?? "-" }
+}
+
 /// H3's visible-window size bands, re-expressed in **remote px** (adr/0015 §6 rule 1: the unit
 /// is remote px). Both bands' constants are RAIL-observed remote-pixel facts -- the 150x80 floor
 /// from the 136x39 tray helper / 1009x4 edge strips / dxdiag's 478x188 progress dialog, the
@@ -2127,6 +2204,80 @@ enum WindowSmokeGateSelfTest {
             "advertisedScaleEvidenceSuffixSaysOnlyWhatWasAssigned: nothing assigned = no suffix (unset, none, or a knob that resolved to nothing); otherwise both wire fields as ASSIGNED plus the matrix advertised_scale value, labelled by SOURCE -- product default D when the knob is unset, the knob otherwise -- in the one ADVERTISED TO SERVER form all three [topology] lines share"
         )
 
+        // --- O-A: the [edge] measurement line (WINDOW_SMOKE_EDGE_PROFILE) -------------------
+        let edgeFull = RemoteWindow.EdgeBorderProfile(
+            mappedWidth: 1044, mappedHeight: 940, allocWidth: 1088, allocHeight: 960,
+            topDarkRatio: 1, bottomDarkRatio: 1.0 / 1044, leftDarkRatio: 1, rightDarkRatio: 1.0 / 940,
+            topLeftDarkCount: 11, topRightDarkCount: 6, bottomLeftDarkCount: 6, bottomRightDarkCount: 0,
+            firstDarkRowFromTop: 0, firstDarkRowFromBottom: nil,
+            firstDarkColumnFromLeft: 0, firstDarkColumnFromRight: nil
+        )
+        expect(
+            EdgeProfile.line(windowId: 7, profile: edgeFull, hasDisplayedContent: true, isVisible: true, at: .firstFrame)
+                == "[edge] id=7 mapped=1044x940 alloc=1088x960 top=1.000 bottom=0.001 left=1.000 right=0.001"
+                    + " corners=11,6,6,0 firstDark=0,-,0,- at=first-frame"
+                // the four ratios keep their own slots, in the fixed order top/bottom/left/right,
+                // and firstDark repeats that order -- an offset of 0 is a REAL answer (the
+                // outermost row IS the frame) and only absence prints as `-`.
+                && EdgeProfile.line(
+                    windowId: 1,
+                    profile: RemoteWindow.EdgeBorderProfile(
+                        mappedWidth: 4, mappedHeight: 3, allocWidth: 64, allocHeight: 64,
+                        topDarkRatio: 0.1, bottomDarkRatio: 0.2, leftDarkRatio: 0.3, rightDarkRatio: 0.4,
+                        topLeftDarkCount: 1, topRightDarkCount: 2, bottomLeftDarkCount: 3, bottomRightDarkCount: 4,
+                        firstDarkRowFromTop: 1, firstDarkRowFromBottom: 2,
+                        firstDarkColumnFromLeft: 5, firstDarkColumnFromRight: 7
+                    ),
+                    hasDisplayedContent: true, isVisible: true, at: .finish
+                ) == "[edge] id=1 mapped=4x3 alloc=64x64 top=0.100 bottom=0.200 left=0.300 right=0.400"
+                    + " corners=1,2,3,4 firstDark=1,2,5,7 at=finish",
+            "edgeProfileLineStatesTheSubRectItProfiledAndTheRunPhase: [edge] carries mapped= (the profiled sub-rect) beside alloc= (the 64-aligned allocation), the four dark ratios in the fixed order top/bottom/left/right at three decimals, the four corner counts in the order tl,tr,bl,br, firstDark= in the SAME edge order with `-` for none within the scanned depth, and at=first-frame|finish. Measurement only -- no verdict, no exit code"
+        )
+
+        // The gate O-A r1 I-1 pair, at the level a run record actually reads: a frame INSET by
+        // five columns and a window with no left frame at all produce the SAME left ratio, and
+        // differ only in firstDark. Two lines side by side, so that the field's whole reason for
+        // existing is a pinned string rather than a claim in a comment.
+        func edgeBand(firstDarkColumnFromLeft: Int?) -> RemoteWindow.EdgeBorderProfile {
+            RemoteWindow.EdgeBorderProfile(
+                mappedWidth: 1044, mappedHeight: 940, allocWidth: 1088, allocHeight: 960,
+                topDarkRatio: 1, bottomDarkRatio: 1, leftDarkRatio: 0, rightDarkRatio: 1.0 / 940,
+                topLeftDarkCount: 6, topRightDarkCount: 6, bottomLeftDarkCount: 6, bottomRightDarkCount: 0,
+                firstDarkRowFromTop: 0, firstDarkRowFromBottom: 0,
+                firstDarkColumnFromLeft: firstDarkColumnFromLeft, firstDarkColumnFromRight: nil
+            )
+        }
+        let edgeInsetLine = EdgeProfile.line(
+            windowId: 3, profile: edgeBand(firstDarkColumnFromLeft: 5),
+            hasDisplayedContent: true, isVisible: true, at: .finish
+        )
+        let edgeNoLeftFrameLine = EdgeProfile.line(
+            windowId: 3, profile: edgeBand(firstDarkColumnFromLeft: nil),
+            hasDisplayedContent: true, isVisible: true, at: .finish
+        )
+        expect(
+            edgeInsetLine.contains(" left=0.000 ") && edgeNoLeftFrameLine.contains(" left=0.000 ")
+                && edgeInsetLine.hasSuffix(" corners=6,6,6,0 firstDark=0,0,5,- at=finish")
+                && edgeNoLeftFrameLine.hasSuffix(" corners=6,6,6,0 firstDark=0,0,-,- at=finish")
+                && edgeInsetLine.replacingOccurrences(of: "firstDark=0,0,5,-", with: "firstDark=0,0,-,-")
+                    == edgeNoLeftFrameLine,
+            "edgeProfileLineSeparatesAnInsetFrameFromNoFrameOnlyThroughFirstDark: a frame inset by five columns and an edge with no frame at all print the SAME left=0.000 and the same corner counts; firstDark= is the only field that differs (5 vs -), which is why the empty-band row of the interpretation table is decidable at all"
+        )
+
+        expect(
+            EdgeProfile.line(windowId: 7, profile: nil, hasDisplayedContent: false, isVisible: true, at: .finish)
+                == "[edge] id=7 unavailable=no-displayed-surface visible=1 at=finish"
+                && EdgeProfile.line(windowId: 9, profile: nil, hasDisplayedContent: false, isVisible: false, at: .firstFrame)
+                    == "[edge] id=9 unavailable=no-displayed-surface visible=0 at=first-frame"
+                // A window that HAS displayed content and still has no profile is the other half
+                // of edgeBorderProfile()'s nil (empty sub-rect / refused lock / non-32bpp), and it
+                // must not be reported as "drew nothing" -- the pre-registration reads that token
+                // as a statement about the window, not about the reader.
+                && EdgeProfile.line(windowId: 8, profile: nil, hasDisplayedContent: true, isVisible: true, at: .finish)
+                    == "[edge] id=8 unavailable=surface-not-readable visible=1 at=finish",
+            "edgeProfileReportsAWindowThatDisplayedNothingInsteadOfSkippingIt: a window with no displayed surface prints unavailable=no-displayed-surface (an absent line would be indistinguishable from a knob that never fired), visible= tells it from a bookkeeping window that never draws, and a displayed-but-unreadable surface gets its own token"
+        )
+
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
         // rev-L9 M-4: `Scripts/run-window-smoke.command:192-193` records `DONE exit=<rc>` via `launcher_done` and its callers
         // read that line as the whole verdict. A `WINDOW_SMOKE_SELFTEST=1` leaked into the
@@ -2674,6 +2825,27 @@ if let rawRounds = ProcessInfo.processInfo.environment["WINDOW_SMOKE_GEOMETRY_RO
 /// RemoteWindowRegistry/FocusAuthority entirely, and report whether the window closed
 /// anyway. Purely informational: never changes what a cycle's close-leg gates as.
 let closeProbeEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_CLOSE_PROBE"] == "1"
+
+/// O-A (ADR-0018 §5.1 增补 2026-09-10 14:27 item ①): opt-in, MEASUREMENT ONLY. When set, EVERY
+/// window in the registry gets one `[edge]` line at its first frame and one more at finish --
+/// reporting how much of each outermost row/column of the GFX mapped sub-rect is dark, and how far
+/// in from each edge the first frame-like row/column sits (`RemoteWindow.edgeBorderProfile()`,
+/// read out of the IOSurface itself -- no screenshot, no Screen Recording grant, no image written
+/// anywhere). A window that has displayed nothing says so with `unavailable=` rather than being
+/// skipped: an absent line would be indistinguishable from a knob that never fired. Nothing
+/// branches on any of it, nothing asserts on it, and with the knob unset the diagnostic is never
+/// called at all, so an unset run is byte-identical to one built before this existed (source
+/// pins: `Scripts/test-window-smoke-pins.sh`).
+///
+/// WHAT IT IS FOR. The About-window content offset the 2026-09-09 checkpoint recorded (ADR-0018
+/// §5.1 item 1, a blocking defect for the D default) has one explanation the offline survey could
+/// not decide: at 2x the server may DECLARE a mapped rect smaller than the window bitmap it drew,
+/// and this client then faithfully crops the right column and bottom row away. The 1x control is
+/// already measured per-pixel (survey §4: all four edges flush against the mapped rect, all four
+/// rounded corners present), so the discriminating live observation is simply whether the right
+/// column and bottom row still carry the dialog's frame at 2x. Opt-in rather than always-on
+/// because it reads every pixel of four edges per window per sample.
+let edgeProfileEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_EDGE_PROFILE"] == "1"
 
 /// Phase 2 W2 task item 5b/5c (docs/plans/phase2.md §2 W2): maximize/restore/close e2e via
 /// `CRSession.sendSysCommand(_:command:)`, direct from this harness (no synthetic NSEvent,
@@ -3603,6 +3775,17 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// First `WindowCreate` per windowId (its own doc comment says what "first" means): what
     /// `AboutTarget.pick` orders by, through `chooseTarget(among:)` / `MoveResizeTarget.lock`.
     private var firstSeen = FirstSeenClock()
+    /// O-A: windowIds whose first-frame `[edge]` sample has already been taken -- one per window
+    /// per run, never re-taken on later frames (a 60fps stream would otherwise print a line per
+    /// frame, exactly what `F1BackingVsMappedTally`'s dedupe exists to avoid).
+    private var edgeProfileFirstFrameSampled: Set<UInt32> = []
+    /// O-A: windowIds that have already said `unavailable=` in the FIRST-FRAME phase. A window
+    /// that has displayed nothing yet reports that once and stays eligible for its real
+    /// first-frame sample when a frame finally arrives -- which is why this is a second set and
+    /// not an early insert into the one above. Two lines per window per run is the ceiling; the
+    /// alternative (marking it sampled) would silently cost that window its first frame, and the
+    /// alternative to THAT (no dedupe) would print a line per drain batch.
+    private var edgeProfileFirstFrameUnavailable: Set<UInt32> = []
     /// The About-path reason `MoveResizeTarget.reason` gave when the move/resize target was locked,
     /// printed on that leg's round-1 "target locked" line (nil under an explicit filter).
     private var moveResizeLockReason: String?
@@ -4479,6 +4662,59 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// O-A (`WINDOW_SMOKE_EDGE_PROFILE=1`): the ONE place `registry.edgeBorderProfile` is called
+    /// and the ONE place an `[edge]` line is printed. Two callers -- `drainNow()` for the
+    /// first-frame sample (same "a frame was just presented" moment `sampleF1BackingVsMapped`
+    /// uses, which is when the window is provably showing the surface being profiled) and
+    /// `finish()` for the settled one.
+    ///
+    /// `first-frame` is precise about the window, not about the frame: it is the first DRAIN BATCH
+    /// in which this window reported displayed content, so it can be up to one batch later than
+    /// the literal first frame if several frames arrive in one batch. Same semantics as
+    /// `sampleF1BackingVsMapped`, which shares the call site; nothing in the interpretation
+    /// depends on it, since the settled `finish` sample is the one the table reads.
+    ///
+    /// The knob guard is the FIRST statement, so with `WINDOW_SMOKE_EDGE_PROFILE` unset nothing is
+    /// sampled, nothing is printed, and `RemoteWindow.edgeBorderProfile()` is never entered.
+    ///
+    /// EVERY window in the registry gets a line -- there is NO content filter, and that is the
+    /// whole point of the shape. A window that has displayed nothing prints
+    /// `unavailable=no-displayed-surface` instead of vanishing, because an absent line is
+    /// indistinguishable from a knob that never fired, and because the state worth reporting most
+    /// is exactly that one: the About window of C-2' run 2 held `layer.contents == nil` for its
+    /// whole run, and a filtered sampler would have recorded that run as if the window had never
+    /// existed while the run's other windows made the knob look alive. `hasDisplayedContent` is
+    /// still read -- but only to say WHICH reason the line carries and which dedupe set the
+    /// first-frame phase uses, never to decide whether to speak. (It is not the plausible-content
+    /// band, which needs a FROZEN session topology and reports false without one; a sampler keyed
+    /// on that would go quiet for a whole run and look identical to a quiet run.)
+    /// Ordered by windowId so a batch that presents several windows at once prints in a stable
+    /// order across runs.
+    private func sampleEdgeProfiles(registry: RemoteWindowRegistry, at phase: EdgeProfile.Phase) {
+        guard edgeProfileEnabled else { return }
+        for snapshot in registry.windowSnapshots().sorted(by: { $0.windowId < $1.windowId }) {
+            if phase == .firstFrame {
+                // Deduped per window AND per state: at most one "nothing yet" line and, later,
+                // exactly one line for the frame that does arrive. `finish` is not deduped at all
+                // -- it runs once.
+                if snapshot.hasDisplayedContent {
+                    guard !edgeProfileFirstFrameSampled.contains(snapshot.windowId) else { continue }
+                    edgeProfileFirstFrameSampled.insert(snapshot.windowId)
+                } else {
+                    guard !edgeProfileFirstFrameUnavailable.contains(snapshot.windowId) else { continue }
+                    edgeProfileFirstFrameUnavailable.insert(snapshot.windowId)
+                }
+            }
+            print(EdgeProfile.line(
+                windowId: snapshot.windowId,
+                profile: registry.edgeBorderProfile(windowId: snapshot.windowId),
+                hasDisplayedContent: snapshot.hasDisplayedContent,
+                isVisible: snapshot.isVisible,
+                at: phase
+            ))
+        }
+    }
+
     /// The ADR §5 reconnect re-take, pinned. `RemoteWindowRegistry.sessionTopologyFreezeCount`
     /// (`RemoteWindowRegistry.swift:462-477`) counts 1 for `init` plus one per
     /// `prepareForReconnect()`; the App target has no test bundle, so this harness is the only
@@ -4885,6 +5121,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // the registry knows -- present time, and the only moment the pairing is meaningful.
             // Sampled AFTER the latency sample so it can never distort that measurement.
             sampleF1BackingVsMapped(registry: registry)
+            // O-A (`WINDOW_SMOKE_EDGE_PROFILE=1`, opt-in): same present-time reasoning, one sample
+            // per window for its FIRST frame only. No-op with the knob unset.
+            sampleEdgeProfiles(registry: registry, at: .firstFrame)
         }
 
         // Focus rotation convergence poll (task item 2/3): checked once per drain batch
@@ -7658,6 +7897,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
 
         let snapshots = registry.windowSnapshots()
         let visibleWindows = snapshots.filter(\.isVisible)
+        // O-A (`WINDOW_SMOKE_EDGE_PROFILE=1`, opt-in): the settled second sample, taken BEFORE
+        // `shutdownAndWait()` below so every profiled surface is unambiguously still the one this
+        // session presented. No-op with the knob unset.
+        sampleEdgeProfiles(registry: registry, at: .finish)
         // adr/0014 §6: read the outbound lane's two drop counters BEFORE the shutdown below.
         // `-shutdownAndWait` DESTROYS the outbound queue (CRSession.mm step 5), and
         // `outboundPostDroppedCount` is a passthrough to that queue's own counter -- after

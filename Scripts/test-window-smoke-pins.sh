@@ -113,6 +113,69 @@ pin e1ef86b57fc2f275 "$(grep 'rasterScale' "$SRC" | shasum -a 256 | cut -c1-16)"
 # The retry does not relax the verdict: a still-short count after it is the same hard failure.
 pin 1 "$(code_only | grep -cE 'newContentIds\.count >= extraApps\.count,' || true)" "the hard multi-window gate still there"
 
+echo "== O-A edge profile: opt-in, one sampler, one printer (WINDOW_SMOKE_EDGE_PROFILE) =="
+# ADR-0018 §5.1 增补 2026-09-10 14:27 item (1). The whole diagnostic is measurement-only, so what
+# has to hold is NEGATIVE as much as positive: with the knob unset nothing is sampled, nothing is
+# printed, and RemoteWindow.edgeBorderProfile() is never entered. That is structural here -- the
+# knob is opt-in, the sampler's FIRST statement is the guard, and every read and every print lives
+# inside that one guarded function.
+pin 1 "$(code_only | grep -cE 'WINDOW_SMOKE_EDGE_PROFILE"\] == "1"' || true)" "edge knob read once, opt-in"
+pin 0 "$(code_only | grep -cE 'WINDOW_SMOKE_EDGE_PROFILE"\] != "0"' || true)" "edge knob is not default-on"
+pin 1 "$(code_only | grep -cE 'private func sampleEdgeProfiles\(' || true)" "sampleEdgeProfiles definition"
+pin 1 "$(code_only | grep -cE 'guard edgeProfileEnabled else \{ return \}' || true)" "the knob guard, once"
+# The guard is the FIRST statement of the sampler: a guard placed after the loop would still pin
+# above while sampling every window. Checked positionally, not by counting.
+# KNOWN BRITTLENESS (gate O-A r1 m-5): `grep -A1` reads the line that physically follows the
+# signature, so wrapping the signature onto two lines turns this pin red against code that is
+# perfectly correct. Fail-safe, and stated here so the next reader fixes the pin rather than
+# doubting the guard.
+pin 1 "$(code_only | grep -A1 -E 'private func sampleEdgeProfiles\(' | grep -cE 'guard edgeProfileEnabled else \{ return \}' || true)" "the guard is the sampler's first line"
+# Exactly three CALL SHAPES: the definition and its two callers (first frame, finish). Anchored on
+# `(registry:` rather than on the bare name (gate O-A r1 m-6, and the project's own rule that a
+# name count also counts prose): `code_only` only drops lines that START with a comment marker, so
+# a trailing comment naming the function would otherwise pollute the count.
+pin 3 "$(code_only | grep -cE 'sampleEdgeProfiles\(registry: ' || true)" "sampleEdgeProfiles: definition + two callers"
+pin 1 "$(code_only | grep -cE 'sampleEdgeProfiles\(registry: registry, at: \.firstFrame\)' || true)" "first-frame sample driven once"
+pin 1 "$(code_only | grep -cE 'sampleEdgeProfiles\(registry: registry, at: \.finish\)' || true)" "finish sample driven once"
+# The diagnostic is reached from exactly one place in the whole harness ...
+pin 1 "$(code_only | grep -cE 'registry\.edgeBorderProfile\(windowId:' || true)" "one registry.edgeBorderProfile call site"
+# ... its text is built in one place (two return shapes, both inside EdgeProfile.line) ...
+pin 1 "$(code_only | grep -cE 'windowId: UInt32, profile: RemoteWindow\.EdgeBorderProfile\?, hasDisplayedContent: Bool,' || true)" "EdgeProfile.line definition"
+pin 2 "$(code_only | grep -cE '\[edge\] id=\\\(windowId\)' || true)" "[edge] text built in one place (profile + unavailable)"
+# ... and printed from one place. A second print site is a line no pin above governs.
+pin 1 "$(code_only | grep -cE 'print\(EdgeProfile\.line\(' || true)" "[edge] printed from one site"
+# One first-frame sample per window per run (a 60fps stream would otherwise print per frame).
+pin 1 "$(code_only | grep -cE 'edgeProfileFirstFrameSampled\.insert\(' || true)" "first-frame sample deduped once per window"
+# ... and one -- at most one -- "nothing displayed yet" line per window in that same phase, from a
+# SECOND set: inserting into the set above would cost that window its real first-frame sample.
+pin 1 "$(code_only | grep -cE 'edgeProfileFirstFrameUnavailable\.insert\(' || true)" "the unavailable first-frame line deduped separately"
+# THE NEGATIVE PIN THAT MATTERS (gate O-A r1 B-1). No content filter on the sampler's loop: every
+# window in the registry gets a line, and one that has displayed nothing says so. A `where` clause
+# here would silently drop exactly the window this diagnostic exists to report (C-2' run 2's About
+# held `layer.contents == nil` for its whole run) while the other windows kept the knob looking
+# alive.
+# Scoped to the sampler's own body: `sampleF1BackingVsMapped` above KEEPS its `where` clause and
+# is right to (it pairs a presented frame with a mapped size and has nothing to say without one),
+# so a file-wide count of that clause is 1 and always will be. `-A25` covers this function and
+# stops well short of the next one; a body that grew past it would relax the pin, not break it,
+# which is why the positive loop-shape pin below is the one that actually holds the line.
+pin 0 "$(code_only | grep -A25 -E 'private func sampleEdgeProfiles\(registry: ' | grep -cE 'where snapshot\.hasDisplayedContent' || true)" "no content filter inside the edge sampler"
+# The loop shape itself: every snapshot, sorted, and the line ENDS at the opening brace -- a
+# `where` clause of any kind would have to sit between the two and would break this pin.
+# shellcheck disable=SC2016  # `$0`/`$1` are Swift closure parameters inside the ERE, not shell
+pin 1 "$(code_only | grep -cE 'for snapshot in registry\.windowSnapshots\(\)\.sorted\(by: \{ \$0\.windowId < \$1\.windowId \}\) \{$' || true)" "the edge sampler iterates every window"
+# The window's own displayed-content flag reaches the line builder as DATA (it picks the reason
+# token), which is the shape that replaced the filter.
+pin 1 "$(code_only | grep -cE 'hasDisplayedContent: snapshot\.hasDisplayedContent' || true)" "hasDisplayedContent is passed, not filtered on"
+pin 1 "$(code_only | grep -cE 'hasDisplayedContent \? \.surfaceNotReadable : \.noDisplayedSurface' || true)" "the two unavailable reasons, decided in one place"
+pin 1 "$(code_only | grep -cE 'case noDisplayedSurface = "no-displayed-surface"' || true)" "no-displayed-surface token"
+pin 1 "$(code_only | grep -cE 'case surfaceNotReadable = "surface-not-readable"' || true)" "surface-not-readable token"
+pin 1 "$(code_only | grep -cE 'visible=\\\(isVisible \? 1 : 0\)' || true)" "visible= on the unavailable shape"
+# The inward scan (gate O-A r1 I-1) is on the line, in the same edge order as the ratios, and is
+# built from the profile's own fields rather than re-derived here.
+pin 1 "$(code_only | grep -cE 'firstDark=\\\(fmtOffset\(profile\.firstDarkRowFromTop\)\)' || true)" "firstDark= built from the profile"
+pin 1 "$(code_only | grep -cE 'static func fmtOffset\(' || true)" "one absent-offset formatter"
+
 echo "== summary =="
 printf 'failures=%s\n' "$FAILURES"
 [ "$FAILURES" -eq 0 ]
