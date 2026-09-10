@@ -317,7 +317,7 @@ gather() { # <source> <destination name> <required 0|1>
 # can report DONE exit=0 and still have written its evidence log somewhere this manifest does not
 # read (which is exactly the defect that made this a required-artefact question at all), and the
 # relay can report a verdict without the host having written its report into the share.
-# shellcheck disable=SC2329  # reached only through the EXIT trap, via cp_on_exit
+# shellcheck disable=SC2329,SC2317  # reached only through the EXIT trap, via cp_on_exit (SC2317: shellcheck 0.9 on Tier 1 reads a trap-only function body as unreachable; 0.11 does not)
 cp_gather() {
     if [ "$LISTING_ONLY" -eq 1 ]; then
         # No mkdir here -- a directory this refusal did not find must not exist because it asked.
