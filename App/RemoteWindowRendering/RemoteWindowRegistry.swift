@@ -2383,6 +2383,21 @@ final class RemoteWindowRegistry {
         windows[windowId]?.nonWhitePixelRatio(inBottomFraction: bottomFraction, sampleCount: sampleCount)
     }
 
+    /// Diagnostics only (O-A, ADR-0018 §5.1 增补 2026-09-10 14:27 item ①; window-smoke's
+    /// `WINDOW_SMOKE_EDGE_PROFILE=1`). Sibling of `nonWhitePixelRatio` immediately above and the
+    /// only way a harness can reach `RemoteWindow.edgeBorderProfile()` at all -- `windows` is
+    /// private, and the profile is a property of the DISPLAYED SURFACE, which nothing in
+    /// `WindowSnapshot` carries. MEASUREMENT ONLY: read-only, changes no geometry, and no
+    /// production path calls it. `nil` when this registry has no window for `windowId`, when that
+    /// window has nothing displayed yet (the case a run is expected to meet), or when the surface
+    /// it does have could not be read at all -- `RemoteWindow.edgeBorderProfile()`'s own doc
+    /// comment lists the three unreadable shapes. The harness tells "nothing displayed" from
+    /// "unreadable" by the window's own `hasDisplayedContent`, which it already has in the
+    /// snapshot it iterates, so this forwarder does not have to carry a reason of its own.
+    func edgeBorderProfile(windowId: UInt32) -> RemoteWindow.EdgeBorderProfile? {
+        windows[windowId]?.edgeBorderProfile()
+    }
+
     /// Diagnostics only (adr/0010 §4, `Tools/window-smoke`'s popup scenario) -- `windowId`'s
     /// CURRENTLY attached owner windowId, or `nil` if it isn't attached as a child right now
     /// (whether because `ownerWindowId` is 0, its owner isn't a known window, or it's simply

@@ -636,6 +636,222 @@ final class RemoteWindow {
         return Double(nonWhiteCount) / Double(sampled)
     }
 
+    /// One reading of `edgeBorderProfile()` -- pure data, no judgement. Every field is a raw
+    /// count or ratio so that the READER (a run record, not this code) decides what it means;
+    /// the survey's 1x baseline is "all four ratios > 0.9 and all four corner counts non-zero"
+    /// (`docs/upgrade-gate/2026-09-10-about-offset-offline-survey.md` §4), but nothing here
+    /// asserts that, and nothing in the product ever branches on any of it.
+    struct EdgeBorderProfile: Equatable {
+        /// The sub-rect actually profiled -- the GFX mapped size clamped to the allocation, or
+        /// the whole allocation when no mapped size is known (same fallback `nonWhitePixelRatio`
+        /// takes, for the same reason).
+        let mappedWidth: Int
+        let mappedHeight: Int
+        /// The IOSurface's own 64-aligned allocation, reported alongside so a reader can see at a
+        /// glance whether the two differ (they normally do -- e.g. 522x514 mapped in 576x576).
+        let allocWidth: Int
+        let allocHeight: Int
+        /// Fraction of DARK pixels along, respectively, row 0, row H-1, column 0 and column W-1
+        /// of the mapped sub-rect. Full-span reads, not a sampled grid: an edge is only W (or H)
+        /// pixels, so there is nothing to gain by sub-sampling and a great deal to lose.
+        let topDarkRatio: Double
+        let bottomDarkRatio: Double
+        let leftDarkRatio: Double
+        let rightDarkRatio: Double
+        /// Dark-pixel COUNTS (not ratios) in each corner block of at most 6x6 -- counts, because
+        /// what the survey needs from a corner is "is the rounded corner there at all", and a
+        /// count states that without a denominator that changes with the clamp.
+        ///
+        /// READING RULE ON A SMALL SUB-RECT. The block side is `min(6, W, H)` and the four blocks
+        /// are anchored at the four corners, so as soon as W < 12 the left and right blocks
+        /// OVERLAP (and as soon as H < 12 the top and bottom ones do). At 4x3 all four blocks
+        /// cover the very same 3x3 pixels and the four counts are then necessarily EQUAL -- four
+        /// equal counts on a small window are an artefact of the clamp, not evidence of a
+        /// symmetric frame. The window this diagnostic exists for is 522x514 (1x) / 1044x940
+        /// (2x), an order of magnitude clear of the overlap, so the rule only ever bites on a
+        /// helper window that wandered into the same run.
+        let topLeftDarkCount: Int
+        let topRightDarkCount: Int
+        let bottomLeftDarkCount: Int
+        let bottomRightDarkCount: Int
+        /// Offset, from the OUTSIDE inward, of the first row (top/bottom) or column (left/right)
+        /// that is a FRAME by `borderDarkRatioFloor`: 0 means the outermost row/column itself is
+        /// the frame, `nil` means no frame-like row/column within `firstDarkScanDepth` of that
+        /// edge. `firstDarkRowFromTop == 0` and `topDarkRatio >= borderDarkRatioFloor` are the
+        /// same statement by construction, and that is the point -- the field extends the four
+        /// ratios inward instead of re-deciding them.
+        ///
+        /// WHY THE FOUR RATIOS ARE NOT ENOUGH. They read row 0 / row H-1 / column 0 / column W-1
+        /// and nothing else, so "the frame is INSET by k" -- the survey's empty-band model, which
+        /// predicts a 5-7 px band at 1x (§4's own reductio) -- and "that edge carries no frame at
+        /// all" both report a ratio near 0 and are indistinguishable. The corner blocks do cover
+        /// columns 0..5, but only as one 36-pixel aggregate: they can say "something dark is in
+        /// there", never WHERE. Without this field the band model is simply not on the observable
+        /// surface, and a run record that claimed it either way would be extrapolating.
+        let firstDarkRowFromTop: Int?
+        let firstDarkRowFromBottom: Int?
+        let firstDarkColumnFromLeft: Int?
+        let firstDarkColumnFromRight: Int?
+    }
+
+    /// The darkness cut, and the ONLY place it is expressed. Deliberately NOT the negation of
+    /// `nonWhitePixelRatio`'s "close to solid white" test (b/g/r all > 240): the About dialog's
+    /// own background measures 235-240 in the survey's 1x per-pixel reading, so it IS "non-white"
+    /// -- negating that test would call the whole dialog dark and drive every ratio below to 1.0,
+    /// leaving this diagnostic structurally unable to report anything. What it DOES share with
+    /// that function is the byte order (BGRA/BGRX, adr/0005 §2's empirical finding) and the
+    /// per-channel form; the constant sits midway between the survey's two measured populations
+    /// (border columns/rows, channel mean 67; dialog background, 235-240), and is strictly darker
+    /// than the white cut, so "dark" is a proper subset of "non-white" at every value.
+    static let darkChannelCeiling: UInt8 = 128
+
+    /// The share of a row/column that must be dark before `firstDark*` calls it a FRAME. Not a
+    /// second judgement smuggled into a measurement: 0.9 is the survey's OWN 1x baseline for "this
+    /// edge carries the dialog's frame" (§4), reused here so that `firstDark* == 0` and "that
+    /// edge's ratio > 0.9" can never disagree. A share rather than "any dark pixel at all",
+    /// because every row of a framed dialog contains the left and right frame's own pixels, and a
+    /// single glyph of text would otherwise be reported as a frame two rows in.
+    static let borderDarkRatioFloor: Double = 0.9
+
+    /// How far in from each edge `firstDark*` looks before reporting `nil`. 8, because the model
+    /// it has to be able to see is the survey's 5-7 px empty band, and a depth of 7 could not tell
+    /// "a band of 7" from "no frame anywhere". Bounded on purpose: an unbounded inward scan would
+    /// read the whole 1044x940 bitmap on every sample, which is the cost this opt-in diagnostic
+    /// exists to avoid paying.
+    static let firstDarkScanDepth = 8
+
+    /// Diagnostics only -- exposed so the offline fixtures can pin the cut itself rather than
+    /// inferring it from a ratio (the mutation "reuse the 240 white test negated" then has a
+    /// direct, one-line killer). Not called from the rendering path.
+    static func isDarkChannelTriple(blue: UInt8, green: UInt8, red: UInt8) -> Bool {
+        blue < darkChannelCeiling && green < darkChannelCeiling && red < darkChannelCeiling
+    }
+
+    /// Diagnostics only (O-A, ADR-0018 §5.1 增补 2026-09-10 14:27 item ①; window-smoke's
+    /// `WINDOW_SMOKE_EDGE_PROFILE=1`) -- MEASUREMENT ONLY. Reads the currently displayed
+    /// IOSurface's own mapped sub-rect (the very rect `present`'s `contentsRect` crop selects)
+    /// and reports how much of each outermost row/column, and of each corner block, is dark.
+    /// Returns `nil` when there is nothing to profile OR nothing it can read: no displayed
+    /// surface (overwhelmingly the common case, and the only one a run is expected to meet), an
+    /// empty mapped sub-rect, a read-only lock the surface refused, or elements that are not 4
+    /// bytes wide. A diagnostic that cannot read must say nothing rather than publish ratios
+    /// computed out of bytes it does not understand; the harness distinguishes "nothing was
+    /// displayed" from "the surface was unreadable" from OUTSIDE, by the window's own
+    /// `hasDisplayedContent`, and prints a different `unavailable=` token for each.
+    /// Changes no geometry, no constant and no layer
+    /// property; the product behaves bit-for-bit as it did without it, at any scale, because
+    /// nothing outside a harness ever calls it. (This file names no scale factor at all, and
+    /// `MaskUnitBoundaryPinTests` pins that: unit conversion is not this layer's job.)
+    ///
+    /// WHY THIS EXISTS. The About-window offset the 2026-09-09 checkpoint recorded has one
+    /// remaining offline-undecidable explanation (survey §5 (f)): at 2x the server DECLARES a
+    /// mapped rect smaller than the window bitmap it actually drew, and this client faithfully
+    /// crops the right column and bottom row away. The 1x control is already measured (§4: all
+    /// four edges flush, all four corners present), so the discriminating observation is simply
+    /// whether the right column and bottom row still carry the dialog's frame at 2x. Reading the
+    /// IOSurface directly rather than a screenshot is what makes that observation trustworthy:
+    /// no Screen Recording grant, no chance of capturing the wrong window or a stale file, and
+    /// no image is produced to archive (see `nonWhitePixelRatio`'s own doc comment -- this is the
+    /// same technique, widened from one bottom band to the four edges).
+    func edgeBorderProfile() -> EdgeBorderProfile? {
+        guard let surface = displayedSurface else { return nil }
+        return Self.edgeBorderProfile(ofSurface: surface, mappedSize: displayedMappedSize)
+    }
+
+    /// The pure half of `edgeBorderProfile()`, split out so the offline fixtures can drive it
+    /// with a synthesised IOSurface (a real `RemoteWindow` needs a live `CRSession` and a real
+    /// screen). Same read-only lock, same mapped-sub-rect clamp, same byte order.
+    ///
+    /// `cornerSide` is clamped to the sub-rect, so a sub-rect narrower or shorter than the block
+    /// reports a smaller block rather than reading out of bounds.
+    static func edgeBorderProfile(
+        ofSurface surface: IOSurface, mappedSize: CGSize?, cornerSide: Int = 6
+    ) -> EdgeBorderProfile? {
+        let allocWidth = IOSurfaceGetWidth(surface)
+        let allocHeight = IOSurfaceGetHeight(surface)
+        var width = allocWidth
+        var height = allocHeight
+        if let mapped = mappedSize, mapped.width > 0, mapped.height > 0 {
+            // `Int(...)` truncates toward zero, so a fractional mapped size profiles one column or
+            // row fewer. Deliberate, and deliberately the SAME truncation `nonWhitePixelRatio`
+            // does above -- the two diagnostics must profile the same sub-rect or their numbers
+            // are not about the same thing. That window-smoke's `[f1]` line happens to print an
+            // integral mapped size through its own formatter is a COINCIDENCE, not a shared
+            // implementation; the pre-registration compares the two `mapped=` values verbatim, so
+            // the day either side stops truncating, the run's own validity clause reports it.
+            width = min(width, Int(mapped.width))
+            height = min(height, Int(mapped.height))
+        }
+        guard width > 0, height > 0 else { return nil }
+        // 32 bits per pixel is what the `x * 4` arithmetic below IS -- checked, not assumed. A
+        // STRIDE check rather than a pixel-format one on purpose: the rendering path's surfaces
+        // are BGRA/BGRX (adr/0005 §2's empirical finding) and a format equality test would refuse
+        // the sibling of whichever one it was written against, while a surface whose elements are
+        // not 4 bytes wide would silently produce ratios read out of the wrong bytes.
+        guard IOSurfaceGetBytesPerElement(surface) == 4 else { return nil }
+
+        // The lock's verdict is READ, not discarded: a refused lock leaves the base pointer below
+        // aimed at whatever it was aimed at before, and this function then reads on the order of
+        // 8x(2W+2H) pixels of it. Ratios computed from that would look exactly like measurements.
+        guard IOSurfaceLock(surface, IOSurfaceLockOptions(rawValue: 1 /* kIOSurfaceLockReadOnly */), nil)
+            == kIOReturnSuccess else { return nil }
+        defer { IOSurfaceUnlock(surface, IOSurfaceLockOptions(rawValue: 1), nil) }
+        let base = IOSurfaceGetBaseAddress(surface)
+        let bytesPerRow = IOSurfaceGetBytesPerRow(surface)
+
+        func isDark(_ x: Int, _ y: Int) -> Bool {
+            let pixel = base.advanced(by: y * bytesPerRow + x * 4).assumingMemoryBound(to: UInt8.self)
+            return isDarkChannelTriple(blue: pixel[0], green: pixel[1], red: pixel[2])
+        }
+        func rowRatio(_ y: Int) -> Double {
+            var dark = 0
+            for x in 0..<width where isDark(x, y) { dark += 1 }
+            return Double(dark) / Double(width)
+        }
+        func columnRatio(_ x: Int) -> Double {
+            var dark = 0
+            for y in 0..<height where isDark(x, y) { dark += 1 }
+            return Double(dark) / Double(height)
+        }
+        let side = max(1, min(cornerSide, width, height))
+        func cornerCount(originX: Int, originY: Int) -> Int {
+            var dark = 0
+            for y in originY..<(originY + side) {
+                for x in originX..<(originX + side) where isDark(x, y) { dark += 1 }
+            }
+            return dark
+        }
+        // The inward scan. Bounded by `firstDarkScanDepth` AND by the sub-rect, so a window
+        // shallower than the depth scans its whole height -- in which case the top and bottom
+        // scans see the same rows, the same overlap the corner blocks have and documented in the
+        // same place (`EdgeBorderProfile`'s own field comments).
+        let rowScanDepth = min(firstDarkScanDepth, height)
+        let columnScanDepth = min(firstDarkScanDepth, width)
+        func firstDarkOffset(depth: Int, ratioAt: (Int) -> Double) -> Int? {
+            for offset in 0..<depth where ratioAt(offset) >= borderDarkRatioFloor { return offset }
+            return nil
+        }
+
+        return EdgeBorderProfile(
+            mappedWidth: width,
+            mappedHeight: height,
+            allocWidth: allocWidth,
+            allocHeight: allocHeight,
+            topDarkRatio: rowRatio(0),
+            bottomDarkRatio: rowRatio(height - 1),
+            leftDarkRatio: columnRatio(0),
+            rightDarkRatio: columnRatio(width - 1),
+            topLeftDarkCount: cornerCount(originX: 0, originY: 0),
+            topRightDarkCount: cornerCount(originX: width - side, originY: 0),
+            bottomLeftDarkCount: cornerCount(originX: 0, originY: height - side),
+            bottomRightDarkCount: cornerCount(originX: width - side, originY: height - side),
+            firstDarkRowFromTop: firstDarkOffset(depth: rowScanDepth, ratioAt: { rowRatio($0) }),
+            firstDarkRowFromBottom: firstDarkOffset(depth: rowScanDepth, ratioAt: { rowRatio(height - 1 - $0) }),
+            firstDarkColumnFromLeft: firstDarkOffset(depth: columnScanDepth, ratioAt: { columnRatio($0) }),
+            firstDarkColumnFromRight: firstDarkOffset(depth: columnScanDepth, ratioAt: { columnRatio(width - 1 - $0) })
+        )
+    }
+
     /// Phase 2 W3: refuses to touch the real `NSWindow` while
     /// `isLocalGeometrySuppressed` is true (see that property's own doc comment) -- the
     /// server's own geometry echo for this window is simply not applied for the moment,

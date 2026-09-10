@@ -773,6 +773,18 @@ else
 	fail "$CASE: accepted:$bad"
 fi
 
+# 10b. EDGE_PROFILE, the O-A measurement knob (WINDOW_SMOKE_EDGE_PROFILE), holds to the same
+#      domain as the four scenario switches. Its own case rather than a fifth key inside case 10:
+#      the wrapper refuses it with its own message, and a shared check would report a refusal that
+#      does not name the key that caused it.
+begin '10b EDGE_PROFILE is 0 or 1'
+bad="$(reject_values EDGE_PROFILE '2' 'yes' '01' 'true')"
+if [ -z "$bad" ]; then
+	pass "$CASE: 2, yes, 01 and true are each refused (an EMPTY value is not an error: like an absent key it means the measurement knob stays off)"
+else
+	fail "$CASE: accepted:$bad"
+fi
+
 begin '11 EXTRA_APPS charset'
 # shellcheck disable=SC2016  # the literals are the values under test
 bad="$(reject_values EXTRA_APPS 'notepad calc' 'notepad|calc' 'note$pad' 'note.pad')"
@@ -983,6 +995,58 @@ if [ -z "$reasons" ] && [ "$(child_calls)" = '1' ]; then
 	pass "$CASE: with every switch at 0 and every string empty, the child's environment carries WINDOW_SMOKE_LOG and nothing else this wrapper owns"
 else
 	fail "$CASE: present in the child:$reasons (launcher calls=$(child_calls))"
+fi
+
+# 22b. EDGE_PROFILE's mapping, in all three of the shapes that can go wrong. The knob is
+#      MEASUREMENT ONLY in the child (it prints [edge] lines and changes nothing else), so what
+#      matters here is not that it works but that the child's environment is a function of the JOB
+#      FILE: on when the file says 1, absent when it says 0, and absent when the file is silent
+#      even though the shell that launched this wrapper had it set. That last one is the whole
+#      reason WINDOW_SMOKE_EDGE_PROFILE joined SMOKE_MANAGED_VARS -- without it, a run's evidence
+#      could not say afterwards whether the diagnostic had been armed.
+begin '22b EDGE_PROFILE maps to the child knob, and only the job file can arm it'
+reasons=''
+job_base
+job_override 'EDGE_PROFILE=1'
+run_smoke "$SBLAB/smoke-job.command" ""
+[ "$(child_env 'WINDOW_SMOKE_EDGE_PROFILE=1')" = '1' ] || reasons="$reasons on-not-mapped;"
+[ "$(last_line)" = 'DONE exit=0' ] || reasons="$reasons on-last-line=[$(last_line)];"
+grep -qF 'edge_profile=1' "$SMOKELOG" || reasons="$reasons on-not-in-the-run-line;"
+# 0 is expressed by ABSENCE, exactly like the four scenario switches.
+reset_run
+job_base
+job_override 'EDGE_PROFILE=0'
+run_smoke "$SBLAB/smoke-job.command" ""
+if child_has_var WINDOW_SMOKE_EDGE_PROFILE; then reasons="$reasons off-reached-the-child;"; fi
+grep -qF 'edge_profile=0' "$SMOKELOG" || reasons="$reasons off-not-in-the-run-line;"
+# And the inherited knob: set in the WRAPPER's own environment, absent from the job file. The
+# managed-variable list is what removes it; without that entry this assertion is the one that goes
+# red, and a live run would silently measure because of whatever shell opened Terminal.
+reset_run
+job_base
+env -i \
+	HOME="$SBHOME" \
+	PATH="$SB/bin:$PATH" \
+	TMPDIR="$SBTMP" \
+	TERM_PROGRAM= \
+	LABTEST_TRACE="$LABTEST_TRACE" \
+	LABTEST_REFUSED_TRACE="$LABTEST_REFUSED_TRACE" \
+	LABTEST_SMOKE_LOG="$SMOKELOG" \
+	LABTEST_TAG_LOG="$SBRUNTIME/smoke-labtest.log" \
+	LABTEST_OSASCRIPT_EXPECTED="$OSASCRIPT_EXPECTED" \
+	LABTEST_DISPLAY_TEXT="$DISPLAY_TEXT" \
+	LABTEST_CHILD_RC=0 \
+	LABTEST_CHILD_LEAK=0 \
+	MACDOWS_LAB_BOUNDARY_FILE= \
+	WINDOW_SMOKE_EDGE_PROFILE=1 \
+	bash "$SBLAB/smoke-job.command" >/dev/null 2>&1
+if child_has_var WINDOW_SMOKE_EDGE_PROFILE; then reasons="$reasons INHERITED-KNOB-REACHED-THE-CHILD;"; fi
+[ "$(child_calls)" = '1' ] || reasons="$reasons inherited-launcher-calls=$(child_calls);"
+if [ -z "$reasons" ]; then
+	pass "$CASE: EDGE_PROFILE=1 puts WINDOW_SMOKE_EDGE_PROFILE=1 in the child and edge_profile=1 in the run line, 0 leaves the variable absent, and a knob inherited from the launching shell is stripped -- the child's environment is a function of the job file alone"
+else
+	fail "$CASE:$reasons"
+	note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
 fi
 
 # 23. The launcher's exit code IS the run's verdict, and a failing run still gets its per-TAG copy:
@@ -1993,7 +2057,7 @@ fi
 
 # Every case must have reported: a case that neither passed nor failed would otherwise vanish from
 # the tally with exit 0. Placed after the LAST case on purpose.
-EXPECTED_CASES=63
+EXPECTED_CASES=65
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi
