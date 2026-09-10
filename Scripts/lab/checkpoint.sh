@@ -281,7 +281,7 @@ LISTING_ONLY=0
 # calls `cp` -- it reports only whether <destination name> is ALREADY in the batch directory, which
 # is true only for window-smoke's own artefact (its source IS the batch directory; see WS_LOG_SRC)
 # or for a directory a previous, completed run of the SAME batch name left behind.
-# shellcheck disable=SC2329  # reached only through the EXIT trap, via cp_gather
+# shellcheck disable=SC2329,SC2317  # reached only through the EXIT trap, via cp_gather (SC2317: shellcheck 0.9 on Tier 1 follows the trap chain and reads this body as unreachable; 0.11 does not)
 gather() { # <source> <destination name> <required 0|1>
     local src="$1" dst="$EVIDENCE/$2" required="$3" why=''
     if [ "$LISTING_ONLY" -eq 1 ]; then
