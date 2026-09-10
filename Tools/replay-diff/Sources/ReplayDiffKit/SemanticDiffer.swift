@@ -439,9 +439,45 @@ public struct SemanticDiffer: Sendable {
             )
             matchedPairs.append(contentsOf: pairs)
             differences.append(contentsOf: countFindings)
+            // adr/0008 §5's append-only field rule: a newer probe writes keys the frozen
+            // baseline's probe never wrote. Declared per event name (NewFieldDeclaration), exempt
+            // only when absent on the counterpart and present on the declaration's own side, and
+            // reported ONCE for the whole class rather than once per matched event -- the same
+            // shape step 4b already uses for a substitution's newFields, minus the substitution.
+            // Without it a two-append probe upgrade produces 8 fieldPresenceChanged findings on
+            // every single window row.
+            let declaration = options.knownDifferenceTable.newFieldDeclaration(for: name)
+            var declaredHits: [String: Int] = [:]
             for pair in pairs {
-                let outcome = compareFields(eventName: name, pair: pair)
+                let outcome = compareFields(
+                    eventName: name,
+                    pair: pair,
+                    expectedNewFields: Set(declaration?.fields ?? []),
+                    newFieldSide: declaration?.side ?? .candidate
+                )
                 differences.append(contentsOf: outcome.findings)
+                for (field, count) in outcome.expectedNewFieldHits {
+                    declaredHits[field, default: 0] += count
+                }
+            }
+            if let declaration {
+                for field in declaration.fields.sorted() {
+                    guard let hits = declaredHits[field], hits > 0 else { continue }
+                    let present = "present on \(hits) matched event(s)"
+                    differences.append(
+                        Difference(
+                            diffClass: .knownLocalDifference,
+                            eventName: name,
+                            field: field,
+                            baselineValue: declaration.side == .baseline ? present : "<absent>",
+                            candidateValue: declaration.side == .baseline ? "<absent>" : present,
+                            detail: "declared appended probe key (adr/0008 §5) -- exempt from field comparison"
+                                + " only while the counterpart recording lacks it; every other field of these"
+                                + " \(pairs.count) matched event(s) was compared normally. \(declaration.cause)"
+                                + " [\(declaration.reference)]"
+                        )
+                    )
+                }
             }
         }
 
@@ -549,6 +585,25 @@ public struct SemanticDiffer: Sendable {
                         let supersedes = entry.supersedes.map { ", supersedes \($0)" } ?? ""
                         return "\(entry.eventName) expected on \(entry.expectedSide.rawValue)\(supersedes)"
                     }.joined(separator: "; ")
+            )
+        }
+        // The declarations are the OTHER way a finding can come out `expected`, and until now the
+        // notes did not mention them at all: a 2x re-record's artifact carried eight
+        // knownLocalDifference findings whose only explanation was the per-finding `detail`. Same
+        // rule as the table above -- what can excuse a difference belongs in the artifact header.
+        let activeDeclarations = options.knownDifferenceTable.newFieldDeclarations.values
+            .sorted { $0.eventName < $1.eventName }
+        if !activeDeclarations.isEmpty {
+            notes.append(
+                "appended-probe-key declarations (adr/0008 §5) in force: "
+                    + activeDeclarations.map { declaration in
+                        "\(declaration.eventName) — \(declaration.fields.count) key(s) expected on"
+                            + " the \(declaration.side.rawValue) side"
+                            + " [\(declaration.fields.sorted().joined(separator: ", "))]"
+                    }.joined(separator: "; ")
+                    + ". Exempt from field comparison only while absent on the counterpart;"
+                    + " reported once per key per event type, values compared as soon as both sides"
+                    + " carry them."
             )
         }
         let unmodelled = baseline.unmodelledEventNames.union(candidate.unmodelledEventNames)

@@ -248,6 +248,27 @@ struct CommandLineOptions {
             lines.append("      \(entry.cause)")
             lines.append("      reference: \(entry.reference)")
         }
+        // Listed separately from the entries above because they are a different mechanism, not a
+        // different entry: a declaration only ever exempts named KEYS on an event type BOTH sides
+        // have, and can never excuse a whole event type being one-sided. An artifact reader who
+        // sees a knownLocalDifference on a field name should be able to find it here.
+        let declarations = KnownDifferenceTable.preSeeded.newFieldDeclarations.values
+            .sorted(by: { $0.eventName < $1.eventName })
+        if !declarations.isEmpty {
+            lines.append("")
+            lines.append("Built-in appended-probe-key declarations (adr/0008 §5; not loadable from --known-difference-table):")
+            for declaration in declarations {
+                lines.append("  \(declaration.eventName) — appended keys expected on the \(declaration.side.rawValue) side")
+                lines.append(
+                    "      fields: \(declaration.fields.sorted().joined(separator: ", "))"
+                        + " — exempt from field comparison only while absent on the counterpart side, and"
+                        + " only on the side named above; reported once per field, values compared normally"
+                        + " as soon as both sides carry them."
+                )
+                lines.append("      \(declaration.cause)")
+                lines.append("      reference: \(declaration.reference)")
+            }
+        }
         return lines.joined(separator: "\n")
     }
 }

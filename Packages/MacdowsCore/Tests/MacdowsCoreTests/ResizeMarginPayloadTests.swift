@@ -38,13 +38,18 @@ struct ResizeMarginPayloadTests {
         #expect(p.resizeMarginLeft == 0 && p.resizeMarginTop == 0 && p.resizeMarginRight == 0 && p.resizeMarginBottom == 0)
     }
 
+    /// The margins are no longer the LAST thing on the line: W3 route B step 1 appended
+    /// `clientOffsetX/Y` + `windowClientDeltaX/Y` after them (`ClientRectPayloadTests` pins that
+    /// pair and its ordering). So this anchor stops at `resizeMarginBottom`'s `%u` instead of
+    /// also requiring the C string literal to close there -- the ORDER claim in this test's name
+    /// is what it checks, and that claim is unchanged.
     @Test("rail-probe emits the four keys on the WindowCreate/WindowUpdate line, after title, in Left/Top/Right/Bottom order (the census's key order)")
     func emitterCarriesTheKeys() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let src = try String(contentsOf: root.appendingPathComponent("Tools/rail-probe/rail-probe.c"), encoding: .utf8)
         let collapsed = src.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
-        let margins = "\\\"resizeMarginLeft\\\":%u,\\\"resizeMarginTop\\\":%u,\\\"resizeMarginRight\\\":%u,\\\"resizeMarginBottom\\\":%u\""
+        let margins = "\\\"resizeMarginLeft\\\":%u,\\\"resizeMarginTop\\\":%u,\\\"resizeMarginRight\\\":%u,\\\"resizeMarginBottom\\\":%u"
         let title = "\\\"title\\\":\\\"%s\\\",\""
         let marginsAt = collapsed.range(of: margins)?.lowerBound
         let titleAt = collapsed.range(of: title)?.lowerBound

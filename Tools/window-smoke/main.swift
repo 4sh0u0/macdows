@@ -3931,6 +3931,12 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// accumulated size itself carries no timestamp, so this is what dates it (review railcmp-r2 m-4).
     private var latestRailSizeElapsed: [UInt32: TimeInterval] = [:]
     private var windowStyleBits: [UInt32: UInt32] = [:]
+    /// W3 route B step 1: window ids whose `[client-rect]` line has already been printed for their
+    /// FIRST WindowCreate. A window can be re-created within one session (`windowCreateTimestamps`'
+    /// own doc comment covers the re-sent-create case), and the point of the create line is "what
+    /// did the server say about this window when it first appeared" -- one per window, not one per
+    /// create order.
+    private var clientRectCreateLogged: Set<UInt32> = []
     private var lastClientWindowMoveSent: (left: Int32, top: Int32, right: Int32, bottom: Int32, at: Date)?
     /// Team-lead review round 4 (2026-08-23, no-false-red discipline): whether the real
     /// target window's `NSWindow.styleMask` actually included `.resizable` at the moment
@@ -4764,6 +4770,27 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                     windowStyleBits[event.windowId] = event.style
                 }
                 print(Self.styleDumpLine(for: event))
+            }
+            // W3 route B step 1: the measurement-only `[client-rect]` line. UNCONDITIONAL (every
+            // run, every scenario), unlike `[style-dump]` above -- the whole point is that an
+            // ordinary 1x run and an ordinary 2x run can be compared afterwards, and a line that
+            // only appeared under WINDOW_SMOKE_EXTRA_APPS would be absent from exactly the runs
+            // this measurement needs. Bounded by construction: one line per window's FIRST create
+            // (~23 windows in the observed corpus) plus one per client-rect-bearing WindowUpdate
+            // (4 in the whole frozen corpus of six scenarios -- ClientRectCorpusPinTests).
+            //
+            // The update gate is "carries EITHER bit", not "carries both": the two pairs have
+            // independent validity bits, so an order carrying only one of them is still a
+            // measurement, and dropping it would hide precisely the asymmetry a 2x run might show.
+            // CLIENT_AREA_OFFSET | WND_CLIENT_DELTA, as a named local rather than a trailing
+            // comment on the condition -- the plumbing pin matches this file with whitespace
+            // collapsed, and an inline comment would sit inside the matched text.
+            let clientRectBits: UInt32 = 0x0000_4000 | 0x0000_8000
+            if event.kind == .windowCreate, !clientRectCreateLogged.contains(event.windowId) {
+                clientRectCreateLogged.insert(event.windowId)
+                print(Self.clientRectLine(for: event))
+            } else if event.kind == .windowUpdate, event.fieldFlags & clientRectBits != 0 {
+                print(Self.clientRectLine(for: event))
             }
             // adr/0010 §5: unconditional WindowCreate timestamp bookkeeping (see
             // windowCreateTimestamps' own doc comment) -- every run, not just
@@ -7420,6 +7447,59 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         let titleText = event.title.isEmpty ? "<empty>" : event.title
         return "[style-dump] id=\(event.windowId) \(event.windowWidth)x\(event.windowHeight) "
             + "title=\"\(titleText)\" style=\(styleText) styleEx=\(styleExText) owner=\(ownerText)"
+    }
+
+    /// W3 route B step 1 (survey §6.2 route B): the `[client-rect]` MEASUREMENT-ONLY line. One per
+    /// window's first WindowCreate, plus one per WindowUpdate that actually carries a client-rect
+    /// bit -- see the call site for that gate.
+    ///
+    /// Purpose: get the server's own per-window client-rectangle anchors onto a 1x log and a 2x log
+    /// so they can be compared. `WindowGeometry`'s per-style left borders (5 for WS_THICKFRAME, 7
+    /// for the About shape) were measured once at 1x and are explicitly NOT multiplied by the
+    /// 1x/2x raster factor; whether these wire fields hold 5/7 at 1x and 10/14 at 2x is exactly the
+    /// question this line exists to answer, and nothing may be rewired until a real run answers it.
+    ///
+    /// (The factor is deliberately not named by its identifier here: `Scripts/test-window-smoke-
+    /// pins.sh` hashes EVERY line of this file containing that identifier, comments included, to
+    /// hold a different lane's "not one byte of it changed" claim. Mentioning it in prose would
+    /// break that pin without changing any behaviour it guards.)
+    /// Printing changes no behaviour: `macContentRect` and the outbound deduction are untouched.
+    ///
+    /// Every group is gated on the bit that makes it meaningful and prints `n/a` otherwise, the
+    /// same convention `styleDumpLine` above uses -- a group rendered as `(0,0)` because its bit was
+    /// absent would be indistinguishable from the server genuinely saying zero, which is the one
+    /// distinction this measurement needs to survive.
+    ///
+    /// `rm=` is `n/a` on EVERY line, not sometimes: the four `resizeMargin*` values reach
+    /// `WindowOrderPayload` (rail-probe JSONL -> replay) but were never added to `crdpq_window_
+    /// order_t`, so the live bridge this tool reads through structurally cannot see them. The slot
+    /// is kept in the line so the format matches the one the lane was asked for and so the gap is
+    /// visible rather than silently dropped; filling it is a second POD growth (four UINT32,
+    /// 588 -> 604) and an owner ruling, not something this measurement-only step may decide.
+    private static func clientRectLine(for event: CRDPEvent) -> String {
+        // Duplicated narrowly here, same discipline as styleDumpLine's own copies and
+        // RemoteWindowRegistry.WindowOrderField: this file must not share a constant with the
+        // layer it is measuring.
+        let styleFieldBit: UInt32 = 0x0000_0008    // WINDOW_ORDER_FIELD_STYLE (gates style+styleEx)
+        let sizeFieldBit: UInt32 = 0x0000_0400     // WINDOW_ORDER_FIELD_WND_SIZE
+        let offsetFieldBit: UInt32 = 0x0000_0800   // WINDOW_ORDER_FIELD_WND_OFFSET
+        let visOffsetFieldBit: UInt32 = 0x0000_1000 // WINDOW_ORDER_FIELD_VIS_OFFSET
+        let clientAreaOffsetBit: UInt32 = 0x0000_4000 // WINDOW_ORDER_FIELD_CLIENT_AREA_OFFSET
+        let wndClientDeltaBit: UInt32 = 0x0000_8000   // WINDOW_ORDER_FIELD_WND_CLIENT_DELTA
+        let ff = event.fieldFlags
+        func pair(_ bit: UInt32, _ x: Int32, _ y: Int32) -> String {
+            ff & bit != 0 ? "(\(x),\(y))" : "n/a"
+        }
+        let styleText = ff & styleFieldBit != 0 ? String(format: "0x%08X", event.style) : "n/a"
+        let sizeText = ff & sizeFieldBit != 0 ? "\(event.windowWidth)x\(event.windowHeight)" : "n/a"
+        return "[client-rect] id=\(event.windowId) style=\(styleText) "
+            + String(format: "ff=0x%08X ", ff)
+            + "win=\(sizeText) "
+            + "off=\(pair(offsetFieldBit, event.offsetX, event.offsetY)) "
+            + "coff=\(pair(clientAreaOffsetBit, event.clientOffsetX, event.clientOffsetY)) "
+            + "delta=\(pair(wndClientDeltaBit, event.windowClientDeltaX, event.windowClientDeltaY)) "
+            + "voff=\(pair(visOffsetFieldBit, event.visibleOffsetX, event.visibleOffsetY)) "
+            + "rm=n/a"
     }
 
     /// Human-readable form of `MacdowsCore.ServerActiveWindow` for `[flow]`/`[focus-rotation]`

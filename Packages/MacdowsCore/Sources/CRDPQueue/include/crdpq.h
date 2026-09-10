@@ -208,16 +208,50 @@ typedef struct {
      *  Appended at the end of the struct, per adr/0008 §5's "new fields append" rule. */
     int32_t visibleOffsetX;
     int32_t visibleOffsetY;
+    /** W3 route B step 1: `TS_WINDOW_STATE_ORDER.clientOffsetX/Y` (window.h:201-202) and
+     *  `windowClientDeltaX/Y` (window.h:209-210) -- wire INT32, remote px, the two anchors that
+     *  describe where this window's CLIENT rectangle sits relative to the screen and to the
+     *  window's own origin. Read by `libfreerdp/core/window.c:334-340` and `:395-401` through
+     *  `Stream_Read_INT32`, each behind its OWN validity bit:
+     *  `WINDOW_ORDER_FIELD_CLIENT_AREA_OFFSET` (0x4000) for the first pair,
+     *  `WINDOW_ORDER_FIELD_WND_CLIENT_DELTA` (0x8000) for the second. Two independent bits,
+     *  the same shape `resizeMargin*`'s X/Y pair has -- a consumer that gates both on one of
+     *  them reads the other pair's memset zero as data.
+     *
+     *  The third client-rect bit, `WINDOW_ORDER_FIELD_CLIENT_AREA_SIZE` (0x10000), gates
+     *  `clientAreaWidth/Height` and is DELIBERATELY not carried: a census of the frozen corpus
+     *  (`ClientRectCorpusPinTests`) found it on 0 of 202 window orders, against 142 for each of
+     *  the two pairs above. There is no client-area SIZE on this wire to carry.
+     *
+     *  MEASUREMENT ONLY as of this step. No consumer reads these: `macContentRect`'s inbound
+     *  geometry and the outbound `ClientWindowMove` deduction are byte-for-byte unchanged, and
+     *  `rasterScale == 1` product behaviour is bit-identical. They exist so a 1x and a 2x
+     *  recording can say what the server actually puts here before any constant is replaced by
+     *  them.
+     *
+     *  Bit-gated at the writer exactly like `ownerWindowId` and `visibleOffset*` above
+     *  (adr/0008 §3, adr/0010 §1): an order that doesn't carry a bit leaves that pair at
+     *  `ev.payload`'s memset zero, which is NOT "the offset is 0" -- the WindowModel/
+     *  PendingWindowState delta-merge layer is what turns "absent bit" into "keep prior value".
+     *  Appended at the end of the struct, per adr/0008 §5's "new fields append" rule. */
+    int32_t clientOffsetX;
+    int32_t clientOffsetY;
+    int32_t windowClientDeltaX;
+    int32_t windowClientDeltaY;
 } crdpq_window_order_t;
 
 /* adr/0008 §5's ABI/version discipline: no version number, no reserved padding — a struct
  * layout change must be caught by the compiler at build time, not papered over by
- * convention. 572 was measured (not estimated) with `clang`/arm64 immediately after adding
- * `visibleOffsetX/Y` above (adr/0010 §1; up from 564 before this ADR -- see adr/0008 §5's
- * own assert comment for the 300B/296B lineage before that). If this ever fires, some
- * other field in this struct (or its `crdpq_text_t`/`crdpq_rect_t` member) changed shape and
- * every consumer needs re-auditing, not just this assert updating. */
-_Static_assert(sizeof(crdpq_window_order_t) == 572, "crdpq_window_order_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0010 §1)");
+ * convention. 588 was measured (not estimated) with `clang`/arm64 immediately after adding
+ * `clientOffsetX/Y` + `windowClientDeltaX/Y` above (W3 route B step 1; up from 572 after
+ * adr/0010 §1's `visibleOffsetX/Y`, itself up from 564 -- see adr/0008 §5's own assert comment
+ * for the 300B/296B lineage before that). Four INT32 appended to a struct whose tail was
+ * already 4-aligned and whose alignment is 4, so the growth is exactly 16B with no new
+ * padding -- and that is a MEASUREMENT, stated here as the explanation of the number rather
+ * than its source. If this ever fires, some other field in this struct (or its
+ * `crdpq_text_t`/`crdpq_rect_t` member) changed shape and every consumer needs re-auditing,
+ * not just this assert updating. */
+_Static_assert(sizeof(crdpq_window_order_t) == 588, "crdpq_window_order_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0010 §1 / W3 route B step 1)");
 
 /** WindowDelete, WindowIcon. */
 typedef struct {
@@ -306,7 +340,7 @@ typedef struct {
  * predicted (adr/0013 §6.2's discipline): the assert below was compiled at the old value
  * first and clang reported "expression evaluates to '280 == 276'", then confirmed by a
  * runtime sizeof/offsetof probe (iconCached@272, versionPresent@273, version@276).
- * Deliberately still well under crdpq_window_order_t's 572, which remains the union's
+ * Deliberately still well under crdpq_window_order_t's 588, which remains the union's
  * largest member — adr/0013 §1's whole "pixels go to a side store, the event carries a
  * reference" decision exists to keep this event type from becoming that. */
 _Static_assert(sizeof(crdpq_notify_icon_t) == 280, "crdpq_notify_icon_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0013 §1 / adr/0014 §7)");
@@ -430,7 +464,7 @@ typedef struct {
 /* adr/0008 §5's measure-don't-estimate discipline, applied to this struct for the first time
  * (it had no assert before phase3 M1 — it had also never grown before). Needed on its own
  * because `crdpq_event_payload_t`'s union-level assert structurally CANNOT see this member: at
- * 32 bytes it is nowhere near `crdpq_window_order_t`'s 572, so a reshaping here that changes
+ * 32 bytes it is nowhere near `crdpq_window_order_t`'s 588, so a reshaping here that changes
  * this struct's SIZE would still leave the union's size untouched.
  *
  * WHAT THIS ASSERT DOES AND DOES NOT CATCH — measured by mutating this struct and re-running
@@ -537,13 +571,13 @@ typedef union {
      * DISCONNECTED(gen)") is everything a consumer needs. */
 } crdpq_event_payload_t;
 
-/* adr/0008 §5: measured (not estimated) with clang/arm64. `crdpq_window_order_t` (572,
- * adr/0010 §1) is still this union's largest member post-ADR (adr/0008 §4's deliberate
+/* adr/0008 §5: measured (not estimated) with clang/arm64. `crdpq_window_order_t` (588,
+ * W3 route B step 1) is still this union's largest member post-ADR (adr/0008 §4's deliberate
  * "take 96, not 255" bound choice for CRDPQ_MAX_WINDOW_IDS exists specifically to keep it
  * that way, and adr/0013 §1's side-store decision keeps the freshly-grown
  * `crdpq_notify_icon_t` at 280 — still under half of it — for the same reason); the union's
  * own alignment is 8 (from `crdpq_surface_mapped_t`'s `uint64_t windowId`, not from
- * `crdpq_window_order_t`), so 572 pads up to the next multiple of 8 = 576. Unchanged by
+ * `crdpq_window_order_t`), so 588 pads up to the next multiple of 8 = 592. Unchanged by
  * adr/0013 (which grew the notify-icon member to 276) or by adr/0014 §7 (280, re-measured
  * at both steps — see that struct's own assert comment); up from 568 before adr/0010.
  *
@@ -553,7 +587,8 @@ typedef union {
  * move, so nothing moved" is exactly the reasoning that discipline exists to refuse). Both
  * halves were re-run after the growth: clang's own diagnostic on the member's assert reported
  * '32 == 24', and a runtime sizeof probe then read this union back at 576 and `CrdpEvent` at
- * 584. 32 is still an order of magnitude under `crdpq_window_order_t`'s 572, so the union's
+ * 584 (the sizes of that day; 592/600 since W3 route B step 1 grew the window-order member).
+ * 32 is still an order of magnitude under `crdpq_window_order_t`'s 588, so the union's
  * size is still set by that member and its 8-byte alignment, neither of which this growth
  * touched. Consumer audit at the same commit: the ONLY readers of this union member are
  * `CRDPEventFromCrdpEvent` (CRSession.mm) and the two GFX callbacks that write it — every
@@ -562,7 +597,7 @@ typedef union {
  * decodes rail-probe JSONL and never touches this type. No consumer indexes, memcpy's a fixed
  * width out of, or serializes this struct, so none needed changing beyond the promotion
  * itself. */
-_Static_assert(sizeof(crdpq_event_payload_t) == 576, "crdpq_event_payload_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0010 §1)");
+_Static_assert(sizeof(crdpq_event_payload_t) == 592, "crdpq_event_payload_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0010 §1 / W3 route B step 1)");
 
 /** One control-lane event. POD, no pointers, safe to memcpy — this is the whole point
  *  (adr/0005 §1/§3). `generation` is stamped by crdpq_post itself at enqueue time from
@@ -576,10 +611,11 @@ typedef struct {
     crdpq_event_payload_t payload;
 } CrdpEvent;
 
-/* adr/0008 §5: measured (not estimated) with clang/arm64. type(4)+generation(4)+payload(576)
- * = 584, already an exact multiple of the struct's own 8-byte alignment, so no further
- * padding. Up from 576 before this ADR. */
-_Static_assert(sizeof(CrdpEvent) == 584, "CrdpEvent layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0010 §1)");
+/* adr/0008 §5: measured (not estimated) with clang/arm64. type(4)+generation(4)+payload(592)
+ * = 600, already an exact multiple of the struct's own 8-byte alignment, so no further
+ * padding. Up from 584 before W3 route B step 1, which was itself up from 576 before
+ * adr/0010. */
+_Static_assert(sizeof(CrdpEvent) == 600, "CrdpEvent layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0010 §1 / W3 route B step 1)");
 
 typedef struct crdpq_control crdpq_control_t;
 

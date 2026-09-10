@@ -125,6 +125,51 @@ public struct KnownDifferenceEntry: Sendable, Equatable, Codable {
     }
 }
 
+/// Keys a NEWER probe build appends to an event type **both sides already have**.
+///
+/// Distinct from ``KnownDifferenceEntry/newFields``, which belongs to a *substitution*: there, the
+/// keys' presence IS the variant, and the whole event type is one-sided. Here nothing is one-sided
+/// — `WindowCreate` is on both sides, in the same numbers — and the only difference is that the
+/// candidate's probe writes keys the frozen baseline's probe had not been taught to write yet.
+/// adr/0008 §5's append-only field rule makes that the *expected* shape of a probe upgrade, and
+/// without this declaration the gate reports it as one ``DiffClass/fieldPresenceChanged`` per key
+/// per matched event — 8 findings on every window row once U-5 step 1 and route B step 1 have both
+/// landed, which is a false alarm loud enough to train an operator to ignore the gate (the F-1
+/// failure mode, one layer down).
+///
+/// **Deliberately a separate declaration surface, not another ``KnownDifferenceEntry``.** An entry
+/// keyed `WindowCreate` would also be consulted by
+/// ``KnownDifferenceTable/explanation(for:presentOnlyOn:)`` and would therefore excuse
+/// `WindowCreate` *vanishing from the baseline entirely* — a catastrophic regression the gate
+/// exists to catch. A declaration is consulted only on the both-sides path, so it cannot disarm
+/// the type census no matter what it names.
+///
+/// Directional, like everything else here: the keys are exempt only when absent on the counterpart
+/// and present on ``side``. A declared key showing up on the wrong side, or present on both sides
+/// with different values, is compared normally and can still fail the gate.
+public struct NewFieldDeclaration: Sendable, Equatable, Codable {
+    /// The `ev` name whose lines grew keys.
+    public let eventName: String
+    /// The side the newer probe's recording is on, as an empirical statement about these two
+    /// recordings — normally ``DiffSide/candidate``, since the baseline is the frozen one.
+    public let side: DiffSide
+    /// The appended keys. Exempt from field comparison only in the direction ``side`` names.
+    public let fields: [String]
+    /// What is known, printed into evidence artifacts. Same rule as
+    /// ``KnownDifferenceEntry/cause``: no host addresses, no credentials, no unmeasured mechanism.
+    public let cause: String
+    /// Where the change that appended the keys is recorded.
+    public let reference: String
+
+    public init(eventName: String, side: DiffSide, fields: [String], cause: String, reference: String) {
+        self.eventName = eventName
+        self.side = side
+        self.fields = fields
+        self.cause = cause
+        self.reference = reference
+    }
+}
+
 /// The set of ``KnownDifferenceEntry``s in force for a run.
 ///
 /// Kept deliberately small and explicit. Every entry is a difference the gate will *not*
@@ -133,6 +178,9 @@ public struct KnownDifferenceEntry: Sendable, Equatable, Codable {
 /// drill, recorded in that drill's record).
 public struct KnownDifferenceTable: Sendable, Equatable {
     public private(set) var entries: [String: KnownDifferenceEntry]
+    /// Per-event-name appended-key declarations, consulted only on the both-sides comparison path.
+    /// See ``NewFieldDeclaration`` for why these are not entries.
+    public private(set) var newFieldDeclarations: [String: NewFieldDeclaration]
 
     /// `uniquingKeysWith`, never `uniqueKeysWithValues`: the latter *traps* on a duplicate
     /// event name, and this initializer is on the path from an operator-authored
@@ -140,9 +188,50 @@ public struct KnownDifferenceTable: Sendable, Equatable {
     /// SIGILL is not what a drill operator should see. Last entry wins, matching
     /// ``merging(_:)``'s documented precedence — and ``load(fromJSONAt:)`` refuses the file
     /// outright rather than relying on that, so silence is not the file path's behaviour.
-    public init(entries: [KnownDifferenceEntry] = []) {
+    /// `newFieldDeclarations` defaults to EMPTY, not to the pre-seeded set: a caller writing
+    /// `KnownDifferenceTable(entries: [])` means "explain nothing", and silently handing it
+    /// exemptions it did not ask for would make every such test weaker than it reads.
+    public init(
+        entries: [KnownDifferenceEntry] = [],
+        newFieldDeclarations: [NewFieldDeclaration] = []
+    ) {
         self.entries = Dictionary(entries.map { ($0.eventName, $0) }, uniquingKeysWith: { _, new in new })
+        self.newFieldDeclarations = Dictionary(
+            newFieldDeclarations.map { ($0.eventName, $0) }, uniquingKeysWith: { _, new in new }
+        )
     }
+
+    /// The appended-key declarations in force by default.
+    ///
+    /// Both entries name the same eight keys because `rail-probe.c` emits ONE format string for
+    /// both `WindowCreate` and `WindowUpdate` (`probe_window_common`) — `EmitterContractTests` pins
+    /// that single key list — so the two event types grow together, always.
+    public static let preSeededNewFieldDeclarations: [NewFieldDeclaration] = {
+        let fields = [
+            "resizeMarginLeft", "resizeMarginTop", "resizeMarginRight", "resizeMarginBottom",
+            "clientOffsetX", "clientOffsetY", "windowClientDeltaX", "windowClientDeltaY",
+        ]
+        let cause = """
+            PROBE INSTRUMENTATION, NOT SERVER BEHAVIOUR. rail-probe's window-order line gained \
+            four RAIL resize margins (ADR-0018 U-5 step 1, 2026-09-08) and then the four \
+            client-rectangle fields clientOffsetX/Y + windowClientDeltaX/Y (W3 route B step 1, \
+            2026-09-10). Both appends are MEASUREMENT ONLY: no client path consumes any of the \
+            eight, and the values ride on WINDOW_STATE_ORDER fields the server was already \
+            sending. The frozen 2026-08-19 baselines were recorded by a probe that predates both, \
+            so the keys appearing on the candidate side is the recorder growing, not the recorded \
+            end changing -- adr/0008 §5's append-only field rule is exactly this case. The VALUES \
+            are compared normally as soon as both sides carry them, and a declared key appearing \
+            on the BASELINE side is not exempt.
+            """
+        let reference = """
+            adr/0008 §5 (append-only fields); ADR-0018 U-5 step 1 and U-7 (which asked for this \
+            declaration); rail-probe.c's probe_window_common is the emitter, and MacdowsCore's \
+            EmitterContractTests pins its key list verbatim
+            """
+        return ["WindowCreate", "WindowUpdate"].map {
+            NewFieldDeclaration(eventName: $0, side: .candidate, fields: fields, cause: cause, reference: reference)
+        }
+    }()
 
     /// The one entry M1 wave-1 ruling F-1 makes mandatory.
     ///
@@ -275,7 +364,7 @@ public struct KnownDifferenceTable: Sendable, Equatable {
                 probe_gfx_caps_confirm is the emitter
                 """
         ),
-    ])
+    ], newFieldDeclarations: preSeededNewFieldDeclarations)
 
     /// The explanation for `eventName` having *appeared* on `side` and nowhere else, or
     /// `nil`. Directional: an entry only ever excuses its own expected side.
@@ -332,11 +421,21 @@ public struct KnownDifferenceTable: Sendable, Equatable {
         return nil
     }
 
-    /// Right-hand entries win on an event-name collision.
+    /// Right-hand entries win on an event-name collision. Declarations merge by the same rule and
+    /// in the same call, so a `--known-difference-table` override cannot silently drop the
+    /// pre-seeded ones (a JSON table produces no declarations at all, so in practice the left
+    /// side's survive untouched).
     public func merging(_ other: KnownDifferenceTable) -> KnownDifferenceTable {
         var merged = self
         merged.entries.merge(other.entries) { _, new in new }
+        merged.newFieldDeclarations.merge(other.newFieldDeclarations) { _, new in new }
         return merged
+    }
+
+    /// The appended-key declaration for `eventName`, or `nil`. Directional by construction: the
+    /// caller gets ``NewFieldDeclaration/side`` back and must apply the exemption only there.
+    public func newFieldDeclaration(for eventName: String) -> NewFieldDeclaration? {
+        newFieldDeclarations[eventName]
     }
 
     /// A `--known-difference-table` file the loader refuses.
@@ -369,6 +468,9 @@ public struct KnownDifferenceTable: Sendable, Equatable {
         for entry in decoded where !seen.insert(entry.eventName).inserted {
             throw LoadError.duplicateEventName(entry.eventName)
         }
+        // Declarations are deliberately NOT loadable from a drill file: an appended probe key is a
+        // property of a committed probe build, so it belongs in the reviewed, pre-seeded set, not
+        // in a per-drill override that outlives nothing and is reviewed by nobody.
         return KnownDifferenceTable(entries: decoded)
     }
 }

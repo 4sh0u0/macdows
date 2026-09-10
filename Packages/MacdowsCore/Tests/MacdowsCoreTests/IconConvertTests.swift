@@ -695,9 +695,13 @@ struct NotifyIconPayloadTests {
         // deliberately re-asserted unchanged: the whole point of adr/0013 §1's side-store
         // split is that growing this event type must not move crdpq_event_payload_t.
         #expect(MemoryLayout<crdpq_notify_icon_t>.size == 280)
-        #expect(MemoryLayout<crdpq_window_order_t>.size == 572)
-        #expect(MemoryLayout<crdpq_event_payload_t>.size == 576)
-        #expect(MemoryLayout<CrdpEvent>.size == 584)
+        // 572 -> 588 / 576 -> 592 / 584 -> 600 at W3 route B step 1 (clientOffsetX/Y +
+        // windowClientDeltaX/Y). The notify-icon member is deliberately re-asserted UNCHANGED
+        // across that growth: adr/0013 §1's side-store split is what keeps this event type's
+        // size independent of the union's largest member moving.
+        #expect(MemoryLayout<crdpq_window_order_t>.size == 588)
+        #expect(MemoryLayout<crdpq_event_payload_t>.size == 592)
+        #expect(MemoryLayout<CrdpEvent>.size == 600)
     }
 
     @Test("the appended fields survive a post/drain round trip unmodified")

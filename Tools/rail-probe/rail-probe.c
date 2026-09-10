@@ -702,24 +702,42 @@ static BOOL probe_window_common(rdpContext* context, const WINDOW_ORDER_INFO* or
 	}
 
 	const bool isNew = (orderInfo->fieldFlags & WINDOW_ORDER_STATE_NEW) != 0;
-	/* ADR-0018 U-5 step 1: the line ends with the four RAIL resize margins (remote px). Two
+	/* ADR-0018 U-5 step 1: the line carries the four RAIL resize margins (remote px). Two
 	 * INDEPENDENT validity bits, exactly as libfreerdp/core/window.c reads them: Left/Right are
 	 * valid when fieldFlags carries RESIZE_MARGIN_X 0x80, Top/Bottom when it carries
 	 * RESIZE_MARGIN_Y 0x08000000 (gate w3-u5-step1 r1 I-1). Logged always so a 2x recording can
 	 * say whether THICKFRAME margins scale with DPI. Decoded by MacdowsCore's
 	 * WindowOrderPayload (absent in older recordings = 0); the key list is pinned verbatim by
-	 * EmitterContractTests, so a change here is a contract change, made deliberately. */
+	 * EmitterContractTests, so a change here is a contract change, made deliberately.
+	 *
+	 * W3 route B step 1 (2026-09-10): the line then ends with the two RAIL client-rectangle
+	 * anchors, also remote px, also two INDEPENDENT validity bits read by the same parser:
+	 * `clientOffsetX/Y` when fieldFlags carries CLIENT_AREA_OFFSET 0x4000 (window.c:334-340),
+	 * `windowClientDeltaX/Y` when it carries WND_CLIENT_DELTA 0x8000 (window.c:395-401). All
+	 * four are SIGNED on the wire (Stream_Read_INT32), hence %d, not the %u the margins use.
+	 *
+	 * Why these four and not `clientAreaWidth/Height`: a census of the frozen corpus
+	 * (ClientRectCorpusPinTests) found CLIENT_AREA_OFFSET and WND_CLIENT_DELTA on 142 of 202
+	 * window orders -- every single WindowCreate -- and CLIENT_AREA_SIZE (0x10000) on ZERO of
+	 * them. The server states where the client rectangle STARTS and never how big it is, so
+	 * these two pairs are the whole of what a client-rect consumer could ever read.
+	 *
+	 * Logged always, exactly like the margins, so a 1x and a 2x recording can be compared.
+	 * MEASUREMENT ONLY at this step: nothing in the client consumes the values yet. */
 	log_event(p, isNew ? "WindowCreate" : "WindowUpdate",
 	          "\"windowId\":%u,\"fieldFlags\":%u,\"windowOffsetX\":%d,\"windowOffsetY\":%d,"
 	          "\"windowWidth\":%u,\"windowHeight\":%u,\"numVisibilityRects\":%u,"
 	          "\"style\":%u,\"styleEx\":%u,\"show\":%u,\"title\":\"%s\","
-	          "\"resizeMarginLeft\":%u,\"resizeMarginTop\":%u,\"resizeMarginRight\":%u,\"resizeMarginBottom\":%u",
+	          "\"resizeMarginLeft\":%u,\"resizeMarginTop\":%u,\"resizeMarginRight\":%u,\"resizeMarginBottom\":%u,"
+	          "\"clientOffsetX\":%d,\"clientOffsetY\":%d,\"windowClientDeltaX\":%d,\"windowClientDeltaY\":%d",
 	          orderInfo->windowId, orderInfo->fieldFlags, windowState->windowOffsetX,
 	          windowState->windowOffsetY, windowState->windowWidth, windowState->windowHeight,
 	          windowState->numVisibilityRects, windowState->style, windowState->extendedStyle,
 	          windowState->showState, titleEsc, windowState->resizeMarginLeft,
 	          windowState->resizeMarginTop, windowState->resizeMarginRight,
-	          windowState->resizeMarginBottom);
+	          windowState->resizeMarginBottom, windowState->clientOffsetX,
+	          windowState->clientOffsetY, windowState->windowClientDeltaX,
+	          windowState->windowClientDeltaY);
 
 	if (isNew)
 		track_window_id(&p->created_ids, &p->created_count, &p->created_cap, orderInfo->windowId);

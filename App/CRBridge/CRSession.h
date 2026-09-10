@@ -181,6 +181,31 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 @property (nonatomic, readonly) int32_t visibleOffsetX;
 @property (nonatomic, readonly) int32_t visibleOffsetY;
 
+/// WindowCreate/Update only. `TS_WINDOW_STATE_ORDER.clientOffsetX/Y` -- the screen-space
+/// top-left corner of the window's CLIENT rectangle -- meaningful only when `fieldFlags` sets
+/// `WINDOW_ORDER_FIELD_CLIENT_AREA_OFFSET` (0x4000). **remote px**, signed.
+///
+/// `windowClientDeltaX/Y` below is a SEPARATE field pair behind a SEPARATE bit,
+/// `WINDOW_ORDER_FIELD_WND_CLIENT_DELTA` (0x8000): the client rectangle's offset from the
+/// window's own origin (`offsetX`/`offsetY`). libfreerdp/core/window.c reads the two pairs in
+/// two independent `if`s (:334 and :395), so an order may carry either, both or neither, and a
+/// caller must check each bit separately -- checking one for both reads the other's zero as
+/// data. Same fieldFlags-gating caveat as `ownerWindowId`/`visibleOffset*` above: 0 is a
+/// legitimate value once the bit has actually been seen.
+///
+/// MEASUREMENT ONLY as of W3 route B step 1. The only consumer is window-smoke's
+/// `[client-rect]` diagnostic line; no rendering or outbound-geometry path reads these, and
+/// `rasterScale == 1` behaviour is bit-identical with and without them.
+///
+/// The third client-rect bit, `WINDOW_ORDER_FIELD_CLIENT_AREA_SIZE` (0x10000) with its
+/// `clientAreaWidth/Height`, is not carried at all: the frozen-corpus census
+/// (`ClientRectCorpusPinTests`) counts it on 0 of 202 window orders. The server states where
+/// the client rectangle starts, never how big it is.
+@property (nonatomic, readonly) int32_t clientOffsetX;
+@property (nonatomic, readonly) int32_t clientOffsetY;
+@property (nonatomic, readonly) int32_t windowClientDeltaX;
+@property (nonatomic, readonly) int32_t windowClientDeltaY;
+
 /// WindowCreate/Update only, meaningful only when `fieldFlags` sets the visibility bit
 /// (0x0200, `WINDOW_ORDER_FIELD_VISIBILITY`). `TS_WINDOW_STATE_ORDER.visibilityRects`
 /// (adr/0008 §2b), flattened as `[left, top, right, bottom, left, top, right, bottom, ...]`
