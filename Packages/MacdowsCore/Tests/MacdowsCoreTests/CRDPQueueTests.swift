@@ -757,10 +757,11 @@ struct CRDPQueueLayoutTests {
     /// The three new event structs (`crdpq_local_move_size_t`=16B,
     /// `crdpq_min_max_info_t`=36B, `crdpq_zorder_sync_t`=4B) are all far smaller than
     /// `crdpq_window_order_t` and don't move the union's own size. adr/0010 §1 grew it
-    /// again: `crdpq_window_order_t` gained `visibleOffsetX/Y` (564B -> 572B). Every number
-    /// below was re-measured with clang/arm64 after adding each ADR's fields (matching
-    /// crdpq.h's own `_Static_assert`s), not estimated from either ADR's own illustrative
-    /// table.
+    /// again: `crdpq_window_order_t` gained `visibleOffsetX/Y` (564B -> 572B). W3 route B step 1
+    /// grew it once more: `clientOffsetX/Y` + `windowClientDeltaX/Y`, four INT32 appended at the
+    /// tail (572B -> 588B). Every number below was re-measured with clang/arm64 after adding each
+    /// ADR's fields (matching crdpq.h's own `_Static_assert`s), not estimated from either ADR's
+    /// own illustrative table.
     ///
     /// phase3 M1 F2 grew `crdpq_surface_mapped_t` (24B -> 32B) and left the union and
     /// `CrdpEvent` at 576B/584B. That last clause is the part worth being explicit about: it
@@ -774,7 +775,7 @@ struct CRDPQueueLayoutTests {
     func reportSizes() {
         #expect(MemoryLayout<crdpq_text_t>.size == 260)
         #expect(MemoryLayout<crdpq_rect_t>.size == 8)
-        #expect(MemoryLayout<crdpq_window_order_t>.size == 572)
+        #expect(MemoryLayout<crdpq_window_order_t>.size == 588)
         #expect(MemoryLayout<crdpq_monitored_desktop_t>.size == 400)
         #expect(MemoryLayout<crdpq_local_move_size_t>.size == 16)
         #expect(MemoryLayout<crdpq_min_max_info_t>.size == 36)
@@ -803,7 +804,7 @@ struct CRDPQueueLayoutTests {
         //     convention" posture.
         // Same three-kind reasoning crdpq_cmd_notify_event_t records on the outbound side; the
         // union-level expectations further below cannot substitute for any of them, since at
-        // 32B this member is nowhere near crdpq_window_order_t's 572B.
+        // 32B this member is nowhere near crdpq_window_order_t's 588B.
         #expect(MemoryLayout<crdpq_surface_mapped_t>.size == 32)
         #expect(MemoryLayout<crdpq_surface_mapped_t>.alignment == 8)
         let surfaceMappedProbe = crdpq_surface_mapped_t()
@@ -819,13 +820,16 @@ struct CRDPQueueLayoutTests {
         #expect(MemoryLayout<crdpq_surface_mapped_t>.offset(of: \.mappedHeight) == 20)
         #expect(MemoryLayout<crdpq_surface_mapped_t>.offset(of: \.targetWidth) == 24)
         #expect(MemoryLayout<crdpq_surface_mapped_t>.offset(of: \.targetHeight) == 28)
-        // crdpq_window_order_t (572B, adr/0010 §1) is still this union's largest member;
-        // crdpq_event_payload_t's OWN alignment is 8 (crdpq_surface_mapped_t's uint64_t
+        // crdpq_window_order_t (588B since W3 route B step 1) is still this union's largest
+        // member; crdpq_event_payload_t's OWN alignment is 8 (crdpq_surface_mapped_t's uint64_t
         // windowId sets that, not crdpq_window_order_t), so the union's size pads up from
-        // 572 to the next multiple of 8 = 576B. CrdpEvent adds a 4B type tag + 4B
-        // generation on top = 584B total (already 8-aligned, no further padding).
-        #expect(MemoryLayout<crdpq_event_payload_t>.size == 576)
-        #expect(MemoryLayout<CrdpEvent>.size == 584)
+        // 588 to the next multiple of 8 = 592B. CrdpEvent adds a 4B type tag + 4B
+        // generation on top = 600B total (already 8-aligned, no further padding). Re-MEASURED
+        // after the four INT32s landed, per adr/0008 §5 -- the arithmetic above is the
+        // explanation of the measurement, not its source (M1 F2's own note on why "the largest
+        // member didn't move" is unsound reasoning applies in the other direction too).
+        #expect(MemoryLayout<crdpq_event_payload_t>.size == 592)
+        #expect(MemoryLayout<CrdpEvent>.size == 600)
         #expect(MemoryLayout<CrdpEvent>.alignment == 8)
 
         // crdpq_cmd_execute_t (crdpq_text_t alone, 260B) is the largest CrdpCommand union

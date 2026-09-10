@@ -27,6 +27,21 @@ private enum WindowOrderField {
     /// (`WINDOW_ORDER_FIELD_WND_OFFSET`, `windowOffsetX/Y`, the window's own origin) — the
     /// two anchors agree only when the window is unoccluded (adr/0010 §0(b)).
     static let visOffset: UInt32 = 0x0000_1000
+    /// `WINDOW_ORDER_FIELD_CLIENT_AREA_OFFSET` (window.h:39, 0x00004000) — gates
+    /// `clientOffsetX/Y` together (window.c:334-340).
+    static let clientAreaOffset: UInt32 = 0x0000_4000
+    /// `WINDOW_ORDER_FIELD_WND_CLIENT_DELTA` (window.h:46, 0x00008000) — gates
+    /// `windowClientDeltaX/Y` together (window.c:395-401). A SEPARATE bit from
+    /// `clientAreaOffset` above: window.c reads the two pairs in two independent `if`s, so a
+    /// merge that gated both on one of them would silently apply the other pair's
+    /// never-written zero.
+    static let wndClientDelta: UInt32 = 0x0000_8000
+    // 0x0001_0000 is WINDOW_ORDER_FIELD_CLIENT_AREA_SIZE, gating `clientAreaWidth/Height`
+    // (window.c:343-350) — deliberately absent here and from `WindowState`: the frozen-corpus
+    // census (`ClientRectCorpusPinTests`) counts that bit on 0 of 202 window orders, against
+    // 142 each for the two above, so the server states the client rectangle's ORIGIN and never
+    // its SIZE. Named in this comment rather than left out entirely so the next reader does not
+    // have to rediscover that the third bit exists and is empty.
 }
 
 /// Everything RAIL/RDPGFX order-handling needs to know about one remote window.
@@ -62,6 +77,25 @@ public struct WindowState: Sendable, Equatable {
     /// (whole-window fail-open) is the only correct reading, distinct from "anchor is
     /// (0, 0)" (a legitimate value once this is `true`).
     public var hasSeenVisibleOffset: Bool = false
+    /// `TS_WINDOW_STATE_ORDER.clientOffsetX/Y` and `windowClientDeltaX/Y` — **remote px**,
+    /// signed, the screen-space origin of this window's CLIENT rectangle and that rectangle's
+    /// offset from the window's own origin. W3 route B step 1.
+    ///
+    /// MEASUREMENT ONLY: nothing reads these yet. They are carried so a 1x and a 2x recording
+    /// can say what the server puts here before `WindowGeometry`'s per-style border constants
+    /// are considered for replacement (survey §6.2 route B; no constant may move until then).
+    ///
+    /// Bit-gated on `WindowOrderField.clientAreaOffset` and `.wndClientDelta` INDEPENDENTLY,
+    /// exactly as window.c reads them — an order without a bit leaves that pair unchanged from
+    /// whatever was last known, never silently reset to 0, and 0 with the bit set is a real
+    /// value. Like `ownerWindowId` (and unlike `visibleOffset*`) there is no `hasSeen…`
+    /// discriminator: nothing consumes these, so there is no consumer that could yet need to
+    /// tell "never observed" from "observed as 0". Adding one is the wiring step's job, and
+    /// belongs with the consumer that needs it.
+    public var clientOffsetX: Int32 = 0
+    public var clientOffsetY: Int32 = 0
+    public var windowClientDeltaX: Int32 = 0
+    public var windowClientDeltaY: Int32 = 0
     /// Set once a `WindowIcon` or `WindowCachedIcon` order has been seen for this window.
     /// The probe log doesn't carry icon bytes, only that an icon order occurred.
     public var hasIcon: Bool = false
@@ -93,6 +127,14 @@ public struct WindowState: Sendable, Equatable {
             visibleOffsetX = payload.visibleOffsetX
             visibleOffsetY = payload.visibleOffsetY
             hasSeenVisibleOffset = true
+        }
+        if payload.fieldFlags & WindowOrderField.clientAreaOffset != 0 {
+            clientOffsetX = payload.clientOffsetX
+            clientOffsetY = payload.clientOffsetY
+        }
+        if payload.fieldFlags & WindowOrderField.wndClientDelta != 0 {
+            windowClientDeltaX = payload.windowClientDeltaX
+            windowClientDeltaY = payload.windowClientDeltaY
         }
         if payload.fieldFlags & WindowOrderField.size != 0 {
             width = payload.windowWidth

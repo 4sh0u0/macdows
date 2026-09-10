@@ -366,12 +366,36 @@ public struct WindowOrderPayload: Decodable, Sendable, Equatable {
     public let resizeMarginTop: UInt32
     public let resizeMarginRight: UInt32
     public let resizeMarginBottom: UInt32
+    /// W3 route B step 1 (survey §5 (b), §6.2 route B): `WINDOW_STATE_ORDER.clientOffsetX/Y`
+    /// and `windowClientDeltaX/Y`, **remote px**, signed. Two INDEPENDENT validity bits, read
+    /// by `libfreerdp/core/window.c` in two separate `if`s: `clientOffsetX/Y` is meaningful
+    /// when `fieldFlags` carries `WINDOW_ORDER_FIELD_CLIENT_AREA_OFFSET` (0x4000, window.c:334),
+    /// `windowClientDeltaX/Y` when it carries `WINDOW_ORDER_FIELD_WND_CLIENT_DELTA` (0x8000,
+    /// window.c:395). Consumers gate each pair on its own bit, never on "value != 0" -- 0 is a
+    /// legitimate wire value.
+    ///
+    /// `Int32`, not `UInt32`: all four go through `Stream_Read_INT32`, and a negative
+    /// `windowClientDelta` is the ordinary case for a window whose client area starts below a
+    /// title bar.
+    ///
+    /// The third client-rect bit, `CLIENT_AREA_SIZE` (0x10000) with its
+    /// `clientAreaWidth/Height`, is absent from this type on purpose: `ClientRectCorpusPinTests`
+    /// counts it on 0 of 202 frozen-corpus window orders, so there is nothing to decode.
+    ///
+    /// Recordings made before this step -- the frozen corpus included -- carry no such keys and
+    /// decode as 0, per adr/0008 §5's replay-compat rule, which is why that census counts flag
+    /// bits and not these values.
+    public let clientOffsetX: Int32
+    public let clientOffsetY: Int32
+    public let windowClientDeltaX: Int32
+    public let windowClientDeltaY: Int32
 
     private enum CodingKeys: String, CodingKey {
         case windowId, fieldFlags, windowOffsetX, windowOffsetY, windowWidth, windowHeight
         case numVisibilityRects, style, styleEx, show, title, ownerWindowId
         case visibleOffsetX, visibleOffsetY
         case resizeMarginLeft, resizeMarginTop, resizeMarginRight, resizeMarginBottom
+        case clientOffsetX, clientOffsetY, windowClientDeltaX, windowClientDeltaY
     }
 
     public init(from decoder: Decoder) throws {
@@ -394,6 +418,10 @@ public struct WindowOrderPayload: Decodable, Sendable, Equatable {
         resizeMarginTop = try container.decodeIfPresent(UInt32.self, forKey: .resizeMarginTop) ?? 0
         resizeMarginRight = try container.decodeIfPresent(UInt32.self, forKey: .resizeMarginRight) ?? 0
         resizeMarginBottom = try container.decodeIfPresent(UInt32.self, forKey: .resizeMarginBottom) ?? 0
+        clientOffsetX = try container.decodeIfPresent(Int32.self, forKey: .clientOffsetX) ?? 0
+        clientOffsetY = try container.decodeIfPresent(Int32.self, forKey: .clientOffsetY) ?? 0
+        windowClientDeltaX = try container.decodeIfPresent(Int32.self, forKey: .windowClientDeltaX) ?? 0
+        windowClientDeltaY = try container.decodeIfPresent(Int32.self, forKey: .windowClientDeltaY) ?? 0
     }
 
     /// Explicit memberwise init — a custom `init(from:)` above suppresses Swift's
@@ -406,7 +434,9 @@ public struct WindowOrderPayload: Decodable, Sendable, Equatable {
         styleEx: UInt32, show: UInt32, title: String, ownerWindowId: UInt32 = 0,
         visibleOffsetX: Int32 = 0, visibleOffsetY: Int32 = 0,
         resizeMarginLeft: UInt32 = 0, resizeMarginTop: UInt32 = 0,
-        resizeMarginRight: UInt32 = 0, resizeMarginBottom: UInt32 = 0
+        resizeMarginRight: UInt32 = 0, resizeMarginBottom: UInt32 = 0,
+        clientOffsetX: Int32 = 0, clientOffsetY: Int32 = 0,
+        windowClientDeltaX: Int32 = 0, windowClientDeltaY: Int32 = 0
     ) {
         self.windowId = windowId
         self.fieldFlags = fieldFlags
@@ -426,6 +456,10 @@ public struct WindowOrderPayload: Decodable, Sendable, Equatable {
         self.resizeMarginTop = resizeMarginTop
         self.resizeMarginRight = resizeMarginRight
         self.resizeMarginBottom = resizeMarginBottom
+        self.clientOffsetX = clientOffsetX
+        self.clientOffsetY = clientOffsetY
+        self.windowClientDeltaX = windowClientDeltaX
+        self.windowClientDeltaY = windowClientDeltaY
     }
 }
 

@@ -81,6 +81,10 @@
 @property (nonatomic) uint32_t ownerWindowId;
 @property (nonatomic) int32_t visibleOffsetX;
 @property (nonatomic) int32_t visibleOffsetY;
+@property (nonatomic) int32_t clientOffsetX;
+@property (nonatomic) int32_t clientOffsetY;
+@property (nonatomic) int32_t windowClientDeltaX;
+@property (nonatomic) int32_t windowClientDeltaY;
 @property (nonatomic) NSArray<NSNumber *> *visibilityRects;
 @property (nonatomic) uint32_t numVisibilityRects;
 @property (nonatomic) BOOL visibilityRectsTruncated;
@@ -178,6 +182,13 @@ static CRDPEvent *CRDPEventFromCrdpEvent(const CrdpEvent *ev, crdpq_icon_store_t
              * ownerWindowId's own copy one line up. */
             out.visibleOffsetX = wo->visibleOffsetX;
             out.visibleOffsetY = wo->visibleOffsetY;
+            /* W3 route B step 1: same shape as visibleOffset* just above -- crdpq already
+             * bit-gated these two pairs at the transport layer (crb_window_common below), each
+             * on its OWN bit, so this is a direct, unconditional field copy. */
+            out.clientOffsetX = wo->clientOffsetX;
+            out.clientOffsetY = wo->clientOffsetY;
+            out.windowClientDeltaX = wo->windowClientDeltaX;
+            out.windowClientDeltaY = wo->windowClientDeltaY;
             out.numVisibilityRects = wo->numVisibilityRects;
             out.visibilityRectsTruncated = wo->visibilityRectsTruncated;
             if (wo->numVisibilityRects > 0)
@@ -572,6 +583,27 @@ static BOOL crb_window_common(rdpContext *context, const WINDOW_ORDER_INFO *orde
     {
         ev.payload.windowOrder.visibleOffsetX = windowState->visibleOffsetX;
         ev.payload.windowOrder.visibleOffsetY = windowState->visibleOffsetY;
+    }
+
+    /* W3 route B step 1: the two client-rectangle anchors, bit-gated in TWO INDEPENDENT `if`s
+     * because window.c reads them that way (:334 for CLIENT_AREA_OFFSET, :395 for
+     * WND_CLIENT_DELTA) -- a single combined gate would copy one pair's never-written value
+     * whenever only the other bit was set. Same memset-zero else-case discipline as OWNER and
+     * VIS_OFFSET above; WindowModel/PendingWindowState's delta-merge is what turns "bit absent"
+     * into "keep prior value", not this transport layer.
+     *
+     * MEASUREMENT ONLY: the sole reader is window-smoke's `[client-rect]` line. Neither
+     * `macContentRect` nor the outbound ClientWindowMove deduction touches these. */
+    if (orderInfo->fieldFlags & WINDOW_ORDER_FIELD_CLIENT_AREA_OFFSET)
+    {
+        ev.payload.windowOrder.clientOffsetX = windowState->clientOffsetX;
+        ev.payload.windowOrder.clientOffsetY = windowState->clientOffsetY;
+    }
+
+    if (orderInfo->fieldFlags & WINDOW_ORDER_FIELD_WND_CLIENT_DELTA)
+    {
+        ev.payload.windowOrder.windowClientDeltaX = windowState->windowClientDeltaX;
+        ev.payload.windowOrder.windowClientDeltaY = windowState->windowClientDeltaY;
     }
 
     /* adr/0008 §2b: the visibilityRects array's existence (not just its length) is gated

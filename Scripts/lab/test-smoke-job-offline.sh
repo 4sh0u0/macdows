@@ -1175,28 +1175,100 @@ else
 	note "instance: $(tr '\n' ';' < "$JOB")"
 fi
 
-# 30. The TRACKED jobs/smoke-2x-D.env must actually be accepted by the wrapper and produce the run
-#     it describes -- the same property test-relay-offline.sh's case 5 keeps for relay jobs. A
-#     regression pin: what it guards is a future edit to the template that would surface as a
+# 30. EVERY TRACKED smoke job (jobs/smoke-*.env) must be accepted by the wrapper and produce the run
+#     IT describes -- the traversal shape test-relay-offline.sh's case 5 keeps for relay jobs (that
+#     one skips smoke-*.env precisely because this suite owns them). A regression pin: what it
+#     guards is an edit to a template -- or a newly added template -- that would surface as a
 #     refused run on the lab host and nowhere else.
-begin '30 the tracked jobs/smoke-2x-D.env drives the wrapper'
-cp "$SBLAB/jobs/smoke-2x-D.env" "$JOB" || exit 1
-DISPLAY_TEXT='          UI Looks like: 1280 x 720 @ 180.00Hz'
-run_smoke "$SBLAB/smoke-job.command" ""
-reasons=''
-[ "$(child_calls)" = '1' ] || reasons="$reasons launcher-calls=$(child_calls);"
-[ "$(sysprofiler_calls)" = '1' ] || reasons="$reasons display-not-checked;"
-child_has_var 'WINDOW_SMOKE_ADVERTISED_SCALE' && reasons="$reasons D-should-mean-the-knob-is-unset;"
-[ "$(child_env 'WINDOW_SMOKE_MOVE=1')" = '1' ] || reasons="$reasons MOVE;"
-[ "$(child_env 'WINDOW_SMOKE_EXTRA_APPS=notepad')" = '1' ] || reasons="$reasons EXTRA_APPS;"
-[ "$(child_env 'WINDOW_SMOKE_MOVE_TARGET=Notepad|记事本')" = '1' ] || reasons="$reasons MOVE_TARGET;"
-[ "$(child_env "WINDOW_SMOKE_LOG=$SBEVIDENCE/w3-2x-checkpoint/window-smoke-2xD.log")" = '1' ] || reasons="$reasons WINDOW_SMOKE_LOG;"
-[ "$(last_line)" = 'DONE exit=0' ] || reasons="$reasons last-line=[$(last_line)];"
-if [ -z "$reasons" ]; then
-	pass "$CASE: the shipped 2x-D template arms both preflights, leaves the knob unset (product default D) and drives the MOVE + notepad leg"
+#
+#     Every expectation is READ OUT OF THE JOB FILE rather than written here, so the case cannot
+#     drift into pinning a copy of the template instead of the template: a value that changes has
+#     to change what the child is asked to do. The two properties that are per-file and not merely
+#     forwarded get their own arms -- ADVERTISED_SCALE=D means the knob is UNSET (getting that
+#     backwards silently turns a measurement of the product default into one of a fixture knob), and
+#     an EMPTY DISPLAY_LOOKS_LIKE must leave system_profiler unasked rather than asked-and-passed.
+#
+#     REQUIRE_SYMBOL is checked twice over, and the second half is the one that catches a typo: the
+#     symbol is planted in the SANDBOX main.swift so the preflight can pass, and separately grepped
+#     for in the REAL Tools/window-smoke/main.swift. A job naming a symbol this checkout does not
+#     have would otherwise refuse on the lab host, after the operator has set up the display.
+begin '30 every tracked jobs/smoke-*.env drives the wrapper'
+jobs_ok=0
+jobs_total=0
+jobs_failed=''
+mainswift_saved="$(cat "$MAINSWIFT")"
+# The REAL jobs directory, not the sandbox copy of it: earlier cases author their own
+# smoke-*.env fixtures in the sandbox, and a traversal that swept those up would report a
+# tracked-template tally that is mostly this suite's own scaffolding.
+for jobfile in "$LAB"/jobs/smoke-*.env; do
+	jobs_total=$((jobs_total + 1))
+	jobname="$(basename "$jobfile")"
+	reset_run
+	cp "$jobfile" "$JOB" || exit 1
+	# Sourced in a SUBSHELL and handed back through %q: the values reach this shell as data, and
+	# the job file's own assignments never touch the suite's variables. Declared empty first so
+	# a key a template stops carrying cannot be read as the PREVIOUS template's value.
+	j_tag=''; j_batch=''; j_looks=''; j_scale=''; j_move=''; j_extra=''; j_target=''; j_sym=''
+	eval "$(
+		# shellcheck source=/dev/null
+		. "$jobfile" >/dev/null 2>&1
+		printf 'j_tag=%q; j_batch=%q; j_looks=%q; j_scale=%q; j_move=%q; j_extra=%q; j_target=%q; j_sym=%q\n' \
+			"${TAG:-}" "${BATCH:-}" "${DISPLAY_LOOKS_LIKE:-}" "${ADVERTISED_SCALE:-}" \
+			"${MOVE:-0}" "${EXTRA_APPS:-}" "${MOVE_TARGET:-}" "${REQUIRE_SYMBOL:-}"
+	)"
+	reasons=''
+	if [ -n "$j_sym" ]; then
+		grep -qF "$j_sym" "$REPO_ROOT/Tools/window-smoke/main.swift" \
+			|| reasons="$reasons REQUIRE_SYMBOL-absent-from-the-real-main.swift;"
+		printf '%s\nlet labtestPlanted_%s = 1\n' "$mainswift_saved" "$j_sym" > "$MAINSWIFT" || exit 1
+	else
+		printf '%s\n' "$mainswift_saved" > "$MAINSWIFT" || exit 1
+	fi
+	# A geometry the job does NOT name: if an empty DISPLAY_LOOKS_LIKE ever started asking, it
+	# would compare against this and refuse, so the "not asked" arm below cannot pass vacuously.
+	if [ -n "$j_looks" ]; then
+		DISPLAY_TEXT="          UI Looks like: ${j_looks%x*} x ${j_looks#*x} @ 180.00Hz"
+	else
+		DISPLAY_TEXT='          UI Looks like: 640 x 480 @ 60.00Hz'
+	fi
+	run_smoke "$SBLAB/smoke-job.command" ""
+	[ "$(child_calls)" = '1' ] || reasons="$reasons launcher-calls=$(child_calls);"
+	if [ -n "$j_looks" ]; then
+		[ "$(sysprofiler_calls)" = '1' ] || reasons="$reasons display-not-checked;"
+	else
+		[ "$(sysprofiler_calls)" = '0' ] || reasons="$reasons display-checked-without-a-geometry;"
+	fi
+	if [ "$j_scale" = 'D' ]; then
+		child_has_var 'WINDOW_SMOKE_ADVERTISED_SCALE' && reasons="$reasons D-should-mean-the-knob-is-unset;"
+	elif [ "$(child_env "WINDOW_SMOKE_ADVERTISED_SCALE=$j_scale")" != '1' ]; then
+		reasons="$reasons ADVERTISED_SCALE;"
+	fi
+	if [ "$j_move" = '1' ] && [ "$(child_env 'WINDOW_SMOKE_MOVE=1')" != '1' ]; then reasons="$reasons MOVE;"; fi
+	# Internal consistency of the definition itself, not of the wrapper: the MOVE leg aims at a
+	# SECOND window, which only EXTRA_APPS produces, and MOVE_TARGET is the title filter that
+	# picks it. A template with MOVE=1 and neither runs, reports DONE exit=0, and measures one
+	# window shape twice -- and the run record cannot tell that from the target never appearing.
+	if [ "$j_move" = '1' ] && { [ -z "$j_extra" ] || [ -z "$j_target" ]; }; then
+		reasons="$reasons MOVE-without-a-second-window(EXTRA_APPS=[$j_extra] MOVE_TARGET-set=$([ -n "$j_target" ] && echo yes || echo no));"
+	fi
+	if [ -n "$j_extra" ] && [ "$(child_env "WINDOW_SMOKE_EXTRA_APPS=$j_extra")" != '1' ]; then reasons="$reasons EXTRA_APPS;"; fi
+	if [ -n "$j_target" ] && [ "$(child_env "WINDOW_SMOKE_MOVE_TARGET=$j_target")" != '1' ]; then reasons="$reasons MOVE_TARGET;"; fi
+	[ "$(child_env "WINDOW_SMOKE_LOG=$SBEVIDENCE/$j_batch/window-smoke-$j_tag.log")" = '1' ] || reasons="$reasons WINDOW_SMOKE_LOG;"
+	[ "$(last_line)" = 'DONE exit=0' ] || reasons="$reasons last-line=[$(last_line)];"
+	if [ -z "$reasons" ]; then
+		jobs_ok=$((jobs_ok + 1))
+	else
+		jobs_failed="$jobs_failed $jobname:$reasons"
+		note "$jobname trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
+	fi
+done
+printf '%s\n' "$mainswift_saved" > "$MAINSWIFT" || exit 1
+# One verdict for the case, and a floor on the count: jobs/ shrinking to nothing must not read as
+# "all tracked jobs passed".
+if [ "$jobs_total" -ge 2 ] && [ "$jobs_ok" -eq "$jobs_total" ]; then
+	pass "$CASE: all $jobs_total tracked smoke templates arm the preflights they name, map ADVERTISED_SCALE as declared and drive the legs they declare"
 else
-	fail "$CASE:$reasons"
-	note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
+	fail "$CASE: $jobs_ok of $jobs_total tracked smoke jobs drove the run they describe (failed:${jobs_failed:- none}; total<2 means jobs/ shrank)"
 fi
 
 # 31. The etw mode is unchanged by this lane's additions: same copy, same removal, same wrapper.

@@ -243,10 +243,16 @@ struct EmitterContractTests {
         let windowOrder = try #require(sites.first { $0.names.contains("WindowCreate") }?.format)
         // ADR-0018 U-5 step 1 (2026-09-08) appended the four resize margins -- consumers:
         // WindowOrderPayload (decodeIfPresent, absent = 0) and ResizeMarginPayloadTests.
+        // W3 route B step 1 (2026-09-10) appended the four client-rect fields after them --
+        // consumers: WindowOrderPayload (same decodeIfPresent shape), WindowState's bit-gated
+        // merge, ClientRectPayloadTests, ClientRectCorpusPinTests, and window-smoke's
+        // measurement-only `[client-rect]` line. Signed (%d), not %u: window.c reads all four
+        // through Stream_Read_INT32.
         #expect(windowOrder == "\"windowId\":%u,\"fieldFlags\":%u,\"windowOffsetX\":%d,\"windowOffsetY\":%d,"
             + "\"windowWidth\":%u,\"windowHeight\":%u,\"numVisibilityRects\":%u,"
             + "\"style\":%u,\"styleEx\":%u,\"show\":%u,\"title\":\"%s\","
-            + "\"resizeMarginLeft\":%u,\"resizeMarginTop\":%u,\"resizeMarginRight\":%u,\"resizeMarginBottom\":%u")
+            + "\"resizeMarginLeft\":%u,\"resizeMarginTop\":%u,\"resizeMarginRight\":%u,\"resizeMarginBottom\":%u,"
+            + "\"clientOffsetX\":%d,\"clientOffsetY\":%d,\"windowClientDeltaX\":%d,\"windowClientDeltaY\":%d")
 
         var lines: [String] = []
         var lineEvents: [String] = []

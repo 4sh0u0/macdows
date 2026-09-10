@@ -31,7 +31,11 @@ struct WindowModelTests {
         title: String = "",
         ownerWindowId: UInt32 = 0,
         visibleOffsetX: Int32 = 0,
-        visibleOffsetY: Int32 = 0
+        visibleOffsetY: Int32 = 0,
+        clientOffsetX: Int32 = 0,
+        clientOffsetY: Int32 = 0,
+        windowClientDeltaX: Int32 = 0,
+        windowClientDeltaY: Int32 = 0
     ) -> WindowOrderPayload {
         WindowOrderPayload(
             windowId: windowId,
@@ -47,7 +51,11 @@ struct WindowModelTests {
             title: title,
             ownerWindowId: ownerWindowId,
             visibleOffsetX: visibleOffsetX,
-            visibleOffsetY: visibleOffsetY
+            visibleOffsetY: visibleOffsetY,
+            clientOffsetX: clientOffsetX,
+            clientOffsetY: clientOffsetY,
+            windowClientDeltaX: windowClientDeltaX,
+            windowClientDeltaY: windowClientDeltaY
         )
     }
 
@@ -68,6 +76,9 @@ struct WindowModelTests {
     static let fieldSize: UInt32 = 0x0000_0400
     static let fieldOffset: UInt32 = 0x0000_0800
     static let fieldVisOffset: UInt32 = 0x0000_1000 // VIS_OFFSET — must gate visibleOffsetX/Y
+    static let fieldClientAreaOffset: UInt32 = 0x0000_4000 // CLIENT_AREA_OFFSET — must gate clientOffsetX/Y
+    static let fieldWndClientDelta: UInt32 = 0x0000_8000 // WND_CLIENT_DELTA — must gate windowClientDeltaX/Y
+    static let fieldClientAreaSize: UInt32 = 0x0001_0000 // CLIENT_AREA_SIZE — a THIRD bit, gating nothing this model carries
 
     // MARK: - fieldFlags anchor (M2, W4b review): App/RemoteWindowRendering/
     // RemoteWindowRegistry.swift — the Xcode-target Swift rendering layer, a separate
@@ -393,5 +404,87 @@ struct WindowModelTests {
         _ = model.apply(Self.event(.windowUpdate(reanchored), line: 2))
         #expect(model.windows[1]?.visibleOffsetX == 0 && model.windows[1]?.visibleOffsetY == 0, "VIS_OFFSET bit set with value 0 must overwrite, not be mistaken for 'absent'")
         #expect(model.windows[1]?.hasSeenVisibleOffset == true)
+    }
+
+    // MARK: - W3 route B step 1: clientOffsetX/Y + windowClientDeltaX/Y bit-gated delta-merge
+    //
+    // TWO INDEPENDENT validity bits, exactly as window.c reads them (:334 and :395 are separate
+    // `if`s): CLIENT_AREA_OFFSET (0x4000) gates `clientOffsetX/Y`, WND_CLIENT_DELTA (0x8000) gates
+    // `windowClientDeltaX/Y`. Same shape as `resizeMargin*`'s X/Y pair -- and the reason the pair
+    // gets its own tests here rather than riding on the VIS_OFFSET ones: a merge that gated both
+    // on one bit would pass every VIS_OFFSET test in this file and still be wrong.
+
+    @Test("CLIENT_AREA_OFFSET gates clientOffsetX/Y only; WND_CLIENT_DELTA gates windowClientDeltaX/Y only")
+    func clientRectBitsAreIndependent() {
+        var model = WindowModel()
+        _ = model.apply(Self.event(.windowCreate(Self.windowOrder(
+            windowId: 1, fieldFlags: Self.fieldClientAreaOffset,
+            clientOffsetX: 53, clientOffsetY: 91, windowClientDeltaX: 7, windowClientDeltaY: -31
+        )), line: 1))
+        var state = try! #require(model.windows[1])
+        #expect(state.clientOffsetX == 53 && state.clientOffsetY == 91)
+        #expect(state.windowClientDeltaX == 0 && state.windowClientDeltaY == 0,
+                "WND_CLIENT_DELTA was NOT set — the payload's delta values must not leak through the other bit's gate")
+
+        var other = WindowModel()
+        _ = other.apply(Self.event(.windowCreate(Self.windowOrder(
+            windowId: 2, fieldFlags: Self.fieldWndClientDelta,
+            clientOffsetX: 53, clientOffsetY: 91, windowClientDeltaX: 7, windowClientDeltaY: -31
+        )), line: 1))
+        state = try! #require(other.windows[2])
+        #expect(state.windowClientDeltaX == 7 && state.windowClientDeltaY == -31)
+        #expect(state.clientOffsetX == 0 && state.clientOffsetY == 0,
+                "CLIENT_AREA_OFFSET was NOT set — the payload's offset values must not leak through the other bit's gate")
+    }
+
+    @Test("a later update without the client-rect bits must not clear the previously-known values")
+    func clientRectSurvivesUpdateWithoutTheBits() {
+        var model = WindowModel()
+        let created = Self.windowOrder(
+            windowId: 1, fieldFlags: Self.fieldClientAreaOffset | Self.fieldWndClientDelta | Self.fieldSize,
+            width: 1044, height: 940,
+            clientOffsetX: 53, clientOffsetY: 91, windowClientDeltaX: 7, windowClientDeltaY: -31
+        )
+        _ = model.apply(Self.event(.windowCreate(created), line: 1))
+
+        // The corpus's own title-only shape (0x01000004): 9 orders per scenario look like this.
+        let retitled = Self.windowOrder(windowId: 1, fieldFlags: Self.fieldTitle, title: "About")
+        #expect(retitled.fieldFlags & (Self.fieldClientAreaOffset | Self.fieldWndClientDelta) == 0,
+                "test sanity: neither client-rect bit may be set on this update")
+        _ = model.apply(Self.event(.windowUpdate(retitled), line: 2))
+
+        let state = try! #require(model.windows[1])
+        #expect(state.title == "About", "the title bit's own field must still apply")
+        #expect(state.clientOffsetX == 53 && state.clientOffsetY == 91, "an update without CLIENT_AREA_OFFSET must NOT clear the known client origin")
+        #expect(state.windowClientDeltaX == 7 && state.windowClientDeltaY == -31, "an update without WND_CLIENT_DELTA must NOT clear the known delta")
+    }
+
+    @Test("the bits set with value 0 overwrite — 0 is a wire value, not 'absent'")
+    func clientRectZeroOverwrites() {
+        var model = WindowModel()
+        _ = model.apply(Self.event(.windowCreate(Self.windowOrder(
+            windowId: 1, fieldFlags: Self.fieldClientAreaOffset | Self.fieldWndClientDelta,
+            clientOffsetX: 53, clientOffsetY: 91, windowClientDeltaX: 7, windowClientDeltaY: -31
+        )), line: 1))
+        let rezeroed = Self.windowOrder(
+            windowId: 1, fieldFlags: Self.fieldClientAreaOffset | Self.fieldWndClientDelta,
+            clientOffsetX: 0, clientOffsetY: 0, windowClientDeltaX: 0, windowClientDeltaY: 0
+        )
+        _ = model.apply(Self.event(.windowUpdate(rezeroed), line: 2))
+        let state = try! #require(model.windows[1])
+        #expect(state.clientOffsetX == 0 && state.clientOffsetY == 0)
+        #expect(state.windowClientDeltaX == 0 && state.windowClientDeltaY == 0)
+    }
+
+    @Test("CLIENT_AREA_SIZE (0x10000) is a separate bit that gates nothing here — the server never sends it (ClientRectCorpusPinTests: 0 of 202)")
+    func clientAreaSizeGatesNothing() {
+        var model = WindowModel()
+        _ = model.apply(Self.event(.windowCreate(Self.windowOrder(
+            windowId: 1, fieldFlags: Self.fieldClientAreaSize,
+            clientOffsetX: 53, clientOffsetY: 91, windowClientDeltaX: 7, windowClientDeltaY: -31
+        )), line: 1))
+        let state = try! #require(model.windows[1])
+        #expect(state.clientOffsetX == 0 && state.clientOffsetY == 0)
+        #expect(state.windowClientDeltaX == 0 && state.windowClientDeltaY == 0)
     }
 }
