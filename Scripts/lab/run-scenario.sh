@@ -2,10 +2,13 @@
 # Orchestration helper: run one lab step and wait for its DONE line.
 #   run-scenario.sh relay <job-template>   -- stage the runtime share, copy jobs/<t>.env to
 #                                             the runtime job.env, open relay.command
-#   run-scenario.sh smoke <log> KEY=V ...  -- bake env into the runtime smoke-job.command,
-#                                             open it
+#   run-scenario.sh smoke <job> [batch]    -- copy jobs/smoke-<t>.env to the runtime
+#                                             smoke-job.env (with BATCH optionally overridden),
+#                                             open smoke-job.command (one window-smoke run)
 #   run-scenario.sh etw <job-template>     -- copy jobs/etw-<t>.env to the runtime etw-job.env,
 #                                             open wdp-etw.command (Device Portal ETW capture)
+#   run-scenario.sh checkpoint <j> [batch] -- one whole checkpoint through checkpoint.sh: the
+#                                             capture, the run, the snapshot and the gather
 #
 # TRACKED vs RUNTIME -- see the block at the top of run-matrix.sh for the whole story. In
 # short: jobs/*.env and share/*.ps1 next to this file are tracked DEFINITIONS and are never
@@ -86,10 +89,72 @@ etw)
     echo "etw $1 launched"
     ;;
 smoke)
-    LOG="$1"; shift
-    rm -f "$LOG"
-    "$LAB/mk-smoke-job.sh" "WINDOW_SMOKE_LOG=$LOG" "$@" > /dev/null
-    open -a Terminal "$RUNTIME/smoke-job.command"
-    echo "smoke launched log=$LOG"
+    # No staging: window-smoke opens an RDP session but mounts no redirected drive, so filling a
+    # share for it would only widen what the host can reach during a run that has no business
+    # touching it -- the same reasoning as the etw mode's.
+    #
+    # This mode used to GENERATE a runtime .command with the caller's KEY=VALUE pairs baked into
+    # it. It now copies a TRACKED job definition instead, for the reason the block at the top of
+    # run-matrix.sh gives: a run's parameters belong in a reviewed file, not in whatever the last
+    # caller typed. jobs/smoke-*.env are those definitions; smoke-job.command is the one wrapper
+    # that reads them, and it validates every line, key and value before anything is built or
+    # connected. The generator was deleted with this lane -- it had no caller left, and the file it
+    # produced was named .build/lab-runtime/smoke-job.command, one path component away from the
+    # tracked wrapper of the same name.
+    JOB="$1"
+    TEMPLATE="$LAB/jobs/smoke-$JOB.env"
+    # The optional batch override goes into the RUNTIME instance and never into the tracked
+    # template: a later assignment wins when the file is read, so `checkpoint 2x-D
+    # checkpoint-20260910` gives the run a dated evidence directory without anybody editing a file
+    # that is under review. Its shape is checked here because this is the one place a caller's own
+    # string reaches the job file at all.
+    #
+    # The instance is REBUILT rather than appended to, and the separating newline is written HERE
+    # rather than assumed of the template. An append is correct only while every template ends in
+    # one; a template that does not -- an editor without "insert final newline", a hand-assembled
+    # file -- glues `BATCH=<override>` onto its last line, and what happens then depends entirely on
+    # which key that line is. A key with a strict shape is refused, which is survivable. A FREE-TEXT
+    # key (MOVE_TARGET, APP, APP_ARGS) swallows it silently: the value is corrupted, the override is
+    # LOST, and the run goes to the template's own batch reporting DONE exit=0 while the checkpoint
+    # that asked for a dated directory gathers from one nothing was ever written to. Fail-open, in
+    # the one step whose whole job is to say where the evidence goes. The extra blank line the
+    # unconditional newline can leave behind is admitted by the wrapper's grammar and costs nothing.
+    if [ "$#" -ge 2 ] && [ -n "$2" ]; then
+        if ! printf '%s\n' "$2" | grep -qE '^[A-Za-z0-9._-]{1,32}$'; then
+            echo "[smoke] REFUSED: batch override must match ^[A-Za-z0-9._-]{1,32}\$ -- it names .build/evidence/<BATCH>/" >&2
+            exit 2
+        fi
+        # `set -e` covers the read: a template that is not there fails `cat` and stops the mode,
+        # rather than leaving an instance holding nothing but the override.
+        {
+            cat "$TEMPLATE"
+            printf '\n'
+            printf 'BATCH=%s\n' "$2"
+        } > "$RUNTIME/smoke-job.env"
+    else
+        cp "$TEMPLATE" "$RUNTIME/smoke-job.env"
+    fi
+    # Both of the wrapper's logs go, for the reason the etw mode removes its own: a caller polling
+    # for DONE must not be able to read the last run's verdict. The per-TAG name is derived
+    # TEXTUALLY -- the same grep/sed idiom run-window-smoke.command uses for WIN_HOST, last
+    # assignment winning -- and deliberately not by sourcing the job file: smoke-job.command
+    # checks every line's shape BEFORE it executes one, and this script must not be the thing that
+    # runs a job line ahead of that check.
+    rm -f "$RUNTIME/smoke.log"
+    TAG="$(tr -d '\r' < "$RUNTIME/smoke-job.env" | sed -n 's/^\(export \)\{0,1\}TAG=//p' | tail -n 1 | sed -e "s/^[\"']//" -e "s/[\"']\$//")"
+    if printf '%s\n' "$TAG" | grep -qE '^[A-Za-z0-9._-]{1,32}$'; then
+        rm -f "$RUNTIME/smoke-$TAG.log"
+    fi
+    open -a Terminal "$LAB/smoke-job.command"
+    echo "smoke $JOB launched"
+    ;;
+checkpoint)
+    # The orchestrator runs on THIS side (no Terminal hop): it launches the three modes above and
+    # waits on their logs, so it must stay in a shell whose exit status the caller can read.
+    "$LAB/checkpoint.sh" "$@"
+    ;;
+*)
+    echo "run-scenario.sh: unknown mode '$MODE' -- expected relay, etw, smoke or checkpoint" >&2
+    exit 2
     ;;
 esac

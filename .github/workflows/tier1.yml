@@ -248,6 +248,46 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
         run: ./Scripts/lab/test-wdp-etw-offline.sh
 
+      - name: Lab checkpoint lane offline suite
+        # smoke-job.command turns a job file into one window-smoke run, and checkpoint.sh drives a
+        # whole checkpoint through it: ETW capture -> settle -> run -> capture verdict -> server
+        # snapshot -> gather. Both replace untracked, hand-copied .command files that the
+        # 2026-09-09 W3 2x checkpoint ran from, so the guards those copies carried are the ones
+        # this step keeps: the boundary gate BEFORE the job file is read; a job-file line grammar
+        # that judges VALUES as well as key names (an unquoted `DISPLAY_LOOKS_LIKE=1280 x 720` is
+        # an assignment prefixed to the command `x 720`, which on this platform reads stdin and
+        # hangs the wrapper with no DONE line at all); the ADVERTISED_SCALE mapping, where D means
+        # the knob is UNSET in the child's environment; the two preflight refusals (the checkout
+        # must carry the symbol the run is named for, the display must be the geometry its
+        # arithmetic assumes); the order DONE-line -> per-TAG copy -> close the window; and
+        # checkpoint.sh's overlap guard, because two ETW captures disable each other's providers.
+        #
+        # This suite drives the REAL wrapper, the REAL checkpoint.sh, the REAL run-scenario.sh and
+        # the REAL tracked job templates in a mktemp sandbox, with four mutation proofs (gate
+        # bypassed / key whitelist bypassed / overlap guard removed / window closed before the DONE
+        # line) that require the pins to go red against a script with the guard taken out. Inside
+        # the sandbox `open`, `osascript`, `tty`, `system_profiler`, `pgrep` and `mktemp` are
+        # PATH-shimmed and Scripts/run-window-smoke.command is stubbed at its own path, so nothing
+        # is built, no Terminal window opens and no socket is created. The ETW capture and the
+        # relay are not run at all -- their own suites above own them; this one only needs their
+        # signals to appear on a timeline, which a scripted fake provides. HOME is redirected to a
+        # sandbox whose host.env carries an RFC 5737 documentation address and placeholder
+        # credentials, and `python3` deliberately is NOT shimmed because Scripts/lib.sh's boundary
+        # gate evaluates the allowed segments with it.
+        run: ./Scripts/lab/test-smoke-job-offline.sh
+
+      - name: window-smoke source pins
+        # Tools/window-smoke/main.swift is the live-host harness; it has no unit-test target and
+        # Tier 1 has no Xcode, so its contracts are pinned as SOURCE SHAPES (call sites and literal
+        # log lines, never name counts -- a doc comment that mentions a call would otherwise count).
+        # Today's pins are the 2026-09-10 extra-apps retry (one bounded re-send of a ClientExecute
+        # whose window never appeared -- the 2026-09-06 r2a / 2026-09-09 run-1a flake; exactly two
+        # executeProgram call sites, the RETRY / attempts= / retry-outcome= lines built in one place
+        # each, the hard multi-window gate untouched, the knob default-on) and the byte-identical
+        # rasterScale lines (the W3 invariant that no harness change may move). Pure grep/shasum;
+        # the script is red against the parent commit and green against this one by construction.
+        run: ./Scripts/test-window-smoke-pins.sh
+
       - name: Build-script prefix freshness suite
         # Scripts/build-ffmpeg.sh's idempotent skip is gated on a freshness verdict
         # (`--check-prefix`), not on the version stamp alone: a prefix built before a

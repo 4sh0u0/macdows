@@ -20,7 +20,12 @@
 # Usage: Scripts/probe.sh [rail-probe args, e.g. --app 'C:\Windows\System32\winver.exe' --duration 25 --out runs/s1.jsonl]
 #        W3 lane F knobs (ADR-0018 §2 lane F): --desktop <w>x<h>, --scale <d>[,<v>]; both absent =
 #        today's settings sequence, verbatim. `rail-probe --print-plan ...` prints that sequence
-#        without connecting (Scripts/test-rail-probe-plan.sh pins it).
+#        without connecting -- --app/--out and even $WIN_PASS may be omitted with --print-plan
+#        (--host/--user are still required; gate r1-A I-3 dropped the --pass requirement, since
+#        that path never reads it). This script itself still sources host.env and exports all
+#        three (a --print-plan run through it always has WIN_PASS available; the relaxation only
+#        matters when rail-probe is invoked directly). Scripts/test-rail-probe-plan.sh pins the
+#        sequence and both relaxations.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=Scripts/lib.sh
@@ -126,5 +131,22 @@ cmake --build "$BUILD_DIR" -j"$(sysctl -n hw.ncpu)"
 BIN="$BUILD_DIR/rail-probe"
 [ -x "$BIN" ] || die "build succeeded but $BIN was not produced"
 
-log "Running rail-probe against host from \$WIN_HOST (value withheld from this script's own log output)"
+# gate r1-A m-11: --print-plan never dials (it returns before any FreeRDP context, socket or
+# --out file exists -- see rail-probe.c's --print-plan branch), so logging "Running rail-probe
+# against host ..." for that invocation was simply wrong, not just misleading. Detected the only
+# way this script can, without teaching it rail-probe's option grammar: an exact "--print-plan"
+# token anywhere in argv (matching parse_args, which only recognises it that way too -- there is
+# no --print-plan=1 form for this to miss).
+PRINT_PLAN=0
+for arg in "$@"; do
+	if [ "$arg" = "--print-plan" ]; then
+		PRINT_PLAN=1
+		break
+	fi
+done
+if [ "$PRINT_PLAN" -eq 1 ]; then
+	log "Printing the pre-connect settings plan (no connection)"
+else
+	log "Running rail-probe against host from \$WIN_HOST (value withheld from this script's own log output)"
+fi
 exec "$BIN" "$@"
