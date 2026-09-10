@@ -331,9 +331,14 @@ fi
 begin '5 tracked jobs'
 jobs_ok=0; jobs_total=0
 for jobfile in "$LAB"/jobs/*.env; do
-	# jobs/etw-*.env are Device Portal ETW capture jobs (run-scenario.sh etw <name> -> wdp-etw.command);
-	# they carry no PROGRAM and never reach the relay. test-wdp-etw-offline.sh is their suite.
-	case "$(basename "$jobfile")" in etw-*.env) continue ;; esac
+	# Three job families in jobs/ are not relay jobs: they carry no PROGRAM and never reach
+	# xfreerdp, so the /app pin below has nothing to say about them.
+	#   etw-*.env         Device Portal ETW capture   (run-scenario.sh etw   -> wdp-etw.command)
+	#   smoke-*.env       one window-smoke run        (run-scenario.sh smoke -> smoke-job.command)
+	#   checkpoint-*.env  a whole checkpoint          (run-scenario.sh checkpoint -> checkpoint.sh,
+	#                     which drives all three of the above, the relay included)
+	# test-wdp-etw-offline.sh and test-smoke-job-offline.sh are their suites.
+	case "$(basename "$jobfile")" in etw-*.env | smoke-*.env | checkpoint-*.env) continue ;; esac
 	jobs_total=$((jobs_total + 1))
 	: > "$LABTEST_TRACE"
 	cp "$jobfile" "$SBRUNTIME/job.env" || exit 1

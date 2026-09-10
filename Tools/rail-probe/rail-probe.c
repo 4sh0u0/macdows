@@ -412,7 +412,9 @@ static void usage(const char* prog)
 	       "before.\n"
 	       "  --print-plan             Print the pre-connect settings sequence this configuration would "
 	       "apply -- one 'set <FreeRDP_Key> = <value>' line each, in order -- and exit 0 without "
-	       "connecting. The usual required arguments still apply; --out is never opened.\n"
+	       "connecting. --host/--user are still required; --app, --out and the password ($WIN_PASS) "
+	       "may all be omitted on this path (--out is never opened, and the print sink never reads "
+	       "a password either way).\n"
 	       "  --out <file.jsonl>       JSON Lines event log output path\n"
 	       "  --help                   Show this help and exit\n",
 	       prog);
@@ -470,6 +472,20 @@ static bool parse_scale_knob(const char* text, uint32_t* desktop, uint32_t* devi
 	*desktop = (uint32_t)d;
 	*device = (uint32_t)v;
 	return true;
+}
+
+/* Appends "--name" to buf, joined to whatever is already there with a "/" (matching the
+ * historical "--host/--user/--app/--out" spelling) -- so the missing-argument messages below
+ * can name exactly the flags that are actually absent instead of a fixed list (gate r1-A I-3:
+ * the fixed list used to fire even when every flag on it was present, because it was really
+ * reporting a still-required --pass that has no flag to name). `buf`/`bufsz` are always a
+ * small stack array sized for the longest possible result, so a truncated write here is
+ * unreachable rather than a real failure mode; silently doing nothing on overflow is enough. */
+static void append_missing_arg(char* buf, size_t bufsz, size_t* off, const char* name)
+{
+	int n = snprintf(buf + *off, bufsz - *off, "%s%s", (*off == 0) ? "" : "/", name);
+	if (n > 0 && (size_t)n < bufsz - *off)
+		*off += (size_t)n;
 }
 
 static bool parse_args(int argc, char** argv, probeConfig* cfg)
@@ -582,11 +598,74 @@ static bool parse_args(int argc, char** argv, probeConfig* cfg)
 		}
 	}
 
+	if (cfg->print_plan)
+	{
+		/* --print-plan describes the pre-connect settings sequence and exits before any
+		 * FreeRDP context, socket or --out file exists (main() returns before reaching any of
+		 * that -- see the comment above probe_settings_plan). --app and --out are therefore not
+		 * needed on this path and become optional; --host/--user stay required because
+		 * probe_settings_plan's print sink never lists them (same as it always has -- they are
+		 * applied outside the plan, in main(), on the connect path), so the only way this tool
+		 * can report "which host/user would this run be" is by requiring them up front.
+		 *
+		 * gate r1-A I-3: --pass is NOT required on this path either, as of this change.
+		 * probe_plan_print (the print sink fed to probe_settings_plan below) only ever reads
+		 * item->boolValue/uint32Value/stringValue -- cfg->app is the only cfg field the plan
+		 * touches -- and main()'s one cfg->pass read (FreeRDP_Password) sits on the connect
+		 * path, after the `if (cfg.print_plan) return ...;` branch has already returned. Asking
+		 * an operator for a live host's password just to print a plan that never looks at it
+		 * was the actual bug: it reproduced the exact "exit 2, can't tell what's really
+		 * missing" shape that tool m-1 was filed for, just one flag later. */
+		if (!cfg->host[0] || !cfg->user[0])
+		{
+			char missing[32] = { 0 };
+			size_t off = 0;
+			if (!cfg->host[0])
+				append_missing_arg(missing, sizeof(missing), &off, "--host");
+			if (!cfg->user[0])
+				append_missing_arg(missing, sizeof(missing), &off, "--user");
+			fprintf(stderr,
+			        "Missing required argument(s): %s (may come from WIN_HOST/WIN_USER env "
+			        "vars); --print-plan does not require --app/--out/--pass\n",
+			        missing);
+			usage(argv[0]);
+			return false;
+		}
+		return true;
+	}
+
 	if (!cfg->host[0] || !cfg->user[0] || !cfg->pass[0] || !cfg->app[0] || !cfg->out_path[0])
 	{
-		fprintf(stderr, "Missing required argument(s): --host/--user/--app/--out "
-		                "(host/user/pass may come from WIN_HOST/WIN_USER/WIN_PASS env vars; "
-		                "pass is env-only, there is no --pass flag)\n");
+		/* gate r1-A I-3: name exactly what is missing among the four flag-bearing arguments,
+		 * instead of always printing the full "--host/--user/--app/--out" list (which used to
+		 * fire, misleadingly, even when e.g. only --app was absent and the other three were
+		 * all present -- see the case this replaces above). --pass has no flag to name (it is
+		 * WIN_PASS-only, by design -- see usage()), so it is never added to that list; the
+		 * `off == 0` fallback below is the one shape where --pass is the *only* thing missing
+		 * and the four-item list would otherwise be empty. */
+		char missing[64] = { 0 };
+		size_t off = 0;
+		if (!cfg->host[0])
+			append_missing_arg(missing, sizeof(missing), &off, "--host");
+		if (!cfg->user[0])
+			append_missing_arg(missing, sizeof(missing), &off, "--user");
+		if (!cfg->app[0])
+			append_missing_arg(missing, sizeof(missing), &off, "--app");
+		if (!cfg->out_path[0])
+			append_missing_arg(missing, sizeof(missing), &off, "--out");
+		if (off == 0)
+		{
+			fprintf(stderr, "Missing required argument: WIN_PASS (env-only, there is no --pass "
+			                "flag; --host/--user/--app/--out are all present)\n");
+		}
+		else
+		{
+			fprintf(stderr,
+			        "Missing required argument(s): %s (host/user/pass may come from "
+			        "WIN_HOST/WIN_USER/WIN_PASS env vars; pass is env-only, there is no --pass "
+			        "flag)\n",
+			        missing);
+		}
 		usage(argv[0]);
 		return false;
 	}

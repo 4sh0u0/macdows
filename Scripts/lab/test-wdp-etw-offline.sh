@@ -42,9 +42,10 @@
 #      reached" assertion at the end covers the whole run.
 #
 # Each case starts with `begin`, which resets the per-case trace, the sandbox log and the job
-# instance, so no case depends on what the previous one left behind. Three mutation proofs
-# (M1 gate bypassed, M2 credential removal disabled, M3 log mask disabled) copy the wrapper with
-# one guard removed and require the case that claims to pin it to FAIL against the mutant. A pin
+# instance, so no case depends on what the previous one left behind. Four mutation proofs
+# (M1 gate bypassed, M2 credential removal disabled, M3 log mask disabled, M4 masking pipeline
+# reverted to block buffering) copy the wrapper with one guard removed and require the case that
+# claims to pin it to FAIL against the mutant. A pin
 # that would also pass against the broken code pins nothing.
 #
 # Exit: 0 if every case passed, 1 otherwise.
@@ -135,8 +136,39 @@ cat > "$SBLAB/wdp_etw.py" <<'STUB_CLIENT' || exit 1
 and contents and its argv, then exits with LABTEST_CLIENT_RC. Opens no socket, writes no capture."""
 import os
 import sys
+import time
+
+if os.environ.get("LABTEST_CLIENT_WS_OPEN") == "1":
+    # Stand-in for the real client's `say("WS-OPEN")` (wdp_etw.py's `say()` flushes after every
+    # line). The `running` sentinel is written FIRST, then WS-OPEN is printed and flushed: the
+    # sandbox's wait for "the client is up" (case 26, M4) polls the sentinel, and if the log line
+    # could in principle land before the sentinel file does, a fast reader could see WS-OPEN with
+    # no sentinel yet on disk and misreport the client as not-yet-running. Writing the sentinel
+    # first removes that ordering risk entirely rather than relying on the sentinel path being
+    # slower (forking `sed` before it can never be faster than a local file write, but "faster"
+    # is not the same guarantee as "always"). This process then stays alive -- the sentinel now on
+    # disk -- for up to 5s or until a `release` file appears, whichever comes first. That is the
+    # window in which the sandbox checks whether WS-OPEN already reached etw.log even though this
+    # process has not exited: a masking pipeline that buffers a whole block before writing would
+    # show nothing here (case 26's M4 mutant), one that writes per line would.
+    running_file = os.environ.get("LABTEST_RUNNING_FILE", "")
+    if running_file:
+        with open(running_file, "w") as handle:
+            handle.write("running\n")
+    print("WS-OPEN", flush=True)
+    release_file = os.environ.get("LABTEST_RELEASE_FILE", "")
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if release_file and os.path.exists(release_file):
+            break
+        time.sleep(0.05)
 
 lines = ["client-run"]
+# The pid of the process that started this client -- which is the WRAPPER's own pid, because the
+# capture runs as `env ... python3 wdp_etw.py | etw_sink` and bash forks one child per pipeline
+# element. That is what makes "the number the wrapper logged is its own pid" a checkable claim
+# (case 17c) rather than "a number of the right shape".
+lines.append("client-ppid %d" % os.getppid())
 for key in sorted(os.environ):
     if key.startswith("WDP_"):
         lines.append("client-env %s=%s" % (key, os.environ[key]))
@@ -247,6 +279,19 @@ cat > "$SB/bin/osascript" <<'SHIM_OSA' || exit 1
 printf 'osascript:unexpected-call\n' >> "$LABTEST_REFUSED_TRACE"
 exit 97
 SHIM_OSA
+cat > "$SB/bin/labtest-stdin-cmd" <<'SHIM_STDIN' || exit 1
+#!/usr/bin/env bash
+# OFFLINE TEST SHIM standing in for the program an UNQUOTED job value would run. `TAG=a b` is an
+# assignment prefixed to the command `b`, so this is what `b` looks like in the shape that was
+# actually measured on the lab Mac: a command that exists on PATH and reads stdin (there,
+# /opt/X11/bin/x). It records that it ran -- the whole point of the line grammar is that this
+# never happens -- and then reads one line, which is instant when stdin is closed and up to 30s
+# when it is not. Bounded rather than infinite so a suite that ever reaches it cannot be left with
+# a process nobody owns.
+set -u
+printf 'job-line-executed\n' >> "$LABTEST_TRACE"
+IFS= read -r -t 30 _labtest_ignored || true
+SHIM_STDIN
 chmod +x "$SB"/bin/* || exit 1
 for shim in "$SB"/bin/*; do
 	if ! bash -n "$shim"; then printf 'shim does not parse: %s\n' "$shim"; exit 1; fi
@@ -327,7 +372,7 @@ GOOD_PROVIDERS='1139c61b-b549-4251-8ed3-27250a1edec8:5;c76baa63-ae81-421c-b425-3
 # `${MACDOWS_LAB_BOUNDARY_FILE:-…}` treats exactly like unset: the wrapper resolves the DEFAULT
 # path under the sandbox HOME, as it does live. (A plain variable, not an array -- `"${arr[@]}"`
 # on an empty array is an unbound-variable error under bash 3.2 + `set -u`.)
-run_etw() { # <wrapper-path> <boundary-file|""> [client-rc] [client-stderr 0|1]
+run_etw() { # <wrapper-path> <boundary-file|""> [client-rc] [client-stderr 0|1] [ws-open 0|1] [running-file] [release-file]
 	env -i \
 		HOME="$SBHOME" \
 		PATH="$SB/bin:$PATH" \
@@ -337,6 +382,9 @@ run_etw() { # <wrapper-path> <boundary-file|""> [client-rc] [client-stderr 0|1]
 		LABTEST_REFUSED_TRACE="$LABTEST_REFUSED_TRACE" \
 		LABTEST_CLIENT_RC="${3:-0}" \
 		LABTEST_CLIENT_STDERR="${4:-0}" \
+		LABTEST_CLIENT_WS_OPEN="${5:-0}" \
+		LABTEST_RUNNING_FILE="${6:-}" \
+		LABTEST_RELEASE_FILE="${7:-}" \
 		MACDOWS_LAB_BOUNDARY_FILE="$2" \
 		bash "$1" >/dev/null 2>&1
 }
@@ -478,14 +526,96 @@ case_invalid '12b TAG with a traversal' \
 PROVIDERS='$GOOD_PROVIDERS'
 " 'JOB-ENV-INVALID -- TAG' 'a TAG that is a relative path is not a name'
 
-# 13. A value that spans lines shifts every following key, so the sentinel line is what proves the
-#     read stayed aligned. Refused as JOB-ENV-INVALID rather than acted on with keys that silently
-#     hold the wrong values (same failure the relay's sentinel closes).
-case_invalid '13 multi-line job value' \
-	"TAG=smoke
-PROVIDERS='1139c61b-b549-4251-8ed3-27250a1edec8:5
-c76baa63-ae81-421c-b425-340b4b24157f:5'
-" 'spans more than one line' 'a PROVIDERS value with an embedded newline'
+# 13. A value that spans lines shifts every following key, so the run would proceed with keys that
+#     silently hold the wrong values (the same failure the relay's sentinel closes). TWO guards
+#     catch it and this case measures both, because they catch different FILES: the line grammar
+#     refuses a naive continuation (its second line is not an assignment to a permitted key), while
+#     a continuation whose second line HAPPENS to look like one gets past the grammar and is caught
+#     by the sentinel instead. Both answer 65, and that is deliberate: "this file is not a table of
+#     values" is ONE answer to the caller, and which guard reached that answer is a question for the
+#     reason line above DONE (the grammar names a line NUMBER, the sentinel says "spans more than
+#     one line"), not for the exit code. The code a reader acts on has to be the same for both,
+#     because the action is the same -- go and fix the job file. Both halves assert that reason line
+#     as well as the code, so the two guards remain distinguishable to a human.
+begin '13 multi-line job value'
+reasons=''
+printf "TAG=smoke\nPROVIDERS='%s\n%s'\n" \
+	'1139c61b-b549-4251-8ed3-27250a1edec8:5' 'c76baa63-ae81-421c-b425-340b4b24157f:5' > "$JOB"
+run_etw "$SBLAB/wdp-etw.command" ""
+grep -qF 'is neither blank, a comment, nor an assignment' "$LOG" || reasons="$reasons grammar-did-not-catch-the-plain-continuation;"
+[ "$(last_line)" = 'DONE exit=65' ] || reasons="$reasons grammar-case-last-line=[$(last_line)];"
+[ "$(client_calls)" = '0' ] || reasons="$reasons grammar-case-client-ran;"
+# The one shape the line grammar cannot see: a trailing `\"` inside a double-quoted value escapes
+# the closing quote, so the value runs on to the next line -- and that next line is a COMMENT,
+# which the grammar admits. Both lines pass; PROVIDERS still ends up carrying a newline, PIN_RECORD
+# ends up holding a comment and the sentinel ends up holding PIN_RECORD's value.
+begin "$CASE"
+printf 'TAG=smoke\nDURATION=30\nPROVIDERS="a\\"\n# still inside the string"\nPIN_RECORD=0\n' > "$JOB"
+run_etw "$SBLAB/wdp-etw.command" ""
+grep -qF 'spans more than one line' "$LOG" || reasons="$reasons sentinel-did-not-catch-it[$(last_line)];"
+[ "$(last_line)" = 'DONE exit=65' ] || reasons="$reasons sentinel-case-last-line=[$(last_line)];"
+[ "$(client_calls)" = '0' ] || reasons="$reasons sentinel-case-client-ran;"
+[ "$(mktemp_calls)" = '0' ] || reasons="$reasons credential-file-created;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: a plain continuation is refused by the line grammar (nothing executed) and a grammar-shaped one by the sentinel; both answer DONE exit=65 and are told apart by their reason lines; no client and no credential file either way"
+else
+	fail "$CASE:$reasons"; note "log: $(tr '\n' ';' < "$LOG")"
+fi
+
+# 13b. THE LINE GRAMMAR. A job file is a table of values or it does not run, and the VALUE half of
+#      that rule is what this case measures. To the shell, `TAG=a b` is an assignment PREFIXED to
+#      the command `b`, so a wrapper that whitelisted only KEY NAMES would still run programs out
+#      of a job file. Measured on the sibling wrapper rather than theorised: an early draft of
+#      smoke-job.command hung FOREVER on `DISPLAY_LOOKS_LIKE=1280 x 720`, because /opt/X11/bin/x
+#      exists on the lab Mac and reads stdin -- no DONE line at all, and every orchestrator polling
+#      for one waited out its full timeout.
+#      Two shapes, because they fail differently: `TAG=a b`, whose second word does not exist, and
+#      the same shape with a command that DOES exist and reads stdin, which is the form that hung.
+#      Both must be refused as TEXT, before a single line of the file is executed -- the witness
+#      line is the measurement -- and the wrapper must still reach its DONE line quickly. (M5 pins
+#      this.)
+begin '13b the line grammar refuses an unquoted value before any line runs'
+reasons=''
+printf 'TAG=a b\nDURATION=30\nPROVIDERS=%s\nPIN_RECORD=0\n' "'$GOOD_PROVIDERS'" > "$JOB"
+run_etw "$SBLAB/wdp-etw.command" ""
+grep -qF 'JOB-ENV-INVALID' "$LOG" || reasons="$reasons two-word-value-not-refused;"
+[ "$(last_line)" = 'DONE exit=65' ] || reasons="$reasons two-word-last-line=[$(last_line)];"
+[ "$(client_calls)" = '0' ] || reasons="$reasons two-word-client-ran;"
+[ "$(mktemp_calls)" = '0' ] || reasons="$reasons two-word-credential-file-created;"
+# The reason line names the line NUMBER and never the line: an offending value may BE the secret
+# that must not be printed. (`grep -qF ' b'` would not do -- the wrapper's own "so this log is safe
+# to paste" line contains it.)
+grep -qF 'TAG=a b' "$LOG" && reasons="$reasons the-offending-line-was-echoed;"
+# jobs/etw-smoke.env is 48 lines of which 40 are comment, so "put a note at the end of this line" is
+# the natural next edit -- and the grammar refuses it. The reason has to SAY that, or the reader
+# follows the advice about quoting, quotes the comment, and is refused a second time.
+grep -qF 'a comment must be on a line of its own' "$LOG" \
+	|| reasons="$reasons reason-does-not-name-the-comment-rule;"
+# The shape that hung. `begin` again, with the same label: it resets the trace, the log and the job
+# instance, so the two halves of this case cannot read each other's evidence.
+begin "$CASE"
+printf 'TAG=a labtest-stdin-cmd\nDURATION=30\nPROVIDERS=%s\nPIN_RECORD=0\n' "'$GOOD_PROVIDERS'" > "$JOB"
+run_etw "$SBLAB/wdp-etw.command" "" &
+RUN_PID=$!
+waited=0
+while kill -0 "$RUN_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do
+	sleep 0.1
+	waited=$((waited + 1))
+done
+if kill -0 "$RUN_PID" 2>/dev/null; then
+	kill -9 "$RUN_PID" 2>/dev/null
+	reasons="$reasons WRAPPER-STILL-RUNNING-AFTER-5s;"
+fi
+wait "$RUN_PID" 2>/dev/null
+grep -q '^job-line-executed$' "$LABTEST_TRACE" && reasons="$reasons THE-JOB-FILE-WAS-EXECUTED;"
+grep -qF 'JOB-ENV-INVALID' "$LOG" || reasons="$reasons stdin-command-not-refused;"
+[ "$(last_line)" = 'DONE exit=65' ] || reasons="$reasons stdin-command-last-line=[$(last_line)];"
+[ "$(client_calls)" = '0' ] || reasons="$reasons stdin-command-client-ran;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: an unquoted TAG=a b and the same shape naming a command that reads stdin are both refused as text with DONE exit=65, and the reason names the comment rule as well as the quoting one -- nothing in the job file ran, no credential file was created, and the wrapper reported inside 5s"
+else
+	fail "$CASE:$reasons"; note "log: $(tr '\n' ';' < "$LOG")"
+fi
 
 # 14. No certificate pin on disk and PIN_RECORD=0: refused with PIN-MISSING and DONE exit=79
 #     (the client's own EX_PIN), before the credential file exists. This is the rule that keeps
@@ -687,6 +817,48 @@ else
 	fail "$CASE:$reasons"; note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
 fi
 
+# 17c. THE PID LINE. checkpoint.sh's overlap guard has to answer "is a capture still in flight?"
+#      before it launches another one, because two realtime subscriptions against the same portal
+#      disable each other's providers and the damage lands in the OTHER run's evidence. The signal
+#      it reads is this line: the wrapper writes its OWN pid into etw.log right after the capture's
+#      start line and BEFORE it dials, so a guard can `kill -0` it.
+#      Pinned three ways, because each answers a different way of getting it wrong: the number is
+#      the process that started the client (its ppid -- not merely "a number of the right shape");
+#      there is exactly ONE such line (a guard reading the wrong one of several would be watching a
+#      process that already exited); and it precedes the client's first output, since a pid written
+#      after the dial arrives too late for a guard that must decide before the second capture is
+#      launched.
+begin '17c the wrapper records its own pid before it dials'
+mkdir -p "$SBWDP" || exit 1
+printf '%s\n' "$FAKE_FP" > "$PINFILE"
+write_job smoke 30 "$GOOD_PROVIDERS" 0
+PID_RELEASE="$SB/pid-release"
+# Created BEFORE the run: the stub breaks out of its wait on the first poll, so this case pays for
+# the WS-OPEN line without paying for the 5s window case 26 needs.
+: > "$PID_RELEASE"
+run_etw "$SBLAB/wdp-etw.command" "" 0 0 1 "$SB/pid-running" "$PID_RELEASE"
+reasons=''
+pid_lines="$(grep -c '^\[etw\] pid=[0-9][0-9]*$' "$LOG" 2>/dev/null || true)"
+logged_pid="$(sed -n 's/^\[etw\] pid=\([0-9][0-9]*\)$/\1/p' "$LOG" | head -n 1)"
+client_ppid="$(sed -n 's/^client-ppid //p' "$LABTEST_TRACE" | head -n 1)"
+tag_line="$(grep -n '^\[etw\] etw capture tag=' "$LOG" | head -n 1 | cut -d: -f1)"
+pid_line="$(grep -n '^\[etw\] pid=' "$LOG" | head -n 1 | cut -d: -f1)"
+ws_line="$(grep -n '^WS-OPEN$' "$LOG" | head -n 1 | cut -d: -f1)"
+[ "$pid_lines" = '1' ] || reasons="$reasons pid-lines=$pid_lines;"
+if [ -z "$logged_pid" ] || [ "$logged_pid" != "$client_ppid" ]; then
+	reasons="$reasons logged-pid=[$logged_pid]-client-ppid=[$client_ppid];"
+fi
+if [ -z "$tag_line" ] || [ -z "$pid_line" ] || [ -z "$ws_line" ] \
+	|| [ "$tag_line" -ge "$pid_line" ] || [ "$pid_line" -ge "$ws_line" ]; then
+	reasons="$reasons order=[tag:$tag_line pid:$pid_line ws-open:$ws_line];"
+fi
+[ "$(last_line)" = 'DONE exit=0' ] || reasons="$reasons last-line=[$(last_line)];"
+if [ -z "$reasons" ]; then
+	pass "$CASE: exactly one [etw] pid= line, carrying the pid of the process that started the client, written after the capture's start line and before the client's first output"
+else
+	fail "$CASE:$reasons"; note "log: $(tr '\n' ';' < "$LOG")"
+fi
+
 # 18. etw.log is what a human pastes into a report, so the address, the account and the local
 #     account name appear only in their masked form and the password not at all. The masked forms
 #     have to BE there: an empty mask would satisfy a "does not contain" assertion on its own.
@@ -730,6 +902,31 @@ if [ -z "$reasons" ]; then
 	pass "$CASE: trailing CRs are stripped from TAG/DURATION/PROVIDERS/PIN_RECORD; the job is accepted and no CR reaches the client"
 else
 	fail "$CASE:$reasons"; note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
+fi
+
+# 19b. A CR in the MIDDLE of a value. The line grammar judges the file with every CR deleted, so
+#      `TAG=sm<CR>oke` is admitted as the text `TAG=smoke` -- but the subshell reads the ORIGINAL
+#      file, and a strip that took only the TRAILING CR handed back `sm<CR>oke`, which then failed
+#      TAG's own shape check. Two guards disagreeing about the same file: the grammar said yes, the
+#      shape check said no, and the reason printed was about TAG's character class rather than about
+#      a stray CR. Every CR is removed now, and the value the client gets is the value the grammar
+#      admitted. checkpoint.sh reads this same file with tr -d '\r' to build the waits an
+#      orchestrator runs on, so agreeing with it is not cosmetic: they name the same JSONL.
+begin '19b a CR inside a value, not only at the end of the line'
+mkdir -p "$SBWDP" || exit 1
+printf '%s\n' "$FAKE_FP" > "$PINFILE"
+printf 'TAG=sm\roke\r\nDURATION=30\r\nPROVIDERS=%s\r\nPIN_RECORD=0\r\n' "'$GOOD_PROVIDERS'" > "$JOB"
+run_etw "$SBLAB/wdp-etw.command" ""
+reasons=''
+[ "$(client_calls)" = '1' ] || reasons="$reasons client-calls=$(client_calls);"
+[ "$(client_env "WDP_OUT=$SBWDP/etw-smoke.jsonl")" = '1' ] || reasons="$reasons WDP_OUT;"
+[ -f "$SBRUNTIME/wdp/etw-smoke.log" ] || reasons="$reasons per-TAG-log-not-named-etw-smoke.log;"
+grep -q "$(printf '\r')" "$LABTEST_TRACE" && reasons="$reasons bare-CR-reached-the-client;"
+[ "$(last_line)" = 'DONE exit=0' ] || reasons="$reasons last-line=[$(last_line)];"
+if [ -z "$reasons" ]; then
+	pass "$CASE: a CR anywhere in TAG is removed, so the grammar and the shape check judge the same value and the capture is named etw-smoke.jsonl"
+else
+	fail "$CASE:$reasons"; note "trace: $(tr '\n' ';' < "$LABTEST_TRACE" | tr '\r' '?')"
 fi
 
 # 20. The client's exit code IS the run's verdict -- unlike the relay, whose xfreerdp exit says
@@ -855,6 +1052,79 @@ else
 	fail "$CASE: tracked tree changed"; diff "$TRACKED_PRISTINE" <(snapshot_tracked) | sed 's/^/        /'
 fi
 
+# 26. WS-OPEN is the client's first line once the WebSocket is up, and it must reach etw.log WHILE
+#     the client is still running -- not only after it exits. The stub writes a `running` sentinel
+#     (per m-2, BEFORE it prints WS-OPEN), prints WS-OPEN (flushed, exactly like the real client's
+#     `say()`), then blocks on a `release` file for up to 5s so this case can look at the log
+#     before the pipe closes. This is the fix for the gap the 2026-09-09 checkpoint hit (record
+#     m-2): a masking pipeline that buffers a whole block before writing leaves etw.log empty
+#     until the client exits, so an orchestrator can only treat the JSONL file's appearance as
+#     "the socket is open".
+#     Waiting for the sentinel and polling the log are two SEPARATE bounded waits (record m-1):
+#     first up to 5s for the sentinel to appear (this is "has the wrapper even gotten the client
+#     running yet", a question about the harness/machine, not about the masking pipeline), and
+#     only once that is true, up to 3s of polling etw.log for WS-OPEN. Folding both into one
+#     window let a slow-to-start wrapper (nothing to do with the defect this case exists to catch)
+#     produce the same `seen=0` a real block-buffering regression would, on a machine too loaded to
+#     start the client inside the old single 2s bound.
+begin '26 WS-OPEN reaches etw.log before the client exits'
+mkdir -p "$SBWDP" || exit 1
+printf '%s\n' "$FAKE_FP" > "$PINFILE"
+write_job smoke 30 "$GOOD_PROVIDERS" 0
+RUNNING_FILE="$SB/ws-open-running"
+RELEASE_FILE="$SB/ws-open-release"
+rm -f "$RUNNING_FILE" "$RELEASE_FILE"
+env -i \
+	HOME="$SBHOME" \
+	PATH="$SB/bin:$PATH" \
+	TMPDIR="$SBTMP" \
+	TERM_PROGRAM= \
+	LABTEST_TRACE="$LABTEST_TRACE" \
+	LABTEST_REFUSED_TRACE="$LABTEST_REFUSED_TRACE" \
+	LABTEST_CLIENT_RC=0 \
+	LABTEST_CLIENT_STDERR=0 \
+	LABTEST_CLIENT_WS_OPEN=1 \
+	LABTEST_RUNNING_FILE="$RUNNING_FILE" \
+	LABTEST_RELEASE_FILE="$RELEASE_FILE" \
+	MACDOWS_LAB_BOUNDARY_FILE="" \
+	bash "$SBLAB/wdp-etw.command" >/dev/null 2>&1 &
+WRAPPER_PID=$!
+RUNNING_SEEN=0
+SECONDS=0
+while [ "$SECONDS" -lt 5 ]; do
+	if [ -f "$RUNNING_FILE" ]; then
+		RUNNING_SEEN=1
+		break
+	fi
+	if ! kill -0 "$WRAPPER_PID" 2>/dev/null; then
+		break
+	fi
+	sleep 0.1
+done
+SEEN=0
+STILL_RUNNING=0
+if [ "$RUNNING_SEEN" -eq 1 ]; then
+	SECONDS=0
+	while [ "$SECONDS" -lt 3 ]; do
+		if grep -qF 'WS-OPEN' "$LOG" 2>/dev/null; then
+			SEEN=1
+			if [ -f "$RUNNING_FILE" ] && kill -0 "$WRAPPER_PID" 2>/dev/null; then
+				STILL_RUNNING=1
+			fi
+			break
+		fi
+		sleep 0.1
+	done
+fi
+: > "$RELEASE_FILE"
+wait "$WRAPPER_PID"
+if [ "$RUNNING_SEEN" -eq 1 ] && [ "$SEEN" -eq 1 ] && [ "$STILL_RUNNING" -eq 1 ] \
+	&& assert_eq "$(last_line)" 'DONE exit=0' 'last log line'; then
+	pass "$CASE: the running sentinel appeared within 5s and WS-OPEN reached etw.log within 3s of it, while the client stub was still blocked on its release file"
+else
+	fail "$CASE: running_seen=$RUNNING_SEEN seen=$SEEN still_running=$STILL_RUNNING"; note "log: $(tr '\n' ';' < "$LOG")"
+fi
+
 # ------------------------------------------------------------------------------------------
 # Mutation proofs: the pins above must FAIL against a wrapper with the guard removed.
 # ------------------------------------------------------------------------------------------
@@ -928,9 +1198,140 @@ else
 	fail "$CASE: could not build the mutant (etw_sink moved?)"
 fi
 
+# M4. The masking pipeline reverted to a single persistent `sed`/`cat` (etw_mask_pipe's old,
+#     block-buffered body): case 26's WS-OPEN-while-still-running pin must now go red, because the
+#     mutant's sed only flushes once the client's whole pipe closes. Built with python3 -- not sed
+#     -- because the line being swapped is itself full of the shell metacharacters (`$`, `"`, `[`,
+#     `]`) a sed BRE pattern would have to escape one by one; an exact, single-occurrence literal
+#     match is what "the guard line moved" is supposed to catch, and a fragile regex would make
+#     that check itself unreliable rather than the thing it is meant to protect.
+#     The judgement (record m-1) is the causal claim itself, not a single point-in-time snapshot:
+#     WS-OPEN must be ABSENT from etw.log throughout the whole window in which the client is
+#     confirmed still running (sentinel present AND `kill -0` succeeds), and PRESENT only once the
+#     client has actually exited. A single "not seen within N seconds" check cannot tell a real
+#     block-buffering regression apart from a wrapper that is merely slow to start the client on a
+#     loaded machine -- both would report "not seen" for an unrelated reason and this proof would
+#     go green either way. Polling for absence continuously while the sentinel/kill-0 pair
+#     confirms the client is alive removes that ambiguity: the slow-start case still eventually
+#     shows the sentinel and then, on correctly line-buffered code, WS-OPEN soon after -- so it
+#     would fail this proof's "absent while running" check instead of passing it for the wrong
+#     reason.
+begin 'M4 line-buffer mutant'
+MUTANT_BUFFER="$SBLAB/labtest-mutant-buffer.command"
+# shellcheck disable=SC2016  # deliberate literal `$1`/`$line`/`$script`: this is the exact source
+# text being matched and replaced, not a shell expansion.
+OLD_PIPE_LINE='etw_mask_pipe() { local script="$1" line; while IFS= read -r line || [ -n "$line" ]; do if [ -n "$script" ]; then printf "%s\n" "$line" | sed -e "$script"; else printf "%s\n" "$line"; fi; done; }'
+# shellcheck disable=SC2016  # same reason: literal replacement text, not an expansion
+NEW_PIPE_LINE='etw_mask_pipe() { local script="$1"; if [ -n "$script" ]; then sed -e "$script"; else cat; fi; }'
+if python3 -B -c '
+import sys
+old, new, src, dst = sys.argv[1:5]
+text = open(src, encoding="utf-8").read()
+if text.count(old) != 1:
+    sys.exit(1)
+with open(dst, "w", encoding="utf-8") as handle:
+    handle.write(text.replace(old, new, 1))
+' "$OLD_PIPE_LINE" "$NEW_PIPE_LINE" "$SBLAB/wdp-etw.command" "$MUTANT_BUFFER" \
+	&& [ -s "$MUTANT_BUFFER" ] && ! cmp -s "$MUTANT_BUFFER" "$SBLAB/wdp-etw.command" && bash -n "$MUTANT_BUFFER"; then
+	mkdir -p "$SBWDP" || exit 1
+	printf '%s\n' "$FAKE_FP" > "$PINFILE"
+	write_job smoke 30 "$GOOD_PROVIDERS" 0
+	M4_RUNNING="$SB/m4-ws-open-running"
+	M4_RELEASE="$SB/m4-ws-open-release"
+	rm -f "$M4_RUNNING" "$M4_RELEASE"
+	env -i \
+		HOME="$SBHOME" \
+		PATH="$SB/bin:$PATH" \
+		TMPDIR="$SBTMP" \
+		TERM_PROGRAM= \
+		LABTEST_TRACE="$LABTEST_TRACE" \
+		LABTEST_REFUSED_TRACE="$LABTEST_REFUSED_TRACE" \
+		LABTEST_CLIENT_RC=0 \
+		LABTEST_CLIENT_STDERR=0 \
+		LABTEST_CLIENT_WS_OPEN=1 \
+		LABTEST_RUNNING_FILE="$M4_RUNNING" \
+		LABTEST_RELEASE_FILE="$M4_RELEASE" \
+		MACDOWS_LAB_BOUNDARY_FILE="" \
+		bash "$MUTANT_BUFFER" >/dev/null 2>&1 &
+	M4_PID=$!
+	# Bounded 5s wait for the sentinel (same budget as case 26): the mutant only changes the
+	# masking pipeline downstream of the client, not the client itself, so the sentinel -- written
+	# by the client stub directly to disk -- appears on the same schedule as in case 26.
+	M4_RUNNING_SEEN=0
+	SECONDS=0
+	while [ "$SECONDS" -lt 5 ]; do
+		if [ -f "$M4_RUNNING" ]; then
+			M4_RUNNING_SEEN=1
+			break
+		fi
+		if ! kill -0 "$M4_PID" 2>/dev/null; then
+			break
+		fi
+		sleep 0.1
+	done
+	# Poll for the WHOLE 3s window the sentinel is confirmed live, not just once: a single
+	# point-in-time check cannot distinguish "genuinely absent throughout" from "we happened to
+	# look before it appeared", and the latter would let this proof pass for the wrong reason.
+	M4_SEEN_WHILE_RUNNING=0
+	if [ "$M4_RUNNING_SEEN" -eq 1 ]; then
+		SECONDS=0
+		while [ "$SECONDS" -lt 3 ] && [ -f "$M4_RUNNING" ] && kill -0 "$M4_PID" 2>/dev/null; do
+			if grep -qF 'WS-OPEN' "$LOG" 2>/dev/null; then
+				M4_SEEN_WHILE_RUNNING=1
+			fi
+			sleep 0.1
+		done
+	fi
+	: > "$M4_RELEASE"
+	wait "$M4_PID"
+	if [ "$M4_RUNNING_SEEN" -eq 1 ] && [ "$M4_SEEN_WHILE_RUNNING" -eq 0 ] && grep -qF 'WS-OPEN' "$LOG" 2>/dev/null; then
+		pass "$CASE: detected -- WS-OPEN never reached etw.log while the client stub was confirmed still running (sentinel present, kill -0 succeeded), only after it exited (case 26 pins the per-line flush)"
+	else
+		fail "$CASE: NOT detected -- case 26 would pass against the old block-buffered pipe (running_seen=$M4_RUNNING_SEEN seen-while-running=$M4_SEEN_WHILE_RUNNING)"
+	fi
+else
+	fail "$CASE: could not build the mutant (etw_mask_pipe's line moved?)"
+fi
+
+# M5. The line grammar removed (its verdict -> the empty string, i.e. "no bad line"): a job file
+#     whose unquoted value is an assignment prefixed to a COMMAND must now execute that command --
+#     i.e. case 13b's witness pin bites. The `</dev/null` on the source stays, which is why the
+#     mutant merely RUNS the command instead of hanging on it: that redirection is defence in depth
+#     BEHIND the grammar, and this is the measurement that says so. With the grammar gone it is the
+#     only thing between a job file and a wrapper that never writes a DONE line at all.
+begin 'M5 line-grammar mutant'
+MUTANT_GRAMMAR="$SBLAB/labtest-mutant-grammar.command"
+# shellcheck disable=SC2016  # sed must see the literal $BAD_LINE, and the replacement must too
+if sed 's|^elif BAD_LINE=.*; \[ -n "$BAD_LINE" \]; then$|elif BAD_LINE=""; [ -n "$BAD_LINE" ]; then|' \
+	"$SBLAB/wdp-etw.command" > "$MUTANT_GRAMMAR" \
+	&& ! cmp -s "$MUTANT_GRAMMAR" "$SBLAB/wdp-etw.command" && bash -n "$MUTANT_GRAMMAR"; then
+	printf 'TAG=a labtest-stdin-cmd\nDURATION=30\nPROVIDERS=%s\nPIN_RECORD=0\n' "'$GOOD_PROVIDERS'" > "$JOB"
+	run_etw "$MUTANT_GRAMMAR" "" &
+	M5_PID=$!
+	waited=0
+	while kill -0 "$M5_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do
+		sleep 0.1
+		waited=$((waited + 1))
+	done
+	M5_HUNG=0
+	if kill -0 "$M5_PID" 2>/dev/null; then
+		kill -9 "$M5_PID" 2>/dev/null
+		M5_HUNG=1
+	fi
+	wait "$M5_PID" 2>/dev/null
+	if grep -q '^job-line-executed$' "$LABTEST_TRACE" || [ "$M5_HUNG" -eq 1 ]; then
+		pass "$CASE: detected -- the job file's own command line ran (executed=$(grep -c '^job-line-executed$' "$LABTEST_TRACE" 2>/dev/null || true) hung=$M5_HUNG), which case 13b refuses"
+	else
+		fail "$CASE: NOT detected -- case 13b would pass against a wrapper without the line grammar"
+		note "log: $(tr '\n' ';' < "$LOG")"
+	fi
+else
+	fail "$CASE: could not build the mutant (the grammar's elif moved?)"
+fi
+
 # Every case must have reported: a case that neither passed nor failed would otherwise vanish
 # from the tally with exit 0. Placed after the LAST case on purpose.
-EXPECTED_CASES=35
+EXPECTED_CASES=41
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi

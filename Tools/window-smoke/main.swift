@@ -870,6 +870,20 @@ enum SizeBand {
 ///    `check(!oscillated)` reads), or `text` naming the wrong state =>
 ///    `oscillationVerdictIsUnjudgeableUntilTheRectMatches`. **Not covered here**: `finish()`
 ///    printing PASS instead of N/A for `.unjudgeable` -- live wiring, no offline seam.
+///  * **the extra apps' bounded retry** losing its loop bound (attempt 2 resending), firing on a
+///    satisfied count or before the settle budget expires, ignoring the `=0` knob, resending a
+///    program the server already rejected, resending everything when one program is identifiably
+///    the missing one, resending anything at all when every program was already answered (gate
+///    r1-A I-2), or any of the four log lines changing shape =>
+///    `extraAppsRetryResendsOnceWhenTheSettleExpiresShort` and
+///    `extraAppsRetryLinesReadAsTheRecordExpects`. **Not covered here** (live wiring, no offline
+///    seam): `runExtraAppsRetry` not being driven from `tick()` at all, the deadline not being
+///    extended after a resend, `windowIdsBeforeExtraApps` being recaptured on the retry, or the
+///    finish-time measure feeding `retry-outcome=` being taken from a different accumulator than
+///    the retry-time one -- the next EXTRA_APPS run's `[extra-apps] attempts=`,
+///    `[extra-apps] retry-outcome=` and `[extra-apps] DIAG: retry fired` lines are the live check,
+///    and `Scripts/test-window-smoke-pins.sh` holds the structural half offline (two send paths,
+///    each line built and printed from exactly one site, one live decision caller).
 ///
 /// **Known blind spot, stated rather than papered over** (rev-L9 I-2, R6): replacing the two
 /// `WindowGeometry.windowsPoint` calls with a copy of the rect conversion's own origin is an
@@ -1359,6 +1373,102 @@ enum WindowSmokeGateSelfTest {
                 // exclusion also applies to a harness-closed window
                 && MultiWindowGate.newContentWindowIds(visibleAtFinish: [5], closedByHarness: [328166], everSeenContent: [5, 328166], before: [5], exclude: [328166]).isEmpty,
             "multiWindowGateExcludesBaseAppAboutWindows: an About-titled window of this run's own base app never counts as an extra-app content window, even when new, visible, or closed by us"
+        )
+
+        // --- extra-apps bounded retry: one more ClientExecute, never a loop ---------------------
+        // (F r2a 2026-09-06 and checkpoint run 1a 2026-09-09: `[extra-apps] ClientExecute sent:
+        // notepad` went out, no notepad window ever appeared -- run 1a's DIAG line reported `got 0`
+        // with notepad missing from `exec results seen` entirely -- and the whole run was invalid
+        // under the checkpoint's pre-registration (v5), costing a manual same-shape rerun.)
+        let retryApps = ["notepad", "calc"]
+        expect(
+            // the F r2a shape: the unanswered program goes again
+            ExtraAppsRetry.programsToResend(
+                enabled: true, attempt: 1, deadlineExpired: true, newContentCount: 0,
+                all: ["notepad"], answered: [], failed: []
+            ) == ["notepad"]
+                // and ONLY it, when a sibling already answered
+                && ExtraAppsRetry.programsToResend(
+                    enabled: true, attempt: 1, deadlineExpired: true, newContentCount: 1,
+                    all: retryApps, answered: ["calc"], failed: []
+                ) == ["notepad"]
+                // enough new content windows: nothing to retry, whatever the exec answers were
+                && ExtraAppsRetry.programsToResend(
+                    enabled: true, attempt: 1, deadlineExpired: true, newContentCount: 2,
+                    all: retryApps, answered: [], failed: []
+                ).isEmpty
+                // the budget has not expired yet
+                && ExtraAppsRetry.programsToResend(
+                    enabled: true, attempt: 1, deadlineExpired: false, newContentCount: 0,
+                    all: retryApps, answered: [], failed: []
+                ).isEmpty
+                // NEVER a loop: the retry itself (attempt 2) and anything past it resend nothing
+                && ExtraAppsRetry.programsToResend(
+                    enabled: true, attempt: 2, deadlineExpired: true, newContentCount: 0,
+                    all: retryApps, answered: [], failed: []
+                ).isEmpty
+                && ExtraAppsRetry.programsToResend(
+                    enabled: true, attempt: 9, deadlineExpired: true, newContentCount: 0,
+                    all: retryApps, answered: [], failed: []
+                ).isEmpty
+                && ExtraAppsRetry.maxAttempts == 2
+                // WINDOW_SMOKE_EXTRA_APPS_RETRY=0
+                && ExtraAppsRetry.programsToResend(
+                    enabled: false, attempt: 1, deadlineExpired: true, newContentCount: 0,
+                    all: retryApps, answered: [], failed: []
+                ).isEmpty
+                // everything answered but the count is short: NOT this mechanism's shape, so
+                // nothing goes again (gate r1-A I-2 -- the server accepted every launch, the
+                // deficit is unattributable, and a duplicate instance plus a second exec result
+                // into the hard gate is not a trade worth making for a window that may simply be
+                // slow). The gate below still fails the run, exactly as it always did.
+                && ExtraAppsRetry.programsToResend(
+                    enabled: true, attempt: 1, deadlineExpired: true, newContentCount: 0,
+                    all: retryApps, answered: ["notepad", "calc"], failed: []
+                ).isEmpty
+                && ExtraAppsRetry.programsToResend(
+                    enabled: true, attempt: 1, deadlineExpired: true, newContentCount: 0,
+                    all: retryApps, answered: ["notepad", "calc"], failed: ["calc"]
+                ).isEmpty
+                // a path the server REJECTED is never resent even when it also looks unanswered.
+                // The live caller cannot produce that pair (both sets come from the same
+                // `.execResult` event, so `failed` is a subset of `answered`); it is this pure
+                // function's own invariant, exercised rather than assumed.
+                && ExtraAppsRetry.programsToResend(
+                    enabled: true, attempt: 1, deadlineExpired: true, newContentCount: 0,
+                    all: retryApps, answered: [], failed: ["calc"]
+                ) == ["notepad"]
+                // no extra apps at all: the scenario is off, so is this
+                && ExtraAppsRetry.programsToResend(
+                    enabled: true, attempt: 1, deadlineExpired: true, newContentCount: 0,
+                    all: [], answered: [], failed: []
+                ).isEmpty,
+            "extraAppsRetryResendsOnceWhenTheSettleExpiresShort: the unanswered program goes again exactly once when the settle budget expires with too few new content windows; a satisfied count, an unexpired budget, attempt >= 2, the =0 knob, or a deficit in which every program was already answered all resend nothing; a server-rejected path is never resent"
+        )
+        expect(
+            ExtraAppsRetry.retryLine(attempt: 2, program: "notepad") == "[extra-apps] RETRY attempt=2 program=notepad"
+                && ExtraAppsRetry.summaryLine(attempts: 1, retried: false) == "[extra-apps] attempts=1 retried=0"
+                && ExtraAppsRetry.summaryLine(attempts: 2, retried: true) == "[extra-apps] attempts=2 retried=1"
+                // what the retry SAW when it decided (gate r1-A I-1): `observed=0` with the
+                // program unanswered is the twice-observed "nothing happened" shape; `observed`
+                // one short of `expected` is the slow-window shape this cannot tell apart at
+                // t~12 s and therefore reports rather than asserts
+                && ExtraAppsRetry.diagLine(elapsed: 12.34, observed: 0, expected: 1, unanswered: ["notepad"])
+                == "[extra-apps] DIAG: retry fired at t=12.3s observed=0 expected>=1 unanswered=[notepad]"
+                && ExtraAppsRetry.diagLine(elapsed: 12, observed: 1, expected: 2, unanswered: ["notepad", "calc"])
+                == "[extra-apps] DIAG: retry fired at t=12.0s observed=1 expected>=2 unanswered=[notepad, calc]"
+                // and whether anything appeared afterwards, so a record reads the outcome instead
+                // of reconstructing it from window ids
+                && ExtraAppsRetry.outcomeLine(retried: false, observedAtRetry: nil, observedAtFinish: 2)
+                == "[extra-apps] retry-outcome=not-retried"
+                && ExtraAppsRetry.outcomeLine(retried: true, observedAtRetry: 0, observedAtFinish: 1)
+                == "[extra-apps] retry-outcome=windows-appeared-after-retry"
+                && ExtraAppsRetry.outcomeLine(retried: true, observedAtRetry: 0, observedAtFinish: 0)
+                == "[extra-apps] retry-outcome=none"
+                && ExtraAppsRetry.outcomeLine(retried: true, observedAtRetry: 1, observedAtFinish: 1)
+                == "[extra-apps] retry-outcome=none"
+                && ExtraAppsRetry.settleBudget == 6,
+            "extraAppsRetryLinesReadAsTheRecordExpects: the RETRY line names attempt and program, the finish summary is attempts=<1|2> retried=<0|1>, the retry DIAG line carries the observation the decision was taken on, retry-outcome is one of windows-appeared-after-retry|none|not-retried, and the retry's extended settle is the same 6 s budget the launch got"
         )
 
         // --- the generic visible-window check judges "ever visible during the run" -------------
@@ -2495,6 +2605,20 @@ let inputTargetTitleSubstring = ProcessInfo.processInfo.environment["WINDOW_SMOK
 let extraApps: [String] = (ProcessInfo.processInfo.environment["WINDOW_SMOKE_EXTRA_APPS"] ?? "")
     .split(separator: ";").map(String.init).filter { !$0.isEmpty }
 
+/// `WINDOW_SMOKE_EXTRA_APPS_RETRY`: the extra apps' single bounded retry -- see `ExtraAppsRetry`
+/// for the mechanism and for the two runs that motivate it (F r2a 2026-09-06, checkpoint run 1a
+/// 2026-09-09: the `ClientExecute` went out, no window ever appeared, the whole run was invalid
+/// and had to be repeated by hand).
+///
+/// Why default ON, unlike every opt-in `WINDOW_SMOKE_*` switch above: those add a scenario, this
+/// one only spends a second `ClientExecute` on a run that is otherwise already lost, and the
+/// runs it would rescue are precisely the ones nobody was watching. Set it to `0` -- the literal
+/// string, nothing else disables it -- to get the historical single-attempt behaviour back, e.g.
+/// when a record needs the first attempt's outcome to stand on its own. Has no effect at all
+/// unless `WINDOW_SMOKE_EXTRA_APPS` is set (multiwin prereq, same convention as the switches
+/// below); no other scenario's logs or behaviour change by one byte either way.
+let extraAppsRetryEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOKE_EXTRA_APPS_RETRY"] != "0"
+
 /// Phase 1 acceptance (reconnect soak): connect/disconnect cycle count. A value > 1
 /// switches the harness into a dedicated cycle mode -- per cycle: start, wait for at
 /// least one visible window with real displayed content, shutdownAndWait, assert clean --
@@ -3100,6 +3224,127 @@ enum MultiWindowGate {
     }
 }
 
+/// The extra apps' single bounded retry, as a pure function (tool m-3).
+///
+/// **Trigger, twice observed:** `WINDOW_SMOKE_EXTRA_APPS=notepad` had its `ClientExecute` sent
+/// (`[extra-apps] ClientExecute sent: notepad`) and the target window never appeared -- F r2a on
+/// 2026-09-06 (docs/upgrade-gate/2026-09-f-live.md §2a, the run that also produced the About
+/// exclusion above) and again on checkpoint run 1a of 2026-09-09, whose `[extra-apps] DIAG` line
+/// reported `got 0` with the notepad exec answer missing entirely from `exec results seen`. Both
+/// times the gate below correctly read RED and the whole run was thrown away as invalid under the
+/// checkpoint's pre-registration (v5), costing a manual same-shape rerun. The window-create side
+/// is the server's business and this harness cannot fix it; what it can do is spend one more
+/// settle budget on a second `ClientExecute` before burning the run.
+///
+/// **Deliberately narrow.** This changes nothing about the gate itself: after the retry's own
+/// budget expires, a still-short count is the SAME hard failure it has always been (the F r2a
+/// About exclusion and the `>=extraApps.count` check are untouched). And it fires exactly once:
+/// `maxAttempts == 2` is the whole loop bound, so a server that never launches the program costs
+/// one extra `ClientExecute`, never a spin.
+///
+/// **What "still short" means, exactly** (gate r1-A I-1). The trigger is this harness's own
+/// mid-run measure AT THE DECISION MOMENT (t~12 s): every new non-About content window seen so
+/// far. That is a superset of what `MultiWindowGate` would accept if finish happened right then,
+/// but it is NOT a superset of what the gate accepts at finish -- the gate counts at t>=25 s and
+/// additionally credits windows this run closed itself. So a window that is merely SLOW (created
+/// after the settle budget expires, before finish) reads as ABSENT here, and the retry does fire
+/// on a run that was going to pass. Two consequences, neither cosmetic:
+///  1. the second `ClientExecute`'s `RAIL_EXEC_RESULT` goes into the unrelaxed
+///     `failedExecResults.isEmpty` check in `finish()`, so a server that refuses the second launch
+///     (single-instance programs, timing) turns a would-be green run red;
+///  2. `retried=1` on its own cannot tell "no window at all" from "a slow window", and that line
+///     is exactly what a record is meant to register as a (v5)-relevant observation.
+/// Hence the two extra lines this mechanism prints: `[extra-apps] DIAG: retry fired ...` says what
+/// was actually observed when it decided, and `[extra-apps] retry-outcome=...` at finish says
+/// whether anything appeared afterwards. The two shapes are then separable from the log alone
+/// instead of being guessed at.
+enum ExtraAppsRetry {
+    /// The settle each attempt gets, and what the retry's deadline is extended by -- the same 6 s
+    /// `tick()` already grants the FIRST app's window before it launches the extra ones. With the
+    /// launch at t>=6 s that puts attempt 2 at t~12 s and its own budget's end at t~18 s, both
+    /// comfortably inside the 25 s base battery floor (`FinishGate.minimumElapsed`), so no
+    /// scenario deadline moves and no run gets longer because this exists.
+    static let settleBudget: TimeInterval = 6
+
+    /// Attempt 1 is the launch itself; attempt 2 is the retry. There is no attempt 3.
+    static let maxAttempts = 2
+
+    /// Which programs to re-send, in launch order; empty means "do not retry".
+    ///
+    /// `answered` is every program a `RAIL_EXEC_RESULT` came back for (success or failure) and
+    /// `failed` the non-zero subset. A program with NO answer at all is the F r2a / run-1a shape,
+    /// and it is the only thing this mechanism ever resends.
+    ///
+    /// When every program DID answer and the count is still short, this returns nothing (gate
+    /// r1-A I-2). That is not the shape twice observed live: the server accepted every launch, the
+    /// deficit cannot be attributed to a program (this harness has no window->program map), and a
+    /// second send would duplicate an already-running instance and push a second exec result into
+    /// the hard gate -- for a deficit at least as likely to be a slow window as a missing one.
+    /// That case belongs to the gate, which already fails the run, not to this retry.
+    ///
+    /// `failed` is still subtracted from the candidates: a second send of a path the server
+    /// refused cannot help and would only add a second entry to the `failedExecResults` list
+    /// `finish()` fails on. At the live call site that subtraction can never bite -- both sets are
+    /// filled from the same `.execResult` event, so `failed` is a subset of `answered` and an
+    /// unanswered program is in neither -- which makes it this pure function's own invariant,
+    /// exercised in the self-test with a combination the live caller cannot produce rather than
+    /// quietly assumed.
+    static func programsToResend(
+        enabled: Bool,
+        attempt: Int,
+        deadlineExpired: Bool,
+        newContentCount: Int,
+        all: [String],
+        answered: Set<String>,
+        failed: Set<String>
+    ) -> [String] {
+        guard enabled, deadlineExpired, !all.isEmpty else { return [] }
+        guard attempt >= 1, attempt < maxAttempts else { return [] }
+        guard newContentCount < all.count else { return [] }
+        let unanswered = all.filter { !answered.contains($0) }
+        return unanswered.filter { !failed.contains($0) }
+    }
+
+    /// The one place the `RETRY` line's text exists (pinned: exactly one caller, the resend loop).
+    static func retryLine(attempt: Int, program: String) -> String {
+        "[extra-apps] RETRY attempt=\(attempt) program=\(program)"
+    }
+
+    /// `finish()`'s one-line attempt summary, so a record can register "the first ClientExecute
+    /// produced no window" as a (v5)-relevant observation instead of losing it in the noise.
+    static func summaryLine(attempts: Int, retried: Bool) -> String {
+        "[extra-apps] attempts=\(attempts) retried=\(retried ? 1 : 0)"
+    }
+
+    /// The observation the retry actually decided on, printed the moment it decides (gate r1-A
+    /// I-1). Rides the `[extra-apps] DIAG` channel the F r2a record already reads for the gate's
+    /// own short-count line, on its own separate line -- `observed=0` with the program still
+    /// unanswered is the twice-seen "nothing happened at all" shape, while `observed` merely one
+    /// short of `expected` is the "slow window" shape this mechanism cannot distinguish at t~12 s
+    /// and must therefore report instead of assert.
+    static func diagLine(elapsed: TimeInterval, observed: Int, expected: Int, unanswered: [String]) -> String {
+        "[extra-apps] DIAG: retry fired at t=\(String(format: "%.1f", elapsed))s observed=\(observed) "
+            + "expected>=\(expected) unanswered=[\(unanswered.joined(separator: ", "))]"
+    }
+
+    /// `summaryLine`'s companion at finish: did anything come up AFTER the retry went out?
+    /// `observedAtRetry` is the count the retry decided on, `observedAtFinish` the same optimistic
+    /// measure taken again at finish. Strictly greater does NOT prove the retry caused it -- a slow
+    /// window from attempt 1 reads identically (gate r1-A I-1) -- it says only that the run was
+    /// short at t~12 s and had more by finish, which is precisely the distinction a record
+    /// otherwise has to reconstruct from window ids by hand.
+    static func outcomeLine(retried: Bool, observedAtRetry: Int?, observedAtFinish: Int) -> String {
+        let outcome: String
+        switch (retried, observedAtRetry) {
+        case (true, let atRetry?):
+            outcome = observedAtFinish > atRetry ? "windows-appeared-after-retry" : "none"
+        default:
+            outcome = "not-retried"
+        }
+        return "[extra-apps] retry-outcome=\(outcome)"
+    }
+}
+
 /// adr/0010 W4 first slice: menu-popup end-to-end acceptance -- activates the About window
 /// (via the real, gated `FocusAuthority` click path, same as `activateForClose`), sends
 /// Alt+Space (About's system menu shortcut on Windows), and asserts a NEW child window
@@ -3260,6 +3505,29 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// Every ServerExecuteResult seen, `program -> code` (0 = S_OK), for the multi-window
     /// diagnostic: a gate that reads short must be able to say whether the exec was even answered.
     private var execResultsSeen: [String] = []
+    /// The same events as `execResultsSeen`/`failedExecResults`, keyed by program string alone, so
+    /// `ExtraAppsRetry` can ask "which program was never answered / was refused" without parsing
+    /// the ` -> ` display strings above (a Windows path may legally contain that sequence).
+    /// The key is the SERVER's string, not ours (gate r1-A m-5): `event.program` carries the
+    /// `exeOrFile` field echoed back in `RAIL_EXEC_RESULT` (`MacdowsCore/WindowModel.swift` builds
+    /// `ExecResult(program: exeOrFile, ...)` straight from it), which this harness then matches
+    /// against what it sent. A server that echoes a DIFFERENT string (case, quoting, an expanded
+    /// path) breaks BOTH sets at once, and the consequences are not symmetric: every program looks
+    /// unanswered, so the retry resends all of them, AND the "never resend a path the server
+    /// rejected" promise silently disappears with it, because the rejected program is not under
+    /// the key being subtracted either. Nothing here detects the mismatch; the echoed strings are
+    /// printed verbatim in the gate's `[extra-apps] DIAG` line, which is where a reader can see it.
+    private var execAnsweredPrograms: Set<String> = []
+    private var execFailedPrograms: Set<String> = []
+    /// The extra apps' attempt bookkeeping (tool m-3, `ExtraAppsRetry`): 1 after the launch loop,
+    /// 2 after the single retry; the deadline is the current settle budget's end, cleared once the
+    /// count is satisfied or the retry has been spent so no later tick re-evaluates it.
+    private var extraAppsAttempts = 0
+    private var extraAppsRetried = false
+    private var extraAppsSettleDeadline: Date?
+    /// The optimistic new-content-window count the retry decided on, `nil` until it fires -- the
+    /// baseline `finish()`'s `retry-outcome=` line compares against (gate r1-A I-1).
+    private var extraAppsObservedAtRetry: Int?
     private var cycleIndex = 0
     private var cycleDeadline: Date?
     private var cycleStartedAt: Date?
@@ -4468,9 +4736,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // every failure so finish() can gate on none having occurred.
             if event.kind == .execResult {
                 self.execResultsSeen.append("\(event.program) -> \(event.execResult)")
+                self.execAnsweredPrograms.insert(event.program)
             }
             if event.kind == .execResult, event.execResult != 0 {
                 self.failedExecResults.append("\(event.program) -> \(event.execResult)")
+                self.execFailedPrograms.insert(event.program)
             }
             // Phase 2 W2 task item 2 (docs/plans/phase2.md §2 W2, adr/0008 §3): ground
             // truth for the ghost-sliver rule's one unverified leg (ownerWindowId --
@@ -4686,11 +4956,18 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         if elapsed >= 6, !extraAppsLaunched, !extraApps.isEmpty {
             extraAppsLaunched = true
             windowIdsBeforeExtraApps = Set(registry.windowSnapshots().map(\.windowId))
+            extraAppsAttempts = 1
+            extraAppsSettleDeadline = Date().addingTimeInterval(ExtraAppsRetry.settleBudget)
             for program in extraApps {
                 session.executeProgram(program)
                 print("[extra-apps] ClientExecute sent: \(program)")
             }
         }
+        // Tool m-3: one bounded retry when that settle expires with nothing to show for it.
+        // Deliberately AFTER the launch block so the first attempt's budget always starts on a
+        // later tick than it is measured on, and `windowIdsBeforeExtraApps` is never recaptured
+        // (a retry must not disqualify a window the first attempt did produce).
+        runExtraAppsRetry(session: session, elapsed: elapsed)
 
         if elapsed >= 15, !evidenceRoutineRan {
             evidenceRoutineRan = true
@@ -4801,6 +5078,67 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             }
             finish()
         }
+    }
+
+    /// The extra apps' one bounded retry (tool m-3 -- see `ExtraAppsRetry` for the mechanism and
+    /// for the two runs, F r2a 2026-09-06 and checkpoint run 1a 2026-09-09, where the
+    /// `ClientExecute` went out and the window never came).
+    ///
+    /// Runs every tick once the apps have been launched, but only decides anything when the
+    /// current settle budget has expired. `nil`-ing the deadline is what stops it: either the
+    /// count is satisfied (nothing more to do) or the retry has been spent (the gate in `finish()`
+    /// owns the verdict from here, exactly as it always has).
+    private func runExtraAppsRetry(session: CRSession, elapsed: TimeInterval) {
+        guard extraAppsLaunched, let deadline = extraAppsSettleDeadline, Date() >= deadline else { return }
+        // Measured ONCE: the number the decision acts on and the number the DIAG line reports have
+        // to be the same observation, or the log describes a state nothing ever decided on.
+        let observedAtRetry = newExtraAppContentWindowCount()
+        let programs = ExtraAppsRetry.programsToResend(
+            enabled: extraAppsRetryEnabled,
+            attempt: extraAppsAttempts,
+            deadlineExpired: true,
+            newContentCount: observedAtRetry,
+            all: extraApps,
+            answered: execAnsweredPrograms,
+            failed: execFailedPrograms
+        )
+        guard !programs.isEmpty else {
+            extraAppsSettleDeadline = nil
+            return
+        }
+        extraAppsAttempts += 1
+        extraAppsRetried = true
+        extraAppsObservedAtRetry = observedAtRetry
+        extraAppsSettleDeadline = Date().addingTimeInterval(ExtraAppsRetry.settleBudget)
+        // Printed BEFORE the resends, so the log reads in causal order: what was seen, then what
+        // was sent because of it (gate r1-A I-1 -- `retried=1` alone cannot say which shape this
+        // was, and a run that fired the retry on a merely slow window has to be recognisable).
+        print(ExtraAppsRetry.diagLine(
+            elapsed: elapsed, observed: observedAtRetry, expected: extraApps.count, unanswered: programs
+        ))
+        for program in programs {
+            session.executeProgram(program)
+            print(ExtraAppsRetry.retryLine(attempt: extraAppsAttempts, program: program))
+        }
+    }
+
+    /// The mid-run stand-in for what `MultiWindowGate` will count at finish: every window seen
+    /// visible-with-content inside the plausible band after the exec (`before` already subtracted
+    /// when the accumulator is filled), minus this run's own base-app About windows -- the same
+    /// exclusion, via the same `MoveResizeTarget.matches` heuristic, that F r2a added to the gate
+    /// after a winver About was counted as notepad's window.
+    ///
+    /// Deliberately OPTIMISTIC relative to what the gate would accept AT THIS INSTANT: it does not
+    /// additionally require the window to be visible at finish or to have been closed by this run's
+    /// own close leg, neither of which is decided yet at t~12 s.
+    ///
+    /// What it is NOT (gate r1-A I-1) is a superset of the gate's FINAL count: the gate counts at
+    /// t>=25 s, so a window created after the settle budget expires is missing from this number and
+    /// present in that one. Read short, this means "the exec has nothing to show for itself YET",
+    /// never "the run is already lost" -- which is why the retry PRINTS it
+    /// (`[extra-apps] DIAG: retry fired ...`) instead of only acting on it.
+    private func newExtraAppContentWindowCount() -> Int {
+        contentWindowsSeenAfterExtraApps.filter { !MoveResizeTarget.matches(title: $0.value, filter: nil) }.count
     }
 
     /// Reconnect-soak driver (`WINDOW_SMOKE_CYCLES` > 1): success for a cycle is at least
@@ -7310,6 +7648,28 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // additionally turns "nothing ever appeared" into a hard failure -- this formula
         // gate alone stays conditional so every OTHER scenario keeps printing zeros
         // ungated, exactly as before.
+
+        // Tool m-3: how many `ClientExecute` rounds the extra apps needed. Printed here, beside
+        // the other unconditional summary lines, rather than inside the multi-window gate block
+        // further down -- that block sits behind `inputTestMode == nil`, and a run whose first
+        // attempt produced nothing needs to say so whether or not an input test was active.
+        // `retried=1` is the (v5)-relevant observation: the first ClientExecute went unanswered
+        // or produced no window, exactly the F r2a / run-1a shape. Only ever printed for a
+        // scenario that set WINDOW_SMOKE_EXTRA_APPS, so every other run's log is byte-identical.
+        // And, on the next line, whether the retry changed anything (gate r1-A I-1): the retry
+        // fires on the count as measured at t~12 s, which a merely SLOW window also fails, so
+        // `retried=1` by itself is ambiguous. Comparing the same optimistic measure at finish
+        // against the one the retry decided on separates "nothing appeared either way" from
+        // "windows did show up afterwards" -- correlation, not proof of causation, and the doc on
+        // `outcomeLine` says so; a record should not have to reconstruct even that from ids.
+        if !extraApps.isEmpty {
+            print(ExtraAppsRetry.summaryLine(attempts: extraAppsAttempts, retried: extraAppsRetried))
+            print(ExtraAppsRetry.outcomeLine(
+                retried: extraAppsRetried,
+                observedAtRetry: extraAppsObservedAtRetry,
+                observedAtFinish: newExtraAppContentWindowCount()
+            ))
+        }
         let trayDiag = registry.trayDiagnostics()
         print("[tray] creates=\(trayDiag.createsSeen) updates=\(trayDiag.updatesSeen) deletes=\(trayDiag.deletesSeen) liveCount=\(trayDiag.liveCount)")
         if trayDiag.createsSeen > 0 || trayDiag.updatesSeen > 0 || trayDiag.deletesSeen > 0 {
