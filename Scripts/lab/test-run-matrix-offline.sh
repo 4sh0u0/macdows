@@ -172,8 +172,23 @@ relay.command)
 		job='verify'
 	elif grep -c 'charmap' "$runtime/job.env" >/dev/null 2>&1; then
 		job='negative'
+	elif grep -cE "^PROGRAM='C:.*logoff\.exe'" "$runtime/job.env" >/dev/null 2>&1; then
+		# checked before the generic 'logoff' branch below: logoff-path.env's PROGRAM
+		# value contains "logoff.exe", which the generic branch would also match, and
+		# the more specific full-path job must win the case so the trace can tell the
+		# two apart (jobs-twins lane). Anchored on the PROGRAM= line itself (gate r1
+		# m-1) so a future comment mentioning "logoff.exe" cannot mis-route the trace.
+		job='logoff-path'
 	elif grep -c 'logoff' "$runtime/job.env" >/dev/null 2>&1; then
 		job='logoff'
+	elif grep -c 'stage\.ps1' "$runtime/job.env" >/dev/null 2>&1; then
+		# stage.env and stage-path.env both reference stage.ps1 via CMDARGS; only the
+		# PROGRAM value tells them apart (`||powershell` vs a C:\ full path).
+		if grep -cF "PROGRAM='C:" "$runtime/job.env" >/dev/null 2>&1; then
+			job='stage-path'
+		else
+			job='stage'
+		fi
 	fi
 	printf 'relay:%s\n' "$job" >> "$LABTEST_TRACE"
 	# relay.command truncates its log at startup; mirror that or a previous job's DONE
@@ -722,8 +737,9 @@ else
 fi
 
 # -- 17. a hand-launched lane stages the share on its own ------------------------------------
-# run-matrix.sh drives four of the seven jobs in jobs/. The other three -- stage, readback,
-# host-agent-tests -- are launched by hand, straight through run-scenario.sh, and were the
+# run-matrix.sh drives 4 of jobs/'s 11 relay jobs (regprobe, matrix-verify, matrix-negative,
+# logoff). The other 7 -- e.g. stage-path, logoff-path, readback, host-agent-tests,
+# server-snapshot -- are launched by hand, straight through run-scenario.sh, and were the
 # reason staging ended up in that script rather than in run-matrix.sh: staged from run-matrix
 # alone, a hand-launched lane would run against whatever the last matrix run left in the share,
 # which on a fresh clone is an empty directory. Driven here WITHOUT run-matrix.sh, because that
@@ -795,12 +811,137 @@ else
 	fail "$CASE: the prune ran but staging did not re-fill the share"
 fi
 
+# -- 19. the full-path twins launch outside the Enforce window (jobs-twins lane) -------------
+# stage.env/logoff.env use the `||alias` RAIL form, which resolves only while the TS
+# allow-list matrix's Enforce step has a publication for it; on the restored host (the
+# default state this sandbox models) it comes back RAIL_EXEC_E_FILE_NOT_FOUND. stage-path.env
+# and logoff-path.env are the full-path twins that work in both states -- see owner ruling
+# 2026-09-15 00:04 JST, option (b). This pins both twins through the real
+# run-scenario.sh/relay.command path and checks the RUNTIME job.env they leave behind, not the
+# tracked template, so a future template edit that breaks the copy is caught here too.
+#
+# The check is on the EFFECTIVE PROGRAM value, not on how many lines merely match the grammar
+# (gate r1 I-1): relay.command sources job.env in a subshell, so if a second `PROGRAM=` line
+# ever appeared, the LAST assignment would win at launch time regardless of what the first one
+# said. `nlines` catches a second line outright; sourcing the file the same way relay.command
+# does and matching the grammar against the resulting value catches it even if some other
+# mutation kept the count at one.
+begin scenario-standalone-path 'the full-path twins launch and leave a full-path, single-assignment PROGRAM= in the runtime job.env'
+for tmpl in stage-path logoff-path; do
+	rm -rf "$SBRUNTIME"
+	: > "$LABTEST_TRACE"
+	OUT="$SB/out-$CASE-$tmpl.txt"
+	HOME="$SB/home" PATH="$SB/bin:$PATH" bash "$SBLAB/run-scenario.sh" relay "$tmpl" > "$OUT" 2>&1
+	RC=$?
+	if [ "$RC" -eq 0 ]; then
+		pass "$CASE: relay $tmpl exits 0"
+	else
+		fail "$CASE: relay $tmpl exited $RC (output: $OUT)"
+	fi
+	if grep -cFx "relay:$tmpl" "$LABTEST_TRACE" >/dev/null 2>&1; then
+		pass "$CASE: launch trace shows relay:$tmpl"
+	else
+		fail "$CASE: expected relay:$tmpl in the trace; trace was: $(tr '\n' ' ' < "$LABTEST_TRACE")"
+	fi
+	rt_nlines=0
+	rt_effective=''
+	if [ -f "$SBRUNTIME/job.env" ]; then
+		rt_nlines="$(grep -c '^PROGRAM=' "$SBRUNTIME/job.env")"
+		# shellcheck source=/dev/null
+		rt_effective="$( . "$SBRUNTIME/job.env" >/dev/null 2>&1; printf '%s' "${PROGRAM:-}" )"
+	fi
+	if [ "$rt_nlines" -eq 1 ] && printf '%s' "$rt_effective" | grep -qE '^C:\\.*[^\\]\.exe$'; then
+		pass "$CASE: $tmpl's runtime job.env has exactly one PROGRAM= line and its effective value (sourced the way relay.command reads it) is a full Windows .exe path"
+	else
+		fail "$CASE: $tmpl's runtime job.env -- $rt_nlines PROGRAM= line(s) (want 1), effective PROGRAM='$rt_effective' (checked the copy, not the template)"
+	fi
+done
+
+# -- 20. the Enforce-window note is harmless to the copier ------------------------------------
+# jobs/stage.env and jobs/logoff.env each gained a leading `#` comment line pointing at their
+# full-path twin (see jobs-fullpath-pin below). run-scenario.sh's relay mode never parses
+# job.env -- it is a plain `cp` -- so this case proves the comment does not upset THAT path.
+# It does NOT prove anything about relay.command's own `.` source step: relay.command is
+# deliberately not copied into this sandbox (suite header, point 2), so the real proof that a
+# `#` line survives being sourced is test-relay-offline.sh's case 5, which drives the real
+# relay.command against every tracked jobs/*.env, comments included ("all 11 tracked
+# jobs/*.env reach xfreerdp ...").
+begin scenario-standalone-comment 'relay stage / relay logoff still copy cleanly with the new comment line'
+for tmpl in stage logoff; do
+	rm -rf "$SBRUNTIME"
+	: > "$LABTEST_TRACE"
+	OUT="$SB/out-$CASE-$tmpl.txt"
+	HOME="$SB/home" PATH="$SB/bin:$PATH" bash "$SBLAB/run-scenario.sh" relay "$tmpl" > "$OUT" 2>&1
+	RC=$?
+	if [ "$RC" -eq 0 ]; then
+		pass "$CASE: relay $tmpl exits 0 with its comment line in place"
+	else
+		fail "$CASE: relay $tmpl exited $RC (output: $OUT)"
+	fi
+	if grep -cFx "relay:$tmpl" "$LABTEST_TRACE" >/dev/null 2>&1; then
+		pass "$CASE: launch trace shows relay:$tmpl (comment did not confuse the copier or the shim)"
+	else
+		fail "$CASE: expected relay:$tmpl in the trace; trace was: $(tr '\n' ' ' < "$LABTEST_TRACE")"
+	fi
+done
+
+# -- 21. source pin: every *-path.env twin, every alias job is paired or allow-listed --------
+# Guards the future (jobs-twins brief, deliverable 5 case B): a new `||alias` job added to
+# jobs/ later must either ship its own <name>-path.env twin or be added to the explicit
+# allow-list below, or this case fails. The allow-list is the Enforce-window matrix's own
+# alias-only jobs (out of scope for this lane, per the brief). Default-deny only -- no filename
+# exemptions (gate r1 I-2): a file with no PROGRAM= line simply never matches the `||` check
+# below and is skipped by that, not by a separate carve-out. Runs against $LAB/jobs directly --
+# these files are never mutated by any case in this suite (only $SBLAB/jobs and $SBRUNTIME
+# are), so a plain read of the tracked tree is exactly what a "source pin" is for.
+begin jobs-fullpath-pin 'every jobs/*-path.env has one single-assignment full-path PROGRAM=; every alias job is paired or allow-listed'
+ENFORCE_WINDOW_ONLY='host-agent-tests matrix-verify regprobe readback'
+path_count=0
+for f in "$LAB"/jobs/*-path.env; do
+	[ -f "$f" ] || continue
+	path_count=$((path_count + 1))
+	nlines="$(grep -c '^PROGRAM=' "$f")"
+	# shellcheck source=/dev/null
+	v="$( . "$f" >/dev/null 2>&1; printf '%s' "${PROGRAM:-}" )"
+	if [ "$nlines" -eq 1 ] && printf '%s' "$v" | grep -qE '^C:\\.*[^\\]\.exe$'; then
+		pass "$CASE: $(basename "$f") has exactly one PROGRAM= line and its effective value is a full Windows .exe path"
+	else
+		fail "$CASE: $(basename "$f") -- $nlines PROGRAM= line(s) (want 1), effective PROGRAM='$v'"
+	fi
+done
+# Floor assertion (gate r1 m-3): with both twins gone the glob above stays a literal string and
+# the loop silently does nothing, which without this would read as "0 failures" rather than
+# naming the real problem.
+if [ "$path_count" -ge 2 ]; then
+	pass "$CASE: $path_count *-path.env twin(s) found"
+else
+	fail "$CASE: only $path_count *-path.env file(s) found under jobs/ (want >=2) -- jobs/ shrank or lost its twins"
+fi
+for f in "$LAB"/jobs/*.env; do
+	base="$(basename "$f" .env)"
+	case "$base" in *-path) continue ;; esac
+	if ! grep -qE "^PROGRAM='\\|\\|" "$f"; then
+		continue
+	fi
+	allowed=0
+	for a in $ENFORCE_WINDOW_ONLY; do
+		[ "$a" = "$base" ] && allowed=1 && break
+	done
+	if [ -f "$LAB/jobs/$base-path.env" ]; then
+		pass "$CASE: alias job $base is paired with $base-path.env"
+	elif [ "$allowed" -eq 1 ]; then
+		pass "$CASE: alias job $base is Enforce-window allow-listed"
+	else
+		fail "$CASE: alias job $base has neither a $base-path.env twin nor an Enforce-window allow-list entry"
+	fi
+done
+
 # ------------------------------------------------------------------------------------------
 
 printf '\n'
 printf -- '---------------------------------------------------------------------\n'
 if [ "$FAILURES" -eq 0 ]; then
-	printf 'OFFLINE GUARD TEST: PASS -- %s assertions, 20 cases (17 pins + 3 mutation proofs)\n' "$PASSES"
+	printf 'OFFLINE GUARD TEST: PASS -- %s assertions, 23 cases (20 pins + 3 mutation proofs)\n' "$PASSES"
 	exit 0
 fi
 printf 'OFFLINE GUARD TEST: FAIL -- %s failed, %s passed\n' "$FAILURES" "$PASSES"

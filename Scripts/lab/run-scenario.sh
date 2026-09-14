@@ -25,7 +25,11 @@ mkdir -p "$SHARE"
 #
 # This lives HERE, at the single choke point every relay job passes through, and not in
 # run-matrix.sh: the matrix drives its four jobs through this script, and so does every
-# hand-launched lane (`run-scenario.sh relay stage`, `... readback`, `... host-agent-tests`).
+# hand-launched lane (`run-scenario.sh relay stage-path`, `... logoff-path`, `... readback`,
+# `... host-agent-tests`). stage, logoff, readback and host-agent-tests use the `||alias` RAIL
+# form and resolve only inside the matrix's Enforce window -- outside it they come back
+# RAIL_EXEC_E_FILE_NOT_FOUND. stage-path/logoff-path are full-path twins that work in both
+# states; readback/host-agent-tests have no twin yet and stay Enforce-window-only.
 # Staging from run-matrix.sh alone would have left each of those running against whatever the
 # last matrix run happened to leave in the share -- which, on a fresh clone, is nothing at all,
 # and the failure would surface on the host as a job that starts, finds no script, and reports
