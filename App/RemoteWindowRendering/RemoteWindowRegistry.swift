@@ -2385,17 +2385,36 @@ final class RemoteWindowRegistry {
 
     /// Diagnostics only (O-A, ADR-0018 §5.1 增补 2026-09-10 14:27 item ①; window-smoke's
     /// `WINDOW_SMOKE_EDGE_PROFILE=1`). Sibling of `nonWhitePixelRatio` immediately above and the
-    /// only way a harness can reach `RemoteWindow.edgeBorderProfile()` at all -- `windows` is
-    /// private, and the profile is a property of the DISPLAYED SURFACE, which nothing in
-    /// `WindowSnapshot` carries. MEASUREMENT ONLY: read-only, changes no geometry, and no
-    /// production path calls it. `nil` when this registry has no window for `windowId`, when that
-    /// window has nothing displayed yet (the case a run is expected to meet), or when the surface
-    /// it does have could not be read at all -- `RemoteWindow.edgeBorderProfile()`'s own doc
-    /// comment lists the three unreadable shapes. The harness tells "nothing displayed" from
+    /// only way a harness can reach `RemoteWindow.edgeProfileSample(currentMapped:)` at all --
+    /// `windows` is private, and the profile is a property of the DISPLAYED SURFACE, which nothing
+    /// in `WindowSnapshot` carries. MEASUREMENT ONLY: read-only, writes no state, changes no
+    /// geometry, and no production path calls it. `nil` when this registry has no window for
+    /// `windowId`, when that window has nothing displayed yet (the case a run is expected to
+    /// meet), or when the surface it does have could not be read at all -- `RemoteWindow`'s own
+    /// doc comment lists the three unreadable shapes. The harness tells "nothing displayed" from
     /// "unreadable" by the window's own `hasDisplayedContent`, which it already has in the
     /// snapshot it iterates, so this forwarder does not have to carry a reason of its own.
-    func edgeBorderProfile(windowId: UInt32) -> RemoteWindow.EdgeBorderProfile? {
-        windows[windowId]?.edgeBorderProfile()
+    ///
+    /// WHAT THIS FORWARDER CONTRIBUTES (O-A finish, 2026-09-15 E-D (e3)): the CURRENT mapped size.
+    /// The window knows only what it presented; `.surfaceMapped` updates this registry's
+    /// `surfaceMappedSize` (and re-applies geometry) without presenting anything, so the About
+    /// window that took one frame and two later remaps kept profiling its first surface while
+    /// `[f1]` reported the newer mapping. `mappedSize(forWindowId:)` is deliberately the SAME
+    /// lookup `[f1]` and `sizeCorrection(for:windowId:)` read -- comparing against a second notion
+    /// of "current" would turn a difference of surfaces into a difference of definitions -- and
+    /// the `.surfaceMapped` handler keeps windowId -> surfaceId strictly 1:1, so that scan can
+    /// only ever find the current mapping.
+    func edgeBorderProfile(windowId: UInt32) -> RemoteWindow.EdgeProfileSample? {
+        windows[windowId]?.edgeProfileSample(currentMapped: mappedSize(forWindowId: windowId))
+    }
+
+    /// Diagnostics only, read-only (O-A finish; window-smoke's `[edge-presents]` line). How many
+    /// frames `windowId` has ever PRESENTED -- `nil` when this registry has no such window. The
+    /// counter is the window's own (`RemoteWindow.presentCount`, whose single writer is
+    /// `present`); this registry neither writes nor derives it, and nothing outside diagnostics
+    /// reads it.
+    func presentCount(windowId: UInt32) -> Int? {
+        windows[windowId]?.presentCount
     }
 
     /// Diagnostics only (adr/0010 §4, `Tools/window-smoke`'s popup scenario) -- `windowId`'s
