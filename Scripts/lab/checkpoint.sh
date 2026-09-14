@@ -9,7 +9,9 @@
 #   (b) run-scenario.sh etw <ETW_JOB>, wait for the capture's socket, then settle
 #   (c) run-scenario.sh smoke <SMOKE_JOB>, wait for the run's DONE
 #   (d) wait for the capture's own DONE (it ends by itself, DURATION seconds after it started)
-#   (e) SNAPSHOT=1: run-scenario.sh relay server-snapshot, wait for the relay's DONE
+#   (e) SNAPSHOT=1: run-scenario.sh relay server-snapshot, wait for the relay's DONE (ceiling: the
+#       job's own TIMEOUT plus a 90s margin, not a number this script carries -- see the
+#       RELAY_TIMEOUT= line, near the bottom, for the derivation)
 #   (f) gather everything into .build/evidence/<BATCH>/ and print a manifest
 #
 # WHY THE ORDER IS THE DESIGN, not a convenience. The capture must be OPEN before the run dials,
@@ -46,7 +48,9 @@
 #   4  the ETW capture never opened its output
 #   5  the smoke run never reported a DONE line
 #   6  the ETW capture never reported a DONE line
-#   7  the snapshot relay never reported a DONE line
+#   7  the snapshot relay never reported a DONE line within its ceiling (jobs/server-snapshot.env's
+#      own TIMEOUT plus the same 90s margin ETW_DONE_TIMEOUT uses, or CHECKPOINT_TIMEOUT_RELAY when
+#      that is set)
 #   8  every step reported, and the evidence directory is still INCOMPLETE -- a REQUIRED artefact
 #      was never produced. Distinct from 2-7 on purpose: those say a step failed and the scrollback
 #      says which, while this one says every step SUCCEEDED and the evidence is short anyway, which
@@ -281,12 +285,19 @@ LISTING_ONLY=0
 # calls `cp` -- it reports only whether <destination name> is ALREADY in the batch directory, which
 # is true only for window-smoke's own artefact (its source IS the batch directory; see WS_LOG_SRC)
 # or for a directory a previous, completed run of the SAME batch name left behind.
+#
+# <annotate>: 1 for exactly one artefact, server-snapshot-<TAG>.txt (see the call below, and
+# cp_snapshot_suffix just below this function). Its relay DONE line only says the RDP SESSION
+# ended -- not that the host finished writing the report -- which is exactly the gap the
+# 2026-09-15 offset-20260915 batch fell into: a relay that outlived RELAY_TIMEOUT still leaves a
+# COMPLETE report on disk, and gather() had no way to say so.
 # shellcheck disable=SC2329,SC2317  # reached only through the EXIT trap, via cp_gather (SC2317: shellcheck 0.9 on Tier 1 follows the trap chain and reads this body as unreachable; 0.11 does not)
-gather() { # <source> <destination name> <required 0|1>
-    local src="$1" dst="$EVIDENCE/$2" required="$3" why=''
+gather() { # <source> <destination name> <required 0|1> [annotate 0|1]
+    local src="$1" dst="$EVIDENCE/$2" required="$3" annotate="${4:-0}" why='' suffix=''
     if [ "$LISTING_ONLY" -eq 1 ]; then
         if [ -f "$dst" ]; then
-            cp_log "      $2  $(wc -c < "$dst" | tr -d ' ') bytes"
+            if [ "$annotate" -eq 1 ]; then suffix="$(cp_snapshot_suffix "$dst")"; fi
+            cp_log "      $2  $(wc -c < "$dst" | tr -d ' ') bytes$suffix"
             return 0
         fi
         why='MISSING -- listing only, nothing gathered'
@@ -298,7 +309,8 @@ gather() { # <source> <destination name> <required 0|1>
         why='COPY-FAILED'
     fi
     if [ -z "$why" ]; then
-        cp_log "      $2  $(wc -c < "$dst" | tr -d ' ') bytes"
+        if [ "$annotate" -eq 1 ]; then suffix="$(cp_snapshot_suffix "$dst")"; fi
+        cp_log "      $2  $(wc -c < "$dst" | tr -d ' ') bytes$suffix"
         return 0
     fi
     if [ "$required" -eq 1 ]; then
@@ -308,6 +320,22 @@ gather() { # <source> <destination name> <required 0|1>
         cp_log "      $2  $why"
     fi
     return 1
+}
+
+# The report's own last line is the host's declaration, not this script's: server-snapshot.ps1
+# (see Scripts/lab/share/server-snapshot.ps1) writes RESULT: DONE only once, as its final line,
+# whether or not the relay session around it is later judged a timeout. It writes that line with
+# [IO.File]::WriteAllLines, i.e. Environment.NewLine -- CRLF on Windows -- so the trailing CR is
+# stripped before the comparison the same way cp_job_value already strips CR from every other
+# host-written value this script reads (gate r1 B1: a bare `=` comparison here called every real,
+# complete report INCOMPLETE, because it never matched the CRLF the host actually writes).
+# shellcheck disable=SC2329,SC2317  # reached only through the EXIT trap, via cp_gather -> gather
+cp_snapshot_suffix() { # <gathered path>
+    if [ "$(tail -n 1 "$1" 2>/dev/null | tr -d '\r')" = 'RESULT: DONE' ]; then
+        printf ' (complete)'
+    else
+        printf ' (INCOMPLETE -- last line is not RESULT: DONE)'
+    fi
 }
 
 # WHICH FOUR ARE REQUIRED, and why the capture's two are not. Every way the capture can fail
@@ -332,7 +360,7 @@ cp_gather() {
     gather "$WS_LOG_SRC" "window-smoke-$SMOKE_TAG.log" 1
     if [ "$SNAPSHOT" = '1' ]; then
         gather "$RELAY_LOG" "relay-$SMOKE_TAG.log" 1
-        gather "$SNAPSHOT_OUT" "server-snapshot-$SMOKE_TAG.txt" 1
+        gather "$SNAPSHOT_OUT" "server-snapshot-$SMOKE_TAG.txt" 1 1
     fi
     cp_log "verdicts: capture=[$(cp_done_line "$ETW_LOG")] run=[$(cp_done_line "$SMOKE_TAG_LOG" "$SMOKE_LOG")] snapshot=[$(cp_done_line "$RELAY_LOG")]"
     # The capture's JSONL carries server and channel names and is NEVER quotable as-is; the
@@ -429,6 +457,29 @@ printf '%s\n' "$SMOKE_TAG" | grep -qE '^[A-Za-z0-9._-]{1,32}$' \
 printf '%s\n' "$ETW_DURATION" | grep -qE '^[1-9][0-9]{0,4}$' \
     || cp_die 2 "$(cp_rel "$ETW_JOB_FILE") has a DURATION that is not a positive integer"
 
+# THE SNAPSHOT'S OWN CEILING, read only when the snapshot step will run: SNAPSHOT=0 has no
+# business refusing over a file it will never open. jobs/server-snapshot.env's TIMEOUT is the
+# session length relay.command itself honours (see relay.command's own JOB-ENV-INVALID check), so
+# it is read here the same way ETW_JOB_FILE's DURATION already is -- readable check, then
+# cp_job_value, before anything is launched -- and a missing or malformed value refuses now rather
+# than after the capture and the run have already spent minutes on a checkpoint that was always
+# going to fail at (e). SNAPSHOT_TIMEOUT stays 0 (unused, valid for arithmetic) when SNAPSHOT=0.
+#
+# THE REFUSAL MESSAGE CLAIMS ONLY WHAT IS TRUE OF relay.command, not what would be convenient: a
+# MISSING TIMEOUT is not one of relay.command's own refusals -- it defaults a missing value to 25s
+# (relay.command:107) -- and its own regex (`^[1-9][0-9]*$`) accepts more digits than this script's
+# `^[1-9][0-9]{0,4}$` does. What relay.command WOULD refuse is a non-numeric value; what THIS
+# script additionally requires, for its own reason, is a positive integer of 1-5 digits to derive
+# a wait ceiling from -- it will not guess one for a job it cannot even read.
+SNAPSHOT_TIMEOUT=0
+if [ "$SNAPSHOT" = '1' ]; then
+    SNAPSHOT_JOB_FILE="$LAB/jobs/server-snapshot.env"
+    [ -r "$SNAPSHOT_JOB_FILE" ] || cp_die 2 "$(cp_rel "$SNAPSHOT_JOB_FILE") is not readable"
+    SNAPSHOT_TIMEOUT="$(cp_job_value "$SNAPSHOT_JOB_FILE" TIMEOUT)"
+    printf '%s\n' "$SNAPSHOT_TIMEOUT" | grep -qE '^[1-9][0-9]{0,4}$' \
+        || cp_die 2 "$(cp_rel "$SNAPSHOT_JOB_FILE") has no TIMEOUT that is a positive integer of 1-5 digits (relay.command itself would only refuse a non-numeric value, defaulting a missing one to 25s -- this script needs an actual number to derive the snapshot wait ceiling from)"
+fi
+
 ETW_JSONL="$RUNTIME/wdp/etw-$ETW_TAG.jsonl"
 ETW_LOG="$RUNTIME/etw.log"
 ETW_TAG_LOG="$RUNTIME/wdp/etw-$ETW_TAG.log"
@@ -459,7 +510,12 @@ GATHER_ARMED=1
 #   smoke run   900 s   -- an incremental xcodebuild plus a multi-minute live battery
 #   ETW DONE    DURATION + 90 s -- the capture ends by itself; the margin is teardown and the
 #                                  summary line
-#   relay       180 s   -- one RDP session that runs a read-only PowerShell report
+#   relay       jobs/server-snapshot.env's own TIMEOUT + 90 s -- the same margin ETW_DONE_TIMEOUT
+#                                  uses, read from the job rather than carried as a number here,
+#                                  because a fixed ceiling can drift out of step with the job it is
+#                                  timing: a fixed 180s against TIMEOUT=240 read a complete snapshot
+#                                  (last line RESULT: DONE, relay DONE exit=0 65-85s later) as a
+#                                  timeout three times in the 2026-09-15 offset-20260915 batch.
 #
 # Each is overridable by an environment variable of the same name, because these are statements
 # about PATIENCE, not about safety: nothing this script does depends on a ceiling being large, and
@@ -476,9 +532,18 @@ cp_timeout() { # <override value> <default>
 ETW_OPEN_TIMEOUT="$(cp_timeout "${CHECKPOINT_TIMEOUT_ETW_OPEN:-}" 60)"
 SMOKE_TIMEOUT="$(cp_timeout "${CHECKPOINT_TIMEOUT_SMOKE:-}" 900)"
 ETW_DONE_TIMEOUT="$(cp_timeout "${CHECKPOINT_TIMEOUT_ETW_DONE:-}" $((ETW_DURATION + 90)))"
-RELAY_TIMEOUT="$(cp_timeout "${CHECKPOINT_TIMEOUT_RELAY:-}" 180)"
+RELAY_TIMEOUT="$(cp_timeout "${CHECKPOINT_TIMEOUT_RELAY:-}" $((SNAPSHOT_TIMEOUT + 90)))"
 
-cp_log "checkpoint $JOB_NAME: etw=$ETW_JOB (TAG=$ETW_TAG, ${ETW_DURATION}s) smoke=$SMOKE_JOB (TAG=$SMOKE_TAG) snapshot=$SNAPSHOT batch=$BATCH"
+# Stated in the header, not just held in a variable: a scrollback reader watching (e) run long has
+# no other way to tell whether it is still inside its ceiling. SNAPSHOT=0 never printed a ceiling
+# because it never has one -- (e) does not run -- so this stays silent there rather than printing a
+# number nothing waits on.
+if [ "$SNAPSHOT" = '1' ]; then
+    SNAPSHOT_STATUS="snapshot=$SNAPSHOT snapshot-wait=${RELAY_TIMEOUT}s"
+else
+    SNAPSHOT_STATUS="snapshot=$SNAPSHOT"
+fi
+cp_log "checkpoint $JOB_NAME: etw=$ETW_JOB (TAG=$ETW_TAG, ${ETW_DURATION}s) smoke=$SMOKE_JOB (TAG=$SMOKE_TAG) $SNAPSHOT_STATUS batch=$BATCH"
 # The template's own BATCH is read for exactly one purpose: saying out loud that it is not the one
 # in force. It is never a path here -- see WS_LOG_SRC above for what happens when it is -- but a
 # reader comparing this scrollback against a job file under review deserves to be told that the

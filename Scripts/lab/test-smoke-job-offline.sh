@@ -211,14 +211,26 @@ fi
 FAKE_ETW
 cat > "$SB/bin/labtest-fake-relay" <<'FAKE_RELAY' || exit 1
 #!/usr/bin/env bash
-# OFFLINE TEST FAKE for the relay's server-snapshot job. Opens no socket.
+# OFFLINE TEST FAKE for the relay's server-snapshot job. Opens no socket. Writes RESULT: DONE\r\n
+# by default -- CRLF, the actual last line Scripts/lab/share/server-snapshot.ps1 writes on a real
+# host (WriteAllLines uses Environment.NewLine, which is CRLF on Windows -- see gate r1 B1: an
+# LF-only fixture here let a broken LF-only comparison in checkpoint.sh pass every pin while
+# calling every real report INCOMPLETE). LABTEST_RELAY_SNAPSHOT_LF=1 gives the LF-only complete
+# shape (case 41i, cheap extra coverage); LABTEST_RELAY_SNAPSHOT_INCOMPLETE=1 gives a report that
+# never reached its own end (case 41h).
 set -u
 R="$LABTEST_RUNTIME"
 mkdir -p "$R/share"
 printf 'fake-relay\n' >> "$LABTEST_TRACE"
 sleep "${LABTEST_RELAY_DELAY:-1}"
 if [ "${LABTEST_RELAY_DONES:-1}" = "1" ]; then
-	printf 'RESULT labtest\n' > "$R/share/server-snapshot-out.txt"
+	if [ "${LABTEST_RELAY_SNAPSHOT_INCOMPLETE:-0}" = "1" ]; then
+		printf 'RESULT labtest\n' > "$R/share/server-snapshot-out.txt"
+	elif [ "${LABTEST_RELAY_SNAPSHOT_LF:-0}" = "1" ]; then
+		printf 'RESULT: DONE\n' > "$R/share/server-snapshot-out.txt"
+	else
+		printf 'RESULT: DONE\r\n' > "$R/share/server-snapshot-out.txt"
+	fi
 	printf 'DONE exit=%s\n' "${LABTEST_RELAY_RC:-0}" >> "$R/relay.log"
 fi
 FAKE_RELAY
@@ -524,6 +536,19 @@ run_smoke() { # <wrapper-path> <boundary-file|""> [child-rc] [child-leak 0|1] [t
 }
 
 # Runs run-scenario.sh or checkpoint.sh with the same sandbox environment. Output goes to $2.
+# CHECKPOINT_TIMEOUT_RELAY uses `-` rather than `:-` on purpose (gate r1 m3): UNSET still defaults
+# to a short 20s here, the same blanket net the other three CHECKPOINT_TIMEOUT_* knobs give every
+# case that never thinks about the relay at all -- a future case that hangs the relay without
+# knowing to export anything now costs 20s instead of the real derived ceiling (measured: a mutant
+# that dropped the override wait 463.7s once this default was widened, before the `-` fix). A case
+# that wants to see checkpoint.sh's own derived default -- the 41b/41c/41g/41h/41i family -- SETS
+# the variable to the empty string first (`export CHECKPOINT_TIMEOUT_RELAY=`): that makes it SET
+# rather than unset, so `${CHECKPOINT_TIMEOUT_RELAY-20}` passes the empty value through, and
+# checkpoint.sh's own `${CHECKPOINT_TIMEOUT_RELAY:-}` treats that empty value exactly like unset --
+# the same idiom `MACDOWS_LAB_BOUNDARY_FILE=""` uses elsewhere in this suite. A case that wants a
+# SHORT explicit ceiling (case 40) exports a real number, which passes through unchanged either
+# way. No array is used to omit the key conditionally -- see test-probe-offline.sh's comment on why
+# an empty `"${arr[@]}"` is an unbound-variable error under bash 3.2 + `set -u`.
 run_lab() { # <output file> <script> <args...>
 	local out="$1" script="$2"
 	shift 2
@@ -555,10 +580,12 @@ run_lab() { # <output file> <script> <args...>
 		LABTEST_RELAY_DONES="${LABTEST_RELAY_DONES:-1}" \
 		LABTEST_RELAY_RC="${LABTEST_RELAY_RC:-0}" \
 		LABTEST_RELAY_DELAY="${LABTEST_RELAY_DELAY:-1}" \
+		LABTEST_RELAY_SNAPSHOT_INCOMPLETE="${LABTEST_RELAY_SNAPSHOT_INCOMPLETE:-0}" \
+		LABTEST_RELAY_SNAPSHOT_LF="${LABTEST_RELAY_SNAPSHOT_LF:-0}" \
 		CHECKPOINT_TIMEOUT_ETW_OPEN="${CHECKPOINT_TIMEOUT_ETW_OPEN:-20}" \
 		CHECKPOINT_TIMEOUT_SMOKE="${CHECKPOINT_TIMEOUT_SMOKE:-40}" \
 		CHECKPOINT_TIMEOUT_ETW_DONE="${CHECKPOINT_TIMEOUT_ETW_DONE:-30}" \
-		CHECKPOINT_TIMEOUT_RELAY="${CHECKPOINT_TIMEOUT_RELAY:-20}" \
+		CHECKPOINT_TIMEOUT_RELAY="${CHECKPOINT_TIMEOUT_RELAY-20}" \
 		MACDOWS_LAB_BOUNDARY_FILE= \
 		bash "$script" "$@" > "$out" 2>&1
 }
@@ -1746,6 +1773,158 @@ else
 	fail "$CASE:$reasons"
 fi
 
+# 41b-41h. THE SNAPSHOT WAIT CEILING IS DERIVED FROM THE JOB (owner 2026-09-15 ruling c), not a
+#          round number this script carries. The defect: RELAY_TIMEOUT used to default to a fixed
+#          180s while jobs/server-snapshot.env declares TIMEOUT=240, so a snapshot that legitimately
+#          ran long printed a false step-(e) timeout three times in the offset-20260915 batch even
+#          though the report was complete and the relay's own DONE line followed 65-85s later.
+# Every sub-case restores $SBLAB/jobs/server-snapshot.env from the tracked original ($LAB/jobs/) the
+# moment it is done mutating it, so case 46's tracked-tree census still sees the pristine file.
+SNAPSHOT_ENV_PRISTINE="$LAB/jobs/server-snapshot.env"
+
+# 41b. T1: the tracked job's TIMEOUT=240, unmodified, plus the 90s margin -> 330s in the header.
+begin '41b snapshot-wait is derived from the tracked jobs/server-snapshot.env (TIMEOUT=240)'
+export LABTEST_OPEN_EXEC=1
+export CHECKPOINT_TIMEOUT_RELAY=
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+rc=$?
+unset LABTEST_OPEN_EXEC CHECKPOINT_TIMEOUT_RELAY
+if [ "$rc" -eq 0 ] && grep -qF 'snapshot-wait=330s' "$SB/out.txt"; then
+	pass "$CASE: TIMEOUT=240 + the 90s margin ETW_DONE_TIMEOUT also uses prints snapshot-wait=330s"
+else
+	fail "$CASE: rc=$rc"
+	note "$(head -n 3 "$SB/out.txt")"
+fi
+
+# 41c. T2: a shorter TIMEOUT moves the printed ceiling by the same +90s margin. Appended rather
+#      than edited in place, the same "later assignment wins" convention job_override() uses --
+#      TIMEOUT=7 is what cp_job_value's subshell source sees last.
+begin '41c snapshot-wait follows a shorter TIMEOUT'
+printf 'TIMEOUT=7\n' >> "$SBLAB/jobs/server-snapshot.env" || exit 1
+export LABTEST_OPEN_EXEC=1
+export CHECKPOINT_TIMEOUT_RELAY=
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+rc=$?
+unset LABTEST_OPEN_EXEC CHECKPOINT_TIMEOUT_RELAY
+cp "$SNAPSHOT_ENV_PRISTINE" "$SBLAB/jobs/server-snapshot.env" || exit 1
+if [ "$rc" -eq 0 ] && grep -qF 'snapshot-wait=97s' "$SB/out.txt"; then
+	pass "$CASE: TIMEOUT=7 (the job's last assignment) + 90s prints snapshot-wait=97s"
+else
+	fail "$CASE: rc=$rc"
+	note "$(head -n 3 "$SB/out.txt")"
+fi
+
+# 41d. T3: the environment override still wins over the job's own TIMEOUT, the same as every other
+#      CHECKPOINT_TIMEOUT_* knob -- these are statements about patience, not about the job.
+begin '41d CHECKPOINT_TIMEOUT_RELAY overrides the derived ceiling'
+export LABTEST_OPEN_EXEC=1
+export CHECKPOINT_TIMEOUT_RELAY=5
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+rc=$?
+unset LABTEST_OPEN_EXEC CHECKPOINT_TIMEOUT_RELAY
+if [ "$rc" -eq 0 ] && grep -qF 'snapshot-wait=5s' "$SB/out.txt"; then
+	pass "$CASE: the override wins regardless of the tracked job's TIMEOUT=240"
+else
+	fail "$CASE: rc=$rc"
+	note "$(head -n 3 "$SB/out.txt")"
+fi
+
+# 41e. T4: a malformed TIMEOUT refuses BEFORE anything is launched, the same as every other
+#      job-shape check -- relay.command would refuse this job too, and a checkpoint that launched
+#      the capture first only to fail at (e) would waste the run it just started.
+begin '41e a malformed TIMEOUT in jobs/server-snapshot.env refuses early'
+printf 'TIMEOUT=abc\n' >> "$SBLAB/jobs/server-snapshot.env" || exit 1
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+rc=$?
+cp "$SNAPSHOT_ENV_PRISTINE" "$SBLAB/jobs/server-snapshot.env" || exit 1
+reasons=''
+[ "$rc" -eq 2 ] || reasons="$reasons rc=$rc;"
+grep -qF 'jobs/server-snapshot.env' "$SB/out.txt" || reasons="$reasons message-does-not-name-the-job;"
+[ "$(open_calls)" = '0' ] || reasons="$reasons opened-something;"
+[ -d "$SBEVIDENCE/labtest" ] && reasons="$reasons evidence-dir-created;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: exit 2, the message names jobs/server-snapshot.env, nothing was launched and no evidence directory was created"
+else
+	fail "$CASE:$reasons"
+	note "$(cat "$SB/out.txt")"
+fi
+
+# 41f. T5: SNAPSHOT=0 must not even READ jobs/server-snapshot.env -- a checkpoint that skips the
+#      relay step has no business refusing over a file it will never use.
+begin '41f SNAPSHOT=0 does not read jobs/server-snapshot.env'
+cat > "$SBLAB/jobs/checkpoint-nosnap.env" <<'JOB_NOSNAP2' || exit 1
+ETW_JOB=labtest
+SMOKE_JOB=labtest
+SNAPSHOT=0
+SETTLE_SECONDS=0
+BATCH=labtest
+JOB_NOSNAP2
+printf 'TIMEOUT=abc\n' >> "$SBLAB/jobs/server-snapshot.env" || exit 1
+export LABTEST_OPEN_EXEC=1
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" nosnap
+rc=$?
+unset LABTEST_OPEN_EXEC
+cp "$SNAPSHOT_ENV_PRISTINE" "$SBLAB/jobs/server-snapshot.env" || exit 1
+rm -f "$SBLAB/jobs/checkpoint-nosnap.env"
+reasons=''
+[ "$rc" -eq 0 ] || reasons="$reasons rc=$rc;"
+grep -qF 'snapshot=0' "$SB/out.txt" || reasons="$reasons no-snapshot=0-in-header;"
+grep -q 'snapshot-wait=' "$SB/out.txt" && reasons="$reasons snapshot-wait-printed-with-snapshot-off;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: a malformed jobs/server-snapshot.env does not stop a SNAPSHOT=0 run, and the header shows snapshot=0 with no snapshot-wait="
+else
+	fail "$CASE:$reasons"
+	note "$(head -n 3 "$SB/out.txt")"
+fi
+
+# 41g-41i. T6: WHETHER THE GATHERED SNAPSHOT FILE ITSELF IS COMPLETE, stated on its own manifest
+#      line, is what a reader needs when (e) times out: the relay's DONE line only says the RDP
+#      SESSION ended, not that the host finished writing its report. RESULT: DONE\r\n -- CRLF -- is
+#      the actual last line Scripts/lab/share/server-snapshot.ps1 writes on a real host
+#      (WriteAllLines / Environment.NewLine), and the fake relay writes that shape by default (gate
+#      r1 B1: an LF-only fixture here previously let an LF-only comparison in checkpoint.sh pass
+#      every pin while calling every real report INCOMPLETE -- 41g now exercises the real ending).
+#      LABTEST_RELAY_SNAPSHOT_LF=1 covers the LF-only complete shape too (41i); _INCOMPLETE=1 gives
+#      a report that never reached its own end (41h).
+begin '41g the manifest marks a complete CRLF snapshot file (complete)'
+export LABTEST_OPEN_EXEC=1
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+rc=$?
+unset LABTEST_OPEN_EXEC
+if [ "$rc" -eq 0 ] && grep -qE 'server-snapshot-labtest\.txt  [0-9]+ bytes \(complete\)' "$SB/out.txt"; then
+	pass "$CASE: a report ending in RESULT: DONE\\r\\n (the real host shape) is marked (complete) on its manifest line"
+else
+	fail "$CASE: rc=$rc"
+	note "$(grep 'server-snapshot-labtest.txt' "$SB/out.txt")"
+fi
+
+begin '41h the manifest marks an incomplete snapshot file (INCOMPLETE ...)'
+export LABTEST_OPEN_EXEC=1
+export LABTEST_RELAY_SNAPSHOT_INCOMPLETE=1
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+rc=$?
+unset LABTEST_OPEN_EXEC LABTEST_RELAY_SNAPSHOT_INCOMPLETE
+if [ "$rc" -eq 0 ] \
+	&& grep -qE 'server-snapshot-labtest\.txt  [0-9]+ bytes \(INCOMPLETE -- last line is not RESULT: DONE\)' "$SB/out.txt"; then
+	pass "$CASE: a report NOT ending in RESULT: DONE is marked INCOMPLETE on its manifest line"
+else
+	fail "$CASE: rc=$rc"
+	note "$(grep 'server-snapshot-labtest.txt' "$SB/out.txt")"
+fi
+
+begin '41i the manifest also marks an LF-only complete snapshot file (complete)'
+export LABTEST_OPEN_EXEC=1
+export LABTEST_RELAY_SNAPSHOT_LF=1
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+rc=$?
+unset LABTEST_OPEN_EXEC LABTEST_RELAY_SNAPSHOT_LF
+if [ "$rc" -eq 0 ] && grep -qE 'server-snapshot-labtest\.txt  [0-9]+ bytes \(complete\)' "$SB/out.txt"; then
+	pass "$CASE: a report ending in RESULT: DONE\\n (no CR) is also marked (complete) -- the strip is a no-op on LF text"
+else
+	fail "$CASE: rc=$rc"
+	note "$(grep 'server-snapshot-labtest.txt' "$SB/out.txt")"
+fi
+
 # 42. The checkpoint job file is held to the same standard as the smoke one: a key outside its
 #     whitelist, a value outside its shape, or a job it names that does not exist, all refuse with
 #     exit 2 and launch nothing.
@@ -2057,7 +2236,7 @@ fi
 
 # Every case must have reported: a case that neither passed nor failed would otherwise vanish from
 # the tally with exit 0. Placed after the LAST case on purpose.
-EXPECTED_CASES=65
+EXPECTED_CASES=73
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi
