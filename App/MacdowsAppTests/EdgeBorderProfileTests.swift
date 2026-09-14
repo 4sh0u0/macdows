@@ -427,6 +427,154 @@ struct EdgeBorderProfileTests {
     }
 }
 
+// O-A finish (2026-09-15 E-D (e3)): the SECOND thing a profile line has to be honest about --
+// WHICH surface it profiled. `displayedSurface`/`displayedMappedSize` are written by `present`
+// and by nothing else, while the registry's own mapped size is updated by every `.surfaceMapped`
+// event (`RemoteWindowRegistry.swift`'s `.surfaceMapped` case remaps and re-applies geometry, and
+// never presents). In the 2026-09-15 run the About window took ONE frame (alloc 576x576, mapped
+// 522x515) and then two surface remaps with no frame behind them, so the finish sample profiled
+// the first surface again and printed a line byte-identical to first-frame while `[f1]` reported
+// the registry's current 500x505. Nothing was wrong with the picture -- the diagnostic was
+// describing an older surface than the one its reader assumed. These cases pin the decision that
+// makes that case SAY so instead of printing numbers about the wrong surface.
+@MainActor
+@Suite("O-A finish: a profile states which surface it is about (staleness)")
+struct EdgeProfileStalenessTests {
+    /// The 2026-09-15 numbers, so a fixture cannot drift away from the run it models.
+    private static let edgeMapped = CGSize(width: 522, height: 515)
+    private static let currentMapped = CGSize(width: 500, height: 505)
+    private static let allocSide = 576
+
+    @Test("staleness compares the two mapped sizes and never claims staleness from an unknown one")
+    func stalenessOnlySpeaksWhenBothSizesAreKnownAndDiffer() {
+        // Equal -- today's case, and the one every notepad-shaped window is in.
+        #expect(
+            RemoteWindow.edgeProfileStaleness(displayedMapped: Self.edgeMapped, currentMapped: Self.edgeMapped)
+                == .current
+        )
+        // Differing -- the 2026-09-15 About case. Both sizes travel with the verdict, because the
+        // line that reports it has no other way to name the two surfaces.
+        #expect(
+            RemoteWindow.edgeProfileStaleness(displayedMapped: Self.edgeMapped, currentMapped: Self.currentMapped)
+                == .stale(edgeMapped: Self.edgeMapped, currentMapped: Self.currentMapped)
+        )
+        // One axis is enough: a remap that changed only the height still means the profiled
+        // surface is not the mapping the registry now holds.
+        #expect(
+            RemoteWindow.edgeProfileStaleness(
+                displayedMapped: Self.edgeMapped,
+                currentMapped: CGSize(width: Self.edgeMapped.width, height: Self.currentMapped.height)
+            ) == .stale(
+                edgeMapped: Self.edgeMapped,
+                currentMapped: CGSize(width: Self.edgeMapped.width, height: Self.currentMapped.height)
+            )
+        )
+        // An UNKNOWN size on either side is not evidence of staleness, and must not be reported as
+        // any: the registry has no mapping for this window (`mappedSize(forWindowId:)` nil), or the
+        // presented frame carried no mapped size at all (`present(surface:mappedSize: nil)`, the
+        // whole-allocation fallback `edgeBorderProfile` already documents). Both keep today's
+        // behaviour -- profile what is displayed -- rather than inventing a comparison.
+        #expect(RemoteWindow.edgeProfileStaleness(displayedMapped: Self.edgeMapped, currentMapped: nil) == .current)
+        #expect(RemoteWindow.edgeProfileStaleness(displayedMapped: nil, currentMapped: Self.currentMapped) == .current)
+        #expect(RemoteWindow.edgeProfileStaleness(displayedMapped: nil, currentMapped: nil) == .current)
+    }
+
+    @Test("the 2026-09-15 shape: one surface, profiled at its own mapped size and refused at the registry's newer one")
+    func theSameSurfaceIsProfiledAtItsOwnMappedSizeAndReportedStaleAtTheRegistrysNewerOne() throws {
+        // ONE surface -- the run had exactly one, and that is the whole point: the two questions
+        // below differ only in what the REGISTRY currently says, not in what is displayed.
+        let surface = makeSurface(allocWidth: Self.allocSide, allocHeight: Self.allocSide)
+        let width = Int(Self.edgeMapped.width)
+        let height = Int(Self.edgeMapped.height)
+        fill(surface, x: 0, y: 0, width: Self.allocSide, height: Self.allocSide, value: SurveyGrey.padding)
+        fill(surface, x: 0, y: 0, width: width, height: height, value: SurveyGrey.dialogBackground)
+        drawFrame(surface, width: width, height: height, value: SurveyGrey.border)
+
+        let fresh = try #require(RemoteWindow.edgeProfileSample(
+            ofSurface: surface, displayedMapped: Self.edgeMapped, currentMapped: Self.edgeMapped
+        ))
+        guard case .profile(let profile) = fresh else {
+            Issue.record("a surface whose mapped size is still the registry's own must be PROFILED, got \(fresh)")
+            return
+        }
+        // Byte-for-byte the reading the static half gives on its own: the staleness seam adds a
+        // question, it does not change the answer to the old one.
+        #expect(profile == RemoteWindow.edgeBorderProfile(ofSurface: surface, mappedSize: Self.edgeMapped))
+        #expect(profile.mappedWidth == width && profile.mappedHeight == height)
+        #expect(profile.allocWidth == Self.allocSide && profile.allocHeight == Self.allocSide)
+        #expect(profile.topDarkRatio == 1.0 && profile.bottomDarkRatio == 1.0)
+        #expect(profile.leftDarkRatio == 1.0 && profile.rightDarkRatio == 1.0)
+
+        // Same surface, same displayed mapped size, registry has moved on -- no profile at all.
+        // Returning the numbers here is what made the 2026-09-15 finish line unreadable: they are
+        // a true description of a surface nobody asked about.
+        let stale = try #require(RemoteWindow.edgeProfileSample(
+            ofSurface: surface, displayedMapped: Self.edgeMapped, currentMapped: Self.currentMapped
+        ))
+        #expect(stale == .stale(edgeMapped: Self.edgeMapped, currentMapped: Self.currentMapped))
+        if case .profile = stale {
+            Issue.record("a stale surface must not be profiled -- its numbers describe the older mapping")
+        }
+    }
+}
+
+// The wiring, driven through a REAL `RemoteWindow` (no host, no started session): the two fields
+// the staleness decision reads are written by `present` alone, so a version that compared the
+// wrong field, or that never updated `presentCount`, would pass the pure cases above and still
+// misreport every live run. `RemoteWindowRegistryLeftBorderTests`' own header establishes that an
+// UNSTARTED `CRSession` is enough to construct this far and that nothing contacts any host;
+// `present`'s recycle of the OUTGOING surface is the only call that would reach the session, and
+// a window's first frame has no outgoing surface.
+//
+// WHAT IS STILL OUT OF REACH OFFLINE, registered rather than worked around: the registry-level
+// path (`.surfaceMapped` with no `.frameReady`) cannot be driven here, because the only way a
+// registry-owned window ever gets a displayed surface is `handleFrameReady` ->
+// `session.copyPublishedSurface`, which needs a real GFX publish from a live connection. The
+// forwarder's own shape is pinned as source text in `EdgeBorderProfileScopePinTests` instead.
+@MainActor
+@Suite("O-A finish: staleness and the present counter through a real RemoteWindow")
+struct EdgeProfileStalenessWindowTests {
+    @Test("a window reports no sample before its first frame, then its presented surface's own mapped size")
+    func aWindowsSampleFollowsTheSurfaceItActuallyPresented() throws {
+        let edgeMapped = CGSize(width: 522, height: 515)
+        let currentMapped = CGSize(width: 500, height: 505)
+        let session = CRSession(host: "", user: "", password: "", program: "")
+        let window = RemoteWindow(
+            key: RemoteWindowKey(windowId: 1, generation: 1),
+            contentRect: NSRect(x: 0, y: 0, width: edgeMapped.width, height: edgeMapped.height),
+            title: "fixture"
+        )
+        // Nothing presented yet: no surface, no sample, and a counter that has counted nothing.
+        #expect(window.presentCount == 0)
+        #expect(window.edgeProfileSample(currentMapped: edgeMapped) == nil)
+
+        let surface = makeSurface(allocWidth: 576, allocHeight: 576)
+        fill(surface, x: 0, y: 0, width: 576, height: 576, value: SurveyGrey.padding)
+        fill(surface, x: 0, y: 0, width: 522, height: 515, value: SurveyGrey.dialogBackground)
+        drawFrame(surface, width: 522, height: 515, value: SurveyGrey.border)
+        window.present(surface: surface, mappedSize: edgeMapped, via: session)
+
+        // The counter is the run record's answer to "was anything ever presented after the first
+        // frame" -- the question the 2026-09-15 record could not answer at all.
+        #expect(window.presentCount == 1)
+        let fresh = try #require(window.edgeProfileSample(currentMapped: edgeMapped))
+        guard case .profile(let profile) = fresh else {
+            Issue.record("a window asked at its presented surface's own mapped size must be profiled, got \(fresh)")
+            return
+        }
+        #expect(profile.mappedWidth == 522 && profile.mappedHeight == 515)
+        #expect(profile.allocWidth == 576 && profile.allocHeight == 576)
+        // ... and the same window, once the registry's current mapping has moved past it.
+        #expect(window.edgeProfileSample(currentMapped: currentMapped)
+            == .stale(edgeMapped: edgeMapped, currentMapped: currentMapped))
+        // An unknown current mapping still profiles, exactly as before this lane existed.
+        #expect(window.edgeProfileSample(currentMapped: nil) != nil)
+        if case .stale = try #require(window.edgeProfileSample(currentMapped: nil)) {
+            Issue.record("an unknown current mapped size must not be read as staleness")
+        }
+    }
+}
+
 // MARK: - source pins: this lane changed no geometry
 
 private func source(_ relative: String) throws -> String {
@@ -476,6 +624,29 @@ struct EdgeBorderProfileScopePinTests {
     func oneRegistryForwarder() throws {
         let registry = try source("App/RemoteWindowRendering/RemoteWindowRegistry.swift")
         #expect(occurrences(of: "func edgeBorderProfile(windowId: UInt32)", in: registry) == 1)
-        #expect(occurrences(of: "windows[windowId]?.edgeBorderProfile()", in: registry) == 1)
+        // The forwarder now asks the window for a SAMPLE and hands it the registry's own current
+        // mapped size -- one expression, read-only, no state written (O-A finish, 2026-09-15). The
+        // current size comes from `mappedSize(forWindowId:)`, the same reverse lookup `[f1]` and
+        // `sizeCorrection` read, so "the edge line and `[f1]` disagree" can only mean the surfaces
+        // differ, never that two different notions of "current" were compared.
+        #expect(occurrences(
+            of: "windows[windowId]?.edgeProfileSample(currentMapped: mappedSize(forWindowId: windowId))",
+            in: registry
+        ) == 1)
+        // The present counter reaches the harness through its own read-only forwarder, and the
+        // registry neither writes nor derives it.
+        #expect(occurrences(of: "func presentCount(windowId: UInt32) -> Int?", in: registry) == 1)
+        #expect(occurrences(of: "windows[windowId]?.presentCount", in: registry) == 1)
+    }
+
+    @Test("the present counter has exactly one writer, and it is present() itself")
+    func thePresentCounterIsWrittenOnlyByPresent() throws {
+        let src = try source("App/RemoteWindowRendering/RemoteWindow.swift")
+        // A second increment site (a timeout path, a mask re-apply, anything that touches the
+        // layer without a new frame) would make `[edge-presents] count=` mean something other
+        // than "frames this session presented", which is the only thing the run record reads it
+        // as. `private(set)` is what keeps the rest of the process from writing it at all.
+        #expect(occurrences(of: "presentCount += 1", in: src) == 1)
+        #expect(occurrences(of: "private(set) var presentCount = 0", in: src) == 1)
     }
 }

@@ -90,17 +90,39 @@ final class RemoteWindow {
     let window: NSWindow
     private let contentLayer: CALayer
 
-    /// The surface currently assigned to `contentLayer.contents`, if any — held onto so
-    /// that a *later* `present(surface:via:)` call can recycle it once CoreAnimation has
-    /// actually finished with it (adr/0005 §2: "the recycle point is CATransaction
-    /// completion, not the moment contents is swapped"). This is always the *outgoing* surface being replaced, never the
-    /// incoming one.
+    /// The surface currently assigned to `contentLayer.contents`, if any -- i.e. the one this
+    /// window most recently PRESENTED. Held onto so that a *later* `present(surface:via:)` call
+    /// can recycle it once CoreAnimation has actually finished with it (adr/0005 §2: "the recycle
+    /// point is CATransaction completion, not the moment contents is swapped"): inside that later
+    /// call this field is read first, as the *outgoing* surface, and only then overwritten with
+    /// the incoming one.
+    ///
+    /// IT CAN OUTLIVE THE MAPPING IT WAS PRESENTED UNDER (2026-09-15 E-D (e3)). `present` is the
+    /// only writer of this field and of `displayedMappedSize`, and only `.frameReady` presents; a
+    /// `.surfaceMapped` event updates the REGISTRY's mapped size and re-applies this window's
+    /// geometry without presenting anything. A window whose server stopped publishing frames after
+    /// its first one therefore keeps showing that first surface -- stretched into the new geometry
+    /// by `.resize` -- while the registry has moved on. Any diagnostic that reads these two fields
+    /// is reading a statement about THAT surface, which is why `edgeProfileSample(currentMapped:)`
+    /// below refuses to profile when the two mappings disagree instead of reporting numbers whose
+    /// subject its reader would guess wrong.
     private var displayedSurface: IOSurface?
     /// The GFX mapped sub-rect size for `displayedSurface` (nil when unknown) -- the real
     /// content region inside the 64-aligned allocation. Kept alongside the surface so
     /// diagnostics (`nonWhitePixelRatio`) sample actual content instead of padding rows,
     /// which used to skew every pixel-honesty metric (padding bytes read as "non-white").
     private var displayedMappedSize: CGSize?
+    /// How many frames this window has PRESENTED, ever -- incremented by `present` and by nothing
+    /// else, read by nobody but diagnostics (window-smoke's `[edge-presents]` line). Measurement
+    /// only: no code path branches on it.
+    ///
+    /// WHY IT EXISTS (2026-09-15 E-D (e3)). "The displayed surface is older than the registry's
+    /// mapping" has two very different causes -- the server published later frames this client
+    /// dropped, or it published none at all -- and the run record had no way to tell them apart:
+    /// a window that presented once and a window that presented two hundred times look identical
+    /// in every other line. One counter per window, sampled at first-frame and at finish, decides
+    /// it.
+    private(set) var presentCount = 0
 
     /// W4c: fed straight from `RemoteWindowContentView.onEvent` — this class does no
     /// translation of its own, just plumbs the closure through to the view constructed in
@@ -636,7 +658,7 @@ final class RemoteWindow {
         return Double(nonWhiteCount) / Double(sampled)
     }
 
-    /// One reading of `edgeBorderProfile()` -- pure data, no judgement. Every field is a raw
+    /// One reading of `edgeBorderProfile(ofSurface:mappedSize:)` -- pure data, no judgement. Every field is a raw
     /// count or ratio so that the READER (a run record, not this code) decides what it means;
     /// the survey's 1x baseline is "all four ratios > 0.9 and all four corner counts non-zero"
     /// (`docs/upgrade-gate/2026-09-10-about-offset-offline-survey.md` §4), but nothing here
@@ -753,12 +775,86 @@ final class RemoteWindow {
     /// no Screen Recording grant, no chance of capturing the wrong window or a stale file, and
     /// no image is produced to archive (see `nonWhitePixelRatio`'s own doc comment -- this is the
     /// same technique, widened from one bottom band to the four edges).
-    func edgeBorderProfile() -> EdgeBorderProfile? {
+    ///
+    /// ASKED THROUGH `edgeProfileSample(currentMapped:)`, never on its own from outside this
+    /// class: a profile is a statement about the surface that is DISPLAYED, and since 2026-09-15
+    /// the harness has to be told when that is no longer the surface the registry's current
+    /// mapping describes.
+    func edgeProfileSample(currentMapped: CGSize?) -> EdgeProfileSample? {
         guard let surface = displayedSurface else { return nil }
-        return Self.edgeBorderProfile(ofSurface: surface, mappedSize: displayedMappedSize)
+        return Self.edgeProfileSample(
+            ofSurface: surface, displayedMapped: displayedMappedSize, currentMapped: currentMapped
+        )
     }
 
-    /// The pure half of `edgeBorderProfile()`, split out so the offline fixtures can drive it
+    /// Which surface a would-be profile is actually about (O-A finish, 2026-09-15 E-D (e3)).
+    /// `.current` is "the displayed surface still carries the mapping the registry holds" -- the
+    /// only state in which the numbers below mean what a reader assumes. `.stale` carries BOTH
+    /// sizes because they are the only names the two surfaces have.
+    enum EdgeProfileStaleness: Equatable {
+        case current
+        case stale(edgeMapped: CGSize, currentMapped: CGSize)
+    }
+
+    /// One reading of the diagnostic: either a profile of the displayed surface, or the statement
+    /// that the displayed surface is not the one the registry's mapping describes. `nil` (no
+    /// surface at all / an unreadable one) stays outside this type, exactly as before -- the
+    /// harness already prints two different `unavailable=` tokens for those, decided from the
+    /// window's own `hasDisplayedContent`.
+    ///
+    /// A SUM TYPE, not a profile plus a flag: "stale" and "here are the profile's numbers" must
+    /// not be sayable at the same time, because the numbers would be about the older surface and
+    /// the 2026-09-15 finish line is precisely what that reads like.
+    enum EdgeProfileSample: Equatable {
+        case profile(EdgeBorderProfile)
+        case stale(edgeMapped: CGSize, currentMapped: CGSize)
+    }
+
+    /// The pure decision, so it can be driven offline without a live `CRSession` or a real screen.
+    ///
+    /// AN UNKNOWN SIZE IS NOT EVIDENCE. `currentMapped == nil` means this registry holds no
+    /// mapping for the window (`mappedSize(forWindowId:)`'s own `nil`) and `displayedMapped == nil`
+    /// means the presented frame carried no mapped size, which `edgeBorderProfile` already handles
+    /// by profiling the whole allocation. Neither is a reason to claim the displayed surface is
+    /// out of date, so both keep the pre-2026-09-15 behaviour: profile what is displayed. Only two
+    /// KNOWN and DIFFERENT sizes are a staleness claim.
+    ///
+    /// THE FALSE NEGATIVE THIS CANNOT SEE, registered rather than papered over: a remap to a
+    /// DIFFERENT surface with the SAME mapped size, with no frame behind it, compares equal and
+    /// is reported as `.current` -- this window keeps no surfaceId to compare identities with, and
+    /// adding one would be a second source of truth for "which surface" rather than a measurement.
+    /// `presentCount` partly compensates (the run record can see that no frame arrived between the
+    /// two samples), and the direction of the error is the safe one: the case this misses prints
+    /// today's line, it never invents a staleness claim.
+    static func edgeProfileStaleness(
+        displayedMapped: CGSize?, currentMapped: CGSize?
+    ) -> EdgeProfileStaleness {
+        guard let displayedMapped, let currentMapped, displayedMapped != currentMapped else {
+            return .current
+        }
+        return .stale(edgeMapped: displayedMapped, currentMapped: currentMapped)
+    }
+
+    /// The pure half of `edgeProfileSample(currentMapped:)` -- same split, and for the same
+    /// reason, as `edgeBorderProfile(ofSurface:mappedSize:)` below. A stale surface is NOT
+    /// profiled: the read would succeed and produce four honest ratios about the wrong subject.
+    static func edgeProfileSample(
+        ofSurface surface: IOSurface, displayedMapped: CGSize?, currentMapped: CGSize?,
+        cornerSide: Int = 6
+    ) -> EdgeProfileSample? {
+        switch edgeProfileStaleness(displayedMapped: displayedMapped, currentMapped: currentMapped) {
+        case .stale(let edgeMapped, let currentMapped):
+            return .stale(edgeMapped: edgeMapped, currentMapped: currentMapped)
+        case .current:
+            guard let profile = edgeBorderProfile(
+                ofSurface: surface, mappedSize: displayedMapped, cornerSide: cornerSide
+            ) else { return nil }
+            return .profile(profile)
+        }
+    }
+
+    /// The pure half of the profile read `edgeProfileSample(currentMapped:)` performs, split
+    /// out so the offline fixtures can drive it
     /// with a synthesised IOSurface (a real `RemoteWindow` needs a live `CRSession` and a real
     /// screen). Same read-only lock, same mapped-sub-rect clamp, same byte order.
     ///
@@ -1432,6 +1528,10 @@ final class RemoteWindow {
         }
         displayedSurface = surface
         displayedMappedSize = mappedSize
+        // The ONE writer of the counter (`presentCount`'s own doc comment): one increment per
+        // presented frame, placed beside the two fields it describes so a future frame path that
+        // forgets one forgets all three together rather than silently desynchronising them.
+        presentCount += 1
         CATransaction.commit()
 
         if !hasClearedFirstFrameGate {

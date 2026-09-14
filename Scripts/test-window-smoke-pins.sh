@@ -116,7 +116,7 @@ pin 1 "$(code_only | grep -cE 'newContentIds\.count >= extraApps\.count,' || tru
 echo "== O-A edge profile: opt-in, one sampler, one printer (WINDOW_SMOKE_EDGE_PROFILE) =="
 # ADR-0018 §5.1 增补 2026-09-10 14:27 item (1). The whole diagnostic is measurement-only, so what
 # has to hold is NEGATIVE as much as positive: with the knob unset nothing is sampled, nothing is
-# printed, and RemoteWindow.edgeBorderProfile() is never entered. That is structural here -- the
+# printed, and RemoteWindow.edgeProfileSample(currentMapped:) is never entered. That is structural
 # knob is opt-in, the sampler's FIRST statement is the guard, and every read and every print lives
 # inside that one guarded function.
 pin 1 "$(code_only | grep -cE 'WINDOW_SMOKE_EDGE_PROFILE"\] == "1"' || true)" "edge knob read once, opt-in"
@@ -139,9 +139,19 @@ pin 1 "$(code_only | grep -cE 'sampleEdgeProfiles\(registry: registry, at: \.fir
 pin 1 "$(code_only | grep -cE 'sampleEdgeProfiles\(registry: registry, at: \.finish\)' || true)" "finish sample driven once"
 # The diagnostic is reached from exactly one place in the whole harness ...
 pin 1 "$(code_only | grep -cE 'registry\.edgeBorderProfile\(windowId:' || true)" "one registry.edgeBorderProfile call site"
-# ... its text is built in one place (two return shapes, both inside EdgeProfile.line) ...
-pin 1 "$(code_only | grep -cE 'windowId: UInt32, profile: RemoteWindow\.EdgeBorderProfile\?, hasDisplayedContent: Bool,' || true)" "EdgeProfile.line definition"
+# ... its text is built in one place. DELIBERATE PIN CHANGE, O-A finish 2026-09-15 (E-D (e3)): the
+# builder used to take `profile: RemoteWindow.EdgeBorderProfile?` and now takes
+# `sample: RemoteWindow.EdgeProfileSample?` -- a sum type, so "this surface is stale" and "here are
+# the profile numbers" cannot be stated at the same time (the numbers would be about the older
+# surface, which is exactly what the 2026-09-15 finish line read like). Same pin, same property,
+# new call shape; a builder that went back to taking a bare optional profile goes red here.
+pin 1 "$(code_only | grep -cE 'windowId: UInt32, sample: RemoteWindow\.EdgeProfileSample\?, hasDisplayedContent: Bool,' || true)" "EdgeProfile.line definition"
+# Three shapes, TWO builders: the profiled line, and the one `unavailable=` grammar all three
+# reasons share (no-displayed-surface / surface-not-readable / stale-surface, the last one with a
+# detail between the token and `visible=`). Still 2 -- a third `[edge] id=` site would be a shape
+# no pin below governs.
 pin 2 "$(code_only | grep -cE '\[edge\] id=\\\(windowId\)' || true)" "[edge] text built in one place (profile + unavailable)"
+pin 1 "$(code_only | grep -cE 'private static func unavailableLine\(' || true)" "one unavailable= grammar"
 # ... and printed from one place. A second print site is a line no pin above governs.
 pin 1 "$(code_only | grep -cE 'print\(EdgeProfile\.line\(' || true)" "[edge] printed from one site"
 # One first-frame sample per window per run (a 60fps stream would otherwise print per frame).
@@ -149,6 +159,17 @@ pin 1 "$(code_only | grep -cE 'edgeProfileFirstFrameSampled\.insert\(' || true)"
 # ... and one -- at most one -- "nothing displayed yet" line per window in that same phase, from a
 # SECOND set: inserting into the set above would cost that window its real first-frame sample.
 pin 1 "$(code_only | grep -cE 'edgeProfileFirstFrameUnavailable\.insert\(' || true)" "the unavailable first-frame line deduped separately"
+# THIRD set, same reasoning one more time (gate r1 I-1). `stale-surface` is a transient state -- a
+# window sitting between a `.surfaceMapped` and the frame behind it -- and the first-frame sample
+# fires once per drain batch that saw ANY window's frame, so a window under study can be caught
+# stale by a batch that was about somebody else. Routing that line into the `sampled` set would
+# spend the window's single profiled first-frame slot on it and cost the run its first-frame
+# baseline for the whole run; a third set keeps the window eligible. Ceiling: three lines per
+# window per first-frame phase, each state at most once.
+pin 1 "$(code_only | grep -cE 'edgeProfileFirstFrameStale\.insert\(' || true)" "the stale first-frame line deduped separately"
+# The sample is fetched ONCE, above the dedupe, because the dedupe now keys on its SHAPE; a second
+# fetch inside the branches could observe a different state than the line eventually printed.
+pin 1 "$(code_only | grep -cE 'let sample = registry\.edgeBorderProfile\(windowId: snapshot\.windowId\)' || true)" "the sample is read once, before the dedupe"
 # THE NEGATIVE PIN THAT MATTERS (gate O-A r1 B-1). No content filter on the sampler's loop: every
 # window in the registry gets a line, and one that has displayed nothing says so. A `where` clause
 # here would silently drop exactly the window this diagnostic exists to report (C-2' run 2's About
@@ -170,11 +191,32 @@ pin 1 "$(code_only | grep -cE 'hasDisplayedContent: snapshot\.hasDisplayedConten
 pin 1 "$(code_only | grep -cE 'hasDisplayedContent \? \.surfaceNotReadable : \.noDisplayedSurface' || true)" "the two unavailable reasons, decided in one place"
 pin 1 "$(code_only | grep -cE 'case noDisplayedSurface = "no-displayed-surface"' || true)" "no-displayed-surface token"
 pin 1 "$(code_only | grep -cE 'case surfaceNotReadable = "surface-not-readable"' || true)" "surface-not-readable token"
+# O-A finish: the third reason, and the two mapped sizes it exists to name. `edge-mapped=` is the
+# mapping the DISPLAYED surface was presented under, `current-mapped=` the one the registry holds
+# now -- without both, a reader cannot tell which surface the missing profile would have been about.
+pin 1 "$(code_only | grep -cE 'case staleSurface = "stale-surface"' || true)" "stale-surface token"
+pin 1 "$(code_only | grep -cE 'edge-mapped=\\\(fmtSize\(edgeMapped\)\) current-mapped=\\\(fmtSize\(currentMapped\)\)' || true)" "both mapped sizes on the stale shape"
 pin 1 "$(code_only | grep -cE 'visible=\\\(isVisible \? 1 : 0\)' || true)" "visible= on the unavailable shape"
 # The inward scan (gate O-A r1 I-1) is on the line, in the same edge order as the ratios, and is
 # built from the profile's own fields rather than re-derived here.
 pin 1 "$(code_only | grep -cE 'firstDark=\\\(fmtOffset\(profile\.firstDarkRowFromTop\)\)' || true)" "firstDark= built from the profile"
 pin 1 "$(code_only | grep -cE 'static func fmtOffset\(' || true)" "one absent-offset formatter"
+# gate r1 m-2: the stale shape's two sizes are formatted BY `[f1]`'s own formatter, not by a second
+# copy of its rule -- the doc comment sells character-for-character comparability with an `[f1]`
+# line, and two copies of "integral as integer, otherwise %.3f" can drift apart silently.
+pin 1 "$(code_only | grep -cE 'static func fmtSize\(' || true)" "one declared-size formatter"
+pin 2 "$(code_only | grep -A4 -E 'static func fmtSize\(' | grep -cE 'F1BackingVsMapped\.Observation\.fmt\(' || true)" "fmtSize defers to the [f1] formatter"
+
+echo "== O-A finish: the present counter (WINDOW_SMOKE_EDGE_PROFILE) =="
+# `[edge-presents]` is what tells "the server published no frame for the newer mapping" from "it
+# did and this client is behind" -- the question the 2026-09-15 record could not answer. Same
+# one-place-built / one-place-printed shape as `[edge]` itself, and read through the registry's
+# read-only forwarder rather than counted here (a harness-side counter would count what the
+# harness saw, not what the window presented).
+pin 1 "$(code_only | grep -cE 'static func presentsLine\(windowId: UInt32, count: Int, at phase: Phase\)' || true)" "presentsLine definition"
+pin 1 "$(code_only | grep -cE '\[edge-presents\] id=\\\(windowId\)' || true)" "[edge-presents] text built in one place"
+pin 1 "$(code_only | grep -cE 'print\(EdgeProfile\.presentsLine\(' || true)" "[edge-presents] printed from one site"
+pin 1 "$(code_only | grep -cE 'registry\.presentCount\(windowId:' || true)" "one registry.presentCount call site"
 
 echo "== summary =="
 printf 'failures=%s\n' "$FAILURES"
