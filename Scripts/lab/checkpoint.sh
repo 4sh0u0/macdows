@@ -43,7 +43,8 @@
 #
 # Exit codes -- one per failed step, so a caller (or a human reading a scrollback) knows where:
 #   0  every step reported AND every required artefact reached the evidence directory
-#   2  the checkpoint job, or one of the job files it names, is missing or malformed
+#   2  the checkpoint job, or one of the job files it names, is missing or malformed, or the
+#      runtime directory cannot take this run's start stamp (see CP_START_STAMP)
 #   3  refused: an ETW capture is still running (see the overlap guard)
 #   4  the ETW capture never opened its output
 #   5  the smoke run never reported a DONE line
@@ -68,8 +69,10 @@
 # unrelated run's leftovers under the very names this batch would use. Copying those in would attribute
 # them to a batch that never produced them, which is worse than an honest MISSING. A normal completion
 # or a step failure that falls through to the bottom of the script is different: something WAS
-# launched for this batch, and that path still gathers from .build/lab-runtime/ into the batch
-# directory as before.
+# launched for this batch, and that path gathers from .build/lab-runtime/ into the batch directory --
+# but only the files written AFTER this run's start stamp (CP_START_STAMP, below). A step that never
+# launched leaves its source exactly as the previous run left it, and such a file is reported MISSING
+# as a previous run's, copied nowhere and left in place, rather than attributed to this batch.
 #
 # The codes in the `run:` / `capture:` / `snapshot relay:` lines below are the WRAPPERS' own and are
 # never re-used as this script's. The two job-file wrappers now answer the same way as each other:
@@ -142,13 +145,52 @@ cp_job_value() { # <job file> <key>
     ) | tr -d '\r'
 }
 
-# Waits for <path> to exist. Returns 0 when it does, 1 on timeout, 2 when <abort-log> reported a
-# verdict first -- a capture that refused (a bad pin, a bad job file) writes DONE and exits, and
-# waiting the full timeout for a file it will never create only delays the diagnosis.
+# THE START STAMP, and the one rule every reader of a run's files applies. Written into
+# .build/lab-runtime/ the moment this batch's run begins (at GATHER_ARMED=1 below: after every
+# job-file refusal, before anything is launched) and compared against by cp_fresh: a file is THIS
+# run's only when it was modified after the stamp. The comparison is `find -newer`, which the BSD and
+# GNU finds both make at the filesystem's own resolution (nanoseconds on APFS and ext4); bash 3.2's
+# `-nt` rounds to whole seconds and would call a file written in the stamp's own second stale.
+#
+# WHY A RULE ABOUT FILES AND NOT ABOUT WHICH STEPS RAN. Every source gathered from
+# .build/lab-runtime/ is cleared immediately before the launch that rewrites it (run-scenario.sh
+# removes smoke-<TAG>.log and relay.log, this script removes the capture's two files and the
+# snapshot report) -- but only when that launch happens. A checkpoint that fails at (b) never
+# launches (c) or (e), never runs their `rm -f`s, and used to reach the gather with the PREVIOUS
+# run's smoke log, the previous logoff relay's log and the previous checkpoint's snapshot report
+# still under the names it was about to attribute to this batch: it copied all three in and read
+# `run=[DONE exit=0] snapshot=[DONE exit=0]` out of them (the 2026-09-16 remapfix p3-none run,
+# record gate r1 B1). Whether a step launched is one fact; whether a FILE is this run's is the one
+# the manifest asserts, and the stamp answers it for every artefact the same way -- including the
+# one source no `rm` ever clears (window-smoke-<TAG>.log's source is the batch directory itself,
+# and a rerun under the same batch name finds the earlier run's copy exactly there).
+#
+# Fail-closed by construction: a real artefact can only be judged stale if its last write predates
+# the stamp, which no launch this script performs can produce; a stale one can only pass if something
+# rewrote it after the stamp, at which point it is this run's to explain. The host writes the
+# snapshot report through the redirected drive, so its mtime is this Mac's clock, not the host's.
+CP_START_STAMP="$RUNTIME/checkpoint-start.stamp"
+
+cp_fresh() { # <path> -- 0 iff the file exists and was modified after this run's start stamp
+    [ -f "$1" ] || return 1
+    [ -n "$(find "$1" -maxdepth 0 -newer "$CP_START_STAMP" 2>/dev/null)" ]
+}
+
+# A DONE line counts only in a log this run wrote. The fixed-name logs (etw.log, smoke.log,
+# relay.log) are exactly where a previous run's verdict survives until the next launch truncates
+# them, so every wait and every verdict below reads them through this and nothing else.
+cp_has_done() { # <log>
+    cp_fresh "$1" && grep -q '^DONE exit=' "$1"
+}
+
+# Waits for <path> to exist AS THIS RUN'S FILE (see cp_fresh). Returns 0 when it does, 1 on timeout,
+# 2 when <abort-log> reported a verdict first -- a capture that refused (a bad pin, a bad job file)
+# writes DONE and exits, and waiting the full timeout for a file it will never create only delays
+# the diagnosis.
 cp_wait_file() { # <path> <timeout seconds> [abort-log]
     local i=0
-    until [ -f "$1" ]; do
-        if [ -n "${3:-}" ] && [ -f "$3" ] && grep -q '^DONE exit=' "$3"; then return 2; fi
+    until cp_fresh "$1"; do
+        if [ -n "${3:-}" ] && cp_has_done "$3"; then return 2; fi
         sleep 1
         i=$((i + 1))
         if [ "$i" -ge "$2" ]; then return 1; fi
@@ -166,7 +208,7 @@ cp_wait_done() { # <timeout seconds> <log>...
     shift
     while :; do
         for log in "$@"; do
-            if [ -f "$log" ] && grep -q '^DONE exit=' "$log"; then return 0; fi
+            if cp_has_done "$log"; then return 0; fi
         done
         sleep 1
         i=$((i + 1))
@@ -177,12 +219,12 @@ cp_wait_done() { # <timeout seconds> <log>...
 cp_done_line() { # <log>...
     local log
     for log in "$@"; do
-        if [ -f "$log" ] && grep -q '^DONE exit=' "$log"; then
+        if cp_has_done "$log"; then
             grep '^DONE exit=' "$log" | tail -n 1
             return 0
         fi
     done
-    printf '%s' '<no DONE line>'
+    printf '%s' '<no DONE line from this run>'
 }
 
 # A fixed wait, spelled as a bounded poll rather than one long `sleep`: the whole script's waiting
@@ -269,7 +311,10 @@ cp_etw_capture_live() {
 # directory ALREADY holds each artefact under its name, which leaves an empty or non-existent batch
 # directory exactly as it found it. A normal completion, or a step failure that falls through to the
 # bottom of the script instead of exiting through cp_die, is different -- something WAS launched for
-# this batch -- and that path still gathers from .build/lab-runtime/ into the batch directory.
+# this batch -- and that path gathers from .build/lab-runtime/ into the batch directory, admitting
+# only what is NEWER THAN THE START STAMP: a step that was skipped after an earlier one failed left
+# its source untouched since the previous run, and that file is a previous run's, not this one's
+# (see CP_START_STAMP and cp_fresh above).
 GATHER_ARMED=0
 GATHER_DONE=0
 MISSING=0
@@ -303,10 +348,21 @@ gather() { # <source> <destination name> <required 0|1> [annotate 0|1]
         why='MISSING -- listing only, nothing gathered'
     elif [ ! -f "$src" ]; then
         why="MISSING ($(cp_rel "$src"))"
+    elif ! cp_fresh "$src"; then
+        # Present, and older than this run's start stamp: a previous run's file under this run's
+        # name (see CP_START_STAMP). Not read, not copied, not removed -- reported for what it is,
+        # and counted exactly like a file that was never written.
+        why="MISSING ($(cp_rel "$src") predates this checkpoint -- a previous run's, left in place, nothing copied)"
     elif [ "$src" != "$dst" ] && ! cp -f "$src" "$dst"; then
         # A required artefact that could not be COPIED is just as absent from the evidence
         # directory as one that was never written, and is counted the same way.
         why='COPY-FAILED'
+    fi
+    # Nothing was copied under this name by this run, yet the name is already there: a rerun under
+    # the same batch name left an earlier run's copy, and a reader of the directory alone would take
+    # it for this run's. Said on the manifest line, so the directory and the record cannot disagree.
+    if [ -n "$why" ] && [ "$src" != "$dst" ] && [ -f "$dst" ]; then
+        why="$why; the $2 already in the batch directory is an earlier run's, not this one's"
     fi
     if [ -z "$why" ]; then
         if [ "$annotate" -eq 1 ]; then suffix="$(cp_snapshot_suffix "$dst")"; fi
@@ -502,8 +558,17 @@ EVIDENCE="$REPO_ROOT/.build/evidence/$BATCH"
 # with a clean manifest, a clean verdicts line and exit 0 over the top of it. The source is now the
 # same directory as the destination, so gather() reports the size and copies nothing.
 WS_LOG_SRC="$EVIDENCE/window-smoke-$SMOKE_TAG.log"
+# THE START STAMP (see CP_START_STAMP above): written now, after the last job-file refusal and
+# before anything is launched, so every file a launch below produces is newer than it and every
+# leftover of a previous run is not. A data write rather than a bare `touch`, so the mtime moves
+# even when the previous checkpoint left a stamp of the same size; the content is for a human
+# reading the runtime directory and is never parsed.
+mkdir -p "$RUNTIME" || cp_die 2 "cannot create $(cp_rel "$RUNTIME")"
+printf 'batch=%s start=%s\n' "$BATCH" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$CP_START_STAMP" \
+    || cp_die 2 "cannot write $(cp_rel "$CP_START_STAMP") -- nothing below could write to the runtime directory either"
 # From here on, every exit gathers and prints the manifest -- including the overlap refusal below.
 GATHER_ARMED=1
+cp_log "start stamp: $(cp_rel "$CP_START_STAMP") -- only files modified after it are gathered as this batch's"
 
 # Wait ceilings, each a statement about the step rather than a round number:
 #   ETW socket   60 s   -- the portal answers in seconds; a minute is a hung TLS handshake

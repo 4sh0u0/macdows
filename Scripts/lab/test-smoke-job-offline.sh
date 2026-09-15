@@ -46,13 +46,14 @@
 #      branch is not taken; the osascript shim records into a run-long trace that is never reset,
 #      and the "never reached" assertion at the end covers the whole run.
 #
-# Eight mutation proofs (M1 gate bypassed, M2 key whitelist bypassed, M3 overlap guard removed,
+# Nine mutation proofs (M1 gate bypassed, M2 key whitelist bypassed, M3 overlap guard removed,
 # M4 the window closed before the DONE line is written, M5 the overlap guard reading the process
 # table instead of the capture's own pid line, M6 the manifest reading the template's batch instead
 # of the run's, M7 the missing-artefact count removed, M8 the batch override appended without a
-# separating newline) copy the script under test with one guard removed and require the case that
-# claims to pin it to FAIL against the mutant. A pin that would also pass against the broken code
-# pins nothing.
+# separating newline, M9 the manifest's freshness check removed so a previous run's leftovers are
+# gathered as this batch's) copy the script under test with one guard removed and require the case
+# that claims to pin it to FAIL against the mutant. A pin that would also pass against the broken
+# code pins nothing.
 #
 # Exit: 0 if every case passed, 1 otherwise.
 set -uo pipefail
@@ -344,6 +345,21 @@ if ! PATH="$SB/bin:$PATH" command -v python3 >/dev/null 2>&1; then
 	printf 'ABORT: python3 is not on PATH -- the boundary gate cannot be evaluated\n'
 	exit 1
 fi
+# checkpoint.sh admits a source into the manifest only when it is NEWER than the start stamp the run
+# wrote when it began, and that is a `find -newer` comparison. The two cases that seed a previous
+# run's leftovers (34d, 34e) write them milliseconds before checkpoint.sh writes its stamp, so they
+# are only a test where find compares timestamps below the second -- which the BSD and GNU finds do
+# on APFS and ext4, the two filesystems the lab Mac and Tier 1 run on. Asserted once here, so a
+# coarser platform aborts loudly instead of turning those two cases into a coin toss.
+: > "$SBTMP/stamp-older"
+sleep 0.01
+: > "$SBTMP/stamp-newer"
+if [ -z "$(find "$SBTMP/stamp-newer" -maxdepth 0 -newer "$SBTMP/stamp-older")" ] \
+	|| [ -n "$(find "$SBTMP/stamp-older" -maxdepth 0 -newer "$SBTMP/stamp-newer")" ]; then
+	printf 'ABORT: find -newer does not order two files written 10ms apart on this filesystem -- the freshness cases cannot be judged here\n'
+	exit 1
+fi
+rm -f "$SBTMP/stamp-older" "$SBTMP/stamp-newer"
 # Positive control for the never-reached trace: hit the refuse path once, confirm it recorded,
 # clear -- so an empty trace at the end means "not reached", not "recorder misconfigured".
 env -i LABTEST_REFUSED_TRACE="$LABTEST_REFUSED_TRACE" LABTEST_TRACE="$LABTEST_TRACE" \
@@ -1507,6 +1523,98 @@ else
 	note "$(tail -n 15 "$SB/out.txt")"
 fi
 
+# 34d. A STEP THAT NEVER LAUNCHED HAS NOTHING OF THIS RUN'S TO GATHER. The 2026-09-16 remapfix
+#      p3-none checkpoint failed at (b) -- the capture reported DONE exit=69 without ever opening its
+#      output -- so (c) and (e) never launched, and the `rm -f`s that clear their sources immediately
+#      before each launch (run-scenario.sh's for smoke-<TAG>.log and relay.log, checkpoint.sh's own
+#      for the snapshot report) never ran either. The EXIT-trap gather then copied what
+#      .build/lab-runtime/ still held -- the PREVIOUS pair's smoke log, the pair's logoff relay log
+#      and the previous checkpoint's snapshot report -- under this batch's names, and read
+#      `run=[DONE exit=0] snapshot=[DONE exit=0]` out of them (record gate r1 B1). Here
+#      .build/lab-runtime/ carries exactly those leftovers, DONE lines and RESULT: DONE included,
+#      and the capture fails the same way. Every leftover must be reported MISSING as a previous
+#      run's, copied nowhere and left in place, and no DONE line of theirs may reach the verdicts
+#      line; the capture's own log IS this run's and is gathered. (M9 pins the check.)
+begin '34d a step that never launched: a previous run leftovers are not gathered as this batch'
+mkdir -p "$SBRUNTIME/share" || exit 1
+printf 'STALE-FROM-A-PREVIOUS-RUN\n[smoke] run tag=labtest batch=previous-batch\nDONE exit=0\n' > "$SBRUNTIME/smoke-labtest.log" || exit 1
+printf 'STALE-FROM-A-PREVIOUS-RUN\nDONE exit=0\n' > "$SBRUNTIME/smoke.log" || exit 1
+printf 'STALE-FROM-A-PREVIOUS-RUN\n[relay] program=logoff\nDONE exit=0\n' > "$SBRUNTIME/relay.log" || exit 1
+printf 'STALE-FROM-A-PREVIOUS-RUN\nRESULT: DONE\r\n' > "$SBRUNTIME/share/server-snapshot-out.txt" || exit 1
+export LABTEST_OPEN_EXEC=1
+export LABTEST_ETW_OPENS=0
+export LABTEST_ETW_RC=69
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+rc=$?
+unset LABTEST_OPEN_EXEC LABTEST_ETW_OPENS LABTEST_ETW_RC
+reasons=''
+[ "$rc" -eq 4 ] || reasons="$reasons rc=$rc;"
+grep -qF '(b) the capture reported [DONE exit=69] without ever opening its output' "$SB/out.txt" \
+	|| reasons="$reasons step-b-not-named;"
+for artefact in smoke-labtest.log relay-labtest.log server-snapshot-labtest.txt window-smoke-labtest.log; do
+	[ -e "$SBEVIDENCE/labtest/$artefact" ] && reasons="$reasons STALE-COPIED-AS-THIS-RUN[$artefact];"
+	grep -qE "^\[checkpoint\]       $artefact  MISSING .*  -- REQUIRED\$" "$SB/out.txt" \
+		|| reasons="$reasons not-reported-missing[$artefact];"
+done
+for artefact in smoke-labtest.log relay-labtest.log server-snapshot-labtest.txt; do
+	grep -qE "^\[checkpoint\]       $artefact  MISSING \(.*predates this checkpoint.*\)" "$SB/out.txt" \
+		|| reasons="$reasons not-named-stale[$artefact];"
+done
+# The capture's own log IS this run's -- written after the stamp -- and its verdict is the one the
+# verdicts line carries; the two leftovers' DONE lines are not. (The per-TAG copy of that log is
+# deliberately NOT asserted on: wdp-etw.command writes DONE and THEN copies, and the (b) abort
+# gathers within milliseconds of reading DONE, so whether etw-<TAG>.log has landed by then is a race
+# the real wrapper runs too -- an honest MISSING for an optional artefact, never false evidence.)
+grep -qF 'verdicts: capture=[DONE exit=69] run=[<no DONE line from this run>] snapshot=[<no DONE line from this run>]' "$SB/out.txt" \
+	|| reasons="$reasons stale-verdicts;"
+grep -qF 'INCOMPLETE: 4 artefact(s) missing' "$SB/out.txt" || reasons="$reasons wrong-missing-count;"
+grep -qF 'checkpoint labtest complete' "$SB/out.txt" && reasons="$reasons claims-complete;"
+# The leftovers are read from nowhere and written to nowhere: still there, byte for byte.
+for f in smoke-labtest.log smoke.log relay.log share/server-snapshot-out.txt; do
+	grep -qF 'STALE-FROM-A-PREVIOUS-RUN' "$SBRUNTIME/$f" 2>/dev/null || reasons="$reasons leftover-touched[$f];"
+done
+if [ -z "$reasons" ]; then
+	pass "$CASE: exit 4 at (b); the previous run's smoke log, relay log and snapshot report are each reported MISSING as predating this checkpoint, none reaches the batch directory or the verdicts line, all are left in place, and the verdicts line carries only the capture's own DONE"
+else
+	fail "$CASE:$reasons"
+	note "$(tail -n 14 "$SB/out.txt")"
+fi
+
+# 34e. THE ONE SOURCE NO PRE-LAUNCH rm CLEARS. window-smoke-<TAG>.log's source IS the batch directory
+#      (see WS_LOG_SRC), and nothing removes it before the run. A second checkpoint under the SAME
+#      batch name (a rerun of a broken pair) whose launcher then never writes its evidence log finds
+#      the earlier run's file already under the name it is about to report, and 34c's INCOMPLETE
+#      verdict would vanish behind it. Same rule, same outcome: the file predates this checkpoint,
+#      so it is MISSING -- and it is neither deleted nor rewritten.
+begin '34e a same-name rerun does not report the earlier run window-smoke log as this run'
+mkdir -p "$SBEVIDENCE/labtest" || exit 1
+printf 'STALE-FROM-A-PREVIOUS-RUN\n' > "$SBEVIDENCE/labtest/window-smoke-labtest.log" || exit 1
+export LABTEST_OPEN_EXEC=1
+export LABTEST_CHILD_NO_WS_LOG=1
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+rc=$?
+unset LABTEST_OPEN_EXEC LABTEST_CHILD_NO_WS_LOG
+reasons=''
+[ "$rc" -eq 8 ] || reasons="$reasons rc=$rc;"
+grep -qE '^\[checkpoint\]       window-smoke-labtest\.log  MISSING \(.*predates this checkpoint.*\)  -- REQUIRED$' "$SB/out.txt" \
+	|| reasons="$reasons not-reported-stale;"
+grep -qF 'INCOMPLETE: 1 artefact(s) missing' "$SB/out.txt" || reasons="$reasons no-incomplete-line;"
+grep -qF 'checkpoint labtest complete' "$SB/out.txt" && reasons="$reasons claims-complete;"
+[ "$(cat "$SBEVIDENCE/labtest/window-smoke-labtest.log" 2>/dev/null)" = 'STALE-FROM-A-PREVIOUS-RUN' ] \
+	|| reasons="$reasons leftover-touched;"
+# The other five are this run's and are gathered as before.
+for artefact in etw-labtest.jsonl etw-labtest.log smoke-labtest.log relay-labtest.log \
+	server-snapshot-labtest.txt; do
+	[ -f "$SBEVIDENCE/labtest/$artefact" ] || reasons="$reasons missing[$artefact];"
+done
+grep -qF '(c) run: DONE exit=0' "$SB/out.txt" || reasons="$reasons run-did-not-report;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: the earlier run's window-smoke log under the same batch name is reported MISSING as predating this checkpoint, left untouched, and the checkpoint is INCOMPLETE (exit 8) rather than complete on its strength"
+else
+	fail "$CASE:$reasons"
+	note "$(tail -n 14 "$SB/out.txt")"
+fi
+
 # 35. THE OVERLAP GUARD. Two realtime captures against the same portal disable each other's
 #     providers, and the damage lands in the OTHER run's evidence. A log with no verdict plus a live
 #     capture process is the refusal condition -- and the refusal must happen before anything is
@@ -2161,10 +2269,14 @@ else
 fi
 
 # M6. The manifest's source directory put back to the TEMPLATE's batch (`${SMOKE_BATCH:-$BATCH}`,
-#     which is what it used to be): with the two batches disagreeing, the checkpoint must now report
-#     the run's own log missing and copy the stale one over it -- i.e. case 34b's pin bites. The
-#     mutant is the previous line verbatim, so what this proves is that the fix is load-bearing and
-#     not a cosmetic rewrite.
+#     which is what it used to be): with the two batches disagreeing, the run writes its log under
+#     the override and the manifest looks for it under the template's batch -- i.e. case 34b's pin
+#     bites. WHAT THAT LOOKS LIKE CHANGED with the freshness rule (34d, M9): the template-batch
+#     directory's stale file predates the run's start stamp, so the mutant no longer copies it over
+#     the real log; it reports the run's own log MISSING as a previous run's and exits 8, while the
+#     log the launcher actually wrote sits untouched under the override. Each half fails 34b on its
+#     own (rc, manifest-reported-it-missing); both are required here. The mutant is the previous line
+#     verbatim, so what this proves is that the fix is load-bearing and not a cosmetic rewrite.
 begin 'M6 template-batch mutant'
 MUTANT_BATCH="$SBLAB/labtest-mutant-batch.sh"
 # shellcheck disable=SC2016  # sed must see the literals $EVIDENCE, $SMOKE_BATCH and $BATCH
@@ -2176,13 +2288,15 @@ if sed 's|^WS_LOG_SRC="$EVIDENCE/window-smoke-$SMOKE_TAG.log"$|WS_LOG_SRC="$REPO
 	printf 'STALE-FROM-A-PREVIOUS-RUN\n' > "$STALE_DIR/window-smoke-labtest.log" || exit 1
 	export LABTEST_OPEN_EXEC=1
 	run_lab "$SB/out.txt" "$MUTANT_BATCH" otherbatch dated-20260910
+	rc=$?
 	unset LABTEST_OPEN_EXEC
 	GATHERED="$SBEVIDENCE/dated-20260910/window-smoke-labtest.log"
-	if grep -qF 'STALE-FROM-A-PREVIOUS-RUN' "$GATHERED" 2>/dev/null; then
-		pass "$CASE: detected -- the previous run's log was copied over this run's under the new batch name (case 34b pins the source directory)"
+	if [ "$rc" -eq 8 ] && grep -qF 'window-smoke-labtest.log  MISSING' "$SB/out.txt" \
+		&& grep -qF '[launcher] labtest stub' "$GATHERED" 2>/dev/null; then
+		pass "$CASE: detected -- reading the template's batch, the manifest reports the run's own log MISSING and exits 8 while the launcher's real log sits under the override (case 34b pins the source directory)"
 	else
 		fail "$CASE: NOT detected -- case 34b would pass against a manifest reading the template's batch"
-		note "gathered: $(head -n 2 "$GATHERED" 2>/dev/null | tr '\n' ';')"
+		note "rc=$rc gathered: $(head -n 2 "$GATHERED" 2>/dev/null | tr '\n' ';')"
 	fi
 else
 	fail "$CASE: could not build the mutant (WS_LOG_SRC moved?)"
@@ -2234,9 +2348,41 @@ else
 	fail "$CASE: could not build the mutant (the newline guarantee moved?)"
 fi
 
+# M9. The manifest's FRESHNESS CHECK removed (cp_fresh's find -newer comparison -> `return 0`, so
+#     any file that exists is admitted), which is exactly the state gather() was in before this fold:
+#     with (c) and (e) never launched, the previous run's smoke log, relay log and snapshot report
+#     are copied in under this batch's names and their DONE lines reach the verdicts line -- i.e.
+#     case 34d's pin bites. The mutant leaves the `-f` test in place and takes only the comparison,
+#     so what it isolates is the rule rather than the existence check that was always there.
+begin 'M9 freshness-check mutant'
+MUTANT_FRESH="$SBLAB/labtest-mutant-fresh.sh"
+# shellcheck disable=SC2016  # sed must see the literals $1 and $CP_START_STAMP
+if sed 's|^    \[ -n "$(find "$1" -maxdepth 0 -newer "$CP_START_STAMP" 2>/dev/null)" \]$|    return 0|' \
+	"$SBLAB/checkpoint.sh" > "$MUTANT_FRESH" \
+	&& ! cmp -s "$MUTANT_FRESH" "$SBLAB/checkpoint.sh" && bash -n "$MUTANT_FRESH"; then
+	mkdir -p "$SBRUNTIME/share" || exit 1
+	printf 'STALE-FROM-A-PREVIOUS-RUN\nDONE exit=0\n' > "$SBRUNTIME/smoke-labtest.log" || exit 1
+	printf 'STALE-FROM-A-PREVIOUS-RUN\nDONE exit=0\n' > "$SBRUNTIME/relay.log" || exit 1
+	printf 'STALE-FROM-A-PREVIOUS-RUN\nRESULT: DONE\r\n' > "$SBRUNTIME/share/server-snapshot-out.txt" || exit 1
+	export LABTEST_OPEN_EXEC=1
+	export LABTEST_ETW_OPENS=0
+	export LABTEST_ETW_RC=69
+	run_lab "$SB/out.txt" "$MUTANT_FRESH" labtest
+	unset LABTEST_OPEN_EXEC LABTEST_ETW_OPENS LABTEST_ETW_RC
+	if grep -qF 'STALE-FROM-A-PREVIOUS-RUN' "$SBEVIDENCE/labtest/smoke-labtest.log" 2>/dev/null \
+		&& grep -qF 'run=[DONE exit=0] snapshot=[DONE exit=0]' "$SB/out.txt"; then
+		pass "$CASE: detected -- the previous run's smoke log was gathered as this batch's and its DONE line reached the verdicts line (case 34d pins the check)"
+	else
+		fail "$CASE: NOT detected -- case 34d would pass against a manifest that admits any file that exists"
+		note "$(grep -F 'verdicts:' "$SB/out.txt")"
+	fi
+else
+	fail "$CASE: could not build the mutant (cp_fresh moved?)"
+fi
+
 # Every case must have reported: a case that neither passed nor failed would otherwise vanish from
 # the tally with exit 0. Placed after the LAST case on purpose.
-EXPECTED_CASES=73
+EXPECTED_CASES=76
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi
