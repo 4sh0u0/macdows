@@ -276,6 +276,46 @@ jobs:
         # gate evaluates the allowed segments with it.
         run: ./Scripts/lab/test-smoke-job-offline.sh
 
+      - name: Lab display-mode offline suite
+        # display-mode.command / display_mode.swift: a tracked, guarded tool that switches THIS
+        # Mac's own display between 1x and 2x (native pixel size derived from the CURRENT mode,
+        # never a literal panel geometry -- see the header of both files), replacing the by-hand
+        # display flip the 2026-09-10 W3 offset-measurement batch needed between its 1x and 2x
+        # runs. It opens no socket and needs no live-host boundary gate. The guards this suite
+        # pins: the argument-shape check (64) before anything is touched; the IN-FLIGHT GUARD
+        # (75) -- an ETW capture, a smoke run or a relay whose runtime log has no DONE exit= line
+        # yet refuses before the helper is even built, using the same three signal files
+        # checkpoint.sh's callers wait on; the BUILD GUARD (69) -- swiftc runs only when the
+        # helper is missing or older than the source, never inside a run; argv/stdout passthrough
+        # to the helper's status/select/set subcommands; and the system_profiler CROSS-CHECK,
+        # which refuses to trust CoreGraphics's own "it worked" and instead asks the helper to
+        # switch back as a best-effort restore when a second, independent source disagrees.
+        # `swiftc` and `system_profiler` are PATH-shimmed inside a mktemp sandbox and the helper
+        # itself is a bash fake pointed at via LABTEST_DISPLAY_HELPER (this helper's real path is
+        # a BUILD OUTPUT, not a source file the sandbox can overwrite in place, hence a variable
+        # rather than a copy). This suite is COMPILE-FREE on CI, deliberately -- adr/0006 §6 and
+        # this file's own header keep Tier 1 free of any toolchain, the same reason the
+        # "window-smoke source pins" step below pins Tools/window-smoke/main.swift as source
+        # shapes instead of building it. The one case that is not a fake -- the helper's own
+        # --self-test, run against a REAL swiftc build of the REAL Scripts/lab/display_mode.swift
+        # -- is SKIPPED here (reported as `skipped=1`, never counted as a pass) and instead runs
+        # locally: every lane gate and every maintainer run of this suite has a real `swiftc` on
+        # PATH, which is what actually exercises the mode-selection arithmetic end to end. The
+        # source-shape pins in the next step are this runner's own coverage of that arithmetic.
+        run: ./Scripts/lab/test-display-mode-offline.sh
+
+      - name: Lab display-mode source pins
+        # display_mode.swift has no unit-test target that can run on this compile-free runner (see
+        # the step above), so its mode-selection arithmetic is pinned as SOURCE SHAPES here, the
+        # same construction as the "window-smoke source pins" step below: the
+        # kCGDisplayShowDuplicateLowResolutionModes option that makes HiDPI modes visible at all,
+        # the integer refresh-rate equality selectMode filters on, both the width*2 and height*2
+        # checks 2x requires, isUsableForDesktopGUI being consulted, and -- the negative pin that
+        # matters -- that neither this file nor the wrapper ever gained a numeric literal that
+        # looks like a display dimension (only the offline suite's synthetic fixtures may carry
+        # one; see that file's own fake-helper strings).
+        run: ./Scripts/lab/test-display-mode-pins.sh
+
       - name: window-smoke source pins
         # Tools/window-smoke/main.swift is the live-host harness; it has no unit-test target and
         # Tier 1 has no Xcode, so its contracts are pinned as SOURCE SHAPES (call sites and literal

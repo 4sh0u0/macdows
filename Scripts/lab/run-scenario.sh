@@ -10,6 +10,10 @@
 #   run-scenario.sh checkpoint <j> [batch] -- one whole checkpoint through checkpoint.sh: the
 #                                             capture, the run, the snapshot and the gather
 #
+# Switching THIS Mac's own display between 1x and 2x for a batch (e.g. jobs/smoke-1x-D.env /
+# smoke-2x-D.env's PREFLIGHT 1) is a separate tool, not a mode here: run
+# `Scripts/lab/display-mode.command status|1x|2x` directly.
+#
 # TRACKED vs RUNTIME -- see the block at the top of run-matrix.sh for the whole story. In
 # short: jobs/*.env and share/*.ps1 next to this file are tracked DEFINITIONS and are never
 # written to; the instance a run uses lives under .build/lab-runtime/, which git ignores, and
