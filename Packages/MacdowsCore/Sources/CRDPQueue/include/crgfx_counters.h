@@ -21,11 +21,20 @@
  * counters showing where the frame was lost afterwards.
  *
  * TWO MORE COUNTERS, ADDED BY THE 2026-09-15 GUARD TRACE (ADR-0018 §5.2 ②b). The trace showed that
- * neither half of the chain above can be read without them: `publishes` is counted whether or not
+ * neither half of the chain above can be read without them: `publishes` was counted whether or not
  * the write into the surface slot was accepted (`writes` is that bool), and the slot itself can be
- * TORN DOWN behind the consumer's back by an unmap of its window (`erased`), which is what leaves a
- * frame with nowhere to land while every other counter looks healthy. `writes < publishes` and
- * `erased > 0` are the two shapes that were previously reachable only by elimination.
+ * TORN DOWN behind the consumer's back (`erased`), which is what leaves a frame with nowhere to
+ * land while every other counter looks healthy. `writes < publishes` and `erased > 0` were the two
+ * shapes that had previously been reachable only by elimination (and the first of them is now
+ * unreachable -- see the paragraph below).
+ *
+ * AND ONE MORE, ADDED BY THE FIX (lane fix/w3-remap-slot-erase): `refused`. The bridge no longer
+ * publishes a frame whose slot write was declined -- there are no pixels to hand out -- so
+ * `writes == publishes` now holds by construction and the old `writes < publishes` shape can no
+ * longer occur. `refused` is where those frames went: one per hook entry whose write the slot table
+ * declined. `updates == writes + refused` holds per surface (CRSession.mm's frame hook counts
+ * exactly one of the two after every update it counts), which is what keeps a declined frame from
+ * simply vanishing from the record now that it is no longer published.
  *
  * WHY A SEPARATE TABLE AND NOT crdpq_frames. crdpq_frames is last-writer-wins STATE (adr/0005
  * §1): a publish overwrites the previous one, so it cannot say how many times anything
@@ -98,27 +107,44 @@ void crgfx_counters_note_update(crgfx_counters_t* counters, uint32_t surfaceId, 
 /** Records that `crsurface_table_write` ACCEPTED a frame for `surfaceId` (returned true, i.e. the
  *  pixels were copied into one of that slot's buffers).
  *
- *  THE GAP THIS CLOSES (2026-09-15 guard trace, ADR-0018 §5.2 ②b). The frame hook ignores that
- *  return value and counts a `publish` regardless, so `publishes` means only "the hook reached its
- *  exit": a write declined because the slot was gone, because all three buffers were leased, or
- *  because an allocation failed is indistinguishable from one that landed. `writes < publishes` is
- *  that difference made visible, and it is the ONLY client-side counter that can say the frame
- *  never reached a buffer at all -- everything downstream sees the same empty slot either way.
+ *  THE GAP THIS CLOSED (2026-09-15 guard trace, ADR-0018 §5.2 ②b). The frame hook USED TO ignore
+ *  that return value and count a `publish` regardless, so `publishes` meant only "the hook reached
+ *  its exit": a write declined because the slot was gone, because all three buffers were leased, or
+ *  because an allocation failed was indistinguishable from one that landed. Since lane
+ *  fix/w3-remap-slot-erase the hook publishes only an accepted write, so `publishes == writes` holds
+ *  by construction and the declined frames are counted by `crgfx_counters_note_refused` instead --
+ *  `writes < publishes` can no longer occur, and a run that shows it is a defect in the hook.
  *  Same no-slot-claiming rule as `crgfx_counters_note_publish`: a write is always preceded by the
  *  update that claimed the slot. */
 void crgfx_counters_note_write(crgfx_counters_t* counters, uint32_t surfaceId);
 
-/** Records that the surface-slot table TORE DOWN this surface's slot -- the unmap sweep that
- *  erases every slot of a windowId, the disconnect/shutdown clear, a remap to a different window,
- *  or a size change that discarded a published frame (`CRSurfaceSlots.h`'s erase-observer comment
- *  lists the four call sites and the one deliberate exclusion).
+/** Records that `crsurface_table_write` DECLINED a frame for `surfaceId` (returned false: no slot
+ *  for the id, every buffer in its ring leased, an allocation failure or a failed surface lock).
+ *
+ *  WHY IT EXISTS (lane fix/w3-remap-slot-erase). Since the fix, a declined write is not published:
+ *  publishing one announced a frame that had reached no buffer, and the consumer's only possible
+ *  response was to find nothing and count a drop. That silence is what this counter replaces --
+ *  without it, a frame the slot table refused would leave no trace at all on either side of the
+ *  boundary, which is strictly worse than the `writes < publishes` shape the old behaviour left.
+ *  The reason for the refusal is NOT recorded here: it belongs to the slot table (which counts
+ *  capacity pressure in its own `dropped_frame_count`), and the one this lane is about -- the slot
+ *  was erased -- is already readable beside it as `erased`.
+ *
+ *  Same no-slot-claiming rule as `crgfx_counters_note_write`: the update that preceded it claimed
+ *  the slot, so a refusal that finds no slot means the table was full when that update arrived. */
+void crgfx_counters_note_refused(crgfx_counters_t* counters, uint32_t surfaceId);
+
+/** Records that the surface-slot table TORE DOWN this surface's slot -- the delete of that surface,
+ *  the defensive unmap sweep that erases every slot of a windowId, the disconnect/shutdown clear, a
+ *  remap to a different window, or a size change that discarded a published frame
+ *  (`CRSurfaceSlots.h`'s erase-observer comment lists the five call sites and the one deliberate
+ *  exclusion).
  *
  *  WHY IT IS HERE AND NOT IN THE SLOT TABLE. The teardown is the one event in the whole chain that
- *  nothing recorded: `UnmapWindowForSurface` erases slots the registry still believes in, and the
- *  registry is never told, so every subsequent frame for that surface dies as "no slot" with no
- *  trace of what removed it -- the 2026-09-15 trace could only reach that conclusion by
- *  elimination. Counting it beside the surface's other counters is what turns that elimination
- *  into a reading.
+ *  nothing recorded: the registry is never told about one, so every subsequent frame for that
+ *  surface dies as "no slot" with no trace of what removed it -- the 2026-09-15 trace could only
+ *  reach that conclusion by elimination. Counting it beside the surface's other counters is what
+ *  turns that elimination into a reading.
  *
  *  UNLIKE the two functions above, this one DOES claim a free slot for an id it has not seen: a
  *  surface can be mapped and torn down without anything ever drawing into it, and that case --
@@ -150,25 +176,27 @@ void crgfx_counters_note_publish(crgfx_counters_t* counters, uint32_t surfaceId)
  *  the same hook that already counted an update for that surface. */
 void crgfx_counters_note_stale(crgfx_counters_t* counters, uint32_t surfaceId);
 
-/** Reads the six counters for `surfaceId`, in the order a frame meets them (`updates` ->
- *  `dirty` -> `writes` -> `publishes` -> `stale`) plus `erased`.
+/** Reads the seven counters for `surfaceId`, in the order a frame meets them (`updates` ->
+ *  `dirty` -> `writes` / `refused` -> `publishes` -> `stale`) plus `erased`.
  *
  *  WHAT `true` MEANS, EXACTLY (gate r1 I-1 -- read this before interpreting a zero). `true` says
- *  SOME bridge event was recorded for this id: an update, a write, a publish, a stale discard or an
- *  ERASE. It does NOT say anything was ever drawn. `crgfx_counters_note_erase` claims a slot on its
- *  own (see its own comment for why), so `true` with `updates == 0` is reachable and means "the
- *  bridge tore this surface's slot down and nothing ever drew into it" -- itself one of the lane's
+ *  SOME bridge event was recorded for this id, and only two kinds can be the FIRST one: an update
+ *  or an ERASE. A write, a refusal, a publish and a stale discard claim no slot of their own (they
+ *  are always preceded by the update that did), so none of them can be the event that flips this.
+ *  It does NOT say anything was ever drawn: `crgfx_counters_note_erase` claims a slot on its own
+ *  (see its own comment for why), so `true` with `updates == 0` is reachable and means "the bridge
+ *  tore this surface's slot down and nothing ever drew into it" -- itself one of the lane's
  *  verdicts, not a bookkeeping accident.
  *
  *  Returns false -- leaving the out-parameters untouched -- when this table has recorded NOTHING for
- *  that surface id, whether because no event of any of those five kinds ever reached it or because
+ *  that surface id, whether because no event of any of those six kinds ever reached it or because
  *  the table was already full when the first one did. The caller is expected to report that "not
  *  tracked" verdict verbatim; collapsing it into zeros would turn "no measurement" into the
- *  measurement 4b consists of. Every out-parameter is optional, and all six are read under ONE lock
- *  so a caller can never see two of them from different instants. Safe from any thread. */
+ *  measurement 4b consists of. Every out-parameter is optional, and all seven are read under ONE
+ *  lock so a caller can never see two of them from different instants. Safe from any thread. */
 bool crgfx_counters_read(crgfx_counters_t* counters, uint32_t surfaceId, uint64_t* out_updates,
-                         uint64_t* out_dirty, uint64_t* out_writes, uint64_t* out_publishes,
-                         uint64_t* out_stale, uint64_t* out_erased);
+                         uint64_t* out_dirty, uint64_t* out_writes, uint64_t* out_refused,
+                         uint64_t* out_publishes, uint64_t* out_stale, uint64_t* out_erased);
 
 #ifdef __cplusplus
 }

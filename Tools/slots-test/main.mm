@@ -342,9 +342,14 @@ int main()
         CHECK(crsurface_table_write(t, 900, px2.data(), W * 2, H * 2, W * 2 * 4, 2, NULL, 0), "write at a new size");
         CHECK(erased.size() == 1 && erased[0] == 900, "a size change over a published frame is one teardown");
 
-        /* 5. THE CASE THE TRACE TURNED ON: unmapping the WINDOW erases every slot of that window,
+        /* 5. The whole-window sweep, which since lane fix/w3-remap-slot-erase is the bridge's
+         *    DEFENSIVE path rather than its normal one: it erases every slot of that windowId,
          *    including this one, and every later lease then misses as NoSlot -- with the observer
-         *    as the only record that the teardown happened at all. */
+         *    as the only record that the teardown happened at all. The sweep's own contract is
+         *    unchanged and still pinned here because the bridge still takes it when a
+         *    UnmapWindowForSurface arrives with no DeleteSurface in flight (CRSession.mm's
+         *    crb_gfx_unmap_window_for_surface); what the 2026-09-15 trace turned on -- a delete of
+         *    a STALE surface erasing the window's CURRENT one -- is scenario I. */
         crsurface_table_unmap_window(t, 77);
         CHECK(erased.size() == 2 && erased[1] == 900, "the unmap sweep reports each erased surface id");
         miss = CRSurfaceLeaseMissNone;
@@ -375,6 +380,137 @@ int main()
         CHECK(erased.size() == 4, "a removed observer records nothing further (got %zu)", erased.size());
         CHECK(crsurface_table_lease_published(t, 902, NULL) == NULL, "the reason-less entry point still answers NULL");
         printf("  four lease-miss reasons and four teardown call sites all reported\n");
+        crsurface_table_destroy(t);
+    }
+
+    printf("=== I. a stale surface's delete leaves the window's CURRENT surface alone "
+           "(lane fix/w3-remap-slot-erase) ===\n");
+    {
+        /* WHY THIS SCENARIO EXISTS -- it is the measured defect, in miniature. In all three pairs
+         * of the 2026-09-15 remap batch the About window's surface history was 4 -> 0 -> 4: the
+         * server mapped surface 4, created and mapped surface 0, mapped 4 back, and only THEN
+         * deleted the now-stale surface 0. FreeRDP's gdi_DeleteSurface still saw windowMapped on
+         * surface 0 (a re-map of the window to 4 never clears the old surface's flag) and called
+         * UnmapWindowForSurface(window), which the bridge turned into the whole-window sweep
+         * below -- erasing surface 4's slot, the one the window was actually showing. No further
+         * MapSurfaceToWindow ever arrived, so nothing re-created the slot, every later write was
+         * refused and the window kept showing its old frame (last-period row of all three pairs:
+         * writes=0 publishes=14 drop-noslot=14 presents=0).
+         *
+         * The fix is that the bridge erases only the DELETED surface's slot, which is what
+         * crsurface_table_erase_surface does; this scenario drives that sequence against the real
+         * table. Pointing it back at the sweep (erasing every slot of the window) fails at the
+         * first CHECK below. */
+        CRSurfaceSlotTable *t = crsurface_table_create();
+        const uint32_t W = 32, H = 32;
+        std::vector<uint8_t> px(W * H * 4, 0x3C);
+
+        static std::vector<uint32_t> erasedI;
+        erasedI.clear();
+        crsurface_table_set_erase_observer(
+            t, NULL, [](void *, uint32_t surfaceId) { erasedI.push_back(surfaceId); });
+
+        const uint64_t kWindow = 328;
+        /* 1. The A -> B -> A history, with no unmap anywhere in it (the server never sent one). */
+        crsurface_table_map(t, 4, kWindow);
+        crsurface_table_map(t, 0, kWindow);
+        crsurface_table_map(t, 4, kWindow);
+        CHECK(crsurface_table_write(t, 4, px.data(), W, H, W * 4, 1, NULL, 0),
+              "the window's current surface takes a frame");
+        CHECK(erasedI.empty(), "mapping and drawing tears nothing down (got %zu)", erasedI.size());
+
+        /* 2. The delete of the STALE surface, the way the bridge's DeleteSurface hook now does it. */
+        crsurface_table_erase_surface(t, 0);
+        CHECK(erasedI.size() == 1 && erasedI[0] == 0, "exactly one teardown, of surface 0 (got %zu)",
+              erasedI.size());
+
+        /* 3. The current surface SURVIVES it, frame and all -- this is the whole fix. */
+        CRSurfaceLeaseMiss miss = CRSurfaceLeaseMissNone;
+        IOSurfaceRef live = crsurface_table_lease_published_reason(t, 4, NULL, &miss);
+        CHECK(live != NULL, "the current surface's slot survives the stale surface's delete");
+        CHECK(miss == CRSurfaceLeaseMissNone, "... and still leases its frame, got miss=%d", (int)miss);
+        if (live)
+            crsurface_table_release_lease(t, live);
+
+        /* 4. ... and the deleted one is gone, which is what the delete was for. */
+        miss = CRSurfaceLeaseMissNone;
+        CHECK(crsurface_table_lease_published_reason(t, 0, NULL, &miss) == NULL,
+              "the deleted surface's slot is gone");
+        CHECK(miss == CRSurfaceLeaseMissNoSlot, "the deleted surface reports NoSlot, got %d", (int)miss);
+
+        /* 5. Erasing an id this table has no slot for is a no-op and is NOT a teardown (a delete
+         *    of a surface that was never window-mapped reaches the hook the same way), and a NULL
+         *    table is inert like every other entry point here. */
+        crsurface_table_erase_surface(t, 0);
+        crsurface_table_erase_surface(t, 12345);
+        crsurface_table_erase_surface(NULL, 4);
+        CHECK(erasedI.size() == 1, "erasing an absent id (or a NULL table) records nothing (got %zu)",
+              erasedI.size());
+
+        /* 6. THE ORDINARY CASE, the mirror of the one above (gate r1 I-5): a DeleteSurface for the
+         *    surface a window is actually SHOWING -- a normal window close, where the slot being
+         *    torn down holds a published frame. It must erase exactly that slot: not the window's
+         *    OTHER, freshly-mapped slot (the shape the About window was in), and not another
+         *    window's. Fresh ids and a fresh window so this step stands on its own, and the
+         *    teardown count is taken RELATIVE to what came before it, so a failure earlier in the
+         *    scenario cannot mask or manufacture this one. */
+        const uint64_t kCloseWindow = 330;
+        const uint64_t kOtherWindow = 329;
+        crsurface_table_map(t, 20, kCloseWindow);
+        CHECK(crsurface_table_write(t, 20, px.data(), W, H, W * 4, 2, NULL, 0),
+              "the closing window's current surface takes a frame");
+        crsurface_table_map(t, 21, kCloseWindow);
+        crsurface_table_map(t, 9, kOtherWindow);
+        CHECK(crsurface_table_write(t, 9, px.data(), W, H, W * 4, 3, NULL, 0), "the other window takes a frame");
+
+        const size_t beforeClose = erasedI.size();
+        crsurface_table_erase_surface(t, 20);
+        CHECK(erasedI.size() == beforeClose + 1 && erasedI.back() == 20,
+              "deleting a window's CURRENT surface is exactly one teardown, of surface 20 (got %zu new)",
+              erasedI.size() - beforeClose);
+        miss = CRSurfaceLeaseMissNone;
+        CHECK(crsurface_table_lease_published_reason(t, 20, NULL, &miss) == NULL,
+              "the current surface's slot is gone after its own delete");
+        CHECK(miss == CRSurfaceLeaseMissNoSlot, "it reports NoSlot, got %d", (int)miss);
+        miss = CRSurfaceLeaseMissNone;
+        CHECK(crsurface_table_lease_published_reason(t, 21, NULL, &miss) == NULL, "surface 21 has no frame yet");
+        CHECK(miss == CRSurfaceLeaseMissNeverWritten,
+              "the SAME window's other slot survives that delete (NeverWritten, not NoSlot), got %d", (int)miss);
+        miss = CRSurfaceLeaseMissNone;
+        IOSurfaceRef other = crsurface_table_lease_published_reason(t, 9, NULL, &miss);
+        CHECK(other != NULL && miss == CRSurfaceLeaseMissNone,
+              "another window's slot is untouched by that delete (miss=%d)", (int)miss);
+        if (other)
+            crsurface_table_release_lease(t, other);
+
+        /* 7. The DEFENSIVE path is still the whole-window sweep: when the bridge sees an unmap with
+         *    no delete in flight it calls crsurface_table_unmap_window, which takes down every slot
+         *    of THAT window at once -- here the two left on it -- and nobody else's. */
+        const size_t beforeSweep = erasedI.size();
+        crsurface_table_map(t, 7, kCloseWindow);
+        CHECK(crsurface_table_write(t, 7, px.data(), W, H, W * 4, 4, NULL, 0), "sweep target takes a frame");
+        crsurface_table_unmap_window(t, kCloseWindow);
+        CHECK(erasedI.size() == beforeSweep + 2, "the sweep reports both remaining slots (got %zu new)",
+              erasedI.size() - beforeSweep);
+        {
+            /* Order is the slot map's iteration order, which is not specified -- assert the SET. */
+            std::vector<uint32_t> swept(erasedI.begin() + (long)beforeSweep, erasedI.end());
+            std::sort(swept.begin(), swept.end());
+            CHECK(swept == std::vector<uint32_t>({7, 21}), "the sweep erased surfaces 7 and 21");
+        }
+        miss = CRSurfaceLeaseMissNone;
+        CHECK(crsurface_table_lease_published_reason(t, 7, NULL, &miss) == NULL, "sweep took surface 7");
+        CHECK(miss == CRSurfaceLeaseMissNoSlot, "surface 7 reports NoSlot after the sweep, got %d", (int)miss);
+        miss = CRSurfaceLeaseMissNone;
+        CHECK(crsurface_table_lease_published_reason(t, 21, NULL, &miss) == NULL, "sweep took surface 21");
+        CHECK(miss == CRSurfaceLeaseMissNoSlot, "surface 21 reports NoSlot after the sweep, got %d", (int)miss);
+        miss = CRSurfaceLeaseMissNone;
+        CHECK(crsurface_table_lease_published_reason(t, 9, NULL, &miss) == NULL,
+              "the other window's frame was already leased and released, so nothing NEW is on offer");
+        CHECK(miss == CRSurfaceLeaseMissAlreadyLeased,
+              "the other window's slot still EXISTS after the sweep (miss=%d)", (int)miss);
+
+        printf("  one delete erases one slot (stale or current); the defensive sweep still takes the window's\n");
         crsurface_table_destroy(t);
     }
 

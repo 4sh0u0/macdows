@@ -387,6 +387,10 @@ typedef struct
      * "never assume a NULL prior value" discipline as the rest of this struct. */
     pcRdpgfxUpdateWindowFromSurface orig_UpdateWindowFromSurface;
     pcRdpgfxUnmapWindowForSurface orig_UnmapWindowForSurface;
+    /* NOTE (lane fix/w3-remap-slot-erase, gate r1 I-4): DeleteSurface is chained too, but its
+     * original does NOT live here -- it lives in the file-static g_crbOrigDeleteSurface beside
+     * g_crbGfxContext, because it must still be reachable after that context has been nulled.
+     * See crb_gfx_delete_surface for the argument. */
 
     /* ADR-0017 §4 row A2: set by crb_on_channel_connected when the RDPGFX decode path is not
      * installed (CRBGfxDecodePathIntact false). The channel handler is a void PubSub callback
@@ -463,8 +467,8 @@ typedef NS_ENUM(NSInteger, CRSessionState) {
      * that it can still be read after the run that produced it (same
      * cumulative-for-this-instance contract as -staleEventsDiscardedCount). Written on T_dvc
      * from crb_gfx_update_window_from_surface, read on any thread through
-     * -gfxSurfaceCounters:updates:dirty:publishes:; the table's own lock is the whole
-     * synchronization story (crgfx_counters.h's threading note). */
+     * -gfxSurfaceCounters:updates:dirty:writes:refused:publishes:stale:erased:; the table's
+     * own lock is the whole synchronization story (crgfx_counters.h's threading note). */
     crgfx_counters_t *_gfxFrameCounters;
     /* Manual-reset (W4a review H2) -- WinPR's POSIX event backend on this platform never
      * actually implements auto-reset (winpr/libwinpr/synch/event.c:279-280 logs "auto-reset
@@ -1364,60 +1368,167 @@ static UINT crb_gfx_update_window_from_surface(RdpgfxClientContext *context, gdi
         const bool writeAccepted =
             crsurface_table_write(crb_surface_slots(p), surface->surfaceId, surface->data, surface->width,
                                    surface->height, surface->scanline, generation, rectsToPass, rectCountToPass);
-        /* ADR-0018 §5.2 ②b, MEASUREMENT ONLY -- reading the bool this call site has always
-         * discarded, and STILL discarding it for every purpose except counting: the publish below
-         * happens exactly as before whether or not the write landed (changing that would change
-         * what the client does, which this lane must not). The 2026-09-15 guard trace named this
-         * the gap that made `publishes` unreadable -- a write declined because the slot was erased,
-         * because all three buffers were leased, or because an allocation failed looked identical
-         * to one that copied pixels. `writes < publishes` is now that difference. */
-        if (writeAccepted)
-            crgfx_counters_note_write(crb_gfx_counters(p), surface->surfaceId);
 
-        /* ROOT CAUSE FIX (regedit white-block bug): gdi/gfx.c's own gdi_UpdateSurfaces
-         * dispatches per-surface to one of two paths depending on outputMapped vs
-         * windowMapped (gfx.c:292-295). The outputMapped path (gdi_OutputUpdate,
-         * gfx.c:174-250) clears surface->invalidRegion itself once it's done consuming it
-         * (gfx.c:248). The windowMapped path we're actually on (gdi_WindowUpdate,
-         * gfx.c:252-257) does nothing but forward to context->UpdateWindowFromSurface --
-         * it hands the *entire* responsibility for consuming (and clearing)
-         * invalidRegion to the callback, exactly the way gdi_OutputUpdate handles its own.
-         * This file never did that: invalidRegion only ever grew (every codec/command
-         * handler unions new dirty rects into it via region16_union_rect, with nothing
-         * upstream of here ever clearing it for a windowMapped surface), so beyond the
-         * first few frames it stopped meaningfully representing "what changed since this
-         * was last consumed" -- confirmed empirically (W4b regedit bug hunt): a live
-         * surface's invalidRegion reported the exact same rect count and extents across
-         * 5+ real, several-seconds-apart updates. Clearing it here, immediately after
-         * crsurface_table_write has copied everything it currently describes, is what
-         * gdi_OutputUpdate's own contract already implies a windowMapped consumer must do. */
+        /* THE INVALID REGION IS CONSUMED HERE, ACCEPTED OR NOT (gate r1 B-1, owner ruling: revert
+         * to `6986c88`'s unconditional clear). An earlier draft of this lane moved the clear into
+         * the accepted branch, on the reasoning that a declined write consumed nothing. That is
+         * true of the PIXELS and false of the MEASUREMENT, which is why it is reverted: the hook's
+         * own entry counter reads this very region a few lines above
+         * (`crgfx_counters_note_update(..., nbRects > 0)`), and for a windowMapped surface this is
+         * the only routine clear there is -- gdi/gfx.c clears `invalidRegion` only in
+         * ResetGraphics, in the outputMapped path and in MapSurfaceToOutput, never in
+         * MapSurfaceToWindow. A region kept across a refusal therefore makes EVERY later entry
+         * count as `dirty`, and `dirty` is the number ADR-0018 §5.2 ②'s fork is read off
+         * (`dirty == 0` = the server only mapped the surface and never painted). One refused frame
+         * would manufacture `dirty > 0` for the rest of the surface's life; that is a worse defect
+         * than the one the move was avoiding, and it is silent.
+         *
+         * THE KNOWN, PRE-EXISTING LIMITATION this restores, stated rather than fixed here: three
+         * of `crsurface_table_write`'s four refusals (no slot, all three buffers leased, and the
+         * IOSurface allocation failure) return BEFORE the call unions this frame's rects into the
+         * slot's per-buffer `pendingDirty`, so for them the clear below does lose the dirty area
+         * until something redraws it -- only the L2 lock failure returns after the union. That is
+         * exactly what `6986c88` and every build before it did; this lane does not change it, and
+         * re-deriving `dirty` from "rects added since the previous entry" is the separate change
+         * that would let the clear be conditional without moving the measurement.
+         *
+         * The original reason for the clear is unchanged: gdi_WindowUpdate (gfx.c:252-257) hands
+         * the ENTIRE responsibility for consuming invalidRegion to this callback, exactly the way
+         * gdi_OutputUpdate (gfx.c:174-250) discharges it for its own path at gfx.c:248. Before W4b
+         * this file never did it and the region only ever grew, which is what produced the regedit
+         * white-block bug (a live surface reporting the same rect count and extents across 5+
+         * several-seconds-apart updates). */
         region16_clear(&surface->invalidRegion);
 
-        /* Frame lane (state, last-writer-wins) plus the lightweight control-lane doorbell
-         * so a consumer draining window orders in FIFO order also observes frame-readiness
-         * without separately polling crdpq_frames every cycle -- crdpq.h's own documented
-         * purpose for CRDPQ_EVENT_FRAME_READY. */
-        crdpq_frame_publish(crb_frames(p), surface->surfaceId, generation);
+        /* NO PUBLISH WITHOUT PIXELS (lane fix/w3-remap-slot-erase, ADR-0018 §5.2 ②). This call
+         * site used to publish whatever `crsurface_table_write` did with the frame: a declined
+         * write -- no slot for the surface, every buffer in its ring leased, an allocation or a
+         * surface lock that failed -- was announced to the consumer exactly like one that copied
+         * pixels. The consumer's only possible response was to look for a frame that had never
+         * reached a buffer and count a drop; the 2026-09-15 About window's last mapping period is
+         * 14 such publishes, 14 `drop-noslot` and `presents=0`. Announcing a frame this bridge
+         * knows does not exist is what that measurement calls a publish, so the announcement is
+         * now conditional and `writes == publishes` holds by construction.
+         *
+         * NOTHING IS LOST BY NOT RINGING THE DOORBELL. All four refusals leave the slot with no
+         * NEWER frame than the consumer's last one: with no slot there is nothing to lease at all,
+         * with every buffer leased the consumer is already holding the most recent publish, and a
+         * failed allocation or lock means these pixels were never copied anywhere. A doorbell here
+         * could only produce a lease miss.
+         *
+         * `refused` is where those frames are counted instead -- without it, a declined frame
+         * would now leave no trace on either side of the boundary, which is strictly worse than
+         * the `writes < publishes` shape this replaces. */
+        if (writeAccepted)
+        {
+            /* ADR-0018 §5.2 ②b: the write's own bool, counted. */
+            crgfx_counters_note_write(crb_gfx_counters(p), surface->surfaceId);
 
-        CrdpEvent ev;
-        memset(&ev, 0, sizeof(ev));
-        ev.type = CRDPQ_EVENT_FRAME_READY;
-        ev.payload.frameReady.surfaceId = surface->surfaceId;
-        crdpq_post(crb_control(p), &ev);
+            /* Frame lane (state, last-writer-wins) plus the lightweight control-lane doorbell
+             * so a consumer draining window orders in FIFO order also observes frame-readiness
+             * without separately polling crdpq_frames every cycle -- crdpq.h's own documented
+             * purpose for CRDPQ_EVENT_FRAME_READY. */
+            crdpq_frame_publish(crb_frames(p), surface->surfaceId, generation);
 
-        /* ADR-0018 §5.2 ②, MEASUREMENT ONLY -- the hook's EXIT, counted separately from its
-         * entry above. The two are equal for every path this function has today, and that
-         * equality is the measurement: `updates == publishes` in a run record says the bridge
-         * forwarded every frame it was handed, so a surface the registry never presented was
-         * lost on the registry's side of the boundary or was never drawn at all -- never
-         * silently swallowed here. An edit that later returns early between the two points
-         * makes itself visible in the record instead of turning into an unexplained gap. */
-        crgfx_counters_note_publish(crb_gfx_counters(p), surface->surfaceId);
+            CrdpEvent ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.type = CRDPQ_EVENT_FRAME_READY;
+            ev.payload.frameReady.surfaceId = surface->surfaceId;
+            crdpq_post(crb_control(p), &ev);
+
+            /* ADR-0018 §5.2 ②, MEASUREMENT ONLY -- the hook's EXIT, counted separately from its
+             * entry above. `updates == writes + refused` is the identity that replaces the old
+             * `updates == publishes` one: every entry counted above leaves through exactly one of
+             * these two counters, so a frame can never disappear from the record, and
+             * `publishes == writes` says the bridge announced exactly the frames it had pixels
+             * for. An edit that later returns early between the entry and both exits makes itself
+             * visible as a broken identity instead of an unexplained gap. */
+            crgfx_counters_note_publish(crb_gfx_counters(p), surface->surfaceId);
+        }
+        else
+        {
+            crgfx_counters_note_refused(crb_gfx_counters(p), surface->surfaceId);
+        }
     }
 
     if (p && p->orig_UpdateWindowFromSurface)
         return p->orig_UpdateWindowFromSurface(context, surface);
     return CHANNEL_RC_OK;
+}
+
+/* Lane fix/w3-remap-slot-erase: the surfaceId whose DeleteSurface is in flight ON THIS THREAD, or
+ * absent when no delete is running. THREAD-LOCAL, and armed only for the duration of one forward,
+ * so neither a second thread deleting a surface concurrently nor a (today impossible) nested
+ * delete can make one delete's unmap erase another's surface -- the state is only ever read by the
+ * unmap that the very same stack frame provoked.
+ *
+ * THE FACT THAT MAKES THIS WORK, verified in the vendored FreeRDP: gdi_DeleteSurface is the ONLY
+ * caller of UnmapWindowForSurface in the whole tree (gfx.c:1344-1346 -- `if (surface->windowMapped)
+ * IFCALLRESULT(..., context->UnmapWindowForSurface, context, surface->windowId)`; the sole other
+ * mentions are the typedef and gdi_graphics_pipeline_init_ex's assignment), and it calls it
+ * SYNCHRONOUSLY, on the delete's own thread, inside context->mux, before freeing the surface. So
+ * the unmap this hook sees always belongs to the delete that set this. */
+static thread_local uint32_t g_crbDeletingSurfaceId = 0;
+static thread_local bool g_crbDeletingSurfaceValid = false;
+
+/* Gate r1 I-4: the DeleteSurface original does NOT live in CRBridgeContext like its siblings.
+ * crb_on_channel_disconnected nulls g_crbGfxContext, and this is the one chained original that
+ * DOES REAL WORK when it runs -- gdi_DeleteSurface frees the surface's pixel buffer, its codec
+ * contexts and its region16 and clears SetSurfaceData, while orig_UpdateWindowFromSurface /
+ * orig_UnmapWindowForSurface are no-ops when skipped. A forward conditioned on the context would
+ * therefore turn a late DeleteSurface into a leak. Written once, in crb_on_channel_connected,
+ * which WINPR_ASSERTs that no other session holds the GFX context. */
+static pcRdpgfxDeleteSurface g_crbOrigDeleteSurface = NULL;
+
+namespace
+{
+/* Gate r1 m-5: arms the thread-local for exactly the span of the forward and restores the previous
+ * value on EVERY exit path, so the "no stale id survives this call" argument does not rest on
+ * gdi_DeleteSurface being non-throwing (it is C and cannot throw -- this removes the reasoning
+ * step rather than a live hazard). Save/restore rather than set/clear so a nested delete (none
+ * exists today: rdpgfx_main.c's three DeleteSurface call sites are all top-level) cannot leave the
+ * outer delete's unmap reading the inner delete's id. */
+struct CRBDeletingSurfaceScope
+{
+    CRBDeletingSurfaceScope(bool arm, uint32_t surfaceId)
+        : previousId(g_crbDeletingSurfaceId), previousValid(g_crbDeletingSurfaceValid)
+    {
+        if (arm)
+        {
+            g_crbDeletingSurfaceId = surfaceId;
+            g_crbDeletingSurfaceValid = true;
+        }
+    }
+    ~CRBDeletingSurfaceScope()
+    {
+        g_crbDeletingSurfaceId = previousId;
+        g_crbDeletingSurfaceValid = previousValid;
+    }
+    CRBDeletingSurfaceScope(const CRBDeletingSurfaceScope &) = delete;
+    CRBDeletingSurfaceScope &operator=(const CRBDeletingSurfaceScope &) = delete;
+
+  private:
+    uint32_t previousId;
+    bool previousValid;
+};
+} // namespace
+
+/* T_dvc. Records which surface is being deleted, then forwards -- gdi_DeleteSurface does all the
+ * real work, including the UnmapWindowForSurface call the hook below reads this for. Chained like
+ * the CapsAdvertise / UnmapWindowForSurface pairs in crb_on_channel_connected, with one deliberate
+ * difference (gate r1 I-4): the FORWARD IS UNCONDITIONAL. The id is recorded only while the bridge
+ * is live -- with no context there is no slot table to erase from -- but gdi_DeleteSurface runs
+ * either way, so this hook can never swallow the surface's teardown. */
+static UINT crb_gfx_delete_surface(RdpgfxClientContext *context, const RDPGFX_DELETE_SURFACE_PDU *pdu)
+{
+    @autoreleasepool
+    {
+        const CRBDeletingSurfaceScope deleting(g_crbGfxContext != NULL && pdu != NULL,
+                                                pdu ? pdu->surfaceId : 0);
+        if (g_crbOrigDeleteSurface)
+            return g_crbOrigDeleteSurface(context, pdu);
+        return CHANNEL_RC_OK;
+    }
 }
 
 static UINT crb_gfx_unmap_window_for_surface(RdpgfxClientContext *context, UINT64 windowId)
@@ -1427,7 +1538,25 @@ static UINT crb_gfx_unmap_window_for_surface(RdpgfxClientContext *context, UINT6
         CRBridgeContext *p = g_crbGfxContext;
         if (p)
         {
-            crsurface_table_unmap_window(crb_surface_slots(p), windowId);
+            /* THE FIX (lane fix/w3-remap-slot-erase, ADR-0018 §5.2 ②). This callback names a
+             * WINDOW, but what actually happened is that ONE SURFACE is being deleted: its only
+             * caller is gdi_DeleteSurface, which passes the deleted surface's windowId and still
+             * sees windowMapped on a surface the window was re-mapped AWAY from (a later
+             * MapSurfaceToWindow never clears the earlier surface's flag). Erasing every slot of
+             * that windowId therefore took down the window's CURRENT surface too, and since no
+             * further map order arrives, nothing re-created its slot: all three pairs of the
+             * 2026-09-15 remap batch end with `writes=0 publishes=14 drop-noslot=14 presents=0` on
+             * the About window's last mapping period. Erasing the deleted surface's own slot is
+             * the whole fix.
+             *
+             * The else branch is DEFENSIVE, not dead-code hygiene: it is what a caller that
+             * invoked UnmapWindowForSurface outside a DeleteSurface would get, and for such a
+             * caller "the window is done with surfaces" is the right reading -- so the old sweep
+             * stays exactly as it was for it. Nothing in the vendored FreeRDP takes that path. */
+            if (g_crbDeletingSurfaceValid)
+                crsurface_table_erase_surface(crb_surface_slots(p), g_crbDeletingSurfaceId);
+            else
+                crsurface_table_unmap_window(crb_surface_slots(p), windowId);
         }
         if (p && p->orig_UnmapWindowForSurface)
             return p->orig_UnmapWindowForSurface(context, windowId);
@@ -1567,6 +1696,17 @@ static void crb_on_channel_connected(void *context, const ChannelConnectedEventA
         p->orig_UnmapWindowForSurface = gfx->UnmapWindowForSurface;
         gfx->UpdateWindowFromSurface = crb_gfx_update_window_from_surface;
         gfx->UnmapWindowForSurface = crb_gfx_unmap_window_for_surface;
+
+        /* Lane fix/w3-remap-slot-erase: DeleteSurface is chained for its ARGUMENT, not for any work
+         * of its own -- gdi_DeleteSurface calls UnmapWindowForSurface synchronously from inside
+         * this call, and the deleted surfaceId is the one thing that callback cannot say. gdi
+         * installs the real gdi_DeleteSurface in gdi_graphics_pipeline_init, which has already run
+         * by the time this handler does (the same ordering the MapSurfaceToWindow save above
+         * relies on). The original is saved in a FILE-STATIC rather than in `p` (gate r1 I-4) so
+         * the hook's forward survives crb_on_channel_disconnected nulling the context -- see
+         * g_crbOrigDeleteSurface's own comment. */
+        g_crbOrigDeleteSurface = gfx->DeleteSurface;
+        gfx->DeleteSurface = crb_gfx_delete_surface;
     }
     else
     {
@@ -2680,16 +2820,17 @@ cleanup:
                    updates:(uint64_t *)updates
                      dirty:(uint64_t *)dirty
                     writes:(uint64_t *)writes
+                   refused:(uint64_t *)refused
                  publishes:(uint64_t *)publishes
                      stale:(uint64_t *)stale
                     erased:(uint64_t *)erased
 {
     /* Passthrough of the session's own counter table (see the header's doc comment for what
-     * the six numbers mean and why "not tracked" is deliberately not zero). One lock, one
-     * read of all six, so a caller can never see two of them from different instants; safe
+     * the seven numbers mean and why "not tracked" is deliberately not zero). One lock, one
+     * read of all seven, so a caller can never see two of them from different instants; safe
      * from any thread, including while T_dvc is writing. */
-    return crgfx_counters_read(_gfxFrameCounters, surfaceId, updates, dirty, writes, publishes, stale,
-                               erased)
+    return crgfx_counters_read(_gfxFrameCounters, surfaceId, updates, dirty, writes, refused, publishes,
+                               stale, erased)
                ? YES
                : NO;
 }

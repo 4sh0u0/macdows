@@ -129,12 +129,15 @@ private final class SurfaceVendingSession: CRSession {
     /// the same answer the real bridge gives for a surface it never saw.
     var bridgeCounters: [UInt32: BridgeCounters] = [:]
 
-    /// The six numbers `-gfxSurfaceCounters:...` returns, as one value so a test can set them in
+    /// The seven numbers `-gfxSurfaceCounters:...` returns, as one value so a test can set them in
     /// one statement and read them back in the order the row prints them.
     struct BridgeCounters {
         var updates: UInt64 = 0
         var dirty: UInt64 = 0
         var writes: UInt64 = 0
+        /// Writes the bridge's slot table DECLINED. Since lane fix/w3-remap-slot-erase those are
+        /// not published, so `updates == writes + refused` and `publishes == writes`.
+        var refused: UInt64 = 0
         var publishes: UInt64 = 0
         var stale: UInt64 = 0
         var erased: UInt64 = 0
@@ -167,6 +170,7 @@ private final class SurfaceVendingSession: CRSession {
         updates: UnsafeMutablePointer<UInt64>,
         dirty: UnsafeMutablePointer<UInt64>,
         writes: UnsafeMutablePointer<UInt64>,
+        refused: UnsafeMutablePointer<UInt64>,
         publishes: UnsafeMutablePointer<UInt64>,
         stale: UnsafeMutablePointer<UInt64>,
         erased: UnsafeMutablePointer<UInt64>
@@ -175,6 +179,7 @@ private final class SurfaceVendingSession: CRSession {
         updates.pointee = counters.updates
         dirty.pointee = counters.dirty
         writes.pointee = counters.writes
+        refused.pointee = counters.refused
         publishes.pointee = counters.publishes
         stale.pointee = counters.stale
         erased.pointee = counters.erased
@@ -392,14 +397,14 @@ struct GfxFrameCountersTests {
         // Surface 11 as the bridge would report a drawn-and-published surface; surface 12 left
         // absent, i.e. one the bridge's fixed-capacity table never held a slot for.
         session.bridgeCounters[11] = SurfaceVendingSession.BridgeCounters(
-            updates: 42, dirty: 7, writes: 40, publishes: 42, stale: 2, erased: 1)
+            updates: 42, dirty: 7, writes: 40, refused: 2, publishes: 40, stale: 2, erased: 1)
         registry.handle(WindowCreateStub(windowId: 101))
         registry.handle(SurfaceMappedStub(surfaceId: 11, windowId: 101, mappedWidth: 522, mappedHeight: 515))
         registry.handle(SurfaceMappedStub(surfaceId: 12, windowId: 101, mappedWidth: 500, mappedHeight: 505))
 
         let rows = registry.gfxFrameRows(windowId: 101)
         #expect(rows[0].tracked)
-        #expect(rows[0].updates == 42 && rows[0].dirty == 7 && rows[0].publishes == 42)
+        #expect(rows[0].updates == 42 && rows[0].dirty == 7 && rows[0].publishes == 40)
         // The drain-side discard is reported per surface too, not folded into the session-wide
         // counter -- it is the term that makes `publishes = stale + ready + in-flight` complete.
         #expect(rows[0].stale == 2)
@@ -459,6 +464,7 @@ struct GfxMappingPeriodTests {
         var updates: UInt64 = 0
         var dirty: UInt64 = 0
         var writes: UInt64 = 0
+        var refused: UInt64 = 0
         var publishes: UInt64 = 0
         var stale: UInt64 = 0
         var erased: UInt64 = 0
@@ -477,6 +483,7 @@ struct GfxMappingPeriodTests {
             updates = row.updates
             dirty = row.dirty
             writes = row.writes
+            refused = row.refused
             publishes = row.publishes
             stale = row.stale
             erased = row.erased
@@ -495,6 +502,7 @@ struct GfxMappingPeriodTests {
             out.updates = lhs.updates + rhs.updates
             out.dirty = lhs.dirty + rhs.dirty
             out.writes = lhs.writes + rhs.writes
+            out.refused = lhs.refused + rhs.refused
             out.publishes = lhs.publishes + rhs.publishes
             out.stale = lhs.stale + rhs.stale
             out.erased = lhs.erased + rhs.erased
@@ -728,17 +736,18 @@ struct GfxMappingPeriodTests {
 
         // While the window shows surface 11 the bridge accepts every write it publishes.
         session.bridgeCounters[11] = SurfaceVendingSession.BridgeCounters(
-            updates: 10, dirty: 4, writes: 10, publishes: 10, stale: 0, erased: 0)
+            updates: 10, dirty: 4, writes: 10, refused: 0, publishes: 10, stale: 0, erased: 0)
         registry.handle(SurfaceMappedStub(surfaceId: 12, windowId: 101, mappedWidth: 500, mappedHeight: 505))
-        // THE 2026-09-15 MECHANISM, in miniature: while the window is on surface 12, an unmap of
-        // the window erases surface 11's slot too (the bridge erases by windowId, and this registry
-        // is never told). Afterwards the server keeps drawing into 11 -- `updates` and `publishes`
-        // rise -- but the writes are declined, because there is no slot to write into.
+        // THE 2026-09-15 MECHANISM, in miniature: while the window is on surface 12, surface 11's
+        // slot is torn down too (before lane fix/w3-remap-slot-erase, by the whole-window sweep an
+        // unmap ran; the registry is told about no teardown at all). Afterwards the server keeps
+        // drawing into 11 -- `updates` rises -- but the writes are declined, because there is no
+        // slot to write into, and since the fix those frames are REFUSED rather than published.
         session.bridgeCounters[11] = SurfaceVendingSession.BridgeCounters(
-            updates: 14, dirty: 6, writes: 10, publishes: 14, stale: 0, erased: 1)
+            updates: 14, dirty: 6, writes: 10, refused: 4, publishes: 10, stale: 0, erased: 1)
         registry.handle(SurfaceMappedStub(surfaceId: 11, windowId: 101, mappedWidth: 522, mappedHeight: 515))
         session.bridgeCounters[11] = SurfaceVendingSession.BridgeCounters(
-            updates: 20, dirty: 9, writes: 12, publishes: 20, stale: 0, erased: 1)
+            updates: 20, dirty: 9, writes: 12, refused: 8, publishes: 12, stale: 0, erased: 1)
 
         let rows = registry.gfxPeriodRows(windowId: 101)
         let first = try #require(rows.first { $0.surfaceId == 11 && $0.period == 1 })
@@ -748,17 +757,23 @@ struct GfxMappingPeriodTests {
         // the same surface rather than stopping at the un-mapping: ending it early would drop the
         // erase, the extra updates and the declined writes into a gap no row reports.
         #expect(first.erased == 1)
-        #expect(first.updates == 14 && first.dirty == 6 && first.writes == 10 && first.publishes == 14)
+        #expect(first.updates == 14 && first.dirty == 6 && first.writes == 10 && first.publishes == 10)
+        #expect(first.refused == 4)
         // The period the lane reads: since the last remap, the server drew six more frames, the
-        // bridge accepted two of the writes, and nothing was torn down.
+        // bridge accepted two of the writes, declined four, and nothing was torn down.
         #expect(second.erased == 0)
-        #expect(second.updates == 6 && second.dirty == 3 && second.writes == 2 && second.publishes == 6)
+        #expect(second.updates == 6 && second.dirty == 3 && second.writes == 2 && second.publishes == 2)
+        #expect(second.refused == 4)
         #expect(first.tracked && second.tracked)
-        // `writes < publishes` over a period is the shape that says a published frame reached no
-        // buffer at all -- invisible in every counter the previous lane had.
-        #expect(second.writes < second.publishes)
+        // The two bridge-side identities of the post-fix hook, per period: every entry into it
+        // leaves through exactly one of `writes`/`refused`, and only a write that landed is
+        // published. `refused > 0` is where a period's missing frames are now -- before the fix
+        // they were published anyway and reappeared one guard later as `drop-noslot`.
+        #expect(second.updates == second.writes + second.refused)
+        #expect(second.publishes == second.writes)
         // And the partition identity holds for the bridge half too.
         #expect(first.updates + second.updates == 20)
+        #expect(first.refused + second.refused == 8)
         #expect(first.erased + second.erased == 1)
     }
 
@@ -776,7 +791,7 @@ struct GfxMappingPeriodTests {
         // "Never measured" must not be able to impersonate "measured, and the server drew nothing"
         // -- that zero is one of the two verdicts ADR-0018 §5.2 ② exists to reach.
         #expect(rows.allSatisfy { $0.updates == 0 && $0.dirty == 0 && $0.writes == 0 })
-        #expect(rows.allSatisfy { $0.publishes == 0 && $0.stale == 0 && $0.erased == 0 })
+        #expect(rows.allSatisfy { $0.refused == 0 && $0.publishes == 0 && $0.stale == 0 && $0.erased == 0 })
     }
 
     @Test("past the retention cap the OLDEST periods are discarded, counted, and never renumbered")
@@ -846,5 +861,195 @@ struct GfxMappingPeriodTests {
         #expect(Counts(rows[0]) == { var c = Counts(); c.ready = 1; c.presents = 1; return c }())
         #expect(Counts(rows[1]) == { var c = Counts(); c.ready = 1; c.presents = 1; return c }())
         #expect(rows.filter(\.isCurrent).map(\.period) == [2])
+    }
+
+    @Test("a declined write lands on refused, moves no other counter, and rings no doorbell")
+    func refusedWritesAreReportedPerPeriodAndNeverPublished() throws {
+        let (registry, session) = try GfxRegistryFixture.makeRegistry()
+        registry.handle(WindowCreateStub(windowId: 101))
+        session.bridgeCounters[11] = SurfaceVendingSession.BridgeCounters()
+        registry.handle(SurfaceMappedStub(surfaceId: 11, windowId: 101, mappedWidth: 522, mappedHeight: 515))
+
+        // THE 2026-09-15 About window's last mapping period, as the FIXED bridge counts it: the
+        // hook ran fourteen times, the slot table declined every write (the slot had been erased
+        // by the delete of a stale surface), and -- this is the fix -- none of them was published.
+        // The measured pre-fix row for the very same fourteen frames was
+        // `writes=0 publishes=14 drop-noslot=14 presents=0`.
+        session.bridgeCounters[11] = SurfaceVendingSession.BridgeCounters(
+            updates: 14, dirty: 3, writes: 0, refused: 14, publishes: 0, stale: 0, erased: 0)
+
+        let row = try #require(registry.gfxPeriodRows(windowId: 101).first { $0.period == 1 })
+        #expect(row.tracked)
+        #expect(row.refused == 14)
+        // Not re-labelled onto any neighbour: a refusal is not a write, and above all not a
+        // publish -- `publishes` would otherwise keep announcing frames that reached no buffer,
+        // which is the defect this lane removes.
+        #expect(row.writes == 0 && row.publishes == 0 && row.stale == 0 && row.erased == 0)
+        #expect(row.updates == 14 && row.dirty == 3)
+        #expect(row.updates == row.writes + row.refused)
+        // ... and because no doorbell was rung for them, the registry half stays empty rather than
+        // counting fourteen drops: the frames are visible ONE guard earlier than they used to be.
+        #expect(row.ready == 0 && row.dropNoSlot == 0 && row.presents == 0)
+    }
+}
+
+
+// ADR-0018 §5.2 ② -- lane fix/w3-remap-slot-erase, the BRIDGE half, as source-text pins.
+//
+// WHY PINS AND NOT BEHAVIOUR. Both halves of this fix live in `crb_gfx_*` callbacks that only a
+// live RDPGFX channel can drive: the hooks are installed from `crb_on_channel_connected`, read
+// `g_crbGfxContext`, and take a `gdiGfxSurface*` the gdi pipeline owns. There is no offline seam
+// and this lane did not invent one -- what IS drivable offline is pinned instead, in the same
+// shape `GfxDecodePathInvariantSourcePins` established for this file: the slot table's own
+// behaviour in `Tools/slots-test` (scenario I), the counter table's in `MacdowsCoreTests`, the
+// registry's merge in the suites above, and the call sites here. The one thing no offline check
+// can see is the live sequence itself -- a run's `[gfx-period]` rows are that check.
+//
+// WHAT EACH PIN HOLDS:
+//   (a) DeleteSurface is chained, records the id BEFORE forwarding, and the unmap callback erases
+//       that ONE surface -- taking the whole-window sweep only on the defensive branch;
+//   (b) the frame hook publishes (and clears the surface's invalid region) only when the slot
+//       write was ACCEPTED, and counts a refusal otherwise.
+private func remapFixRepoRoot() -> URL {
+    // <repo>/App/MacdowsAppTests/<this file>
+    URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+}
+
+/// Whitespace runs (newlines included) collapsed to one space: these pins are about tokens, not
+/// layout, so a reformat must not fail them.
+private func remapFixSource(_ relative: String) throws -> String {
+    let raw = try String(contentsOf: remapFixRepoRoot().appendingPathComponent(relative), encoding: .utf8)
+    return raw.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+}
+
+/// The brace-delimited block following `anchor`: from the first `{` after it to its matching `}`.
+private func remapFixBlock(after anchor: String, in src: String) -> Substring? {
+    guard let a = src.range(of: anchor), let open = src[a.upperBound...].firstIndex(of: "{") else { return nil }
+    var depth = 0
+    var i = open
+    while i < src.endIndex {
+        let c = src[i]
+        if c == "{" { depth += 1 } else if c == "}" { depth -= 1; if depth == 0 { return src[open...i] } }
+        i = src.index(after: i)
+    }
+    return nil
+}
+
+private func remapFixOccurrences(of needle: String, in src: String) -> Int {
+    var count = 0
+    var start = src.startIndex
+    while let r = src.range(of: needle, range: start..<src.endIndex) {
+        count += 1
+        start = r.upperBound
+    }
+    return count
+}
+
+@Suite("remap slot-erase fix (ADR-0018 §5.2 ②, bridge call sites)")
+struct RemapSlotEraseSourcePins {
+    @Test("the unmap callback erases the DELETED surface's slot, and sweeps the window only defensively")
+    func unmapErasesOneSurfaceAndSweepsOnlyAsAFallback() throws {
+        let src = try remapFixSource("App/CRBridge/CRSession.mm")
+        guard let hook = remapFixBlock(
+            after: "static UINT crb_gfx_unmap_window_for_surface(RdpgfxClientContext *context, UINT64 windowId)",
+            in: src)
+        else {
+            Issue.record("crb_gfx_unmap_window_for_surface block not found"); return
+        }
+        // The fix itself, as one branch: the recorded surface if there is one, the old sweep if not.
+        #expect(hook.contains(
+            "if (g_crbDeletingSurfaceValid) crsurface_table_erase_surface(crb_surface_slots(p), g_crbDeletingSurfaceId); "
+                + "else crsurface_table_unmap_window(crb_surface_slots(p), windowId);"))
+        // The whole-window sweep is reachable from NOWHERE else in the bridge -- a second call
+        // site would be a second way to erase a live surface's slot. Call shape, not name, so the
+        // comments that discuss the sweep do not count (project memory: source pins must match
+        // call shapes).
+        #expect(remapFixOccurrences(of: "crsurface_table_unmap_window(crb_surface_slots(p), windowId);", in: src) == 1)
+        #expect(remapFixOccurrences(of: "crsurface_table_erase_surface(crb_surface_slots(p), g_crbDeletingSurfaceId);",
+                                    in: src) == 1)
+    }
+
+    @Test("DeleteSurface is chained, forwards unconditionally, and arms the id before it")
+    func deleteSurfaceIsChainedAndRecordsBeforeForwarding() throws {
+        let src = try remapFixSource("App/CRBridge/CRSession.mm")
+        // Installed in the RDPGFX branch, saved first and replaced after -- the same chain shape
+        // as the CapsAdvertise / UnmapWindowForSurface pairs beside it. A hook installed without
+        // saving the original would silently drop gdi_DeleteSurface, i.e. leak every surface.
+        guard let branch = remapFixBlock(after: "strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0", in: src) else {
+            Issue.record("RDPGFX branch block not found"); return
+        }
+        #expect(branch.contains("g_crbOrigDeleteSurface = gfx->DeleteSurface; gfx->DeleteSurface = crb_gfx_delete_surface;"))
+        // Gate r1 I-4: the original is kept OUTSIDE CRBridgeContext on purpose, because
+        // crb_on_channel_disconnected nulls that context and gdi_DeleteSurface still has to run.
+        // A field on `p` is exactly the shape that reintroduces the swallow.
+        #expect(!src.contains("p->orig_DeleteSurface"))
+
+        guard let hook = remapFixBlock(
+            after: "static UINT crb_gfx_delete_surface(RdpgfxClientContext *context, const RDPGFX_DELETE_SURFACE_PDU *pdu)",
+            in: src)
+        else {
+            Issue.record("crb_gfx_delete_surface block not found"); return
+        }
+        // The forward depends on NOTHING but the saved pointer -- not on the bridge context, whose
+        // absence would otherwise leak the surface's pixel buffer, codecs and region16 (I-4).
+        #expect(hook.contains("if (g_crbOrigDeleteSurface) return g_crbOrigDeleteSurface(context, pdu);"))
+        #expect(!hook.contains("p->orig_DeleteSurface"))
+        #expect(!hook.contains("g_crbGfxContext;"))
+        // The id is armed only while the bridge is live (no context, no slot table to erase from),
+        // by an RAII scope that restores the previous value on every exit path (m-5).
+        #expect(hook.contains(
+            "const CRBDeletingSurfaceScope deleting(g_crbGfxContext != NULL && pdu != NULL, pdu ? pdu->surfaceId : 0);"))
+        // ORDER IS THE WHOLE MECHANISM: gdi_DeleteSurface calls UnmapWindowForSurface from inside
+        // that forward, synchronously, so an id armed after it would arrive too late and the unmap
+        // would take the defensive sweep -- the defect, restored.
+        if let record = hook.range(of: "const CRBDeletingSurfaceScope deleting("),
+           let forward = hook.range(of: "return g_crbOrigDeleteSurface(context, pdu);") {
+            #expect(record.lowerBound < forward.lowerBound)
+        } else {
+            Issue.record("the arming scope or the forward was not found in crb_gfx_delete_surface")
+        }
+        // The scope restores rather than clears, so a nested delete cannot strand the outer one's
+        // id, and a later unmap that belongs to no delete still reaches the defensive branch.
+        #expect(src.contains("g_crbDeletingSurfaceId = previousId; g_crbDeletingSurfaceValid = previousValid;"))
+        // Thread-local, not a shared field: two threads deleting surfaces at once would otherwise
+        // erase each other's ids.
+        #expect(src.contains("static thread_local uint32_t g_crbDeletingSurfaceId = 0;"))
+        #expect(src.contains("static thread_local bool g_crbDeletingSurfaceValid = false;"))
+    }
+
+    @Test("the frame hook publishes only an ACCEPTED write, and counts a refusal otherwise")
+    func nothingIsPublishedWithoutPixels() throws {
+        let src = try remapFixSource("App/CRBridge/CRSession.mm")
+        guard let accepted = remapFixBlock(after: "if (writeAccepted)", in: src) else {
+            Issue.record("the writeAccepted branch was not found"); return
+        }
+        // Everything that ANNOUNCES a frame lives inside the branch...
+        #expect(accepted.contains("crdpq_frame_publish(crb_frames(p), surface->surfaceId, generation);"))
+        #expect(accepted.contains("ev.type = CRDPQ_EVENT_FRAME_READY;"))
+        #expect(accepted.contains("crgfx_counters_note_publish(crb_gfx_counters(p), surface->surfaceId);"))
+        #expect(accepted.contains("crgfx_counters_note_write(crb_gfx_counters(p), surface->surfaceId);"))
+        // ... each from exactly ONE place in the file, so none of them can also run outside it.
+        #expect(remapFixOccurrences(of: "crdpq_frame_publish(crb_frames(p), surface->surfaceId, generation);",
+                                    in: src) == 1)
+        #expect(remapFixOccurrences(of: "crgfx_counters_note_publish(crb_gfx_counters(p), surface->surfaceId);",
+                                    in: src) == 1)
+        // ... and the surface's invalid region is consumed UNCONDITIONALLY, outside the branch and
+        // before it (gate r1 B-1, owner ruling: 6986c88's behaviour restored). It is the same
+        // region the hook's entry counter read a few lines earlier, so a clear that skipped a
+        // refusal would leave `dirty` counting one old dirty frame forever and would invert
+        // ADR-0018 §5.2 ②'s `dirty == 0` reading.
+        #expect(!accepted.contains("region16_clear(&surface->invalidRegion);"))
+        #expect(remapFixOccurrences(of: "region16_clear(&surface->invalidRegion);", in: src) == 1)
+        if let clear = src.range(of: "region16_clear(&surface->invalidRegion);"),
+           let branch = src.range(of: "if (writeAccepted)") {
+            #expect(clear.lowerBound < branch.lowerBound)
+        } else {
+            Issue.record("the region clear or the writeAccepted branch was not found")
+        }
+        // The refusal is counted, and NOT from inside the accepted branch -- one entry into the
+        // hook leaves through exactly one of the two (`updates == writes + refused`).
+        #expect(remapFixOccurrences(of: "crgfx_counters_note_refused(crb_gfx_counters(p), surface->surfaceId);",
+                                    in: src) == 1)
+        #expect(!accepted.contains("crgfx_counters_note_refused("))
     }
 }

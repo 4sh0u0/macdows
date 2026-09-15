@@ -286,6 +286,15 @@ pin 1 "$(code_only | grep -A49 -E 'private func sampleEdgeProfiles\(registry: ' 
 # (dirty) and what left it (publishes) -- printed after `publishes` it would read as a disposition
 # of a forwarded frame instead of the reason one never landed.
 pin 1 "$(code_only | grep -cE 'updates=\\\(row\.updates\) dirty=\\\(row\.dirty\) writes=\\\(row\.writes\)' || true)" "writes= sits between dirty= and publishes="
+# GRAMMAR v3 (lane fix/w3-remap-slot-erase): `refused` is the DECLINED half of `updates` and sits
+# immediately after its partner `writes`, before `publishes` -- the pair partitions `updates`
+# (`updates = writes + refused`), and since the fix a declined write is never published, so a
+# `refused` printed after `publishes` would read as a disposition of a forwarded frame, which is
+# precisely what it is not.
+pin 1 "$(code_only | grep -cE 'writes=\\\(row\.writes\) refused=\\\(row\.refused\)' || true)" "refused= sits immediately after writes="
+# ... and it belongs to the PERIOD row only: [gfx-frames] stays byte-identical, so exactly one
+# interpolation of it exists in the whole harness.
+pin 1 "$(code_only | grep -cE 'refused=\\\(row\.refused\)' || true)" "refused= is interpolated once -- [gfx-frames] did not gain it"
 pin 1 "$(code_only | grep -cE 'publishes=\\\(row\.publishes\) stale=\\\(row\.stale\) ready=\\\(row\.ready\)' || true)" "publishes= stale= ready= keep their order"
 # The six drop keys in the order a frame meets them, and `erased` last before the outcome.
 pin 1 "$(code_only | grep -cE 'drop-nomap=\\\(row\.dropNoMap\) drop-nowindow=\\\(row\.dropNoWindow\)' || true)" "drop-nomap= then drop-nowindow="
