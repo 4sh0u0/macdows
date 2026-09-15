@@ -791,9 +791,13 @@ enum EdgeProfile {
     /// and a zero anywhere else means only that that stage never ran for this surface -- the row
     /// says WHERE a frame stopped, never WHY.
     ///
-    /// `tracked=no` means the bridge's fixed-capacity counter table never held a slot for this
-    /// surface, so `updates`/`dirty`/`publishes`/`stale` are placeholders and NOT a measurement
-    /// of zero -- which matters because zero is itself one of the two verdicts. `id=none` rows
+    /// `tracked=no` means the bridge's counter table has recorded NOTHING for this surface, so
+    /// `updates`/`dirty`/`publishes`/`stale` are placeholders and NOT a measurement of zero --
+    /// which matters because zero is itself one of the two verdicts. The converse is weaker than it
+    /// looks (gate r1 I-1): `tracked=yes` says some bridge event was recorded, and a slot TEARDOWN
+    /// is such an event, so `tracked=yes` with every counter at zero is reachable for a surface the
+    /// bridge mapped, never drew into, and then erased (an unmap of its window, or the disconnect
+    /// sweep). Those zeros are a real measurement -- case 4b stated positively. `id=none` rows
     /// are surfaces with registry events that belong to no RENDERED window -- never mapped at
     /// all, or mapped to a window this client does not render; the row deliberately does not
     /// distinguish those (`RemoteWindowRegistry.gfxFrameOrphanRows`' own doc comment), which is
@@ -817,6 +821,117 @@ enum EdgeProfile {
             + " ready=\(row.ready) drop-unmapped=\(row.dropUnmapped)"
             + " drop-nosurface=\(row.dropNoSurface) presents=\(row.presents)"
             + " at=\(phase.rawValue)"
+    }
+
+    /// One line per MAPPING PERIOD of one surface of one window (ADR-0018 §5.2 ②b), printed
+    /// immediately after that window's `[gfx-frames]` rows. MEASUREMENT ONLY, like everything
+    /// else in this enum -- no verdict, no exit code, nothing branches on it.
+    ///
+    /// WHY THIS LINE EXISTS AT ALL, and it is a defect in the previous line rather than an
+    /// embellishment. `[gfx-frames]` prints one row per surface ID, so a window re-mapped back to
+    /// a surface it already used (`A -> B -> A`, two of the three pairs in the 2026-09-15 remap
+    /// batch) gets ONE row summing BOTH mapping periods. The record had to register that as a
+    /// limitation of its own interpretation unit: every rule keyed on "after the last remap"
+    /// became unjudgeable on that shape, because `presents>0` on a merged row cannot say WHEN the
+    /// present happened. Each row here is one mapping period measured on its own, so the window's
+    /// LAST period -- the `current=yes` row -- is exactly the "after the last remap" interval.
+    ///
+    /// HOW TO READ THE NUMBERS. They are DIFFERENCES over that period, not totals: what the
+    /// surface accumulated between the moment the window was mapped to it and the moment the
+    /// window was mapped to it AGAIN (or now, for the last period). `[gfx-frames]` is still where
+    /// totals are read. On a non-final period that interval can include a stretch where the
+    /// window had moved on to another surface -- the alternative, ending the period at the
+    /// un-mapping, would silently drop everything that happened in between (a surface goes on
+    /// counting `drop-nomap` while unmapped, and its slot can be `erased` by an unmap of the
+    /// window it still belongs to). Only the `current=yes` row is entirely "while this mapping was
+    /// live and nothing since", which is the row every "after the last remap" rule wants.
+    /// The six drop keys are the two `[gfx-frames]` drop columns split into the sub-causes those
+    /// columns conflate. `drop-nomap` (no mapping at that instant) and `drop-nowindow` (mapped to a
+    /// window this client does not render) sum to `drop-unmapped`; `drop-noslot` (the bridge has no
+    /// slot for the surface -- never mapped there, or ERASED since), `drop-neverwritten` (a slot
+    /// with nothing ever written into it), `drop-leased` (this client already holds that frame) and
+    /// `drop-generation` (a real frame refused as belonging to an older connection, adr/0005 §4)
+    /// sum to `drop-nosurface`. The identity is exact:
+    /// `ready = drop-nomap + drop-nowindow + drop-noslot + drop-neverwritten + drop-leased +
+    /// drop-generation + presents`. `drop-generation>0` is the one drop that proves the server DREW
+    /// the frame (ADR-0018 §5.2 ②'s 4a in a single number); `drop-noslot>0` next to `erased>0` is
+    /// the 2026-09-15 shape the trace could previously only reach by elimination -- an unmap of the
+    /// window erased a slot the registry still believes in.
+    ///
+    /// `writes` and `erased` are the bridge-side pair the same trace showed were missing. `writes`
+    /// counts the slot writes the bridge ACCEPTED, which `publishes` does not (the hook counts a
+    /// publish whether or not the write landed), so `writes < publishes` is a frame that reached no
+    /// buffer at all. `erased` counts teardowns of that surface's slot inside the period.
+    ///
+    /// `period=0` is not an interval: it is the frozen pre-history of a surface that already
+    /// carried counts when this window first mapped it (frame-ready before the mapping, or counts
+    /// earned under another window -- the per-surface counters cannot tell those apart), printed
+    /// only when it is non-zero, always `mapped=n/a` because no size was announced for a period
+    /// that predates the mapping. `tracked=no` has the same meaning as on `[gfx-frames]`: the
+    /// bridge has recorded nothing at all for this surface, so its numbers are placeholders and NOT
+    /// the measured zero that case 4b consists of -- while `tracked=yes` with zeros IS that
+    /// measured zero and is reachable from a teardown alone (gate r1 I-1), which is why `erased`
+    /// sits on this line beside them.
+    ///
+    /// THE CHECK A RECORD CAN RUN. For one window and one surface the rows are a gap-free
+    /// partition: `period=0` plus every later period of that surface sums EXACTLY to that
+    /// surface's cumulative `[gfx-frames]` row above. (Across WINDOWS they do not: a surface
+    /// mapped to two windows contributes its earlier life to the second window's `period=0`.)
+    static func periodLine(row: RemoteWindowRegistry.GfxPeriodRow, at phase: Phase) -> String {
+        "[gfx-period] id=\(row.windowId) surface=\(row.surfaceId) period=\(row.period)"
+            + " current=\(row.isCurrent ? "yes" : "no")"
+            // Same declared-size formatter as `[gfx-frames]` and the stale `[edge]` shape, so a
+            // size printed here compares with an `[f1]` line character for character.
+            + " mapped=\(row.mappedSize.map { fmtSize($0) } ?? "n/a")"
+            + " tracked=\(row.tracked ? "yes" : "no")"
+            // The bridge half in the order a frame meets it: handed to the hook, carrying a dirty
+            // region, ACCEPTED into a slot buffer, forwarded, discarded by the drain's filter.
+            + " updates=\(row.updates) dirty=\(row.dirty) writes=\(row.writes)"
+            + " publishes=\(row.publishes) stale=\(row.stale) ready=\(row.ready)"
+            // The six drop keys in the order a frame meets them: no mapping, no window, no slot,
+            // a slot nothing was ever written into, a frame this client already holds, and a frame
+            // refused by the generation filter.
+            + " drop-nomap=\(row.dropNoMap) drop-nowindow=\(row.dropNoWindow)"
+            + " drop-noslot=\(row.dropNoSlot) drop-neverwritten=\(row.dropNeverWritten)"
+            + " drop-leased=\(row.dropLeased) drop-generation=\(row.dropGeneration)"
+            // Last before the outcome: how many times the bridge tore this surface's slot down
+            // during the period -- the event that turns the following frames into drop-noslot.
+            + " erased=\(row.erased) presents=\(row.presents)"
+            + " at=\(phase.rawValue)"
+    }
+
+    /// The control lane's own dropped-event count, once per phase (ADR-0018 §5.2 ②b).
+    ///
+    /// WHY IT IS ON ITS OWN LINE AND NOT PER WINDOW. It is a property of the QUEUE, not of any
+    /// window or surface: `crdpq` drops an event when the ring is full, and a dropped
+    /// `.surfaceMapped` is the one thing that could break the ordering argument every other row
+    /// here rests on ("a frame for a surface cannot be handled before that surface's map order,
+    /// because both are posted by the same thread onto the same FIFO"). The 2026-09-15 trace had
+    /// to leave that hole open because nothing printed this number.
+    ///
+    /// WHICH PHASE'S NUMBER ACTUALLY CLOSES IT (gate r1 I-3). The counter is cumulative and each
+    /// phase prints it ONCE, at that phase's FIRST sample -- and the first-frame sampler runs once
+    /// per drain batch, so `at=first-frame` is the count as of the very first batch of that phase
+    /// and says nothing about a `.surfaceMapped` dropped later within it. Only the `at=finish`
+    /// line, taken after the run's last drain, closes the hole for the run: `dropped=0` there means
+    /// no row on any line above is missing a mapping, and any other value says they may be.
+    static func queueLine(dropped: UInt64, at phase: Phase) -> String {
+        "[gfx-queue] dropped=\(dropped) at=\(phase.rawValue)"
+    }
+
+    /// Printed ONLY when a window's mapping-period retention cap actually discarded something
+    /// (gate r1 I-2) -- absent in every run that stays under the cap, which is every run observed
+    /// so far.
+    ///
+    /// WHY A LINE AND NOT A KEY. The period row's grammar is frozen (a record reads its columns
+    /// positionally), and this is a property of the ROW SET, not of any one period. What it says is
+    /// that the rows above are a SUFFIX of that window's history: `period=` numbers still count
+    /// from the window's first mapping, but the discarded periods' counts are gone, so the
+    /// partition identity (`period=0` plus every period of a surface sums to its `[gfx-frames]`
+    /// totals) no longer holds for a surface that lost one. A record that sees this line must treat
+    /// that window's earlier periods as unavailable rather than as zero.
+    static func periodOverflowLine(windowId: UInt32, dropped: Int, at phase: Phase) -> String {
+        "[gfx-period-overflow] id=\(windowId) dropped=\(dropped) at=\(phase.rawValue)"
     }
 
     /// Three places, fixed -- an edge of a few hundred pixels resolves to better than 0.005, and a
@@ -2492,7 +2607,90 @@ enum WindowSmokeGateSelfTest {
                 && gfxOrphanRow == "[gfx-frames] id=none surface=5 order=0 current=no mapped=n/a"
                 + " tracked=yes updates=4 dirty=4 publishes=4 stale=0 ready=4 drop-unmapped=4"
                 + " drop-nosurface=0 presents=0 at=finish",
-            "gfxFramesLineNamesUnmeasuredAndUnownedSurfacesInsteadOfPrintingZeros: tracked=no says the bridge's fixed-capacity table held no slot for that surface, so its four bridge counters are placeholders rather than the measured zeros case 4b consists of; id=none order=0 is a surface with frame-ready events that no RENDERED window owns -- never mapped, or mapped to a window this client does not render -- which no window's own line would print at all"
+            "gfxFramesLineNamesUnmeasuredAndUnownedSurfacesInsteadOfPrintingZeros: tracked=no says the bridge's counter table recorded NOTHING for that surface -- no update, write, publish, stale discard or slot teardown -- so its four bridge counters are placeholders rather than the measured zeros case 4b consists of (the converse is weaker: tracked=yes with all-zero counters is reachable from a teardown alone, and those zeros ARE the measurement); id=none order=0 is a surface with frame-ready events that no RENDERED window owns -- never mapped, or mapped to a window this client does not render -- which no window's own line would print at all"
+        )
+
+        // ADR-0018 §5.2 ②b. The period row is this lane's whole product, and its grammar is
+        // pinned against the shape the batch actually produced: an About window re-mapped back to
+        // a surface it already used (`A -> B -> A`), whose MERGED `[gfx-frames]` row could not say
+        // whether anything was presented after the last remap. Here the two periods are two rows:
+        // period 1 carries the frame the window did show, period 2 -- the current one -- carries
+        // the 34 frame-ready events that the two guards ate afterwards, with the sub-causes split.
+        let gfxPeriodEarlier = EdgeProfile.periodLine(
+            row: RemoteWindowRegistry.GfxPeriodRow(
+                windowId: 327_722, surfaceId: 4, period: 1, isCurrent: false,
+                mappedSize: CGSize(width: 522, height: 515), tracked: true, updates: 12, dirty: 3,
+                writes: 12, publishes: 12, stale: 0, ready: 12, dropNoMap: 0, dropNoWindow: 0,
+                dropNoSlot: 0, dropNeverWritten: 0, dropLeased: 11, dropGeneration: 0, erased: 0,
+                presents: 1),
+            at: .finish
+        )
+        let gfxPeriodCurrent = EdgeProfile.periodLine(
+            row: RemoteWindowRegistry.GfxPeriodRow(
+                windowId: 327_722, surfaceId: 4, period: 2, isCurrent: true,
+                mappedSize: CGSize(width: 522, height: 515), tracked: true, updates: 34, dirty: 4,
+                writes: 30, publishes: 34, stale: 0, ready: 34, dropNoMap: 22, dropNoWindow: 0,
+                dropNoSlot: 9, dropNeverWritten: 0, dropLeased: 0, dropGeneration: 3, erased: 1,
+                presents: 0),
+            at: .finish
+        )
+        expect(
+            gfxPeriodEarlier == "[gfx-period] id=327722 surface=4 period=1 current=no"
+                + " mapped=522x515 tracked=yes updates=12 dirty=3 writes=12 publishes=12 stale=0"
+                + " ready=12 drop-nomap=0 drop-nowindow=0 drop-noslot=0 drop-neverwritten=0"
+                + " drop-leased=11 drop-generation=0 erased=0 presents=1 at=finish"
+                && gfxPeriodCurrent == "[gfx-period] id=327722 surface=4 period=2 current=yes"
+                + " mapped=522x515 tracked=yes updates=34 dirty=4 writes=30 publishes=34 stale=0"
+                + " ready=34 drop-nomap=22 drop-nowindow=0 drop-noslot=9 drop-neverwritten=0"
+                + " drop-leased=0 drop-generation=3 erased=1 presents=0 at=finish",
+            "gfxPeriodLineMeasuresOneMappingPeriodNotASurfaceLifetime: [gfx-period] carries, for ONE mapping period of one surface of one window, the DIFFERENCE between that surface's counters at the end of the period and at its start -- so the same surface id appears once per period (period=1, period=2 after a re-map back to it) and only the window's current, still-open period says current=yes; that row, and only that row, is the interval ADR-0018 §5.2 ②'s rules mean by \"after the last remap\", which a [gfx-frames] row summing both periods cannot isolate; both fixtures satisfy the exact identity ready = drop-nomap + drop-nowindow + drop-noslot + drop-neverwritten + drop-leased + drop-generation + presents, so a key inserted in the wrong place breaks them"
+        )
+
+        // The two shapes whose zeros must not be read as measurements, and the split that gives
+        // each drop a cause. `period=0` is the frozen pre-history of a surface that was already
+        // carrying counts when the window first mapped it; `tracked=no` says the bridge recorded
+        // nothing at all for it, so its numbers are placeholders, not the measured zero case 4b
+        // consists of (a teardown alone would have made it `tracked=yes` with those same zeros).
+        let gfxPeriodZero = EdgeProfile.periodLine(
+            row: RemoteWindowRegistry.GfxPeriodRow(
+                windowId: 9, surfaceId: 64, period: 0, isCurrent: false, mappedSize: nil,
+                tracked: false, updates: 0, dirty: 0, writes: 0, publishes: 0, stale: 0, ready: 2,
+                dropNoMap: 2, dropNoWindow: 0, dropNoSlot: 0, dropNeverWritten: 0, dropLeased: 0,
+                dropGeneration: 0, erased: 0, presents: 0),
+            at: .firstFrame
+        )
+        let gfxPeriodUnrendered = EdgeProfile.periodLine(
+            row: RemoteWindowRegistry.GfxPeriodRow(
+                windowId: 9, surfaceId: 64, period: 1, isCurrent: true, mappedSize: nil,
+                tracked: true, updates: 8, dirty: 8, writes: 6, publishes: 8, stale: 5, ready: 3,
+                dropNoMap: 0, dropNoWindow: 1, dropNoSlot: 0, dropNeverWritten: 2, dropLeased: 0,
+                dropGeneration: 0, erased: 2, presents: 0),
+            at: .firstFrame
+        )
+        expect(
+            gfxPeriodZero == "[gfx-period] id=9 surface=64 period=0 current=no mapped=n/a"
+                + " tracked=no updates=0 dirty=0 writes=0 publishes=0 stale=0 ready=2 drop-nomap=2"
+                + " drop-nowindow=0 drop-noslot=0 drop-neverwritten=0 drop-leased=0"
+                + " drop-generation=0 erased=0 presents=0 at=first-frame"
+                && gfxPeriodUnrendered == "[gfx-period] id=9 surface=64 period=1 current=yes"
+                + " mapped=n/a tracked=yes updates=8 dirty=8 writes=6 publishes=8 stale=5 ready=3"
+                + " drop-nomap=0 drop-nowindow=1 drop-noslot=0 drop-neverwritten=2 drop-leased=0"
+                + " drop-generation=0 erased=2 presents=0 at=first-frame",
+            "gfxPeriodLineNamesThePreHistoryAndTheSixDropCauses: period=0 is not an interval but the counts a surface already carried when this window first mapped it (always mapped=n/a -- nothing was announced for a period that predates the mapping), and the six drop keys replace [gfx-frames]' two conflations with their sub-causes in the order a frame meets them (drop-nomap + drop-nowindow = drop-unmapped, drop-noslot + drop-neverwritten + drop-leased + drop-generation = drop-nosurface), so drop-generation>0 says the server drew a frame that a reconnect discarded, drop-noslot>0 beside erased>0 says an unmap tore the slot out from under a mapping this client still believes in, and writes<publishes says a frame the bridge counted as published never reached a buffer"
+        )
+
+        expect(
+            EdgeProfile.periodOverflowLine(windowId: 327_722, dropped: 3, at: .finish)
+                == "[gfx-period-overflow] id=327722 dropped=3 at=finish"
+                && EdgeProfile.periodOverflowLine(windowId: 9, dropped: 1, at: .firstFrame)
+                == "[gfx-period-overflow] id=9 dropped=1 at=first-frame",
+            "gfxPeriodOverflowLineSaysTheRowsAreASuffix: [gfx-period-overflow] appears only when a window's period retention cap discarded its oldest periods, and says how many -- the rows above it are then a suffix of that window's history, so their sums no longer reproduce the [gfx-frames] row (period= still counts from the window's first mapping, because it comes from the periods ever opened rather than from what is retained); its absence is the normal state and means nothing was discarded"
+        )
+
+        expect(
+            EdgeProfile.queueLine(dropped: 0, at: .firstFrame) == "[gfx-queue] dropped=0 at=first-frame"
+                && EdgeProfile.queueLine(dropped: 7, at: .finish) == "[gfx-queue] dropped=7 at=finish",
+            "gfxQueueLineReportsTheControlLaneDropCountPerPhase: [gfx-queue] is the session-wide count of control events the ring dropped, printed once per phase ahead of that phase's per-window rows -- dropped=0 is what rules out the one hazard the per-surface rows cannot see (a lost .surfaceMapped would make a later frame look unmapped), and it is a queue property, so it carries no window or surface id"
         )
 
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
@@ -4016,6 +4214,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// the set above exists to prevent, and the run record's first-frame-vs-finish comparison is
     /// what the pre-registration reads. Each state still speaks at most once.
     private var edgeProfileFirstFrameStale: Set<UInt32> = []
+    /// O-A (ADR-0018 §5.2 ②b): phases whose `[gfx-queue]` line has already been printed. The
+    /// number is a session-wide cumulative counter, not a per-window one, so once per phase is
+    /// exactly as much as it can say -- and the first-frame sampler runs once per drain batch,
+    /// which without this set would print it dozens of times.
+    private var gfxQueueLinePhases: Set<EdgeProfile.Phase> = []
     /// The About-path reason `MoveResizeTarget.reason` gave when the move/resize target was locked,
     /// printed on that leg's round-1 "target locked" line (nil under an explicit filter).
     private var moveResizeLockReason: String?
@@ -4922,6 +5125,18 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// order across runs.
     private func sampleEdgeProfiles(registry: RemoteWindowRegistry, at phase: EdgeProfile.Phase) {
         guard edgeProfileEnabled else { return }
+        // ADR-0018 §5.2 ②b: the control lane's dropped-event count, once per phase, BEFORE the
+        // per-window rows it qualifies. A dropped `.surfaceMapped` is the only way the rows below
+        // can be about a mapping the registry never learned of; `dropped=0` is what makes the rest
+        // of the block readable, and nothing printed it before. Kept out of the per-window loop
+        // because it is a property of the queue, not of a window. The FIRST-FRAME line is the count
+        // as of this phase's first drain batch (this sampler runs once per batch, and the set below
+        // lets the first one speak), so only the `finish` line closes the hole for the run -- see
+        // `EdgeProfile.queueLine`'s own doc comment.
+        if let session, !gfxQueueLinePhases.contains(phase) {
+            gfxQueueLinePhases.insert(phase)
+            print(EdgeProfile.queueLine(dropped: session.droppedEventsCount, at: phase))
+        }
         for snapshot in registry.windowSnapshots().sorted(by: { $0.windowId < $1.windowId }) {
             // Read ONCE, above the dedupe, because the dedupe now keys on this value's SHAPE: a
             // second read inside the branches could observe a different state than the line that
@@ -4970,6 +5185,24 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // id that does not exist.
             for row in registry.gfxFrameRows(windowId: snapshot.windowId) {
                 print(EdgeProfile.framesLine(row: row, at: phase))
+            }
+            // ... and then the SAME history cut into mapping periods (ADR-0018 §5.2 ②b),
+            // immediately after the rows it refines, in BOTH phases. The row above says what a
+            // surface ever accumulated; these say what it accumulated while THIS window was
+            // actually mapped to it, which is the only form in which "after the last remap" can
+            // be read off a window that was re-mapped back to an earlier surface. A window that
+            // has never been mapped contributes no rows, exactly as above.
+            for row in registry.gfxPeriodRows(windowId: snapshot.windowId) {
+                print(EdgeProfile.periodLine(row: row, at: phase))
+            }
+            // ... and, only if the retention cap actually discarded periods for this window, the
+            // one line that says the rows above are a suffix rather than the whole history. Silent
+            // otherwise: a `dropped=0` line on every window of every run would be noise around the
+            // one case it exists to report.
+            let periodsDropped = registry.gfxPeriodOverflowCount(windowId: snapshot.windowId)
+            if periodsDropped > 0 {
+                print(EdgeProfile.periodOverflowLine(
+                    windowId: snapshot.windowId, dropped: periodsDropped, at: phase))
             }
         }
         // Surfaces that never belonged to any window, once per run: they follow no window's

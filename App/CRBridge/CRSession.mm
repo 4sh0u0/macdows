@@ -541,6 +541,14 @@ static crdpq_icon_store_t *crb_icon_store(CRBridgeContext *p)
     return crb_session(p)->_iconStore;
 }
 
+/* ADR-0018 §5.2 ②b: the surface table's teardown observer (CRSurfaceSlots.h). Runs with that
+ * table's lock held, on T_dvc for an unmap/remap/resize and on T_main for a clear; touches nothing
+ * but the counter table, which has its own leaf lock. */
+static void crb_note_slot_erased(void *context, uint32_t surfaceId)
+{
+    crgfx_counters_note_erase((crgfx_counters_t *)context, surfaceId);
+}
+
 static crgfx_counters_t *crb_gfx_counters(CRBridgeContext *p)
 {
     return crb_session(p)->_gfxFrameCounters;
@@ -1353,8 +1361,18 @@ static UINT crb_gfx_update_window_from_surface(RdpgfxClientContext *context, gdi
         }
         /* else: rectCountToPass stays 0 -> crsurface_table_write does a full-frame copy. */
 
-        crsurface_table_write(crb_surface_slots(p), surface->surfaceId, surface->data, surface->width,
-                               surface->height, surface->scanline, generation, rectsToPass, rectCountToPass);
+        const bool writeAccepted =
+            crsurface_table_write(crb_surface_slots(p), surface->surfaceId, surface->data, surface->width,
+                                   surface->height, surface->scanline, generation, rectsToPass, rectCountToPass);
+        /* ADR-0018 §5.2 ②b, MEASUREMENT ONLY -- reading the bool this call site has always
+         * discarded, and STILL discarding it for every purpose except counting: the publish below
+         * happens exactly as before whether or not the write landed (changing that would change
+         * what the client does, which this lane must not). The 2026-09-15 guard trace named this
+         * the gap that made `publishes` unreadable -- a write declined because the slot was erased,
+         * because all three buffers were leased, or because an allocation failed looked identical
+         * to one that copied pixels. `writes < publishes` is now that difference. */
+        if (writeAccepted)
+            crgfx_counters_note_write(crb_gfx_counters(p), surface->surfaceId);
 
         /* ROOT CAUSE FIX (regedit white-block bug): gdi/gfx.c's own gdi_UpdateSurfaces
          * dispatches per-surface to one of two paths depending on outputMapped vs
@@ -2242,6 +2260,14 @@ static void crb_schedule_drain(void *ctx)
          * comment. A NULL here (allocation failure) costs the diagnostic and nothing else;
          * every crgfx_counters entry point tolerates it. */
         _gfxFrameCounters = crgfx_counters_create();
+        /* ADR-0018 §5.2 ②b, MEASUREMENT ONLY: route the surface table's slot teardowns into the
+         * counters above, so `erased` can be read per surface id. Installed AFTER both tables
+         * exist and never removed -- and -dealloc destroys _surfaceSlots (whose own destroy runs a
+         * final clear, which fires this observer) BEFORE _gfxFrameCounters, so the callback can
+         * never outlive the table it writes to. The callback takes the counter table's own lock
+         * while the surface table's is held; nothing ever takes them in the other order (see
+         * CRSurfaceSlots.h's threading note). */
+        crsurface_table_set_erase_observer(_surfaceSlots, (void *)_gfxFrameCounters, crb_note_slot_erased);
     }
     return self;
 }
@@ -2653,26 +2679,68 @@ cleanup:
 - (BOOL)gfxSurfaceCounters:(uint32_t)surfaceId
                    updates:(uint64_t *)updates
                      dirty:(uint64_t *)dirty
+                    writes:(uint64_t *)writes
                  publishes:(uint64_t *)publishes
                      stale:(uint64_t *)stale
+                    erased:(uint64_t *)erased
 {
     /* Passthrough of the session's own counter table (see the header's doc comment for what
-     * the four numbers mean and why "not tracked" is deliberately not zero). One lock, one
-     * read of all four, so a caller can never see two of them from different instants; safe
+     * the six numbers mean and why "not tracked" is deliberately not zero). One lock, one
+     * read of all six, so a caller can never see two of them from different instants; safe
      * from any thread, including while T_dvc is writing. */
-    return crgfx_counters_read(_gfxFrameCounters, surfaceId, updates, dirty, publishes, stale) ? YES
-                                                                                               : NO;
+    return crgfx_counters_read(_gfxFrameCounters, surfaceId, updates, dirty, writes, publishes, stale,
+                               erased)
+               ? YES
+               : NO;
 }
 
-- (nullable IOSurfaceRef)copyPublishedSurface:(uint32_t)surfaceId
+- (nullable IOSurfaceRef)copyPublishedSurface:(uint32_t)surfaceId reason:(nullable CRPublishedSurfaceMiss *)outReason
 {
+    /* THE ONE implementation of the frame hand-off. -copyPublishedSurface: is a NULL-reason
+     * call to this method (right below), so the production path and the measured path execute
+     * the same lease, the same generation comparison and the same release -- a second copy of
+     * adr/0005 §4's protocol here would be a second thing to keep correct.
+     *
+     * MEASUREMENT ONLY, and it is only the OUT-PARAMETER that is new: every `return` below sets
+     * `*outReason` and then returns exactly what the previous implementation returned, in the
+     * same order, with the same retain count. Nothing in this method branches on the reason. */
+    if (outReason)
+        *outReason = CRPublishedSurfaceMissNoSlot;
+
+    /* No table at all (before -start's first connect, or after -dealloc tore it down): reported as
+     * NoSlot, which is literally true -- there is no slot for any id. */
     if (!_surfaceSlots)
         return NULL;
 
     uint32_t publishedGeneration = 0;
-    IOSurfaceRef surface = crsurface_table_lease_published(_surfaceSlots, surfaceId, &publishedGeneration);
+    CRSurfaceLeaseMiss leaseMiss = CRSurfaceLeaseMissNone;
+    IOSurfaceRef surface =
+        crsurface_table_lease_published_reason(_surfaceSlots, surfaceId, &publishedGeneration, &leaseMiss);
     if (!surface)
+    {
+        /* The slot table's own three outcomes, carried through 1:1 rather than collapsed: "the
+         * slot is gone", "the slot has never been written" and "you already hold this frame" are
+         * three different statements about the session, and the 2026-09-15 trace had to reach the
+         * first one by elimination precisely because this boundary merged them. */
+        if (outReason)
+        {
+            switch (leaseMiss)
+            {
+                case CRSurfaceLeaseMissNeverWritten:
+                    *outReason = CRPublishedSurfaceMissNeverWritten;
+                    break;
+                case CRSurfaceLeaseMissAlreadyLeased:
+                    *outReason = CRPublishedSurfaceMissAlreadyLeased;
+                    break;
+                case CRSurfaceLeaseMissNoSlot:
+                case CRSurfaceLeaseMissNone: /* unreachable on a NULL return; NoSlot is the safe read */
+                default:
+                    *outReason = CRPublishedSurfaceMissNoSlot;
+                    break;
+            }
+        }
         return NULL;
+    }
 
     /* adr/0005 §4's generation protocol, applied to frames exactly as it is to control-lane
      * events (see this class's ivar block comment on _framesQueue/_surfaceSlots): a lease
@@ -2683,10 +2751,24 @@ cleanup:
     if (publishedGeneration != self.currentGeneration)
     {
         crsurface_table_release_lease(_surfaceSlots, surface);
+        /* ADR-0018 §5.2 ②b: the ONE exit a diagnostic must be able to tell from the one above.
+         * Both hand the caller nothing, but this one means the server DID draw a frame and a
+         * reconnect discarded it, while the other means there was no frame to hand over at
+         * all -- a distinction the registry's `drop-nosurface` total used to swallow. */
+        if (outReason)
+            *outReason = CRPublishedSurfaceMissStaleGeneration;
         return NULL;
     }
 
+    if (outReason)
+        *outReason = CRPublishedSurfaceMissNone;
     return surface;
+}
+
+- (nullable IOSurfaceRef)copyPublishedSurface:(uint32_t)surfaceId
+{
+    /* Unchanged behaviour by construction: the same call, with the reason thrown away. */
+    return [self copyPublishedSurface:surfaceId reason:NULL];
 }
 
 - (void)recycleSurface:(IOSurfaceRef)surface

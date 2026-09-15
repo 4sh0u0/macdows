@@ -35,6 +35,12 @@ COMMON_FLAGS=(
     -I "$FREERDP_PREFIX/include/winpr3"
     -L "$FREERDP_PREFIX/lib"
     -Wl,-rpath,"$FREERDP_PREFIX/lib"
+    # libfreerdp3 links the self-built ffmpeg (WITH_FFMPEG is ON in deps/freerdp.lock), and its
+    # install name for those dylibs is @rpath-relative -- without this second rpath the test
+    # binary dies in dyld before main() with "Library not loaded: @rpath/libavcodec.*.dylib".
+    # Every Xcode target already carries the same pair in LD_RUNPATH_SEARCH_PATHS
+    # (App/project.yml); this suite was the one consumer that had only the first half.
+    -Wl,-rpath,"$CRDP_FFMPEG_PREFIX/lib"
     -lfreerdp3 -lwinpr3
     -framework Foundation -framework CoreFoundation -framework IOSurface
 )

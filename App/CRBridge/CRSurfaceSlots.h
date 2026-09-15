@@ -86,6 +86,69 @@ bool crsurface_table_write(CRSurfaceSlotTable *table, uint32_t surfaceId, const 
  * (if non-NULL) receives the published generation. */
 IOSurfaceRef crsurface_table_lease_published(CRSurfaceSlotTable *table, uint32_t surfaceId, uint32_t *outGeneration);
 
+/* DIAGNOSTICS ONLY (ADR-0018 §5.2 ②b) -- why a lease attempt handed back nothing.
+ *
+ * The three misses are one `NULL` to every caller, on purpose: none of them gives a caller
+ * anything to do differently (adr/0005 §1, a frame is state -- the next one supersedes it).
+ * They are three different statements ABOUT THE SESSION, though, and the 2026-09-15 About
+ * window is the case that needs them apart. A read-only trace of that run could only reach
+ * "the slot was gone" by elimination, because the three collapse into one outcome here:
+ *   - CRSurfaceLeaseMissNoSlot        -- no slot for that surfaceId at all. Something ERASED it
+ *                                        (crsurface_table_unmap_window's loop, or _clear), or it
+ *                                        was never mapped.
+ *   - CRSurfaceLeaseMissNeverWritten  -- the slot exists and nothing has ever been published into
+ *                                        it, either because no write has landed yet or because a
+ *                                        teardown (remap/resize) reset it.
+ *   - CRSurfaceLeaseMissAlreadyLeased -- a published buffer exists but T_main already holds it;
+ *                                        there is simply nothing NEWER to hand out.
+ * Those map 1:1 onto the three early returns of crsurface_table_lease_published_reason. */
+typedef enum
+{
+    CRSurfaceLeaseMissNone = 0,
+    CRSurfaceLeaseMissNoSlot,
+    CRSurfaceLeaseMissNeverWritten,
+    CRSurfaceLeaseMissAlreadyLeased,
+} CRSurfaceLeaseMiss;
+
+/* T_main. crsurface_table_lease_published plus the reason it returned NULL: the identical
+ * lease, the identical bookkeeping, the identical +1-retained result -- that function is now a
+ * NULL-reason call to this one, so there is ONE implementation and the two entry points cannot
+ * drift. `*outMiss` (if non-NULL) is written on EVERY return, CRSurfaceLeaseMissNone when a
+ * surface comes back. Nothing in this function branches on it. */
+IOSurfaceRef crsurface_table_lease_published_reason(CRSurfaceSlotTable *table, uint32_t surfaceId,
+                                                     uint32_t *outGeneration, CRSurfaceLeaseMiss *outMiss);
+
+/* DIAGNOSTICS ONLY (ADR-0018 §5.2 ②b) -- called once per surfaceId whose slot this table tears
+ * down, so a counter outside this file can record teardowns it otherwise cannot observe at all.
+ *
+ * WHY IT EXISTS. `UnmapWindowForSurface` erases EVERY slot belonging to a windowId
+ * (crsurface_table_unmap_window's loop), including a different surface that was freshly mapped to
+ * that same window moments earlier -- while the registry, which is never told about the unmap,
+ * keeps a mapping whose slot no longer exists. Every later frame for that surface then dies as
+ * CRSurfaceLeaseMissNoSlot with nothing anywhere recording the teardown that caused it; the
+ * 2026-09-15 trace had to reach that conclusion by elimination for exactly this reason.
+ *
+ * THE FOUR CALL SITES, and the one deliberate exclusion:
+ *   1. crsurface_table_unmap_window -- each erased slot (the collateral teardown above);
+ *   2. crsurface_table_clear -- each slot dropped by a disconnect/shutdown sweep;
+ *   3. crsurface_table_map's remap branch -- a surface re-mapped to a DIFFERENT windowId, whose
+ *      buffers are destroyed so the old window's last frame cannot leak into the new one;
+ *   4. crsurface_table_write's size-change branch, ONLY when the slot had a published frame to
+ *      lose (lastWrittenIndex >= 0). A surface's FIRST write also takes that branch (the slot
+ *      starts 0x0), and counting that would report a teardown for every surface that ever drew.
+ * 1 and 2 remove the slot (later leases miss as NoSlot); 3 and 4 keep it and only clear its
+ * buffers (later leases miss as NeverWritten) -- so the miss reason says which kind happened.
+ *
+ * THREADING: invoked with the table's lock HELD, on whichever thread performed the teardown
+ * (T_dvc for 1/3/4, T_main for 2). An observer must therefore not call back into this table and
+ * must do its own synchronization; the one in CRSession.mm only touches the crgfx counter table,
+ * which has its own leaf lock, so the lock order is always table -> counters and never back. */
+typedef void (*CRSurfaceEraseObserver)(void *context, uint32_t surfaceId);
+
+/* Installs (or, with a NULL observer, removes) the teardown observer. Call before the table is
+ * handed to any other thread -- it is not itself synchronized, matching create/destroy. */
+void crsurface_table_set_erase_observer(CRSurfaceSlotTable *table, void *context, CRSurfaceEraseObserver observer);
+
 /* T_main, once a CATransaction completion block fires for a surface previously returned
  * by crsurface_table_lease_published (adr/0005 §2: "the recycle point is CATransaction
  * completion, not the moment contents is swapped"). Marks the matching buffer Free again. Safe to call even if the

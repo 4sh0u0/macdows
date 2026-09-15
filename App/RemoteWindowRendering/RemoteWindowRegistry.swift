@@ -237,6 +237,39 @@ final class RemoteWindowRegistry {
     /// BRIDGE side has a fixed ceiling instead, for the one reason that does not apply here: it
     /// is written from the per-frame path, where allocation is forbidden.
     private var gfxRegistryCounters: [UInt32: GfxRegistryCounters] = [:]
+    /// MEASUREMENT ONLY (ADR-0018 §5.2 ②b) -- per window, the MAPPING PERIODS of the surfaces it
+    /// has been mapped to, in the order the periods opened.
+    ///
+    /// WHY THE CUMULATIVE ROWS ARE NOT ENOUGH, first-hand (prereg footnote 1,
+    /// `2026-09-15-w3-remap-frames-prereg.md`): `gfxSurfaceHistory` holds ONE row per surface id,
+    /// so when a window is re-mapped back to a surface it already used (`A -> B -> A`, observed
+    /// in two of the three pairs) that row's counters are the SUM of both mapping periods. The
+    /// record's own finding: such a row cannot isolate the interval AFTER THE LAST REMAP, which
+    /// is the interval every interpretation rule (R1/R2/R3a-c/R4/R6) is keyed on -- so
+    /// `presents>0` on it does NOT rule out "nothing was presented after the last remap". A period carries the
+    /// counters as they stood when it opened, and its row prints the DIFFERENCE, which is that
+    /// interval and nothing else.
+    ///
+    /// Never cleared -- not on window delete, not on reconnect -- exactly like the two
+    /// dictionaries above and for the same reason (a measurement that a reconnect erases cannot
+    /// be read after the run that produced it). A period needs no end snapshot: it ends where the
+    /// SAME surface's next period on this window begins, and the last one ends at the moment of
+    /// reading, so the rows of one surface are a gap-free partition of its history on this window
+    /// (`period=0` plus the periods sums to exactly its `[gfx-frames]` totals).
+    ///
+    /// BOUNDED, unlike the two dictionaries above, and for a reason that only applies here (gate
+    /// r1 I-2). Those grow with the number of DISTINCT surface ids; this one would grow with the
+    /// number of REMAPS -- every resize that lands on a fresh surface id is one -- and each entry
+    /// is also a printed LINE per window per phase, so an hours-long soak would grow both the
+    /// registry's memory and its own evidence log without limit. `gfxMaxMappingPeriodsPerWindow`
+    /// caps the retained periods per window; past it the OLDEST period is discarded and counted in
+    /// `WindowMappingPeriods.dropped`, which window-smoke prints as its own
+    /// `[gfx-period-overflow]` line so a record never mistakes a truncated row set for a complete
+    /// one (the partition identity is exactly what a dropped period breaks). `openedPerSurface` is
+    /// kept apart from the array for the same reason: `period=` must keep counting from the number
+    /// of periods ever OPENED, not from what is still retained, or a discarded period would make
+    /// two rows claim the same `period=` number.
+    private var gfxMappingPeriods: [UInt32: WindowMappingPeriods] = [:]
     private var currentGeneration: UInt32?
     /// adr/0008 §6 / task item 5: pure-data record of the last MonitoredDesktop order, no
     /// ordering/focus policy attached. See `ServerDesktopState`'s own doc comment.
@@ -681,6 +714,11 @@ final class RemoteWindowRegistry {
             handleWindowDelete(windowId: event.windowId)
         case .surfaceMapped:
             let windowId = UInt32(truncatingIfNeeded: event.mappedWindowId)
+            // MEASUREMENT ONLY (ADR-0018 §5.2 ②b), read BEFORE the 1:1 cleanup below rewrites
+            // `surfaceToWindow`: was this order a REMAP (the window's mapping changes) or the
+            // server re-announcing the mapping the window already has? The mapping-period
+            // bookkeeping at the end of this case is the only consumer.
+            let wasAlreadyMapped = surfaceToWindow[event.surfaceId] == windowId
             // Team-lead review round 5 (2026-08-23): "surfaces can remap" -- a window's
             // surfaceId is not guaranteed stable for the window's whole lifetime (a resize
             // or other server-side event can trigger a fresh MapSurfaceToWindow for a NEW
@@ -730,6 +768,14 @@ final class RemoteWindowRegistry {
                 history.append(record)
             }
             gfxSurfaceHistory[windowId] = history
+            // MEASUREMENT ONLY (ADR-0018 §5.2 ②b): and the period this mapping OPENS, which is
+            // the one thing the deduped row above deliberately cannot express -- a surface that
+            // comes back gets a second period, never a merged row. Same size source as the record
+            // (`surfaceMappedSize`, read after the write above), so the two lines about the same
+            // mapping can never print different sizes.
+            noteMappingPeriod(
+                windowId: windowId, surfaceId: event.surfaceId,
+                mappedSize: surfaceMappedSize[event.surfaceId], isRemap: !wasAlreadyMapped)
             // Team-lead review round 6 (2026-08-23, maximize-scenario real-host regression
             // -- the actual root cause, after suspects 1/2/3 were each ruled out): the
             // instrumented run showed the maximize's own big WindowUpdate (windowWidth=2560
@@ -2344,22 +2390,55 @@ final class RemoteWindowRegistry {
         // which is precisely the state the 2026-09-15 About window was in. Counting each exit
         // where it happens turns "the window never showed the new surface" into a named cause.
         gfxRegistryCounters[surfaceId, default: GfxRegistryCounters()].ready += 1
-        guard let windowId = surfaceToWindow[surfaceId], let window = windows[windowId] else {
-            // Either not yet bound to a window, or bound to a window this registry isn't
-            // rendering (isMappableWindow filter) — either way, nothing to present;
-            // see surfaceToWindow's own doc comment for why this is safe to just skip.
-            // The counter inherits that guard's own conflation of the two reasons rather than
-            // splitting it: this lane measures the existing path, it does not reshape it.
-            gfxRegistryCounters[surfaceId, default: GfxRegistryCounters()].dropUnmapped += 1
+        // ADR-0018 §5.2 ②b: the ONE guard of the pair below that was split into two `guard`s.
+        // The control flow is unchanged -- the same two conditions in the same order, the same
+        // silent `return` -- but each half now names the frame's fate, because `drop-unmapped`
+        // as a single number could not say whether the mapping was missing or the WINDOW was.
+        guard let windowId = surfaceToWindow[surfaceId] else {
+            // Not yet bound to a window (or unbound again by a remap); see surfaceToWindow's own
+            // doc comment for why skipping is safe -- adr/0005 §1, the next frame for the same id
+            // retries.
+            gfxRegistryCounters[surfaceId, default: GfxRegistryCounters()].dropNoMap += 1
             return
         }
-        guard let surface = session.copyPublishedSurface(surfaceId) else {
+        guard let window = windows[windowId] else {
+            // Bound to a window this registry isn't rendering (isMappableWindow filter, or
+            // already deleted) -- nothing to present, and nothing about the frame is at fault.
+            gfxRegistryCounters[surfaceId, default: GfxRegistryCounters()].dropNoWindow += 1
+            return
+        }
+        // MEASUREMENT ONLY: the reason-carrying variant of the same call (`CRSession.mm` --
+        // `-copyPublishedSurface:` is now a NULL-reason call to it, so this takes the identical
+        // lease through the identical generation check). Nothing below branches on `miss` except
+        // which counter it increments.
+        var miss = CRPublishedSurfaceMiss.none
+        guard let surface = session.copyPublishedSurface(surfaceId, reason: &miss) else {
             // Already consumed by an earlier FrameReady for the same publish, or rejected
             // as stale-generation by CRSession itself — nothing new to display.
             // A run where this is the only nonzero drop has a live window, a published frame
             // and still nothing on screen -- the one shape that would point at the bridge's
             // own lease/generation bookkeeping rather than at the server.
-            gfxRegistryCounters[surfaceId, default: GfxRegistryCounters()].dropNoSurface += 1
+            switch miss {
+            case .staleGeneration:
+                // The server drew this frame and the reconnect discarded it -- the only one of the
+                // four that says the loss happened upstream of this client's bookkeeping.
+                gfxRegistryCounters[surfaceId, default: GfxRegistryCounters()].dropGeneration += 1
+            case .neverWritten:
+                // The slot is there and has never held pixels: nothing was written yet, or a
+                // teardown that kept the slot reset it.
+                gfxRegistryCounters[surfaceId, default: GfxRegistryCounters()].dropNeverWritten += 1
+            case .alreadyLeased:
+                // This client already holds that frame -- two doorbells, one frame.
+                gfxRegistryCounters[surfaceId, default: GfxRegistryCounters()].dropLeased += 1
+            case .noSlot, .none:
+                // `.none` is unreachable on a nil return (the bridge writes it only alongside a
+                // surface); counted here rather than dropped so a future miss shape shows up as an
+                // inflated `drop-noslot` instead of vanishing from a total that must stay equal to
+                // `ready - the other drops - presents`.
+                gfxRegistryCounters[surfaceId, default: GfxRegistryCounters()].dropNoSlot += 1
+            @unknown default:
+                gfxRegistryCounters[surfaceId, default: GfxRegistryCounters()].dropNoSlot += 1
+            }
             return
         }
         gfxRegistryCounters[surfaceId, default: GfxRegistryCounters()].presents += 1
@@ -2497,20 +2576,59 @@ final class RemoteWindowRegistry {
     }
 
     /// What this registry did with the frame-ready events for ONE surfaceId. Every field is a
-    /// mutually exclusive outcome of `handleFrameReady`, so `ready == dropUnmapped +
-    /// dropNoSurface + presents` holds for any surface; a record where it does not is a fourth
-    /// exit somebody added without counting it.
+    /// mutually exclusive outcome of `handleFrameReady`, so `ready == dropNoMap + dropNoWindow +
+    /// dropNoSlot + dropNeverWritten + dropLeased + dropGeneration + presents` holds exactly for
+    /// any surface (equivalently `ready == dropUnmapped + dropNoSurface + presents`); a record
+    /// where it does not is an exit somebody added without counting it.
+    ///
+    /// SIX DROP SUB-CAUSES, NOT TWO (ADR-0018 §5.2 ②b). The 2026-09-15 record could say only that
+    /// the About window's last surface lost 22 frames to `drop-unmapped` and 12 to
+    /// `drop-nosurface`, and both totals are conflations the record had to state as such: the
+    /// first mixes "no mapping yet" with "mapped to a window this registry does not render", the
+    /// second mixes FOUR bridge-side outcomes that the read-only trace of that run could only tell
+    /// apart by elimination (no slot at all / slot never written / already leased / refused as
+    /// belonging to an older connection). The two lane-② totals are kept as sums below -- the
+    /// `[gfx-frames]` row prints them and must stay byte-identical -- while each cause is counted
+    /// on its own branch.
     private struct GfxRegistryCounters {
         /// Frame-ready events seen for this surface, whatever became of them.
         var ready = 0
-        /// Of those: no live window to present to (not mapped yet, or mapped to a window this
-        /// registry does not render). The existing guard does not separate those two reasons.
-        var dropUnmapped = 0
-        /// Of those: a live window, but the bridge had no surface to hand over (already
-        /// consumed, or refused as belonging to an older connection generation).
-        var dropNoSurface = 0
+        /// Guard 1, first half: no `surfaceToWindow` entry at all for this surface id -- the
+        /// mapping has not arrived (or has already been replaced by a remap). A frame is state
+        /// (adr/0005 §1), so the next one for the same id retries; nothing is retried here.
+        var dropNoMap = 0
+        /// Guard 1, second half: the surface IS mapped, but its windowId has no `RemoteWindow`
+        /// -- filtered out by `isMappableWindow`, deleted since, or never created. The frame is
+        /// discarded for a reason that has nothing to do with the frame.
+        var dropNoWindow = 0
+        /// Guard 2a: a live window, and the bridge has NO SLOT for that surface id
+        /// (`CRPublishedSurfaceMissNoSlot`) -- never mapped on the bridge side, or its slot was
+        /// torn down by an unmap of its window, which the registry is never told about. The
+        /// 2026-09-15 trace ended on this branch, by elimination; it is now counted directly.
+        var dropNoSlot = 0
+        /// Guard 2b: the slot exists but NOTHING WAS EVER WRITTEN into it
+        /// (`CRPublishedSurfaceMissNeverWritten`) -- no accepted write yet, or a teardown that
+        /// kept the slot (remap to another window, size change) reset it.
+        var dropNeverWritten = 0
+        /// Guard 2c: a published frame exists and this client ALREADY HOLDS IT
+        /// (`CRPublishedSurfaceMissAlreadyLeased`) -- the ordinary "two doorbells, one frame"
+        /// case, and the only one of the four that means nothing is wrong.
+        var dropLeased = 0
+        /// Guard 2d: a live window and a real frame, refused because it belongs to a connection
+        /// generation older than the current one (`CRPublishedSurfaceMissStaleGeneration`,
+        /// adr/0005 §4). The ONE drop that says the server drew the frame and a reconnect is what
+        /// threw it away.
+        var dropGeneration = 0
         /// Of those: handed to `RemoteWindow.present`, i.e. actually shown.
         var presents = 0
+
+        /// Guard 1's total -- the exact number the lane-② `[gfx-frames]` row has always printed
+        /// as `drop-unmapped=`, now derived from its two halves rather than counted separately,
+        /// so the two can never disagree.
+        var dropUnmapped: Int { dropNoMap + dropNoWindow }
+        /// Guard 2's total, same contract as `dropUnmapped` for `drop-nosurface=`: the four
+        /// sub-causes summed, so the lane-② row's number is unchanged.
+        var dropNoSurface: Int { dropNoSlot + dropNeverWritten + dropLeased + dropGeneration }
     }
 
     /// One printable line's worth of frame accounting for one surface of one window -- the join
@@ -2532,9 +2650,17 @@ final class RemoteWindowRegistry {
         /// even after a re-map back to an earlier surface (gate r1 B-1).
         let isCurrent: Bool
         let mappedSize: CGSize?
-        /// Whether the bridge's fixed-capacity counter table had a slot for this surface. When
-        /// false the four bridge counters below are meaningless zeros and must be reported as
-        /// "not measured", never as "nothing happened".
+        /// Whether the bridge's counter table has recorded ANY event for this surface -- an update,
+        /// a write, a publish, a stale discard or a slot teardown. When false the four bridge
+        /// counters below are meaningless zeros and must be reported as "not measured", never as
+        /// "nothing happened".
+        ///
+        /// `true` WITH ALL-ZERO `updates` IS REACHABLE (gate r1 I-1): a teardown claims a slot by
+        /// itself, so a surface that was mapped on the bridge side, never drawn into, and then
+        /// erased (an unmap of its window, or the disconnect sweep) flips from `tracked=no` to
+        /// `tracked=yes updates=0 dirty=0 publishes=0 stale=0` the moment the erase fires. That row
+        /// says "the bridge had this surface and nothing ever drew into it" -- ADR-0018 §5.2 ②'s
+        /// case 4b stated positively, not a measurement that went missing.
         let tracked: Bool
         let updates: UInt64
         let dirty: UInt64
@@ -2601,21 +2727,345 @@ final class RemoteWindowRegistry {
     private func gfxFrameRow(
         windowId: UInt32?, record: MappedSurfaceRecord, order: Int, isCurrent: Bool
     ) -> GfxFrameRow {
-        var updates: UInt64 = 0
-        var dirty: UInt64 = 0
-        var publishes: UInt64 = 0
-        var stale: UInt64 = 0
-        // Left untouched by the bridge when it answers "not tracked" -- reported as such below
-        // rather than as measured zeros.
-        let tracked = session.gfxSurfaceCounters(
-            record.surfaceId, updates: &updates, dirty: &dirty, publishes: &publishes, stale: &stale)
-        let counters = gfxRegistryCounters[record.surfaceId] ?? GfxRegistryCounters()
+        // Through the same one reader the period rows use (`gfxSurfaceTotals`), so a `[gfx-frames]`
+        // row and the `[gfx-period]` rows beneath it can never be built from differently-shaped
+        // reads of the same counters. The values are the same ones this row has always printed:
+        // `tracked` is the bridge's own "not tracked" answer, reported as such rather than as
+        // measured zeros, and the two drop columns are the sums of their sub-causes.
+        let totals = gfxSurfaceTotals(surfaceId: record.surfaceId)
         return GfxFrameRow(
             windowId: windowId, surfaceId: record.surfaceId, order: order, isCurrent: isCurrent,
-            mappedSize: record.mappedSize, tracked: tracked, updates: updates, dirty: dirty,
-            publishes: publishes, stale: stale, ready: counters.ready,
-            dropUnmapped: counters.dropUnmapped, dropNoSurface: counters.dropNoSurface,
-            presents: counters.presents)
+            mappedSize: record.mappedSize, tracked: totals.tracked, updates: totals.updates,
+            dirty: totals.dirty, publishes: totals.publishes, stale: totals.stale,
+            ready: totals.registry.ready, dropUnmapped: totals.registry.dropUnmapped,
+            dropNoSurface: totals.registry.dropNoSurface, presents: totals.registry.presents)
+    }
+
+    // MARK: - GFX mapping periods (ADR-0018 §5.2 ②b, measurement only)
+
+    /// One mapping period: the stretch of time during which ONE window was mapped to ONE surface,
+    /// identified by the cumulative counters that surface carried when the period opened.
+    ///
+    /// The row this becomes prints the DIFFERENCE between those counters and the ones the surface
+    /// carries when the period closed (or, for the still-open period, right now), which is the
+    /// per-interval measurement `gfxSurfaceHistory`'s deduped rows cannot give -- see
+    /// `gfxMappingPeriods`' own doc comment for the prereg finding that made this necessary.
+    /// How many mapping periods one window retains (gate r1 I-2). Sized well above anything
+    /// observed -- the 2026-09-15 About window's whole life was three periods, and a ten-cycle
+    /// reconnect soak a few dozen -- so the cap is a tripwire against an unbounded soak, not a
+    /// working limit; a run that hits it says so on its own line rather than silently truncating.
+    static let gfxMaxMappingPeriodsPerWindow = 64
+
+    /// One window's mapping periods, plus the two pieces of bookkeeping the cap makes necessary.
+    private struct WindowMappingPeriods {
+        /// Retained periods, oldest first. At most `gfxMaxMappingPeriodsPerWindow`.
+        var periods: [MappingPeriod] = []
+        /// Periods ever OPENED per surface id, which is where `period=` comes from -- bounded by
+        /// the window's distinct surface ids, exactly like `gfxSurfaceHistory`.
+        var openedPerSurface: [UInt32: Int] = [:]
+        /// How many oldest periods the cap has discarded for this window. Nonzero means the rows
+        /// are a suffix of the history, so their sums no longer reproduce `[gfx-frames]`.
+        var dropped = 0
+    }
+
+    private struct MappingPeriod {
+        let surfaceId: UInt32
+        /// 1-based index of this mapping period AMONG THAT SURFACE'S periods on that window, so
+        /// `A -> B -> A` reads `(A,1) (B,1) (A,2)`. `0` is the special pre-history bucket below.
+        let period: Int
+        /// Cumulative totals at the instant the period opened. For `period == 0` this IS the row:
+        /// everything the surface had already accumulated before this window first mapped it.
+        /// A period ENDS where the next period of the SAME surface on this window begins (or at
+        /// the moment of reading, for the last one), so no end snapshot is stored -- the next
+        /// period's baseline is that end, which is what makes the rows a gap-free partition.
+        let baseline: GfxSurfaceTotals
+        /// The mapped sub-rect size announced for this period, refreshed by a re-announcement of
+        /// the same mapping. Always `nil` on a `period == 0` row: that interval predates any
+        /// mapping of this surface to this window, so no size was ever announced for it.
+        var mappedSize: CGSize?
+    }
+
+    /// Both sides' cumulative counters for ONE surface id at ONE instant -- the unit a period is
+    /// measured in. `tracked` is not a counter: it is the bridge's own "have I ever had a slot for
+    /// this id" answer, carried along so a row can say `tracked=no` instead of printing four
+    /// zeros that would read as "the server drew nothing".
+    private struct GfxSurfaceTotals {
+        var tracked = false
+        var updates: UInt64 = 0
+        var dirty: UInt64 = 0
+        /// Of those updates: the frame-slot writes the bridge ACCEPTED. `writes < publishes` is a
+        /// frame that reached no buffer at all (2026-09-15 guard trace).
+        var writes: UInt64 = 0
+        var publishes: UInt64 = 0
+        var stale: UInt64 = 0
+        /// Teardowns of this surface's slot in the bridge's table -- an unmap of its window erases
+        /// it collaterally, and this registry is never told.
+        var erased: UInt64 = 0
+        var registry = GfxRegistryCounters()
+
+        /// True when nothing whatsoever has been counted for this surface yet. Decides whether a
+        /// `period=0` row is printed at all: a surface whose history begins at its first mapping
+        /// has no pre-history worth a line.
+        var isZero: Bool {
+            updates == 0 && dirty == 0 && writes == 0 && publishes == 0 && stale == 0 && erased == 0
+                && registry.ready == 0 && registry.dropNoMap == 0 && registry.dropNoWindow == 0
+                && registry.dropNoSlot == 0 && registry.dropNeverWritten == 0
+                && registry.dropLeased == 0 && registry.dropGeneration == 0 && registry.presents == 0
+        }
+
+        /// This snapshot minus an EARLIER one, field by field -- the period's own measurement.
+        ///
+        /// Every counter on both sides is monotonic for the registry's whole lifetime (neither
+        /// side is ever reset, not even by a reconnect), so `self >= baseline` holds for every
+        /// field and the clamp below can only fire if that ever stops being true. It is a clamp
+        /// rather than a trap because this is a diagnostic: a measurement that cannot be taken
+        /// must print a zero, never abort the run that was being measured.
+        func delta(since baseline: GfxSurfaceTotals) -> GfxSurfaceTotals {
+            var out = GfxSurfaceTotals()
+            out.tracked = tracked
+            out.updates = Self.step(updates, baseline.updates)
+            out.dirty = Self.step(dirty, baseline.dirty)
+            out.writes = Self.step(writes, baseline.writes)
+            out.publishes = Self.step(publishes, baseline.publishes)
+            out.stale = Self.step(stale, baseline.stale)
+            out.erased = Self.step(erased, baseline.erased)
+            out.registry.ready = Self.step(registry.ready, baseline.registry.ready)
+            out.registry.dropNoMap = Self.step(registry.dropNoMap, baseline.registry.dropNoMap)
+            out.registry.dropNoWindow = Self.step(registry.dropNoWindow, baseline.registry.dropNoWindow)
+            out.registry.dropNoSlot = Self.step(registry.dropNoSlot, baseline.registry.dropNoSlot)
+            out.registry.dropNeverWritten = Self.step(registry.dropNeverWritten, baseline.registry.dropNeverWritten)
+            out.registry.dropLeased = Self.step(registry.dropLeased, baseline.registry.dropLeased)
+            out.registry.dropGeneration = Self.step(registry.dropGeneration, baseline.registry.dropGeneration)
+            out.registry.presents = Self.step(registry.presents, baseline.registry.presents)
+            return out
+        }
+
+        private static func step(_ now: UInt64, _ then: UInt64) -> UInt64 { now > then ? now - then : 0 }
+        private static func step(_ now: Int, _ then: Int) -> Int { now > then ? now - then : 0 }
+    }
+
+    /// One printable line's worth of ONE mapping period of ONE surface of ONE window. Diagnostics
+    /// only; no production path builds or reads one.
+    ///
+    /// Every counter below is an INTERVAL measurement, not a total -- the difference between the
+    /// surface's cumulative counters at the end of this period (or now, if it is still open) and
+    /// at its start. `[gfx-frames]` remains the place totals are read; these rows say WHEN.
+    struct GfxPeriodRow {
+        let windowId: UInt32
+        let surfaceId: UInt32
+        /// `1` for the first period this surface had on this window, `2` for the period it got
+        /// when the window came back to it, and so on. `0` is the pre-history row described by
+        /// `MappingPeriod.period`.
+        let period: Int
+        /// Whether this is the LAST period of the window's CURRENT surface -- at most one row per
+        /// window, and never a `period == 0` row. This is the row every "after the last remap"
+        /// question is about, and the only one whose interval is entirely "while this mapping was
+        /// live".
+        let isCurrent: Bool
+        let mappedSize: CGSize?
+        /// Whether the bridge's counter table has recorded any event for this surface, read now (a
+        /// slot is never released, so this cannot have been true earlier and false now). `false`
+        /// makes the bridge numbers placeholders rather than measurements; `true` with all-zero
+        /// `updates` is a real answer, not a missing one -- a teardown claims a slot on its own, so
+        /// that row means "the bridge had the surface and nothing drew into it" (gate r1 I-1).
+        let tracked: Bool
+        let updates: UInt64
+        let dirty: UInt64
+        /// Of those updates: writes the bridge's slot table ACCEPTED. `writes < publishes` over a
+        /// period is a frame the bridge counted as published that reached no buffer.
+        let writes: UInt64
+        let publishes: UInt64
+        let stale: UInt64
+        let ready: Int
+        /// Guard 1a: a frame-ready whose surface had no mapping at that moment.
+        let dropNoMap: Int
+        /// Guard 1b: mapped, but to a windowId with no `RemoteWindow`.
+        let dropNoWindow: Int
+        /// Guard 2a: a live window, and no slot for the surface in the bridge's table (erased, or
+        /// never mapped there).
+        let dropNoSlot: Int
+        /// Guard 2b: the slot exists and nothing has ever been written into it.
+        let dropNeverWritten: Int
+        /// Guard 2c: this client already holds that frame.
+        let dropLeased: Int
+        /// Guard 2d: a live window and a real frame, refused as belonging to an older connection
+        /// generation -- the one drop that proves the server drew.
+        let dropGeneration: Int
+        /// Teardowns of this surface's slot during the period -- the event that turns later frames
+        /// into `dropNoSlot` (or, for a teardown that keeps the slot, `dropNeverWritten`).
+        let erased: UInt64
+        let presents: Int
+    }
+
+    /// Every mapping period `windowId` has had, in the order the periods opened, each measured
+    /// over ITS OWN interval. Empty for a window that has never been mapped.
+    ///
+    /// WHAT THIS ANSWERS THAT `gfxFrameRows` CANNOT. `gfxFrameRows` prints one row per surface id
+    /// with that surface's LIFETIME totals; when a window is re-mapped back to a surface it has
+    /// used before (`A -> B -> A`), that single row sums both mapping periods, and the
+    /// 2026-09-15 record had to register that limitation explicitly -- `presents>0` on such a row
+    /// does not mean anything was presented after the last remap. Here the two periods are two
+    /// rows, and the last one is exactly the "after the last remap" interval.
+    ///
+    /// WHERE A PERIOD ENDS, and why that is not "when the mapping ended". Period `k` runs from the
+    /// k-th mapping of that surface to this window until the (k+1)-th -- INCLUDING any stretch in
+    /// between where the window was mapped somewhere else and this surface was mapped to nobody.
+    /// That interval is the one that loses nothing: a surface goes on accumulating while unmapped
+    /// (every frame-ready for it then counts as `drop-nomap`, and its bridge slot can be torn down
+    /// by an unmap of the window it still belongs to -- `erased`), and those are exactly the
+    /// events the 2026-09-15 trace needed. Ending a period at the un-mapping instead would drop
+    /// them into a gap no row covers. The consequence to read carefully: on a NON-final period of
+    /// a surface, a count may have accrued while the window was showing something else -- only the
+    /// last period of a surface is "while this mapping was live and nothing since".
+    ///
+    /// THE IDENTITY THIS BUYS: for one window and one surface, `period=0` plus every later period
+    /// sums exactly to that surface's cumulative `[gfx-frames]` totals, because period 0 is
+    /// everything before the first mapping and the periods partition everything after it. A record
+    /// can check a row set against the row above it; a sum that disagrees is a lost period.
+    ///
+    /// Read-only: allocates rows, writes no state, and reaches into the session only through its
+    /// read-only counter getter.
+    func gfxPeriodRows(windowId: UInt32) -> [GfxPeriodRow] {
+        let periods = gfxMappingPeriods[windowId]?.periods ?? []
+        guard !periods.isEmpty else { return [] }
+        // The window's CURRENT surface from the live 1:1 mapping -- the same lookup `[f1]`,
+        // `[edge]` and `gfxFrameRows` use, so all four lines mean the same thing by "current".
+        // Its LAST period is the one still running, which is why one `lastIndex` is the whole
+        // rule; `period > 0` keeps the frozen pre-history row out of the running.
+        let currentSurfaceId = surfaceToWindow.first(where: { $0.value == windowId })?.key
+        let currentIndex = currentSurfaceId.flatMap { surfaceId in
+            periods.lastIndex(where: { $0.surfaceId == surfaceId && $0.period > 0 })
+        }
+        // ONE live read per surface id, not one per row: two rows of the same surface are
+        // measured against the same instant, so their intervals cannot overlap or leave a gap
+        // that is an artefact of two reads taken a moment apart.
+        var liveTotals: [UInt32: GfxSurfaceTotals] = [:]
+        for period in periods where liveTotals[period.surfaceId] == nil {
+            liveTotals[period.surfaceId] = gfxSurfaceTotals(surfaceId: period.surfaceId)
+        }
+        // ONE PASS, BACKWARDS (gate r1 I-2). A period ends where the SAME surface's next period
+        // begins, and walking from the newest backwards makes that "the last baseline seen for this
+        // surface" -- a dictionary lookup instead of the forward suffix rescan this used to do,
+        // which was quadratic in the number of periods. `nextBaseline` therefore holds, for each
+        // surface id, the start of the period that follows the one being built; absent means there
+        // is none, so the period is still running and ends at the live read.
+        var nextBaseline: [UInt32: GfxSurfaceTotals] = [:]
+        var rows: [GfxPeriodRow] = []
+        rows.reserveCapacity(periods.count)
+        for index in periods.indices.reversed() {
+            let period = periods[index]
+            let live = liveTotals[period.surfaceId] ?? GfxSurfaceTotals()
+            let end = nextBaseline[period.surfaceId] ?? live
+            // `period == 0` is not an interval at all -- its row IS the baseline, i.e. everything
+            // that happened before this window first mapped the surface -- and it must not become
+            // the next period's end either, which is why only real periods are recorded below.
+            let values = period.period == 0 ? period.baseline : end.delta(since: period.baseline)
+            if period.period > 0 {
+                nextBaseline[period.surfaceId] = period.baseline
+            }
+            rows.append(GfxPeriodRow(
+                windowId: windowId, surfaceId: period.surfaceId, period: period.period,
+                isCurrent: index == currentIndex, mappedSize: period.mappedSize,
+                tracked: live.tracked, updates: values.updates, dirty: values.dirty,
+                writes: values.writes, publishes: values.publishes, stale: values.stale,
+                ready: values.registry.ready, dropNoMap: values.registry.dropNoMap,
+                dropNoWindow: values.registry.dropNoWindow, dropNoSlot: values.registry.dropNoSlot,
+                dropNeverWritten: values.registry.dropNeverWritten,
+                dropLeased: values.registry.dropLeased,
+                dropGeneration: values.registry.dropGeneration, erased: values.erased,
+                presents: values.registry.presents))
+        }
+        // Back into arrival order, which is the order a record reads them in.
+        return rows.reversed()
+    }
+
+    /// How many of `windowId`'s oldest mapping periods the retention cap has discarded -- 0 in
+    /// every run that stays under `gfxMaxMappingPeriodsPerWindow`, which is every run observed so
+    /// far. Nonzero means the rows above are a SUFFIX of the window's history: `period=` numbers
+    /// still count from the first mapping (they come from `openedPerSurface`), but a surface whose
+    /// earlier periods were discarded no longer sums to its `[gfx-frames]` totals, and the earliest
+    /// retained period of such a surface measures from ITS start, not from the window's first
+    /// mapping. Printed as its own line rather than a row key so the row grammar stays frozen.
+    func gfxPeriodOverflowCount(windowId: UInt32) -> Int {
+        gfxMappingPeriods[windowId]?.dropped ?? 0
+    }
+
+    /// Opens the mapping period a `.surfaceMapped` order starts, or -- when the order merely
+    /// re-announces the mapping the window already has -- refreshes the open period's size.
+    ///
+    /// WHY A RE-ANNOUNCEMENT DOES NOT OPEN A PERIOD (deviation from the lane brief's literal "on
+    /// every `.surfaceMapped`", taken deliberately). The server re-sends an unchanged
+    /// MapSurfaceToWindow, and the lane-② history already treats that as "not a remap" for the
+    /// same reason: a period is the interval during which the window was mapped to the surface,
+    /// and a re-announcement neither ends nor starts such an interval -- it is one moment inside
+    /// one. Opening a period there would cut the very interval this lane exists to isolate at an
+    /// arbitrary point: the LAST period of the current surface would then mean "since the last
+    /// re-announcement", so a `presents=0` on it would NOT mean "nothing presented since the
+    /// remap", which is the exact misreading ADR-0018 §5.2 ②b was opened to remove. `A -> B -> A`
+    /// still opens a second period for `A`: there the window's mapping really did change.
+    ///
+    /// SKEW, one sentence, and it is on the bridge half only: the four bridge counters are written
+    /// on T_dvc when the GFX PDU is processed while this baseline is taken on T_main when the
+    /// control-lane event is DRAINED, so a frame the bridge counted between the server's map order
+    /// and this drain is attributed to the PREVIOUS period (or to `period=0`) rather than to the
+    /// one opening here -- the registry-side counters have no such skew, being written by this
+    /// same drain loop on this same thread.
+    private func noteMappingPeriod(windowId: UInt32, surfaceId: UInt32, mappedSize: CGSize?, isRemap: Bool) {
+        var state = gfxMappingPeriods[windowId] ?? WindowMappingPeriods()
+        guard isRemap else {
+            if let index = state.periods.lastIndex(where: { $0.surfaceId == surfaceId && $0.period > 0 }),
+               let mappedSize
+            {
+                state.periods[index].mappedSize = mappedSize
+                gfxMappingPeriods[windowId] = state
+            }
+            return
+        }
+        let totals = gfxSurfaceTotals(surfaceId: surfaceId)
+        // From the ever-opened tally, not from what is retained: the cap below can discard a
+        // period, and a `period=` derived from the array would then be handed out twice.
+        let earlierPeriods = state.openedPerSurface[surfaceId] ?? 0
+        if earlierPeriods == 0, !totals.isZero {
+            // The pre-history row: this surface was already carrying counts when this window
+            // first claimed it -- frame-ready events that arrived before the mapping (adr/0005 §1
+            // lets them arrive in either order), or counts it earned under a DIFFERENT window,
+            // which the per-surfaceId counters cannot tell apart. Printed only when it is
+            // non-zero, and frozen: nothing later can be added to an interval that already ended.
+            state.periods.append(MappingPeriod(
+                surfaceId: surfaceId, period: 0, baseline: totals, mappedSize: nil))
+        }
+        state.periods.append(MappingPeriod(
+            surfaceId: surfaceId, period: earlierPeriods + 1, baseline: totals,
+            mappedSize: mappedSize))
+        state.openedPerSurface[surfaceId] = earlierPeriods + 1
+        // The retention cap (gate r1 I-2): drop the OLDEST, count it, and let the harness say so on
+        // its own line. Oldest-first because the interval every rule is keyed on is the LAST one --
+        // a cap that dropped the newest would throw away the only row the lane actually reads.
+        while state.periods.count > Self.gfxMaxMappingPeriodsPerWindow {
+            state.periods.removeFirst()
+            state.dropped += 1
+        }
+        gfxMappingPeriods[windowId] = state
+    }
+
+    /// Both sides' cumulative counters for `surfaceId` at this instant: the bridge's four through
+    /// the session's read-only getter (whose `false` answer is kept as `tracked`, never collapsed
+    /// into zeros), this registry's own from `gfxRegistryCounters`. The ONE place a period
+    /// baseline, a period close and a row's live end are read, so all three see the same shape.
+    private func gfxSurfaceTotals(surfaceId: UInt32) -> GfxSurfaceTotals {
+        var updates: UInt64 = 0
+        var dirty: UInt64 = 0
+        var writes: UInt64 = 0
+        var publishes: UInt64 = 0
+        var stale: UInt64 = 0
+        var erased: UInt64 = 0
+        let tracked = session.gfxSurfaceCounters(
+            surfaceId, updates: &updates, dirty: &dirty, writes: &writes, publishes: &publishes,
+            stale: &stale, erased: &erased)
+        return GfxSurfaceTotals(
+            tracked: tracked, updates: updates, dirty: dirty, writes: writes, publishes: publishes,
+            stale: stale, erased: erased,
+            registry: gfxRegistryCounters[surfaceId] ?? GfxRegistryCounters())
     }
 
     /// Diagnostics only (adr/0010 §4, `Tools/window-smoke`'s popup scenario) -- `windowId`'s

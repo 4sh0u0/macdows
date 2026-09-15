@@ -146,10 +146,24 @@ struct CRSurfaceSlotTable
     uint64_t droppedFrameCount = 0;
     uint64_t fullFrameCopies = 0; // diagnostics only (crsurface_table_copy_path_counts)
     uint64_t rectCopies = 0;      // diagnostics only
+    /* Diagnostics only (ADR-0018 §5.2 ②b) -- see crsurface_table_set_erase_observer. Called
+     * with `lock` held; never nullptr-checked by the caller, so every call site goes through
+     * NoteErased below. */
+    CRSurfaceEraseObserver eraseObserver = nullptr;
+    void *eraseObserverContext = nullptr;
 };
 
 namespace
 {
+/* Diagnostics only (ADR-0018 §5.2 ②b): the ONE place the teardown observer is invoked, so the
+ * four call sites documented in the header cannot each grow their own condition. Must be called
+ * with the table lock held -- see the header's threading note for why that is safe. */
+void NoteErased(CRSurfaceSlotTable &table, uint32_t surfaceId)
+{
+    if (table.eraseObserver)
+        table.eraseObserver(table.eraseObserverContext, surfaceId);
+}
+
 void EraseLeasesFor(CRSurfaceSlotTable &table, uint32_t surfaceId)
 {
     for (auto it = table.leases.begin(); it != table.leases.end();)
@@ -197,6 +211,7 @@ void crsurface_table_map(CRSurfaceSlotTable *table, uint32_t surfaceId, uint64_t
          * the moment their caller eventually releases them. */
         DestroySlotBuffers(sIt->second);
         EraseLeasesFor(*table, surfaceId);
+        NoteErased(*table, surfaceId); // call site 3 (see the header's list)
     }
 
     /* operator[] default-constructs a fresh CRSurfaceSlot if surfaceId isn't already
@@ -220,6 +235,7 @@ void crsurface_table_unmap_window(CRSurfaceSlotTable *table, uint64_t windowId)
         {
             DestroySlotBuffers(it->second);
             EraseLeasesFor(*table, it->first); // M4
+            NoteErased(*table, it->first);     // call site 1 -- the collateral teardown
             it = table->slots.erase(it);
         }
         else
@@ -253,9 +269,15 @@ bool crsurface_table_write(CRSurfaceSlotTable *table, uint32_t surfaceId, const 
     if (slot.width != width || slot.height != height)
     {
         /* adr/0005 §2: buffers are bucketed/rebuilt by surface size. */
+        const bool hadPublishedFrame = slot.lastWrittenIndex >= 0;
         DestroySlotBuffers(slot);
         slot.width = width;
         slot.height = height;
+        /* Call site 4, and the ONLY conditional one: every surface's very first write also takes
+         * this branch (the slot starts 0x0 with nothing published), and reporting that as a
+         * teardown would give every surface that ever drew an erased count of 1. */
+        if (hadPublishedFrame)
+            NoteErased(*table, surfaceId);
     }
 
     /* Prefer an unused buffer; otherwise reuse the currently-Written one (last-writer-wins,
@@ -410,6 +432,27 @@ bool crsurface_table_write(CRSurfaceSlotTable *table, uint32_t surfaceId, const 
 
 IOSurfaceRef crsurface_table_lease_published(CRSurfaceSlotTable *table, uint32_t surfaceId, uint32_t *outGeneration)
 {
+    /* Unchanged behaviour by construction: the same call, with the reason thrown away. */
+    return crsurface_table_lease_published_reason(table, surfaceId, outGeneration, NULL);
+}
+
+void crsurface_table_set_erase_observer(CRSurfaceSlotTable *table, void *context, CRSurfaceEraseObserver observer)
+{
+    if (!table)
+        return;
+    table->eraseObserverContext = context;
+    table->eraseObserver = observer;
+}
+
+IOSurfaceRef crsurface_table_lease_published_reason(CRSurfaceSlotTable *table, uint32_t surfaceId,
+                                                     uint32_t *outGeneration, CRSurfaceLeaseMiss *outMiss)
+{
+    /* MEASUREMENT ONLY, and it is only the out-parameter that is new: every return below sets
+     * `*outMiss` and then returns exactly what this function returned before, in the same order,
+     * holding the lock over the same span. */
+    if (outMiss)
+        *outMiss = CRSurfaceLeaseMissNoSlot;
+
     if (!table)
         return NULL;
 
@@ -418,12 +461,19 @@ IOSurfaceRef crsurface_table_lease_published(CRSurfaceSlotTable *table, uint32_t
     auto sIt = table->slots.find(surfaceId);
     if (sIt == table->slots.end())
     {
+        /* No slot at all: never mapped, or ERASED since -- crsurface_table_unmap_window tears
+         * down every slot of a windowId, which is how a surface the registry still believes in
+         * loses its slot without anybody being told (see the erase observer's own comment). */
         os_unfair_lock_unlock(&table->lock);
         return NULL;
     }
     CRSurfaceSlot &slot = sIt->second;
     if (slot.lastWrittenIndex < 0)
     {
+        /* The slot is here and nothing has ever been published into it -- no write has landed
+         * yet, or a teardown (remap/resize) reset it and the next write has not arrived. */
+        if (outMiss)
+            *outMiss = CRSurfaceLeaseMissNeverWritten;
         os_unfair_lock_unlock(&table->lock);
         return NULL;
     }
@@ -433,6 +483,8 @@ IOSurfaceRef crsurface_table_lease_published(CRSurfaceSlotTable *table, uint32_t
         /* Already Leased -- the caller already holds this exact frame, nothing newer to
          * hand out. Never re-lease a buffer that's already checked out (that would let two
          * owners believe they exclusively hold the same write target). */
+        if (outMiss)
+            *outMiss = CRSurfaceLeaseMissAlreadyLeased;
         os_unfair_lock_unlock(&table->lock);
         return NULL;
     }
@@ -441,6 +493,8 @@ IOSurfaceRef crsurface_table_lease_published(CRSurfaceSlotTable *table, uint32_t
     buf.state = CRSurfaceBuffer::State::Leased;
     if (outGeneration)
         *outGeneration = buf.frameGeneration;
+    if (outMiss)
+        *outMiss = CRSurfaceLeaseMissNone;
     table->leases[buf.surface] = LeaseRecord{surfaceId, slot.lastWrittenIndex};
     IOSurfaceRef result = buf.surface;
 
@@ -495,6 +549,7 @@ void crsurface_table_clear(CRSurfaceSlotTable *table)
     {
         DestroySlotBuffers(kv.second);
         EraseLeasesFor(*table, kv.first); // M4
+        NoteErased(*table, kv.first);     // call site 2 -- the disconnect/shutdown sweep
     }
     table->slots.clear();
     os_unfair_lock_unlock(&table->lock);

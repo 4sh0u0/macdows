@@ -22,18 +22,23 @@ struct GfxCounterTableTests {
         body(table!)
     }
 
-    /// Reads all four counters, or `nil` for "this table has never seen that surface id".
+    /// Reads all six counters, or `nil` for "this table has never seen that surface id".
     private func read(_ table: OpaquePointer, _ surfaceId: UInt32)
-        -> (updates: UInt64, dirty: UInt64, publishes: UInt64, stale: UInt64)?
+        -> (updates: UInt64, dirty: UInt64, writes: UInt64, publishes: UInt64, stale: UInt64,
+            erased: UInt64)?
     {
         var updates: UInt64 = 0
         var dirty: UInt64 = 0
+        var writes: UInt64 = 0
         var publishes: UInt64 = 0
         var stale: UInt64 = 0
-        guard crgfx_counters_read(table, surfaceId, &updates, &dirty, &publishes, &stale) else {
+        var erased: UInt64 = 0
+        guard crgfx_counters_read(
+            table, surfaceId, &updates, &dirty, &writes, &publishes, &stale, &erased)
+        else {
             return nil
         }
-        return (updates, dirty, publishes, stale)
+        return (updates, dirty, writes, publishes, stale, erased)
     }
 
     @Test("a surface nobody ever touched is NOT TRACKED, which is not the same answer as zero")
@@ -138,8 +143,12 @@ struct GfxCounterTableTests {
             // One past the capacity: dropped, not attributed to somebody else's slot.
             let overflowId = UInt32(CRGFX_COUNTERS_SLOTS)
             crgfx_counters_note_update(table, overflowId, true)
+            crgfx_counters_note_write(table, overflowId)
             crgfx_counters_note_publish(table, overflowId)
             crgfx_counters_note_stale(table, overflowId)
+            // `note_erase` is the one entry point that DOES claim a slot for an unseen id, so a
+            // full table is also the one place it must decline rather than evict somebody.
+            crgfx_counters_note_erase(table, overflowId)
             #expect(read(table, overflowId) == nil)
 
             // ... and the already-tracked ids keep counting, so an overflow costs the run only
@@ -153,15 +162,85 @@ struct GfxCounterTableTests {
         }
     }
 
+    @Test("accepted slot writes are counted apart from the publishes the hook counts regardless")
+    func writesAreCountedOnlyWhenTheSlotTookTheFrame() {
+        withTable { table in
+            // The gap this closes (2026-09-15 guard trace): the frame hook ignores
+            // `crsurface_table_write`'s bool and counts a publish either way, so a frame that
+            // reached no buffer -- slot erased, all three buffers leased, allocation failed --
+            // was indistinguishable from one that landed. `writes < publishes` is that
+            // difference, and it is the only client-side counter that can state it.
+            crgfx_counters_note_write(table, 5)
+            #expect(read(table, 5) == nil, "a write alone must not claim a slot")
+
+            crgfx_counters_note_update(table, 5, true)
+            crgfx_counters_note_write(table, 5)
+            crgfx_counters_note_publish(table, 5)
+            // ... then two frames the slot refused, published all the same.
+            crgfx_counters_note_update(table, 5, true)
+            crgfx_counters_note_publish(table, 5)
+            crgfx_counters_note_update(table, 5, true)
+            crgfx_counters_note_publish(table, 5)
+
+            let row = read(table, 5)
+            #expect(row?.updates == 3 && row?.publishes == 3)
+            #expect(row?.writes == 1)
+            // It is its own counter, not a re-labelling of dirty/stale/erased.
+            #expect(row?.dirty == 3 && row?.stale == 0 && row?.erased == 0)
+        }
+    }
+
+    @Test("slot teardowns are counted, and are the one event that may claim a slot on its own")
+    func erasuresAreCountedAndClaimTheirOwnSlot() {
+        withTable { table in
+            // A surface can be mapped and torn down with nothing ever drawn into it -- which is
+            // exactly one of the shapes the lane looks for -- so unlike every other counter this
+            // one must be able to speak first. Reporting it as "not tracked" would erase the only
+            // evidence that the slot ever existed.
+            crgfx_counters_note_erase(table, 11)
+            #expect(read(table, 11)?.erased == 1)
+            #expect(read(table, 11)?.updates == 0 && read(table, 11)?.writes == 0)
+
+            // Repeated teardowns accumulate on the same id, and land on nobody else's row.
+            crgfx_counters_note_update(table, 12, true)
+            crgfx_counters_note_erase(table, 12)
+            crgfx_counters_note_erase(table, 12)
+            #expect(read(table, 12)?.erased == 2)
+            #expect(read(table, 12)?.updates == 1)
+            #expect(read(table, 11)?.erased == 1)
+        }
+    }
+
+    @Test("an erase on an id nothing ever drew into reads as TRACKED with zero updates")
+    func anEraseOnlyIdIsTrackedWithZeroUpdates() {
+        withTable { table in
+            // THE READING THIS PINS (gate r1 I-1). Because `note_erase` claims a slot by itself,
+            // `tracked` means "some bridge event was recorded for this id", NOT "something drew".
+            // A surface that was mapped on the bridge side, never drawn into, and then torn down by
+            // an unmap of its window reads exactly like this -- and those zeros are the
+            // measurement ADR-0018 §5.2 ②'s case 4b consists of, stated positively, not a missing
+            // one. A consumer that treated tracked=yes as "drawn" would invert it.
+            #expect(read(table, 4242) == nil, "nothing recorded yet")
+            crgfx_counters_note_erase(table, 4242)
+            let row = read(table, 4242)
+            #expect(row != nil, "an erase alone makes the id tracked")
+            #expect(row?.erased == 1)
+            #expect(row?.updates == 0 && row?.dirty == 0 && row?.writes == 0)
+            #expect(row?.publishes == 0 && row?.stale == 0)
+        }
+    }
+
     @Test("a NULL table is inert rather than fatal")
     func aNullTableIsInert() {
         // `crgfx_counters_create` can fail only under allocation failure, and a session that
         // lost its diagnostic must keep rendering -- so every entry point tolerates NULL.
         crgfx_counters_note_update(nil, 1, true)
+        crgfx_counters_note_write(nil, 1)
         crgfx_counters_note_publish(nil, 1)
         crgfx_counters_note_stale(nil, 1)
+        crgfx_counters_note_erase(nil, 1)
         var updates: UInt64 = 7
-        #expect(crgfx_counters_read(nil, 1, &updates, nil, nil, nil) == false)
+        #expect(crgfx_counters_read(nil, 1, &updates, nil, nil, nil, nil, nil) == false)
         #expect(updates == 7)
         crgfx_counters_destroy(nil)
     }
