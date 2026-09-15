@@ -177,9 +177,13 @@ pin 1 "$(code_only | grep -cE 'let sample = registry\.edgeBorderProfile\(windowI
 # alive.
 # Scoped to the sampler's own body: `sampleF1BackingVsMapped` above KEEPS its `where` clause and
 # is right to (it pairs a presented frame with a mapped size and has nothing to say without one),
-# so a file-wide count of that clause is 1 and always will be. `-A25` covers this function and
-# stops well short of the next one; a body that grew past it would relax the pin, not break it,
-# which is why the positive loop-shape pin below is the one that actually holds the line.
+# so a file-wide count of that clause is 1 and always will be. `-A25` covers the FIRST HALF of this
+# function -- the body is 49 lines in the comment-filtered stream since ADR-0018 §5.2 (2)b added the
+# [gfx-queue] print and the period/overflow rows (gate r1 m-2; it was 25-ish when this was written)
+# -- and the `for snapshot` loop it guards sits at +6, well inside. It still stops short of the next
+# function, so a `where` clause reintroduced on that loop is caught; a body that grew past the
+# window relaxes this pin rather than breaking it, which is why the positive loop-shape pin below is
+# the one that actually holds the line.
 pin 0 "$(code_only | grep -A25 -E 'private func sampleEdgeProfiles\(registry: ' | grep -cE 'where snapshot\.hasDisplayedContent' || true)" "no content filter inside the edge sampler"
 # The loop shape itself: every snapshot, sorted, and the line ENDS at the opening brace -- a
 # `where` clause of any kind would have to sit between the two and would break this pin.
@@ -243,10 +247,13 @@ pin 1 "$(code_only | grep -A1 -E 'if phase == \.finish \{' | grep -cE 'for row i
 # THE KNOB PIN THAT MATTERS: with WINDOW_SMOKE_EDGE_PROFILE unset the registry must not be
 # asked for a single row. Both readers exist exactly twice in the whole file -- once each -- and
 # both of those live inside `sampleEdgeProfiles`, whose first statement is the knob guard
-# (pinned above). `-A38` spans that function's body in the comment-filtered stream; a body that
-# outgrows it makes this pin red rather than silently permissive.
+# (pinned above). `-A49` is that function's body EXACTLY in the comment-filtered stream (measured:
+# the body runs +0..+49, the last line being its closing brace; it was 38 before ADR-0018 §5.2 (2)b
+# added the [gfx-queue] print, the period-row loop and the overflow line -- gate r1 m-1 asked for
+# the span to match the body rather than overshoot into the next function, which is what this is).
+# A body that outgrows it makes this pin red rather than silently permissive.
 pin 2 "$(code_only | grep -cE 'registry\.gfxFrame(Rows|OrphanRows)\(' || true)" "the two row readers, called from nowhere else"
-pin 2 "$(code_only | grep -A38 -E 'private func sampleEdgeProfiles\(registry: ' | grep -cE 'registry\.gfxFrame(Rows|OrphanRows)\(' || true)" "both row readers sit inside the guarded sampler"
+pin 2 "$(code_only | grep -A49 -E 'private func sampleEdgeProfiles\(registry: ' | grep -cE 'registry\.gfxFrame(Rows|OrphanRows)\(' || true)" "both row readers sit inside the guarded sampler"
 # The harness reports the registry's numbers and derives none of its own: a locally computed
 # count would measure what this harness observed, not what the client did.
 pin 0 "$(code_only | grep -cE '(gfxFrameCount|framesSeen|presentsSeen)[[:space:]]*\+= 1' || true)" "no harness-side frame counter"
@@ -254,12 +261,54 @@ pin 0 "$(code_only | grep -cE '(gfxFrameCount|framesSeen|presentsSeen)[[:space:]
 # and it sits BETWEEN `publishes=` and `ready=` -- both that it is on the line at all and that it
 # is in that position (a key printed after `ready=` would read as a disposition of a delivered
 # frame rather than as a reason one was never delivered).
-pin 1 "$(code_only | grep -cE 'stale=\\\(row\.stale\)' || true)" "stale= built from the row"
+# Two rows carry it since ADR-0018 §5.2 (2)b ([gfx-frames] and [gfx-period]), both from the row.
+pin 2 "$(code_only | grep -cE 'stale=\\\(row\.stale\)' || true)" "stale= built from the row, on both row shapes"
 pin 1 "$(code_only | grep -A2 -E 'publishes=\\\(row\.publishes\)' | grep -cE '\+ " stale=\\\(row\.stale\)"' || true)" "stale= sits between publishes= and ready="
 # The declared size on the row is formatted by the same `[f1]` formatter the stale `[edge]`
 # shape uses, so a mapped size can be compared with an `[f1]` line character for character.
 # shellcheck disable=SC2016  # `$0` is a Swift closure parameter inside the ERE, not shell
-pin 1 "$(code_only | grep -cE 'mapped=\\\(row\.mappedSize\.map \{ fmtSize\(\$0\) \} \?\? "n/a"\)' || true)" "the row's mapped size uses the [f1] formatter, or says n/a"
+pin 2 "$(code_only | grep -cE 'mapped=\\\(row\.mappedSize\.map \{ fmtSize\(\$0\) \} \?\? "n/a"\)' || true)" "both row shapes' mapped size use the [f1] formatter, or say n/a"
+
+echo "== ADR-0018 §5.2 (2)b: the per-mapping-period [gfx-period] rows and [gfx-queue] =="
+# Same one-place-built / one-place-printed / inside-the-knob-guard shape as the rows above. The
+# grammar is this lane's whole product, and the KEY ORDER is part of it -- a record reads these
+# columns positionally, so a key moved into the wrong slot is a silent misreading, not a diff.
+pin 1 "$(code_only | grep -cE 'static func periodLine\(row: RemoteWindowRegistry\.GfxPeriodRow, at phase: Phase\)' || true)" "periodLine definition"
+pin 1 "$(code_only | grep -cE '\[gfx-period\] id=\\\(row\.windowId\)' || true)" "[gfx-period] text built in one place"
+# One shape only, unlike [gfx-frames]: a period row always belongs to a window (there is no
+# id=none orphan period), so `id=` interpolates the row's own non-optional windowId.
+pin 1 "$(code_only | grep -cE 'print\(EdgeProfile\.periodLine\(row: row, at: phase\)\)' || true)" "[gfx-period] printed from one site"
+pin 1 "$(code_only | grep -cE 'for row in registry\.gfxPeriodRows\(windowId: snapshot\.windowId\)' || true)" "per-window period rows read once, per window"
+pin 1 "$(code_only | grep -cE 'registry\.gfxPeriodRows\(' || true)" "the period reader, called from nowhere else"
+pin 1 "$(code_only | grep -A49 -E 'private func sampleEdgeProfiles\(registry: ' | grep -cE 'registry\.gfxPeriodRows\(' || true)" "the period reader sits inside the guarded sampler"
+# KEY ORDER, pinned positionally where a wrong slot would change the meaning rather than the text:
+# `writes` is the bridge's accepted-write count and belongs between what was handed to the hook
+# (dirty) and what left it (publishes) -- printed after `publishes` it would read as a disposition
+# of a forwarded frame instead of the reason one never landed.
+pin 1 "$(code_only | grep -cE 'updates=\\\(row\.updates\) dirty=\\\(row\.dirty\) writes=\\\(row\.writes\)' || true)" "writes= sits between dirty= and publishes="
+pin 1 "$(code_only | grep -cE 'publishes=\\\(row\.publishes\) stale=\\\(row\.stale\) ready=\\\(row\.ready\)' || true)" "publishes= stale= ready= keep their order"
+# The six drop keys in the order a frame meets them, and `erased` last before the outcome.
+pin 1 "$(code_only | grep -cE 'drop-nomap=\\\(row\.dropNoMap\) drop-nowindow=\\\(row\.dropNoWindow\)' || true)" "drop-nomap= then drop-nowindow="
+pin 1 "$(code_only | grep -cE 'drop-noslot=\\\(row\.dropNoSlot\) drop-neverwritten=\\\(row\.dropNeverWritten\)' || true)" "drop-noslot= then drop-neverwritten="
+pin 1 "$(code_only | grep -cE 'drop-leased=\\\(row\.dropLeased\) drop-generation=\\\(row\.dropGeneration\)' || true)" "drop-leased= then drop-generation="
+pin 1 "$(code_only | grep -cE 'erased=\\\(row\.erased\) presents=\\\(row\.presents\)' || true)" "erased= sits last, before presents="
+# [gfx-queue]: one builder, one print, once per phase. The dedupe set is what keeps the first-frame
+# phase (which samples once per drain batch) from printing it dozens of times.
+pin 1 "$(code_only | grep -cE 'static func queueLine\(dropped: UInt64, at phase: Phase\)' || true)" "queueLine definition"
+pin 1 "$(code_only | grep -cE '\[gfx-queue\] dropped=\\\(dropped\) at=' || true)" "[gfx-queue] text built in one place"
+pin 1 "$(code_only | grep -cE 'print\(EdgeProfile\.queueLine\(dropped: session\.droppedEventsCount, at: phase\)\)' || true)" "[gfx-queue] printed once, from the session counter"
+pin 1 "$(code_only | grep -cE 'gfxQueueLinePhases\.insert\(phase\)' || true)" "the per-phase dedupe marks the phase exactly once"
+pin 1 "$(code_only | grep -cE 'if let session, !gfxQueueLinePhases\.contains\(phase\)' || true)" "the [gfx-queue] print is guarded by that set"
+# The harness reports the session's number and derives none of its own.
+pin 0 "$(code_only | grep -cE '(queueDropped|droppedSeen)[[:space:]]*\+= 1' || true)" "no harness-side queue counter"
+# [gfx-period-overflow] (gate r1 I-2): its own line, printed ONLY when the registry says periods
+# were discarded -- an unconditional print would put a dropped=0 line under every window of every
+# run, and the one case it exists to report would be lost in it.
+pin 1 "$(code_only | grep -cE 'static func periodOverflowLine\(windowId: UInt32, dropped: Int, at phase: Phase\)' || true)" "periodOverflowLine definition"
+pin 1 "$(code_only | grep -cE '\[gfx-period-overflow\] id=\\\(windowId\) dropped=\\\(dropped\) at=' || true)" "[gfx-period-overflow] text built in one place"
+pin 1 "$(code_only | grep -cE 'print\(EdgeProfile\.periodOverflowLine\(' || true)" "[gfx-period-overflow] printed from one site"
+pin 1 "$(code_only | grep -cE 'if periodsDropped > 0 \{' || true)" "the overflow line is printed only when something was dropped"
+pin 1 "$(code_only | grep -cE 'registry\.gfxPeriodOverflowCount\(windowId: snapshot\.windowId\)' || true)" "the drop count comes from the registry, once per window"
 
 echo "== summary =="
 printf 'failures=%s\n' "$FAILURES"

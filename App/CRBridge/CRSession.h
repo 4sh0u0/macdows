@@ -572,7 +572,16 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// accepted and never forwarded. `stale` counts the published readiness events that
 /// `-drainEventsWithHandler:`'s generation filter then threw away (adr/0005 §4) — the last exit
 /// before any consumer runs, and the term that would otherwise be missing from
-/// `publishes = stale + delivered + still-in-flight`. Together they decide the question a
+/// `publishes = stale + delivered + still-in-flight`.
+///
+/// `writes` and `erased` are the two the 2026-09-15 guard trace showed were indispensable
+/// (ADR-0018 §5.2 ②b). `writes` counts the frame-slot writes that were ACCEPTED, which `publishes`
+/// does not: the hook counts a publish whether or not `crsurface_table_write` took the pixels, so
+/// `writes < publishes` is a frame that reached no buffer at all — invisible in every other
+/// counter. `erased` counts the teardowns of that surface's slot (an unmap of its window erases it
+/// collaterally, and the registry is never told), which is what leaves a mapped surface with
+/// nothing to lease; `erased > 0` beside a run of `drop-noslot` is the direct reading the trace
+/// could previously reach only by elimination. Together they decide the question a
 /// re-mapped window poses: `dirty == 0` means the server only mapped the new surface (nothing
 /// to show), while `dirty > 0` with no frame on screen means the loss is on this side.
 ///
@@ -585,8 +594,60 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 - (BOOL)gfxSurfaceCounters:(uint32_t)surfaceId
                    updates:(uint64_t *)updates
                      dirty:(uint64_t *)dirty
+                    writes:(uint64_t *)writes
                  publishes:(uint64_t *)publishes
-                     stale:(uint64_t *)stale;
+                     stale:(uint64_t *)stale
+                    erased:(uint64_t *)erased;
+
+/// DIAGNOSTICS ONLY (ADR-0018 §5.2 ②b) -- why `-copyPublishedSurface:reason:` handed back
+/// nothing.
+///
+/// The two causes are the SAME `nil` to every production caller, and deliberately so: neither
+/// gives a caller anything to do differently (adr/0005 §1 -- a frame is state, the next one
+/// supersedes it). They are, however, different failures of the SESSION, and the 2026-09-15
+/// About window is the case that needs them apart: 12 of its frame-ready events died on this
+/// `nil` with no way to say whether the bridge's slot was simply already drained
+/// (`CRPublishedSurfaceMissNoSlot`, an ordinary double-doorbell) or whether the generation
+/// protocol refused a frame belonging to the pre-reconnect connection
+/// (`CRPublishedSurfaceMissStaleGeneration`, a reconnect eating a frame the server did draw).
+/// `CRPublishedSurfaceMissNone` is the value written when a surface IS returned, so the
+/// out-parameter always carries a defined answer.
+typedef NS_ENUM(NSInteger, CRPublishedSurfaceMiss) {
+    /// A surface was returned; nothing was missed.
+    CRPublishedSurfaceMissNone = 0,
+    /// NO SLOT for that surface id in the bridge's surface table -- it was never mapped, or its
+    /// slot was ERASED since. The teardown case is the one the 2026-09-15 trace ended on:
+    /// `UnmapWindowForSurface` erases every slot of a windowId, including a surface freshly
+    /// mapped to that same window, and the registry is never told (see `CRSurfaceSlots.h`'s
+    /// erase-observer comment). Every later frame for that surface dies here.
+    CRPublishedSurfaceMissNoSlot,
+    /// The slot exists and NOTHING HAS EVER BEEN PUBLISHED into it -- no write has landed yet,
+    /// or a teardown that kept the slot (a remap to another window, a size change) reset it.
+    /// Distinct from `NoSlot` in what it says about the mapping: the bridge still has the
+    /// surface, it just has no pixels for it.
+    CRPublishedSurfaceMissNeverWritten,
+    /// A published frame exists but T_main ALREADY HOLDS IT -- the ordinary "two doorbells, one
+    /// frame" case, and the only one of the four that means nothing is wrong.
+    CRPublishedSurfaceMissAlreadyLeased,
+    /// A frame WAS leased and then immediately returned to its pool unshown, because it was
+    /// published under a connection generation older than `-currentGeneration` (adr/0005 §4).
+    /// Distinct from the three above in exactly the way the lane cares about: the server did
+    /// draw this frame, and a reconnect is what discarded it.
+    CRPublishedSurfaceMissStaleGeneration,
+};
+
+/// `-copyPublishedSurface:` plus the reason it returned nothing -- the identical lease, the
+/// identical generation check and the identical +1-retained result (that method is now a
+/// call to this one with a NULL `outReason`, so there is ONE implementation of the frame
+/// hand-off and the two entry points cannot drift). MEASUREMENT is the only thing added: the
+/// registry calls this variant so its two `nil` sub-causes can be counted apart
+/// (`RemoteWindowRegistry.handleFrameReady`), and nothing branches on `outReason`.
+///
+/// `outReason` is written on EVERY return -- `CRPublishedSurfaceMissNone` when a surface comes
+/// back -- and may be NULL for a caller that does not want it. A caller that reads it without
+/// checking the return value learns nothing: the reason describes the miss, not the frame.
+- (nullable IOSurfaceRef)copyPublishedSurface:(uint32_t)surfaceId
+                                       reason:(nullable CRPublishedSurfaceMiss *)outReason CF_RETURNS_RETAINED;
 
 /// W4b frame pathway (adr/0005 §2). Call after observing a `CRDPEventKindFrameReady` event
 /// for `surfaceId`: returns a +1-retained `IOSurfaceRef` (caller must `CFRelease`,
@@ -597,7 +658,9 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// reconnect — adr/0005 §4's generation protocol applies to frames exactly as it does to
 /// control-lane events). Safe to call even if nothing new has been published since the
 /// last call for the same `surfaceId` (returns `nil` — the caller already holds the
-/// current frame, there's nothing newer to hand out).
+/// current frame, there's nothing newer to hand out). Which of those two reasons applied is
+/// available -- to diagnostics only -- from `-copyPublishedSurface:reason:`, which this method
+/// is a NULL-reason call to.
 - (nullable IOSurfaceRef)copyPublishedSurface:(uint32_t)surfaceId CF_RETURNS_RETAINED;
 
 /// Returns a surface previously obtained from `-copyPublishedSurface:` back to its

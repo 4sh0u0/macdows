@@ -291,6 +291,93 @@ int main()
         crsurface_table_destroy(t);
     }
 
+    printf("=== H. lease-miss reasons + erase observer (ADR-0018 §5.2 (2)b, measurement only) ===\n");
+    {
+        /* WHY THIS SCENARIO EXISTS. The 2026-09-15 guard trace could only conclude "the slot was
+         * gone" by ELIMINATION, because crsurface_table_lease_published answers all three of its
+         * misses with the same NULL, and nothing anywhere recorded a slot teardown. The reason
+         * out-parameter and the erase observer are what turn both into direct readings; this
+         * scenario drives each of the four outcomes against the real table, in the same process
+         * as the rest of the suite. */
+        CRSurfaceSlotTable *t = crsurface_table_create();
+        const uint32_t W = 32, H = 32;
+        std::vector<uint8_t> px(W * H * 4, 0x5A);
+
+        /* Every teardown the table performs, recorded in order. */
+        static std::vector<uint32_t> erased;
+        erased.clear();
+        crsurface_table_set_erase_observer(
+            t, NULL, [](void *, uint32_t surfaceId) { erased.push_back(surfaceId); });
+
+        /* 1. No slot at all -- the id was never mapped. */
+        CRSurfaceLeaseMiss miss = CRSurfaceLeaseMissNone;
+        CHECK(crsurface_table_lease_published_reason(t, 900, NULL, &miss) == NULL, "unmapped id leases nothing");
+        CHECK(miss == CRSurfaceLeaseMissNoSlot, "unmapped id reports NoSlot, got %d", (int)miss);
+
+        /* 2. Slot present, never written -- mapped and not yet drawn into. */
+        crsurface_table_map(t, 900, 77);
+        miss = CRSurfaceLeaseMissNone;
+        CHECK(crsurface_table_lease_published_reason(t, 900, NULL, &miss) == NULL, "unwritten slot leases nothing");
+        CHECK(miss == CRSurfaceLeaseMissNeverWritten, "unwritten slot reports NeverWritten, got %d", (int)miss);
+        CHECK(erased.empty(), "mapping a NEW id is not a teardown (got %zu)", erased.size());
+
+        /* 3. A real lease sets None; the second attempt on the same publish reports AlreadyLeased
+         *    -- the ordinary "two doorbells, one frame" case, and the one miss that means nothing
+         *    is wrong. */
+        CHECK(crsurface_table_write(t, 900, px.data(), W, H, W * 4, 1, NULL, 0), "write into the mapped slot");
+        CHECK(erased.empty(), "a FIRST write allocates rather than tears down (got %zu)", erased.size());
+        miss = CRSurfaceLeaseMissNoSlot;
+        IOSurfaceRef leased = crsurface_table_lease_published_reason(t, 900, NULL, &miss);
+        CHECK(leased != NULL, "published frame leases");
+        CHECK(miss == CRSurfaceLeaseMissNone, "a successful lease reports None, got %d", (int)miss);
+        miss = CRSurfaceLeaseMissNone;
+        CHECK(crsurface_table_lease_published_reason(t, 900, NULL, &miss) == NULL, "no second lease of one frame");
+        CHECK(miss == CRSurfaceLeaseMissAlreadyLeased, "re-lease reports AlreadyLeased, got %d", (int)miss);
+        crsurface_table_release_lease(t, leased);
+
+        /* 4. A size change that discards a published frame IS a teardown (and the miss it leaves
+         *    behind is NeverWritten -- the slot stays), while the surface's first write above was
+         *    not: counting that would give every surface that ever drew an erased count of 1. */
+        std::vector<uint8_t> px2((W * 2) * (H * 2) * 4, 0x11);
+        CHECK(crsurface_table_write(t, 900, px2.data(), W * 2, H * 2, W * 2 * 4, 2, NULL, 0), "write at a new size");
+        CHECK(erased.size() == 1 && erased[0] == 900, "a size change over a published frame is one teardown");
+
+        /* 5. THE CASE THE TRACE TURNED ON: unmapping the WINDOW erases every slot of that window,
+         *    including this one, and every later lease then misses as NoSlot -- with the observer
+         *    as the only record that the teardown happened at all. */
+        crsurface_table_unmap_window(t, 77);
+        CHECK(erased.size() == 2 && erased[1] == 900, "the unmap sweep reports each erased surface id");
+        miss = CRSurfaceLeaseMissNone;
+        CHECK(crsurface_table_lease_published_reason(t, 900, NULL, &miss) == NULL, "erased slot leases nothing");
+        CHECK(miss == CRSurfaceLeaseMissNoSlot, "an erased slot reports NoSlot, got %d", (int)miss);
+
+        /* 6. A remap to a DIFFERENT window tears the buffers down too (the cross-window frame-leak
+         *    guard), and the disconnect sweep reports every remaining slot. */
+        crsurface_table_map(t, 901, 78);
+        CHECK(crsurface_table_write(t, 901, px.data(), W, H, W * 4, 3, NULL, 0), "write for the second window");
+        crsurface_table_map(t, 901, 79); // remap to another window
+        CHECK(erased.size() == 3 && erased[2] == 901, "a remap to another window is a teardown");
+        crsurface_table_clear(t);
+        CHECK(erased.size() == 4 && erased[3] == 901, "the clear sweep reports the surviving slot");
+
+        /* 7. A NULL TABLE answers NoSlot -- the out-parameter is written BEFORE the table guard,
+         *    so a caller that reads the reason after a torn-down session gets a defined answer
+         *    rather than whatever it seeded (gate r1 m-3; CRSession makes the same choice at its
+         *    own boundary, and "there is no slot for any id" is literally true of no table). */
+        miss = CRSurfaceLeaseMissAlreadyLeased;
+        CHECK(crsurface_table_lease_published_reason(NULL, 900, NULL, &miss) == NULL, "a NULL table leases nothing");
+        CHECK(miss == CRSurfaceLeaseMissNoSlot, "a NULL table reports NoSlot, got %d", (int)miss);
+
+        /* 8. The NULL-reason entry point is unchanged, and observers are removable. */
+        crsurface_table_set_erase_observer(t, NULL, NULL);
+        crsurface_table_map(t, 902, 80);
+        crsurface_table_unmap_window(t, 80);
+        CHECK(erased.size() == 4, "a removed observer records nothing further (got %zu)", erased.size());
+        CHECK(crsurface_table_lease_published(t, 902, NULL) == NULL, "the reason-less entry point still answers NULL");
+        printf("  four lease-miss reasons and four teardown call sites all reported\n");
+        crsurface_table_destroy(t);
+    }
+
     printf("\n%s (%d failures)\n", fails ? "SLOTS: FAIL" : "SLOTS: PASS", fails);
     return fails ? 1 : 0;
 }
