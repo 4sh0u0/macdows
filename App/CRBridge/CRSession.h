@@ -558,6 +558,36 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// cross-thread publish rationale.
 @property (readonly, nullable) NSError *lastConnectError;
 
+/// DIAGNOSTICS ONLY (ADR-0018 §5.2 ②) — the bridge's own per-surfaceId frame counters, read
+/// out for `surfaceId`. Returns `NO`, leaving all four out-parameters untouched, when this
+/// session has never seen that surface id at all.
+///
+/// WHAT EACH NUMBER MEASURES, and why the lane needs all four. `updates` counts entries into
+/// the GFX `UpdateWindowFromSurface` hook for that surface; since the gdi pipeline calls it
+/// for EVERY windowMapped surface at every frame end, dirty or not, it says only "frames were
+/// ending while this surface existed". `dirty` counts the subset that arrived carrying a
+/// non-empty invalid region — that is the server's own statement that it drew into this
+/// surface, and it is available nowhere else on the client. `publishes` counts the hook's exit
+/// (frame lane write plus readiness doorbell), so `updates > publishes` is a frame the bridge
+/// accepted and never forwarded. `stale` counts the published readiness events that
+/// `-drainEventsWithHandler:`'s generation filter then threw away (adr/0005 §4) — the last exit
+/// before any consumer runs, and the term that would otherwise be missing from
+/// `publishes = stale + delivered + still-in-flight`. Together they decide the question a
+/// re-mapped window poses: `dirty == 0` means the server only mapped the new surface (nothing
+/// to show), while `dirty > 0` with no frame on screen means the loss is on this side.
+///
+/// Cumulative and monotonic for this instance's whole lifetime — a reconnect does not reset
+/// them, same contract as `staleEventsDiscardedCount`. `NO` is deliberately NOT reported as
+/// zeros: zero-drawn is itself one of the verdicts above, so "never measured" (an unseen id,
+/// or one that appeared after the fixed-capacity table was full) has to stay distinguishable
+/// from "measured, and nothing was drawn". Safe to call from any thread, at any time,
+/// including mid-session while the GFX thread is writing.
+- (BOOL)gfxSurfaceCounters:(uint32_t)surfaceId
+                   updates:(uint64_t *)updates
+                     dirty:(uint64_t *)dirty
+                 publishes:(uint64_t *)publishes
+                     stale:(uint64_t *)stale;
+
 /// W4b frame pathway (adr/0005 §2). Call after observing a `CRDPEventKindFrameReady` event
 /// for `surfaceId`: returns a +1-retained `IOSurfaceRef` (caller must `CFRelease`,
 /// typically after handing it to a `CALayer`, which retains its own stake) holding that

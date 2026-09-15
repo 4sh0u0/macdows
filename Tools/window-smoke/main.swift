@@ -766,6 +766,59 @@ enum EdgeProfile {
         "[edge-presents] id=\(windowId) count=\(count) at=\(phase.rawValue)"
     }
 
+    /// One line per surface a window was ever mapped to (ADR-0018 §5.2 ②), printed right after
+    /// that window's `[edge]`/`[edge-presents]` pair. MEASUREMENT ONLY, like the rest of this
+    /// enum -- no verdict, no exit code, nothing branches on it.
+    ///
+    /// WHAT THE ROW DECIDES, and why no existing line can. `[edge]` describes the window's last
+    /// PRESENTED surface and `[f1]` its CURRENT mapping; a window that was re-mapped and never
+    /// re-presented is exactly one where those are different surfaces, and neither line can say
+    /// whether the new surface was ever DRAWN INTO. Reading left to right, one row is one
+    /// surface's chain: the server drew (`dirty`), the bridge forwarded (`publishes`), the drain
+    /// discarded some as belonging to an older connection (`stale`), the registry received the
+    /// rest (`ready`) and either dropped each for a named reason (`drop-unmapped` /
+    /// `drop-nosurface`) or showed it (`presents`). `dirty=0` on the current surface of a window
+    /// showing an older one is ADR-0018 §5.2 ②'s sub-case 4b (the server only mapped it);
+    /// `dirty>0` with `presents=0` is 4a (the frame was lost on this side).
+    ///
+    /// WHAT A ZERO CAN AND CANNOT SAY (gate r1 I-1 -- read this before attributing a loss). The
+    /// two sides of the row are counted at different places and the chain is NOT a single
+    /// conservation law: `publishes = stale + ready + in-flight`, where the in-flight term is
+    /// real (a frame published after the last drain of the run is counted by neither `stale` nor
+    /// `ready`), and `ready = drop-unmapped + drop-nosurface + presents` exactly. So
+    /// `publishes>0 ready=0 stale=0` narrows to "published but never drained", not to a
+    /// particular defect; `publishes>0 stale>0` names a reconnect as the loser of those frames;
+    /// and a zero anywhere else means only that that stage never ran for this surface -- the row
+    /// says WHERE a frame stopped, never WHY.
+    ///
+    /// `tracked=no` means the bridge's fixed-capacity counter table never held a slot for this
+    /// surface, so `updates`/`dirty`/`publishes`/`stale` are placeholders and NOT a measurement
+    /// of zero -- which matters because zero is itself one of the two verdicts. `id=none` rows
+    /// are surfaces with registry events that belong to no RENDERED window -- never mapped at
+    /// all, or mapped to a window this client does not render; the row deliberately does not
+    /// distinguish those (`RemoteWindowRegistry.gfxFrameOrphanRows`' own doc comment), which is
+    /// why `order=0`, `current=no` and `mapped=n/a` are structural rather than measured.
+    /// `presents=0` on such a row is not a choice made here but a consequence of `present` being
+    /// reachable only through a rendered window.
+    static func framesLine(row: RemoteWindowRegistry.GfxFrameRow, at phase: Phase) -> String {
+        "[gfx-frames] id=\(row.windowId.map { String($0) } ?? "none")"
+            + " surface=\(row.surfaceId) order=\(row.order)"
+            + " current=\(row.isCurrent ? "yes" : "no")"
+            // The same declared-size formatter the stale `[edge]` shape uses, for the same
+            // reason: a mapped size printed here has to be comparable with an `[f1]` line
+            // character for character.
+            + " mapped=\(row.mappedSize.map { fmtSize($0) } ?? "n/a")"
+            + " tracked=\(row.tracked ? "yes" : "no")"
+            + " updates=\(row.updates) dirty=\(row.dirty) publishes=\(row.publishes)"
+            // Between `publishes` and `ready`, in the order the frame meets them: the drain's
+            // generation filter is the last thing that can eat a published frame before this
+            // client ever sees it, and it used to be invisible on this line.
+            + " stale=\(row.stale)"
+            + " ready=\(row.ready) drop-unmapped=\(row.dropUnmapped)"
+            + " drop-nosurface=\(row.dropNoSurface) presents=\(row.presents)"
+            + " at=\(phase.rawValue)"
+    }
+
     /// Three places, fixed -- an edge of a few hundred pixels resolves to better than 0.005, and a
     /// fixed width keeps the columns readable when a record diffs two runs side by side.
     static func fmt(_ ratio: Double) -> String { String(format: "%.3f", ratio) }
@@ -2382,6 +2435,64 @@ enum WindowSmokeGateSelfTest {
                 && EdgeProfile.presentsLine(windowId: 9, count: 0, at: .firstFrame)
                     == "[edge-presents] id=9 count=0 at=first-frame",
             "edgePresentsLineCountsPresentedFramesPerWindowPerPhase: [edge-presents] states how many frames a window has ever PRESENTED, printed right after that window's [edge] line and carrying the same at= phase -- count=1 beside a stale-surface line says the server published nothing for the newer mapping, a larger count says frames did arrive"
+        )
+
+        // ADR-0018 §5.2 ②. The row is the lane's entire product, so its grammar is pinned
+        // verbatim against the two shapes a run can print -- a window's own surface, and a
+        // surface that never belonged to any window. The second row below is the 4b shape the
+        // lane was opened to look for: a window's SECOND surface, still current, that the server
+        // mapped and never drew into (`dirty=0`), so nothing was ever published, received or
+        // presented -- while its first surface, one line earlier, shows the full chain.
+        let gfxCurrentRow = EdgeProfile.framesLine(
+            row: RemoteWindowRegistry.GfxFrameRow(
+                windowId: 327_722, surfaceId: 1, order: 1, isCurrent: false,
+                mappedSize: CGSize(width: 522, height: 515), tracked: true,
+                updates: 42, dirty: 7, publishes: 42, stale: 2, ready: 40, dropUnmapped: 0,
+                dropNoSurface: 39, presents: 1),
+            at: .finish
+        )
+        let gfxMappedOnlyRow = EdgeProfile.framesLine(
+            row: RemoteWindowRegistry.GfxFrameRow(
+                windowId: 327_722, surfaceId: 2, order: 2, isCurrent: true,
+                mappedSize: CGSize(width: 500, height: 505), tracked: true,
+                updates: 19, dirty: 0, publishes: 19, stale: 0, ready: 0, dropUnmapped: 0,
+                dropNoSurface: 0, presents: 0),
+            at: .finish
+        )
+        expect(
+            gfxCurrentRow == "[gfx-frames] id=327722 surface=1 order=1 current=no mapped=522x515"
+                + " tracked=yes updates=42 dirty=7 publishes=42 stale=2 ready=40 drop-unmapped=0"
+                + " drop-nosurface=39 presents=1 at=finish"
+                && gfxMappedOnlyRow == "[gfx-frames] id=327722 surface=2 order=2 current=yes"
+                + " mapped=500x505 tracked=yes updates=19 dirty=0 publishes=19 stale=0 ready=0"
+                + " drop-unmapped=0 drop-nosurface=0 presents=0 at=finish",
+            "gfxFramesLineStatesTheWholeChainPerSurface: [gfx-frames] carries, for ONE surface of one window, the server's own drawing evidence (updates/dirty), the bridge's forwarding (publishes), the frames a reconnect discarded before delivery (stale) and this client's disposition of the rest (ready = drop-unmapped + drop-nosurface + presents), in first-mapping order -- so a window whose current surface reads dirty=0 was never drawn into (ADR-0018 §5.2 ② case 4b) while dirty>0 presents=0 means the frame was lost on this side (case 4a); the two fixtures are arithmetically whole (publishes = stale + ready, ready = the three dispositions) so a key inserted in the wrong place breaks them"
+        )
+
+        // The two shapes a reader must never confuse with a measured zero: a surface the bridge's
+        // fixed-capacity table never tracked, and a surface that belongs to no window.
+        let gfxUntrackedRow = EdgeProfile.framesLine(
+            row: RemoteWindowRegistry.GfxFrameRow(
+                windowId: 9, surfaceId: 64, order: 1, isCurrent: true, mappedSize: nil,
+                tracked: false, updates: 0, dirty: 0, publishes: 0, stale: 0, ready: 3,
+                dropUnmapped: 0, dropNoSurface: 3, presents: 0),
+            at: .firstFrame
+        )
+        let gfxOrphanRow = EdgeProfile.framesLine(
+            row: RemoteWindowRegistry.GfxFrameRow(
+                windowId: nil, surfaceId: 5, order: 0, isCurrent: false, mappedSize: nil,
+                tracked: true, updates: 4, dirty: 4, publishes: 4, stale: 0, ready: 4,
+                dropUnmapped: 4, dropNoSurface: 0, presents: 0),
+            at: .finish
+        )
+        expect(
+            gfxUntrackedRow == "[gfx-frames] id=9 surface=64 order=1 current=yes mapped=n/a"
+                + " tracked=no updates=0 dirty=0 publishes=0 stale=0 ready=3 drop-unmapped=0"
+                + " drop-nosurface=3 presents=0 at=first-frame"
+                && gfxOrphanRow == "[gfx-frames] id=none surface=5 order=0 current=no mapped=n/a"
+                + " tracked=yes updates=4 dirty=4 publishes=4 stale=0 ready=4 drop-unmapped=4"
+                + " drop-nosurface=0 presents=0 at=finish",
+            "gfxFramesLineNamesUnmeasuredAndUnownedSurfacesInsteadOfPrintingZeros: tracked=no says the bridge's fixed-capacity table held no slot for that surface, so its four bridge counters are placeholders rather than the measured zeros case 4b consists of; id=none order=0 is a surface with frame-ready events that no RENDERED window owns -- never mapped, or mapped to a window this client does not render -- which no window's own line would print at all"
         )
 
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
@@ -4850,6 +4961,24 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 count: registry.presentCount(windowId: snapshot.windowId) ?? 0,
                 at: phase
             ))
+            // ... and then this window's whole mapping history, oldest surface first (ADR-0018
+            // §5.2 ②). Immediately after the pair above, because the three lines are read
+            // together: `[edge]` says which surface is on screen, `[edge-presents]` how many
+            // frames ever reached it, and these say what happened to every surface it was ever
+            // mapped to. A window that has never been mapped contributes no rows -- its
+            // `[edge] unavailable=` line already says so, and an empty row would add a surface
+            // id that does not exist.
+            for row in registry.gfxFrameRows(windowId: snapshot.windowId) {
+                print(EdgeProfile.framesLine(row: row, at: phase))
+            }
+        }
+        // Surfaces that never belonged to any window, once per run: they follow no window's
+        // lines, and at `first-frame` the set is still filling (a surface mapped a moment later
+        // would be reported as orphaned and then contradicted by the finish pass).
+        if phase == .finish {
+            for row in registry.gfxFrameOrphanRows() {
+                print(EdgeProfile.framesLine(row: row, at: phase))
+            }
         }
     }
 
