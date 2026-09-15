@@ -9,11 +9,12 @@
  * top of it never need to see the C++ class this wraps.
  *
  * Threading contract, matching adr/0005 §2/§3 exactly:
- *   - crsurface_table_map / crsurface_table_unmap_window / crsurface_table_write: called
- *     from T_dvc only (the RDPGFX callbacks this is wired into all run there). Must be
- *     fast -- the ADR's own words, "must be fast" -- since this runs inside FreeRDP's mux
- *     critical section; the actual pixel copy this performs *is* the "must be fast" work,
- *     not something deferrable outside a lock the way crdpq_control's post() is.
+ *   - crsurface_table_map / crsurface_table_unmap_window / crsurface_table_erase_surface /
+ *     crsurface_table_write: called from T_dvc only (the RDPGFX callbacks this is wired into
+ *     all run there). Must be fast -- the ADR's own words, "must be fast" -- since this runs
+ *     inside FreeRDP's mux critical section; the actual pixel copy this performs *is* the
+ *     "must be fast" work, not something deferrable outside a lock the way crdpq_control's
+ *     post() is.
  *   - crsurface_table_lease_published / crsurface_table_release_lease: called from
  *     T_main only.
  *   - crsurface_table_clear: called from T_main during -[CRSession shutdownAndWait],
@@ -48,12 +49,33 @@ void crsurface_table_destroy(CRSurfaceSlotTable *table);
  * aren't known yet at map time). */
 void crsurface_table_map(CRSurfaceSlotTable *table, uint32_t surfaceId, uint64_t windowId);
 
-/* T_dvc, from UnmapWindowForSurface: releases every slot currently mapped to windowId
- * (there is normally exactly one) and frees its IOSurface buffers -- but only buffers not
+/* T_dvc, the DEFENSIVE half of UnmapWindowForSurface (lane fix/w3-remap-slot-erase): releases
+ * EVERY slot currently mapped to windowId and frees its IOSurface buffers -- but only buffers not
  * currently leased to T_main; a still-leased buffer is freed when its lease is released
  * (crsurface_table_release_lease already handles a release against an unmapped slot
- * safely -- see that function's own comment). */
+ * safely -- see that function's own comment).
+ *
+ * WHY IT IS NO LONGER THE NORMAL PATH. "Every slot of that windowId" is wrong whenever the window
+ * owns more than one surface, which a re-map makes routine: the only caller of
+ * UnmapWindowForSurface is gdi_DeleteSurface (gfx.c), which passes the DELETED surface's windowId,
+ * and a window re-mapped A -> B -> A still has a live slot for A when B is finally deleted. The
+ * 2026-09-15 About window lost exactly that slot here. The bridge therefore erases just the deleted
+ * surface's slot (crsurface_table_erase_surface below) whenever it knows which surface is being
+ * deleted, and falls back to this sweep only when it does not -- a caller that invokes
+ * UnmapWindowForSurface outside a DeleteSurface, which nothing in the vendored FreeRDP does. Kept,
+ * rather than removed, because that fallback must still tear the window down completely. */
 void crsurface_table_unmap_window(CRSurfaceSlotTable *table, uint64_t windowId);
+
+/* T_dvc, from the bridge's DeleteSurface hook by way of UnmapWindowForSurface (lane
+ * fix/w3-remap-slot-erase): releases the slot of THAT ONE surfaceId, with exactly the teardown
+ * crsurface_table_unmap_window performs for each slot it sweeps (buffers destroyed, leases
+ * reclaimed, the teardown observer told). A surfaceId this table has no slot for is a no-op and is
+ * NOT reported as a teardown -- a surface can be deleted without ever having been window-mapped.
+ *
+ * This is the precise expression of what a DeleteSurface means for this table: the surface's pixels
+ * are about to be freed by the gdi pipeline, so its slot must go, and no other surface's slot may
+ * go with it. */
+void crsurface_table_erase_surface(CRSurfaceSlotTable *table, uint32_t surfaceId);
 
 /* T_dvc, from UpdateWindowFromSurface. `data`/`scanline` describe the GDI-decoded BGRA32
  * surface buffer (never retained past this call); `rects`/`rectCount` is the surface's
@@ -121,26 +143,30 @@ IOSurfaceRef crsurface_table_lease_published_reason(CRSurfaceSlotTable *table, u
 /* DIAGNOSTICS ONLY (ADR-0018 §5.2 ②b) -- called once per surfaceId whose slot this table tears
  * down, so a counter outside this file can record teardowns it otherwise cannot observe at all.
  *
- * WHY IT EXISTS. `UnmapWindowForSurface` erases EVERY slot belonging to a windowId
- * (crsurface_table_unmap_window's loop), including a different surface that was freshly mapped to
- * that same window moments earlier -- while the registry, which is never told about the unmap,
- * keeps a mapping whose slot no longer exists. Every later frame for that surface then dies as
- * CRSurfaceLeaseMissNoSlot with nothing anywhere recording the teardown that caused it; the
- * 2026-09-15 trace had to reach that conclusion by elimination for exactly this reason.
+ * WHY IT EXISTS. A slot can be torn down behind the registry's back -- the registry is never told
+ * about a teardown at all -- and every later frame for that surface then dies as
+ * CRSurfaceLeaseMissNoSlot with nothing anywhere recording what removed it; the 2026-09-15 trace
+ * had to reach that conclusion by elimination for exactly this reason. (The teardown it was
+ * tracking down, the whole-window sweep erasing a freshly re-mapped surface's slot, is the defect
+ * lane fix/w3-remap-slot-erase removed from the bridge's normal path -- see
+ * crsurface_table_unmap_window's own comment. The observer stays: the remaining teardowns are just
+ * as invisible from outside.)
  *
- * THE FOUR CALL SITES, and the one deliberate exclusion:
- *   1. crsurface_table_unmap_window -- each erased slot (the collateral teardown above);
- *   2. crsurface_table_clear -- each slot dropped by a disconnect/shutdown sweep;
- *   3. crsurface_table_map's remap branch -- a surface re-mapped to a DIFFERENT windowId, whose
+ * THE FIVE CALL SITES, and the one deliberate exclusion:
+ *   1. crsurface_table_erase_surface -- the slot of a surface the server deleted (the bridge's
+ *      normal teardown since lane fix/w3-remap-slot-erase);
+ *   2. crsurface_table_unmap_window -- each slot erased by the defensive whole-window sweep;
+ *   3. crsurface_table_clear -- each slot dropped by a disconnect/shutdown sweep;
+ *   4. crsurface_table_map's remap branch -- a surface re-mapped to a DIFFERENT windowId, whose
  *      buffers are destroyed so the old window's last frame cannot leak into the new one;
- *   4. crsurface_table_write's size-change branch, ONLY when the slot had a published frame to
+ *   5. crsurface_table_write's size-change branch, ONLY when the slot had a published frame to
  *      lose (lastWrittenIndex >= 0). A surface's FIRST write also takes that branch (the slot
  *      starts 0x0), and counting that would report a teardown for every surface that ever drew.
- * 1 and 2 remove the slot (later leases miss as NoSlot); 3 and 4 keep it and only clear its
+ * 1, 2 and 3 remove the slot (later leases miss as NoSlot); 4 and 5 keep it and only clear its
  * buffers (later leases miss as NeverWritten) -- so the miss reason says which kind happened.
  *
  * THREADING: invoked with the table's lock HELD, on whichever thread performed the teardown
- * (T_dvc for 1/3/4, T_main for 2). An observer must therefore not call back into this table and
+ * (T_dvc for 1/2/4/5, T_main for 3). An observer must therefore not call back into this table and
  * must do its own synchronization; the one in CRSession.mm only touches the crgfx counter table,
  * which has its own leaf lock, so the lock order is always table -> counters and never back. */
 typedef void (*CRSurfaceEraseObserver)(void *context, uint32_t surfaceId);

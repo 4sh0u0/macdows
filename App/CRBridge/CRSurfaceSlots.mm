@@ -174,6 +174,23 @@ void EraseLeasesFor(CRSurfaceSlotTable &table, uint32_t surfaceId)
             ++it;
     }
 }
+
+/* The whole teardown of ONE slot, in ONE place (lane fix/w3-remap-slot-erase): buffers destroyed,
+ * `leases` entries reclaimed (M4), the teardown observer told, and the slot itself dropped.
+ * crsurface_table_erase_surface (one slot) and crsurface_table_unmap_window (every slot of a
+ * window) are the same teardown applied to a different selection, which is why they share this
+ * rather than each spelling the four steps out -- the two could not agree "by inspection" if one
+ * of them ever gained a step. Returns the iterator following the erased slot so the sweep can keep
+ * walking. Must be called with the table lock held. */
+std::unordered_map<uint32_t, CRSurfaceSlot>::iterator EraseSlot(
+    CRSurfaceSlotTable &table, std::unordered_map<uint32_t, CRSurfaceSlot>::iterator it)
+{
+    const uint32_t surfaceId = it->first;
+    DestroySlotBuffers(it->second);
+    EraseLeasesFor(table, surfaceId); // M4
+    NoteErased(table, surfaceId);
+    return table.slots.erase(it);
+}
 } // namespace
 
 CRSurfaceSlotTable *crsurface_table_create(void)
@@ -211,7 +228,7 @@ void crsurface_table_map(CRSurfaceSlotTable *table, uint32_t surfaceId, uint64_t
          * the moment their caller eventually releases them. */
         DestroySlotBuffers(sIt->second);
         EraseLeasesFor(*table, surfaceId);
-        NoteErased(*table, surfaceId); // call site 3 (see the header's list)
+        NoteErased(*table, surfaceId); // call site 4 (see the header's list)
     }
 
     /* operator[] default-constructs a fresh CRSurfaceSlot if surfaceId isn't already
@@ -229,20 +246,30 @@ void crsurface_table_unmap_window(CRSurfaceSlotTable *table, uint64_t windowId)
     if (!table)
         return;
     os_unfair_lock_lock(&table->lock);
+    /* The DEFENSIVE whole-window sweep (see the header): correct for "this window is going away",
+     * wrong for "one of this window's surfaces was deleted", which is what the bridge used to call
+     * it for and what crsurface_table_erase_surface below now handles. */
     for (auto it = table->slots.begin(); it != table->slots.end();)
     {
         if (it->second.windowId == windowId)
-        {
-            DestroySlotBuffers(it->second);
-            EraseLeasesFor(*table, it->first); // M4
-            NoteErased(*table, it->first);     // call site 1 -- the collateral teardown
-            it = table->slots.erase(it);
-        }
+            it = EraseSlot(*table, it); // call site 2 -- the defensive sweep
         else
-        {
             ++it;
-        }
     }
+    os_unfair_lock_unlock(&table->lock);
+}
+
+void crsurface_table_erase_surface(CRSurfaceSlotTable *table, uint32_t surfaceId)
+{
+    if (!table)
+        return;
+    os_unfair_lock_lock(&table->lock);
+    auto it = table->slots.find(surfaceId);
+    /* An id with no slot is a no-op AND not a teardown: a surface that was never window-mapped is
+     * deleted through the same path, and reporting that as an erase would put a teardown on the
+     * record of every surface the server ever created. */
+    if (it != table->slots.end())
+        EraseSlot(*table, it); // call site 1 -- the deleted surface's own slot
     os_unfair_lock_unlock(&table->lock);
 }
 
@@ -273,7 +300,7 @@ bool crsurface_table_write(CRSurfaceSlotTable *table, uint32_t surfaceId, const 
         DestroySlotBuffers(slot);
         slot.width = width;
         slot.height = height;
-        /* Call site 4, and the ONLY conditional one: every surface's very first write also takes
+        /* Call site 5, and the ONLY conditional one: every surface's very first write also takes
          * this branch (the slot starts 0x0 with nothing published), and reporting that as a
          * teardown would give every surface that ever drew an erased count of 1. */
         if (hadPublishedFrame)
@@ -461,9 +488,11 @@ IOSurfaceRef crsurface_table_lease_published_reason(CRSurfaceSlotTable *table, u
     auto sIt = table->slots.find(surfaceId);
     if (sIt == table->slots.end())
     {
-        /* No slot at all: never mapped, or ERASED since -- crsurface_table_unmap_window tears
-         * down every slot of a windowId, which is how a surface the registry still believes in
-         * loses its slot without anybody being told (see the erase observer's own comment). */
+        /* No slot at all: never mapped, or ERASED since -- the surface was deleted
+         * (crsurface_table_erase_surface), its window was torn down (the defensive sweep in
+         * crsurface_table_unmap_window) or the session was cleared. The registry is told about none
+         * of those, so a surface it still believes in can lose its slot silently; the erase
+         * observer exists to make that readable (see its own comment). */
         os_unfair_lock_unlock(&table->lock);
         return NULL;
     }
@@ -549,7 +578,7 @@ void crsurface_table_clear(CRSurfaceSlotTable *table)
     {
         DestroySlotBuffers(kv.second);
         EraseLeasesFor(*table, kv.first); // M4
-        NoteErased(*table, kv.first);     // call site 2 -- the disconnect/shutdown sweep
+        NoteErased(*table, kv.first);     // call site 3 -- the disconnect/shutdown sweep
     }
     table->slots.clear();
     os_unfair_lock_unlock(&table->lock);

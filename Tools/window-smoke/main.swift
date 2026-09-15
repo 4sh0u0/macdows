@@ -796,8 +796,8 @@ enum EdgeProfile {
     /// which matters because zero is itself one of the two verdicts. The converse is weaker than it
     /// looks (gate r1 I-1): `tracked=yes` says some bridge event was recorded, and a slot TEARDOWN
     /// is such an event, so `tracked=yes` with every counter at zero is reachable for a surface the
-    /// bridge mapped, never drew into, and then erased (an unmap of its window, or the disconnect
-    /// sweep). Those zeros are a real measurement -- case 4b stated positively. `id=none` rows
+    /// bridge mapped, never drew into, and then erased (its own delete, the defensive window sweep,
+    /// or the disconnect clear). Those zeros are a real measurement -- case 4b stated positively. `id=none` rows
     /// are surfaces with registry events that belong to no RENDERED window -- never mapped at
     /// all, or mapped to a window this client does not render; the row deliberately does not
     /// distinguish those (`RemoteWindowRegistry.gfxFrameOrphanRows`' own doc comment), which is
@@ -855,13 +855,22 @@ enum EdgeProfile {
     /// `ready = drop-nomap + drop-nowindow + drop-noslot + drop-neverwritten + drop-leased +
     /// drop-generation + presents`. `drop-generation>0` is the one drop that proves the server DREW
     /// the frame (ADR-0018 §5.2 ②'s 4a in a single number); `drop-noslot>0` next to `erased>0` is
-    /// the 2026-09-15 shape the trace could previously only reach by elimination -- an unmap of the
-    /// window erased a slot the registry still believes in.
+    /// the 2026-09-15 shape the trace could previously only reach by elimination -- a teardown
+    /// erased a slot the registry still believes in. Since lane fix/w3-remap-slot-erase a delete
+    /// erases only ITS OWN surface's slot and the whole-window sweep is taken only when an unmap
+    /// arrives with no delete in flight, so that shape no longer arises from a re-map.
     ///
-    /// `writes` and `erased` are the bridge-side pair the same trace showed were missing. `writes`
-    /// counts the slot writes the bridge ACCEPTED, which `publishes` does not (the hook counts a
-    /// publish whether or not the write landed), so `writes < publishes` is a frame that reached no
-    /// buffer at all. `erased` counts teardowns of that surface's slot inside the period.
+    /// `writes`, `refused` and `erased` are the bridge-side numbers the same trace showed were
+    /// missing. `writes` counts the slot writes the bridge ACCEPTED and `refused` the ones its slot
+    /// table DECLINED (no slot, every buffer leased, an allocation or a lock that failed); since
+    /// lane fix/w3-remap-slot-erase a declined write is NOT published (its dirty rects are still
+    /// consumed at the hook's entry, so `dirty` is unaffected -- gate r1 B-1), so `publishes == writes`
+    /// holds by construction and `updates == writes + refused` accounts for every entry into the
+    /// hook. `refused > 0` is therefore where a period's missing frames are -- before that fix they
+    /// were published anyway and turned up one guard later as `drop-noslot`, which is what the
+    /// 2026-09-15 About window's last period is made of. `erased` counts teardowns of that
+    /// surface's slot inside the period; `drop-noslot > 0` beside `erased > 0` remains the shape
+    /// that says a teardown took a slot the registry still believes in.
     ///
     /// `period=0` is not an interval: it is the frozen pre-history of a surface that already
     /// carried counts when this window first mapped it (frame-ready before the mapping, or counts
@@ -885,8 +894,9 @@ enum EdgeProfile {
             + " mapped=\(row.mappedSize.map { fmtSize($0) } ?? "n/a")"
             + " tracked=\(row.tracked ? "yes" : "no")"
             // The bridge half in the order a frame meets it: handed to the hook, carrying a dirty
-            // region, ACCEPTED into a slot buffer, forwarded, discarded by the drain's filter.
-            + " updates=\(row.updates) dirty=\(row.dirty) writes=\(row.writes)"
+            // region, ACCEPTED into a slot buffer or DECLINED by it, forwarded, discarded by the
+            // drain's filter. `refused` sits beside `writes` because the two partition `updates`.
+            + " updates=\(row.updates) dirty=\(row.dirty) writes=\(row.writes) refused=\(row.refused)"
             + " publishes=\(row.publishes) stale=\(row.stale) ready=\(row.ready)"
             // The six drop keys in the order a frame meets them: no mapping, no window, no slot,
             // a slot nothing was ever written into, a frame this client already holds, and a frame
@@ -2620,30 +2630,32 @@ enum WindowSmokeGateSelfTest {
             row: RemoteWindowRegistry.GfxPeriodRow(
                 windowId: 327_722, surfaceId: 4, period: 1, isCurrent: false,
                 mappedSize: CGSize(width: 522, height: 515), tracked: true, updates: 12, dirty: 3,
-                writes: 12, publishes: 12, stale: 0, ready: 12, dropNoMap: 0, dropNoWindow: 0,
-                dropNoSlot: 0, dropNeverWritten: 0, dropLeased: 11, dropGeneration: 0, erased: 0,
-                presents: 1),
+                writes: 12, refused: 0, publishes: 12, stale: 0, ready: 12, dropNoMap: 0,
+                dropNoWindow: 0, dropNoSlot: 0, dropNeverWritten: 0, dropLeased: 11,
+                dropGeneration: 0, erased: 0, presents: 1),
             at: .finish
         )
         let gfxPeriodCurrent = EdgeProfile.periodLine(
             row: RemoteWindowRegistry.GfxPeriodRow(
                 windowId: 327_722, surfaceId: 4, period: 2, isCurrent: true,
                 mappedSize: CGSize(width: 522, height: 515), tracked: true, updates: 34, dirty: 4,
-                writes: 30, publishes: 34, stale: 0, ready: 34, dropNoMap: 22, dropNoWindow: 0,
-                dropNoSlot: 9, dropNeverWritten: 0, dropLeased: 0, dropGeneration: 3, erased: 1,
-                presents: 0),
+                writes: 30, refused: 4, publishes: 30, stale: 0, ready: 30, dropNoMap: 18,
+                dropNoWindow: 0, dropNoSlot: 9, dropNeverWritten: 0, dropLeased: 0,
+                dropGeneration: 3, erased: 1, presents: 0),
             at: .finish
         )
         expect(
             gfxPeriodEarlier == "[gfx-period] id=327722 surface=4 period=1 current=no"
-                + " mapped=522x515 tracked=yes updates=12 dirty=3 writes=12 publishes=12 stale=0"
-                + " ready=12 drop-nomap=0 drop-nowindow=0 drop-noslot=0 drop-neverwritten=0"
-                + " drop-leased=11 drop-generation=0 erased=0 presents=1 at=finish"
+                + " mapped=522x515 tracked=yes updates=12 dirty=3 writes=12 refused=0 publishes=12"
+                + " stale=0 ready=12 drop-nomap=0 drop-nowindow=0 drop-noslot=0"
+                + " drop-neverwritten=0 drop-leased=11 drop-generation=0 erased=0 presents=1"
+                + " at=finish"
                 && gfxPeriodCurrent == "[gfx-period] id=327722 surface=4 period=2 current=yes"
-                + " mapped=522x515 tracked=yes updates=34 dirty=4 writes=30 publishes=34 stale=0"
-                + " ready=34 drop-nomap=22 drop-nowindow=0 drop-noslot=9 drop-neverwritten=0"
-                + " drop-leased=0 drop-generation=3 erased=1 presents=0 at=finish",
-            "gfxPeriodLineMeasuresOneMappingPeriodNotASurfaceLifetime: [gfx-period] carries, for ONE mapping period of one surface of one window, the DIFFERENCE between that surface's counters at the end of the period and at its start -- so the same surface id appears once per period (period=1, period=2 after a re-map back to it) and only the window's current, still-open period says current=yes; that row, and only that row, is the interval ADR-0018 §5.2 ②'s rules mean by \"after the last remap\", which a [gfx-frames] row summing both periods cannot isolate; both fixtures satisfy the exact identity ready = drop-nomap + drop-nowindow + drop-noslot + drop-neverwritten + drop-leased + drop-generation + presents, so a key inserted in the wrong place breaks them"
+                + " mapped=522x515 tracked=yes updates=34 dirty=4 writes=30 refused=4 publishes=30"
+                + " stale=0 ready=30 drop-nomap=18 drop-nowindow=0 drop-noslot=9"
+                + " drop-neverwritten=0 drop-leased=0 drop-generation=3 erased=1 presents=0"
+                + " at=finish",
+            "gfxPeriodLineMeasuresOneMappingPeriodNotASurfaceLifetime: [gfx-period] carries, for ONE mapping period of one surface of one window, the DIFFERENCE between that surface's counters at the end of the period and at its start -- so the same surface id appears once per period (period=1, period=2 after a re-map back to it) and only the window's current, still-open period says current=yes; that row, and only that row, is the interval ADR-0018 §5.2 ②'s rules mean by \"after the last remap\", which a [gfx-frames] row summing both periods cannot isolate; both fixtures satisfy the exact identity ready = drop-nomap + drop-nowindow + drop-noslot + drop-neverwritten + drop-leased + drop-generation + presents AND the bridge-side identity updates = writes + refused with publishes = writes, so a key inserted in the wrong place breaks them"
         )
 
         // The two shapes whose zeros must not be read as measurements, and the split that gives
@@ -2654,29 +2666,30 @@ enum WindowSmokeGateSelfTest {
         let gfxPeriodZero = EdgeProfile.periodLine(
             row: RemoteWindowRegistry.GfxPeriodRow(
                 windowId: 9, surfaceId: 64, period: 0, isCurrent: false, mappedSize: nil,
-                tracked: false, updates: 0, dirty: 0, writes: 0, publishes: 0, stale: 0, ready: 2,
-                dropNoMap: 2, dropNoWindow: 0, dropNoSlot: 0, dropNeverWritten: 0, dropLeased: 0,
-                dropGeneration: 0, erased: 0, presents: 0),
+                tracked: false, updates: 0, dirty: 0, writes: 0, refused: 0, publishes: 0,
+                stale: 0, ready: 2, dropNoMap: 2, dropNoWindow: 0, dropNoSlot: 0,
+                dropNeverWritten: 0, dropLeased: 0, dropGeneration: 0, erased: 0, presents: 0),
             at: .firstFrame
         )
         let gfxPeriodUnrendered = EdgeProfile.periodLine(
             row: RemoteWindowRegistry.GfxPeriodRow(
                 windowId: 9, surfaceId: 64, period: 1, isCurrent: true, mappedSize: nil,
-                tracked: true, updates: 8, dirty: 8, writes: 6, publishes: 8, stale: 5, ready: 3,
-                dropNoMap: 0, dropNoWindow: 1, dropNoSlot: 0, dropNeverWritten: 2, dropLeased: 0,
-                dropGeneration: 0, erased: 2, presents: 0),
+                tracked: true, updates: 8, dirty: 8, writes: 6, refused: 2, publishes: 6,
+                stale: 3, ready: 3, dropNoMap: 0, dropNoWindow: 1, dropNoSlot: 0,
+                dropNeverWritten: 2, dropLeased: 0, dropGeneration: 0, erased: 2, presents: 0),
             at: .firstFrame
         )
         expect(
             gfxPeriodZero == "[gfx-period] id=9 surface=64 period=0 current=no mapped=n/a"
-                + " tracked=no updates=0 dirty=0 writes=0 publishes=0 stale=0 ready=2 drop-nomap=2"
-                + " drop-nowindow=0 drop-noslot=0 drop-neverwritten=0 drop-leased=0"
+                + " tracked=no updates=0 dirty=0 writes=0 refused=0 publishes=0 stale=0 ready=2"
+                + " drop-nomap=2 drop-nowindow=0 drop-noslot=0 drop-neverwritten=0 drop-leased=0"
                 + " drop-generation=0 erased=0 presents=0 at=first-frame"
                 && gfxPeriodUnrendered == "[gfx-period] id=9 surface=64 period=1 current=yes"
-                + " mapped=n/a tracked=yes updates=8 dirty=8 writes=6 publishes=8 stale=5 ready=3"
-                + " drop-nomap=0 drop-nowindow=1 drop-noslot=0 drop-neverwritten=2 drop-leased=0"
-                + " drop-generation=0 erased=2 presents=0 at=first-frame",
-            "gfxPeriodLineNamesThePreHistoryAndTheSixDropCauses: period=0 is not an interval but the counts a surface already carried when this window first mapped it (always mapped=n/a -- nothing was announced for a period that predates the mapping), and the six drop keys replace [gfx-frames]' two conflations with their sub-causes in the order a frame meets them (drop-nomap + drop-nowindow = drop-unmapped, drop-noslot + drop-neverwritten + drop-leased + drop-generation = drop-nosurface), so drop-generation>0 says the server drew a frame that a reconnect discarded, drop-noslot>0 beside erased>0 says an unmap tore the slot out from under a mapping this client still believes in, and writes<publishes says a frame the bridge counted as published never reached a buffer"
+                + " mapped=n/a tracked=yes updates=8 dirty=8 writes=6 refused=2 publishes=6"
+                + " stale=3 ready=3 drop-nomap=0 drop-nowindow=1 drop-noslot=0"
+                + " drop-neverwritten=2 drop-leased=0 drop-generation=0 erased=2 presents=0"
+                + " at=first-frame",
+            "gfxPeriodLineNamesThePreHistoryAndTheSixDropCauses: period=0 is not an interval but the counts a surface already carried when this window first mapped it (always mapped=n/a -- nothing was announced for a period that predates the mapping), and the six drop keys replace [gfx-frames]' two conflations with their sub-causes in the order a frame meets them (drop-nomap + drop-nowindow = drop-unmapped, drop-noslot + drop-neverwritten + drop-leased + drop-generation = drop-nosurface), so drop-generation>0 says the server drew a frame that a reconnect discarded, drop-noslot>0 beside erased>0 says a teardown took the slot out from under a mapping this client still believes in, and refused>0 says the slot table declined those frames -- which since lane fix/w3-remap-slot-erase are not published at all (publishes == writes by construction, updates == writes + refused), so a refused frame is visible here instead of one guard later as drop-noslot"
         )
 
         expect(

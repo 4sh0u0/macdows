@@ -559,31 +559,41 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 @property (readonly, nullable) NSError *lastConnectError;
 
 /// DIAGNOSTICS ONLY (ADR-0018 §5.2 ②) — the bridge's own per-surfaceId frame counters, read
-/// out for `surfaceId`. Returns `NO`, leaving all four out-parameters untouched, when this
+/// out for `surfaceId`. Returns `NO`, leaving every out-parameter untouched, when this
 /// session has never seen that surface id at all.
 ///
-/// WHAT EACH NUMBER MEASURES, and why the lane needs all four. `updates` counts entries into
+/// WHAT EACH NUMBER MEASURES, and why the lane needs all seven. `updates` counts entries into
 /// the GFX `UpdateWindowFromSurface` hook for that surface; since the gdi pipeline calls it
 /// for EVERY windowMapped surface at every frame end, dirty or not, it says only "frames were
 /// ending while this surface existed". `dirty` counts the subset that arrived carrying a
 /// non-empty invalid region — that is the server's own statement that it drew into this
-/// surface, and it is available nowhere else on the client. `publishes` counts the hook's exit
-/// (frame lane write plus readiness doorbell), so `updates > publishes` is a frame the bridge
-/// accepted and never forwarded. `stale` counts the published readiness events that
+/// surface, and it is available nowhere else on the client. (The hook consumes that region on
+/// every entry, accepted write or not — gate r1 B-1 — so `dirty` keeps meaning "rects arrived
+/// since the previous entry" and ADR-0018 §5.2 ②'s `dirty == 0` fork is read the same way
+/// before and after lane fix/w3-remap-slot-erase.) `publishes` counts the hook's exit (frame
+/// lane write plus readiness doorbell), which since that lane happens only for an ACCEPTED
+/// slot write: `updates > publishes` is therefore exactly `refused` — frames the slot table
+/// DECLINED and the bridge deliberately did not announce — and never "accepted and not
+/// forwarded", which is unreachable. `stale` counts the published readiness events that
 /// `-drainEventsWithHandler:`'s generation filter then threw away (adr/0005 §4) — the last exit
 /// before any consumer runs, and the term that would otherwise be missing from
 /// `publishes = stale + delivered + still-in-flight`.
 ///
 /// `writes` and `erased` are the two the 2026-09-15 guard trace showed were indispensable
-/// (ADR-0018 §5.2 ②b). `writes` counts the frame-slot writes that were ACCEPTED, which `publishes`
-/// does not: the hook counts a publish whether or not `crsurface_table_write` took the pixels, so
-/// `writes < publishes` is a frame that reached no buffer at all — invisible in every other
-/// counter. `erased` counts the teardowns of that surface's slot (an unmap of its window erases it
-/// collaterally, and the registry is never told), which is what leaves a mapped surface with
+/// (ADR-0018 §5.2 ②b). `writes` counts the frame-slot writes that were ACCEPTED. `erased` counts
+/// the teardowns of that surface's slot (a delete of the surface, a window teardown, a remap or a
+/// resize — the registry is told about none of them), which is what leaves a mapped surface with
 /// nothing to lease; `erased > 0` beside a run of `drop-noslot` is the direct reading the trace
 /// could previously reach only by elimination. Together they decide the question a
 /// re-mapped window poses: `dirty == 0` means the server only mapped the new surface (nothing
 /// to show), while `dirty > 0` with no frame on screen means the loss is on this side.
+///
+/// `refused` is the seventh, added with the fix (lane fix/w3-remap-slot-erase): the hook no longer
+/// publishes a frame whose slot write was declined, so `writes == publishes` now holds by
+/// construction and `refused` is where the declined frames are counted instead —
+/// `updates == writes + refused` per surface. Before the fix those frames were published anyway
+/// and died one guard later as `drop-noslot`, which is the shape the 2026-09-15 About window's
+/// last mapping period consists of.
 ///
 /// Cumulative and monotonic for this instance's whole lifetime — a reconnect does not reset
 /// them, same contract as `staleEventsDiscardedCount`. `NO` is deliberately NOT reported as
@@ -595,6 +605,7 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
                    updates:(uint64_t *)updates
                      dirty:(uint64_t *)dirty
                     writes:(uint64_t *)writes
+                   refused:(uint64_t *)refused
                  publishes:(uint64_t *)publishes
                      stale:(uint64_t *)stale
                     erased:(uint64_t *)erased;
@@ -616,10 +627,14 @@ typedef NS_ENUM(NSInteger, CRPublishedSurfaceMiss) {
     /// A surface was returned; nothing was missed.
     CRPublishedSurfaceMissNone = 0,
     /// NO SLOT for that surface id in the bridge's surface table -- it was never mapped, or its
-    /// slot was ERASED since. The teardown case is the one the 2026-09-15 trace ended on:
-    /// `UnmapWindowForSurface` erases every slot of a windowId, including a surface freshly
-    /// mapped to that same window, and the registry is never told (see `CRSurfaceSlots.h`'s
-    /// erase-observer comment). Every later frame for that surface dies here.
+    /// slot was ERASED since. The teardown that erases it is the delete of THAT surface
+    /// (`crsurface_table_erase_surface`, the bridge's normal path since lane
+    /// fix/w3-remap-slot-erase), a whole-window sweep taken defensively when an unmap arrives
+    /// with no delete in flight, or the disconnect clear; the registry is told about none of
+    /// them (see `CRSurfaceSlots.h`'s erase-observer comment). Every later frame for that
+    /// surface dies here. The 2026-09-15 trace ended on this branch because the sweep was then
+    /// the NORMAL path and took down a surface the window had just been re-mapped to -- that
+    /// particular cause is what the lane removed.
     CRPublishedSurfaceMissNoSlot,
     /// The slot exists and NOTHING HAS EVER BEEN PUBLISHED into it -- no write has landed yet,
     /// or a teardown that kept the slot (a remap to another window, a size change) reset it.

@@ -9,6 +9,7 @@ typedef struct {
     uint64_t updates;
     uint64_t dirty;
     uint64_t writes;
+    uint64_t refused;
     uint64_t publishes;
     uint64_t stale;
     uint64_t erased;
@@ -83,6 +84,19 @@ void crgfx_counters_note_write(crgfx_counters_t* counters, uint32_t surfaceId)
     os_unfair_lock_unlock(&counters->lock);
 }
 
+void crgfx_counters_note_refused(crgfx_counters_t* counters, uint32_t surfaceId)
+{
+    if (!counters) return;
+    os_unfair_lock_lock(&counters->lock);
+    /* No slot claiming, exactly like note_write: the update that preceded this refusal is what
+     * claims the slot, so an id with none here means the table was already full then. */
+    crgfx_counter_slot_t* slot = crgfx_counters_slot_locked(counters, surfaceId, false);
+    if (slot) {
+        slot->refused++;
+    }
+    os_unfair_lock_unlock(&counters->lock);
+}
+
 void crgfx_counters_note_erase(crgfx_counters_t* counters, uint32_t surfaceId)
 {
     if (!counters) return;
@@ -120,8 +134,8 @@ void crgfx_counters_note_stale(crgfx_counters_t* counters, uint32_t surfaceId)
 }
 
 bool crgfx_counters_read(crgfx_counters_t* counters, uint32_t surfaceId, uint64_t* out_updates,
-                         uint64_t* out_dirty, uint64_t* out_writes, uint64_t* out_publishes,
-                         uint64_t* out_stale, uint64_t* out_erased)
+                         uint64_t* out_dirty, uint64_t* out_writes, uint64_t* out_refused,
+                         uint64_t* out_publishes, uint64_t* out_stale, uint64_t* out_erased)
 {
     if (!counters) return false;
     os_unfair_lock_lock(&counters->lock);
@@ -131,6 +145,7 @@ bool crgfx_counters_read(crgfx_counters_t* counters, uint32_t surfaceId, uint64_
         if (out_updates) *out_updates = slot->updates;
         if (out_dirty) *out_dirty = slot->dirty;
         if (out_writes) *out_writes = slot->writes;
+        if (out_refused) *out_refused = slot->refused;
         if (out_publishes) *out_publishes = slot->publishes;
         if (out_stale) *out_stale = slot->stale;
         if (out_erased) *out_erased = slot->erased;

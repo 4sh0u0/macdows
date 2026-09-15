@@ -2603,8 +2603,12 @@ final class RemoteWindowRegistry {
         var dropNoWindow = 0
         /// Guard 2a: a live window, and the bridge has NO SLOT for that surface id
         /// (`CRPublishedSurfaceMissNoSlot`) -- never mapped on the bridge side, or its slot was
-        /// torn down by an unmap of its window, which the registry is never told about. The
-        /// 2026-09-15 trace ended on this branch, by elimination; it is now counted directly.
+        /// torn down: by the delete of that surface (the bridge's normal path since lane
+        /// fix/w3-remap-slot-erase), by the whole-window sweep it takes defensively when an unmap
+        /// arrives with no delete in flight, or by the disconnect clear. The registry is told
+        /// about none of them. The 2026-09-15 trace ended on this branch, by elimination, when the
+        /// sweep was still the normal path and took down the window's live surface with it; it is
+        /// now counted directly.
         var dropNoSlot = 0
         /// Guard 2b: the slot exists but NOTHING WAS EVER WRITTEN into it
         /// (`CRPublishedSurfaceMissNeverWritten`) -- no accepted write yet, or a teardown that
@@ -2657,7 +2661,8 @@ final class RemoteWindowRegistry {
         ///
         /// `true` WITH ALL-ZERO `updates` IS REACHABLE (gate r1 I-1): a teardown claims a slot by
         /// itself, so a surface that was mapped on the bridge side, never drawn into, and then
-        /// erased (an unmap of its window, or the disconnect sweep) flips from `tracked=no` to
+        /// erased (its own delete, the defensive window sweep, or the disconnect clear) flips
+        /// from `tracked=no` to
         /// `tracked=yes updates=0 dirty=0 publishes=0 stale=0` the moment the erase fires. That row
         /// says "the bridge had this surface and nothing ever drew into it" -- ADR-0018 §5.2 ②'s
         /// case 4b stated positively, not a measurement that went missing.
@@ -2793,13 +2798,16 @@ final class RemoteWindowRegistry {
         var tracked = false
         var updates: UInt64 = 0
         var dirty: UInt64 = 0
-        /// Of those updates: the frame-slot writes the bridge ACCEPTED. `writes < publishes` is a
-        /// frame that reached no buffer at all (2026-09-15 guard trace).
+        /// Of those updates: the frame-slot writes the bridge ACCEPTED (2026-09-15 guard trace).
         var writes: UInt64 = 0
+        /// The rest of them: writes the bridge's slot table DECLINED, which since lane
+        /// fix/w3-remap-slot-erase are not published at all. `updates == writes + refused`.
+        var refused: UInt64 = 0
         var publishes: UInt64 = 0
         var stale: UInt64 = 0
-        /// Teardowns of this surface's slot in the bridge's table -- an unmap of its window erases
-        /// it collaterally, and this registry is never told.
+        /// Teardowns of this surface's slot in the bridge's table -- its own delete, the defensive
+        /// whole-window sweep, a remap to another window or a size change. This registry is told
+        /// about none of them.
         var erased: UInt64 = 0
         var registry = GfxRegistryCounters()
 
@@ -2807,7 +2815,8 @@ final class RemoteWindowRegistry {
         /// `period=0` row is printed at all: a surface whose history begins at its first mapping
         /// has no pre-history worth a line.
         var isZero: Bool {
-            updates == 0 && dirty == 0 && writes == 0 && publishes == 0 && stale == 0 && erased == 0
+            updates == 0 && dirty == 0 && writes == 0 && refused == 0 && publishes == 0
+                && stale == 0 && erased == 0
                 && registry.ready == 0 && registry.dropNoMap == 0 && registry.dropNoWindow == 0
                 && registry.dropNoSlot == 0 && registry.dropNeverWritten == 0
                 && registry.dropLeased == 0 && registry.dropGeneration == 0 && registry.presents == 0
@@ -2826,6 +2835,7 @@ final class RemoteWindowRegistry {
             out.updates = Self.step(updates, baseline.updates)
             out.dirty = Self.step(dirty, baseline.dirty)
             out.writes = Self.step(writes, baseline.writes)
+            out.refused = Self.step(refused, baseline.refused)
             out.publishes = Self.step(publishes, baseline.publishes)
             out.stale = Self.step(stale, baseline.stale)
             out.erased = Self.step(erased, baseline.erased)
@@ -2871,9 +2881,13 @@ final class RemoteWindowRegistry {
         let tracked: Bool
         let updates: UInt64
         let dirty: UInt64
-        /// Of those updates: writes the bridge's slot table ACCEPTED. `writes < publishes` over a
-        /// period is a frame the bridge counted as published that reached no buffer.
+        /// Of those updates: writes the bridge's slot table ACCEPTED.
         let writes: UInt64
+        /// The rest of them: writes the slot table DECLINED. Since lane fix/w3-remap-slot-erase a
+        /// declined write is not published, so `refused > 0` is where a period's missing frames
+        /// are, and `publishes == writes` holds. Before that fix those frames were published and
+        /// reappeared one guard later as `dropNoSlot`.
+        let refused: UInt64
         let publishes: UInt64
         let stale: UInt64
         let ready: Int
@@ -2912,8 +2926,8 @@ final class RemoteWindowRegistry {
     /// between where the window was mapped somewhere else and this surface was mapped to nobody.
     /// That interval is the one that loses nothing: a surface goes on accumulating while unmapped
     /// (every frame-ready for it then counts as `drop-nomap`, and its bridge slot can be torn down
-    /// by an unmap of the window it still belongs to -- `erased`), and those are exactly the
-    /// events the 2026-09-15 trace needed. Ending a period at the un-mapping instead would drop
+    /// meanwhile -- by its own delete, or by the defensive sweep of a window it still belongs to --
+    /// which is `erased`), and those are exactly the events the 2026-09-15 trace needed. Ending a period at the un-mapping instead would drop
     /// them into a gap no row covers. The consequence to read carefully: on a NON-final period of
     /// a surface, a count may have accrued while the window was showing something else -- only the
     /// last period of a surface is "while this mapping was live and nothing since".
@@ -2967,7 +2981,8 @@ final class RemoteWindowRegistry {
                 windowId: windowId, surfaceId: period.surfaceId, period: period.period,
                 isCurrent: index == currentIndex, mappedSize: period.mappedSize,
                 tracked: live.tracked, updates: values.updates, dirty: values.dirty,
-                writes: values.writes, publishes: values.publishes, stale: values.stale,
+                writes: values.writes, refused: values.refused, publishes: values.publishes,
+                stale: values.stale,
                 ready: values.registry.ready, dropNoMap: values.registry.dropNoMap,
                 dropNoWindow: values.registry.dropNoWindow, dropNoSlot: values.registry.dropNoSlot,
                 dropNeverWritten: values.registry.dropNeverWritten,
@@ -3048,7 +3063,7 @@ final class RemoteWindowRegistry {
         gfxMappingPeriods[windowId] = state
     }
 
-    /// Both sides' cumulative counters for `surfaceId` at this instant: the bridge's four through
+    /// Both sides' cumulative counters for `surfaceId` at this instant: the bridge's own through
     /// the session's read-only getter (whose `false` answer is kept as `tracked`, never collapsed
     /// into zeros), this registry's own from `gfxRegistryCounters`. The ONE place a period
     /// baseline, a period close and a row's live end are read, so all three see the same shape.
@@ -3056,15 +3071,16 @@ final class RemoteWindowRegistry {
         var updates: UInt64 = 0
         var dirty: UInt64 = 0
         var writes: UInt64 = 0
+        var refused: UInt64 = 0
         var publishes: UInt64 = 0
         var stale: UInt64 = 0
         var erased: UInt64 = 0
         let tracked = session.gfxSurfaceCounters(
-            surfaceId, updates: &updates, dirty: &dirty, writes: &writes, publishes: &publishes,
-            stale: &stale, erased: &erased)
+            surfaceId, updates: &updates, dirty: &dirty, writes: &writes, refused: &refused,
+            publishes: &publishes, stale: &stale, erased: &erased)
         return GfxSurfaceTotals(
-            tracked: tracked, updates: updates, dirty: dirty, writes: writes, publishes: publishes,
-            stale: stale, erased: erased,
+            tracked: tracked, updates: updates, dirty: dirty, writes: writes, refused: refused,
+            publishes: publishes, stale: stale, erased: erased,
             registry: gfxRegistryCounters[surfaceId] ?? GfxRegistryCounters())
     }
 

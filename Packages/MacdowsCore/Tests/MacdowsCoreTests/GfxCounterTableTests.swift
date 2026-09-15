@@ -22,23 +22,24 @@ struct GfxCounterTableTests {
         body(table!)
     }
 
-    /// Reads all six counters, or `nil` for "this table has never seen that surface id".
+    /// Reads all seven counters, or `nil` for "this table has never seen that surface id".
     private func read(_ table: OpaquePointer, _ surfaceId: UInt32)
-        -> (updates: UInt64, dirty: UInt64, writes: UInt64, publishes: UInt64, stale: UInt64,
-            erased: UInt64)?
+        -> (updates: UInt64, dirty: UInt64, writes: UInt64, refused: UInt64, publishes: UInt64,
+            stale: UInt64, erased: UInt64)?
     {
         var updates: UInt64 = 0
         var dirty: UInt64 = 0
         var writes: UInt64 = 0
+        var refused: UInt64 = 0
         var publishes: UInt64 = 0
         var stale: UInt64 = 0
         var erased: UInt64 = 0
         guard crgfx_counters_read(
-            table, surfaceId, &updates, &dirty, &writes, &publishes, &stale, &erased)
+            table, surfaceId, &updates, &dirty, &writes, &refused, &publishes, &stale, &erased)
         else {
             return nil
         }
-        return (updates, dirty, writes, publishes, stale, erased)
+        return (updates, dirty, writes, refused, publishes, stale, erased)
     }
 
     @Test("a surface nobody ever touched is NOT TRACKED, which is not the same answer as zero")
@@ -144,6 +145,7 @@ struct GfxCounterTableTests {
             let overflowId = UInt32(CRGFX_COUNTERS_SLOTS)
             crgfx_counters_note_update(table, overflowId, true)
             crgfx_counters_note_write(table, overflowId)
+            crgfx_counters_note_refused(table, overflowId)
             crgfx_counters_note_publish(table, overflowId)
             crgfx_counters_note_stale(table, overflowId)
             // `note_erase` is the one entry point that DOES claim a slot for an unseen id, so a
@@ -162,31 +164,62 @@ struct GfxCounterTableTests {
         }
     }
 
-    @Test("accepted slot writes are counted apart from the publishes the hook counts regardless")
+    @Test("accepted slot writes are counted apart from the publishes the hook counts")
     func writesAreCountedOnlyWhenTheSlotTookTheFrame() {
         withTable { table in
-            // The gap this closes (2026-09-15 guard trace): the frame hook ignores
-            // `crsurface_table_write`'s bool and counts a publish either way, so a frame that
+            // The gap this closes (2026-09-15 guard trace): the frame hook used to ignore
+            // `crsurface_table_write`'s bool and count a publish either way, so a frame that
             // reached no buffer -- slot erased, all three buffers leased, allocation failed --
-            // was indistinguishable from one that landed. `writes < publishes` is that
-            // difference, and it is the only client-side counter that can state it.
+            // was indistinguishable from one that landed. `writes` is that bool.
             crgfx_counters_note_write(table, 5)
             #expect(read(table, 5) == nil, "a write alone must not claim a slot")
 
             crgfx_counters_note_update(table, 5, true)
             crgfx_counters_note_write(table, 5)
             crgfx_counters_note_publish(table, 5)
-            // ... then two frames the slot refused, published all the same.
+            // ... then two frames the slot refused, which since lane fix/w3-remap-slot-erase are
+            // NOT published (there are no pixels to hand out) and are counted as refusals instead.
             crgfx_counters_note_update(table, 5, true)
-            crgfx_counters_note_publish(table, 5)
+            crgfx_counters_note_refused(table, 5)
             crgfx_counters_note_update(table, 5, true)
-            crgfx_counters_note_publish(table, 5)
+            crgfx_counters_note_refused(table, 5)
 
             let row = read(table, 5)
-            #expect(row?.updates == 3 && row?.publishes == 3)
-            #expect(row?.writes == 1)
+            #expect(row?.updates == 3 && row?.publishes == 1)
+            #expect(row?.writes == 1 && row?.refused == 2)
+            // The identity the bridge's hook maintains: every update is followed by exactly one of
+            // the two, so a frame can never leave the record by being declined.
+            #expect(row?.updates == (row?.writes ?? 0) + (row?.refused ?? 0))
             // It is its own counter, not a re-labelling of dirty/stale/erased.
             #expect(row?.dirty == 3 && row?.stale == 0 && row?.erased == 0)
+        }
+    }
+
+    @Test("a refused write is counted as a refusal, never as a write, a publish or a teardown")
+    func refusalsAreTheirOwnCounterAndClaimNoSlot() {
+        withTable { table in
+            // WHY THIS COUNTER EXISTS (lane fix/w3-remap-slot-erase). The bridge no longer publishes
+            // a frame whose slot write was declined, so `publishes` can no longer carry it and the
+            // old `writes < publishes` shape is unreachable. Without a counter of its own the frame
+            // would leave no trace at all -- worse than the shape the fix removed.
+            crgfx_counters_note_refused(table, 6)
+            #expect(read(table, 6) == nil, "a refusal alone must not claim a slot")
+
+            crgfx_counters_note_update(table, 6, true)
+            crgfx_counters_note_refused(table, 6)
+            let row = read(table, 6)
+            #expect(row?.refused == 1)
+            // Not a re-labelling of any other counter: a refusal is not a write, not a publish,
+            // not a teardown (the slot may well still be there -- all three buffers leased).
+            #expect(row?.writes == 0 && row?.publishes == 0 && row?.erased == 0)
+            #expect(row?.updates == 1 && row?.dirty == 1 && row?.stale == 0)
+
+            // Per surface id, like every other counter: the remapped-window case this lane is
+            // about is one window with several surface ids and different histories.
+            crgfx_counters_note_update(table, 7, true)
+            crgfx_counters_note_write(table, 7)
+            #expect(read(table, 7)?.refused == 0)
+            #expect(read(table, 6)?.refused == 1)
         }
     }
 
@@ -226,7 +259,7 @@ struct GfxCounterTableTests {
             #expect(row != nil, "an erase alone makes the id tracked")
             #expect(row?.erased == 1)
             #expect(row?.updates == 0 && row?.dirty == 0 && row?.writes == 0)
-            #expect(row?.publishes == 0 && row?.stale == 0)
+            #expect(row?.refused == 0 && row?.publishes == 0 && row?.stale == 0)
         }
     }
 
@@ -236,11 +269,12 @@ struct GfxCounterTableTests {
         // lost its diagnostic must keep rendering -- so every entry point tolerates NULL.
         crgfx_counters_note_update(nil, 1, true)
         crgfx_counters_note_write(nil, 1)
+        crgfx_counters_note_refused(nil, 1)
         crgfx_counters_note_publish(nil, 1)
         crgfx_counters_note_stale(nil, 1)
         crgfx_counters_note_erase(nil, 1)
         var updates: UInt64 = 7
-        #expect(crgfx_counters_read(nil, 1, &updates, nil, nil, nil, nil, nil) == false)
+        #expect(crgfx_counters_read(nil, 1, &updates, nil, nil, nil, nil, nil, nil) == false)
         #expect(updates == 7)
         crgfx_counters_destroy(nil)
     }
