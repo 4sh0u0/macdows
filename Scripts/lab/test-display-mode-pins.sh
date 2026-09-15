@@ -109,6 +109,16 @@ pin 1 "$(occ "$SWIFT_SRC" 'looks=\\\(width\)x\\\(height\)')" "ModeInfo.descripti
 # (after: after) -- both must keep the SAME `[display] after: ` prefix the wrapper's sed anchors on.
 pin 2 "$(occ "$SWIFT_SRC" 'print\("\[display\] after: ')" "[display] after: printed from exactly two call sites"
 
+echo "== display_mode.swift: --sample-line is display-free CI coverage of the grammar (hotfix after Tier 1 run 34916920114) =="
+# Exists, and is reachable before the CoreGraphics split (same guard shape as --self-test) --
+# without this, a runner with swiftc but no display builds fine and then has no `current:` line
+# for the wrapper-grammar case (gate r1 I2) to parse at all.
+pin 1 "$(occ "$SWIFT_SRC" 'subcommand == "--sample-line"')" "--sample-line subcommand exists"
+# It must print the SAME shared formatter status/select/set already use, not a private literal
+# format string of its own -- a duplicated "looks=..." here would let the sample drift out from
+# under the real grammar and still report PASS.
+pin 1 "$(occ "$SWIFT_SRC" 'print\("\[display\] current: \\\(sample\)"\)')" "--sample-line prints through the shared description formatter, not its own literal"
+
 echo "== negative: no literal that looks like a display dimension (tool files only) =="
 # Neither TOOL file may carry a "WxH"-shaped token (any digits, not just real panel sizes) -- this
 # tool's whole premise is that every size comes from the display at run time (display_mode.swift's

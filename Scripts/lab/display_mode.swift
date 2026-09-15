@@ -178,7 +178,7 @@ func runSelfTest() -> Bool {
 // MARK: - CLI
 
 func printUsage() {
-    fputs("usage: display_mode status | select 1x|2x | set 1x|2x | --self-test\n", stderr)
+    fputs("usage: display_mode status | select 1x|2x | set 1x|2x | --self-test | --sample-line\n", stderr)
 }
 
 func parseWant(_ raw: String) -> WantScale? {
@@ -198,6 +198,28 @@ if subcommand == "--self-test" {
         exit(64)
     }
     exit(runSelfTest() ? 0 : 1)
+}
+
+// --sample-line: a DISPLAY-FREE way to get one real `[display] current: …` line, for CI coverage
+// of the wrapper's own parsing (test-display-mode-offline.sh's gate r1 I2 case). Added after Tier
+// 1 run 34916920114 found a runner that HAS swiftc but no display/CoreGraphics at all: `status`
+// there built fine and then refused with "CoreGraphics is unavailable on this platform" (see the
+// `#else` branch below), producing no `current:` line for that case's extraction to parse. This
+// subcommand needs neither: the ModeInfo is synthetic (the same made-up-number family --self-test
+// uses -- never the maintainer's own panel), and the ONLY formatter that turns it into text is
+// `ModeInfo.description`, the identical one `status`/`select`/`set` use for their own `current:`
+// and `after:` lines (pinned in test-display-mode-pins.sh: a private, duplicated format string
+// here would defeat the whole point of testing the SHARED grammar). Lives entirely above the
+// `#if canImport(CoreGraphics)` split, like --self-test, so it compiles and runs identically on
+// Linux and on a Mac with no attached display.
+if subcommand == "--sample-line" {
+    guard arguments.count == 1 else {
+        printUsage()
+        exit(64)
+    }
+    let sample = ModeInfo(id: 1, width: 2222, height: 1111, pixelWidth: 4444, pixelHeight: 2222, refreshHz: 60, hidpi: true, usable: true)
+    print("[display] current: \(sample)")
+    exit(0)
 }
 
 #if canImport(CoreGraphics)

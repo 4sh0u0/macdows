@@ -465,16 +465,21 @@ else
 	fi
 fi
 
-# 18. gate r1 I2: the real helper's `[display]` line grammar, fed through the WRAPPER's OWN
-#     extraction pattern (copied verbatim from display-mode.command) rather than a fake that merely
-#     reproduces today's shape. `status`'s `current:` line and `set`'s `after:` line share the
-#     identical ModeInfo.description interpolation (test-display-mode-pins.sh pins that this is
-#     ONE shape, printed from three call sites) -- textually relabelling `current:` to `after:`
-#     therefore produces exactly what a real `after:` line looks like, without ever running `set`
-#     or touching the display. If display_mode.swift's grammar ever drifts, the wrapper's sed
-#     (unchanged here) extracts nothing and this case goes red -- exactly the gap the fakes above
-#     cannot close on their own. Reuses REAL_BIN from case 17 when it built there; builds its own
-#     otherwise (independent of whether case 17 happened to skip or fail).
+# 18. gate r1 I2 (hotfixed after Tier 1 run 34916920114): the real helper's `[display]` line
+#     grammar, fed through the WRAPPER's OWN extraction pattern (copied verbatim from
+#     display-mode.command) rather than a fake that merely reproduces today's shape.
+#     `--sample-line` is what makes this DISPLAY-FREE: the Tier 1 runner turned out to HAVE
+#     swiftc but no display/CoreGraphics, so the original version of this case (which ran the real
+#     `status`) built fine and then produced no `[display] current:` line at all -- CoreGraphics
+#     was never reached, and `status` refused with `[display] REFUSED: CoreGraphics is unavailable
+#     on this platform` instead. `--sample-line` prints one `[display] current: …` line built from
+#     a synthetic ModeInfo through the exact same `description` formatter `status`/`after:` use
+#     (test-display-mode-pins.sh pins that it is the shared one, not a private literal), entirely
+#     inside the `#if canImport(CoreGraphics)`-FREE half of the file -- so it builds and runs
+#     identically whether or not this runner has a display. Relabelling `current:` to `after:` is
+#     still how this case gets an after:-shaped line without ever calling `set`. Reuses REAL_BIN
+#     from case 17 when it built there; builds its own otherwise (independent of whether case 17
+#     happened to skip or fail).
 begin '18 the real helper line grammar, through the wrapper''s own parser (gate r1 I2)'
 if ! command -v swiftc >/dev/null 2>&1; then
 	skip "$CASE: no swiftc on this runner (Tier 1 is compile-free; run locally)"
@@ -485,8 +490,8 @@ else
 	if [ ! -x "$REAL_BIN" ]; then
 		fail "$CASE: no real helper binary available to test against"
 	else
-		REAL_STATUS_OUT="$("$REAL_BIN" status)"
-		REAL_CURRENT_LINE="$(printf '%s\n' "$REAL_STATUS_OUT" | grep -E '^\[display\] current: ')"
+		REAL_SAMPLE_OUT="$("$REAL_BIN" --sample-line)"
+		REAL_CURRENT_LINE="$(printf '%s\n' "$REAL_SAMPLE_OUT" | grep -E '^\[display\] current: ')"
 		# current: and after: share one interpolation shape (pinned); relabel to synthesise what a
 		# real after: line looks like, without ever calling `set`.
 		SYNTH_AFTER_LINE="${REAL_CURRENT_LINE/\[display\] current: /[display] after: }"
@@ -495,7 +500,7 @@ else
 		if printf '%s\n' "$EXTRACTED" | grep -qE '^[0-9]+ [0-9]+$'; then
 			pass "$CASE: the wrapper's sed extracts a real after:-shaped line from the real helper's grammar ($EXTRACTED)"
 		else
-			fail "$CASE: extraction failed against the REAL helper's line: $REAL_CURRENT_LINE"
+			fail "$CASE: extraction failed against the REAL helper's --sample-line: $REAL_CURRENT_LINE"
 		fi
 	fi
 fi
