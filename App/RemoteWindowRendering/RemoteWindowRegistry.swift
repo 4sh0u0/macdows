@@ -208,6 +208,35 @@ final class RemoteWindowRegistry {
     /// region inside the 64-aligned surface allocation; RemoteWindow.present crops the
     /// layer to it. Populated by .surfaceMapped, dropped alongside surfaceToWindow.
     private var surfaceMappedSize: [UInt32: CGSize] = [:]
+    /// MEASUREMENT ONLY (ADR-0018 §5.2 ②) -- every surface this window was EVER mapped to, ONE
+    /// entry per surface id at the position it was first mapped at, with the mapped size each
+    /// was last announced with.
+    ///
+    /// It exists because the two dictionaries above deliberately keep only the CURRENT mapping:
+    /// `.surfaceMapped` enforces windowId -> surfaceId 1:1 by deleting the previous surface's
+    /// entries, which is what makes `mappedSize(forWindowId:)` unambiguous and must not change.
+    /// The question this lane asks -- "the window was re-mapped onto a new surface; was the new
+    /// one ever drawn into, and if so where was the frame lost?" -- is about the surfaces that
+    /// deletion removes. Nothing reads this outside the diagnostic rows, and no production path
+    /// branches on it.
+    private var gfxSurfaceHistory: [UInt32: [MappedSurfaceRecord]] = [:]
+    /// MEASUREMENT ONLY (ADR-0018 §5.2 ②) -- per-surfaceId tally of what this registry did with
+    /// the frame-ready events it received. Keyed by surfaceId, not windowId, because the whole
+    /// point is to attribute a drop to ONE of a re-mapped window's surfaces; cumulative for this
+    /// registry's lifetime and never reset, matching the bridge-side counters they are printed
+    /// beside (a counter a reconnect clears cannot be read after the run that produced it).
+    ///
+    /// UNBOUNDED BY DESIGN, and here is the real bound anyway (gate r1 m-1). Both this and
+    /// `gfxSurfaceHistory` grow with the number of DISTINCT surface ids a session ever sees --
+    /// never with frames, never with time: a 60 fps stream adds nothing once the ids are known,
+    /// and a repeat mapping updates an entry rather than adding one. Per surface id that is four
+    /// `Int`s (32 bytes) here plus one `UInt32` + optional `CGSize` (~24 bytes) in the history,
+    /// i.e. well under 100 bytes with dictionary overhead; the 2026-09-15 About window's whole
+    /// life used three ids, and a ten-cycle reconnect soak a few dozen. No cap is imposed because
+    /// dropping an entry would silently delete the measurement the lane exists to take -- the
+    /// BRIDGE side has a fixed ceiling instead, for the one reason that does not apply here: it
+    /// is written from the per-frame path, where allocation is forbidden.
+    private var gfxRegistryCounters: [UInt32: GfxRegistryCounters] = [:]
     private var currentGeneration: UInt32?
     /// adr/0008 §6 / task item 5: pure-data record of the last MonitoredDesktop order, no
     /// ordering/focus policy attached. See `ServerDesktopState`'s own doc comment.
@@ -677,6 +706,30 @@ final class RemoteWindowRegistry {
                 surfaceMappedSize[event.surfaceId] = CGSize(
                     width: CGFloat(event.mappedWidth), height: CGFloat(event.mappedHeight))
             }
+            // MEASUREMENT ONLY (ADR-0018 §5.2 ②): keep a record of the surface the 1:1 cleanup
+            // above just made unfindable, so the diagnostic can still ask questions about it.
+            //
+            // ONE ROW PER SURFACE ID, AT ITS FIRST-MAPPING POSITION (gate r1 B-1, controller
+            // ruling 2026-09-15): a repeat of an id ALREADY in this window's history updates
+            // that entry in place and adds no row, wherever it sits -- not merely when it is
+            // the most recent one. The registry's counters are keyed by surfaceId, so a second
+            // row for the same id would print that surface's whole tally twice and make a
+            // column sum (per-window presents, say) double-count; `A -> B -> A` is reachable
+            // from server orders alone. Keeping the FIRST position means `order=` stays the
+            // order in which surfaces were first seen, which is the sequence the lane reasons
+            // about; the record itself is refreshed so its size is the latest announced.
+            // The size comes from `surfaceMappedSize` -- read AFTER the write above, never
+            // re-derived from the event -- so a row about the current surface can never
+            // disagree with what `[f1]` and `[edge]` read.
+            var history = gfxSurfaceHistory[windowId] ?? []
+            let record = MappedSurfaceRecord(
+                surfaceId: event.surfaceId, mappedSize: surfaceMappedSize[event.surfaceId])
+            if let existing = history.firstIndex(where: { $0.surfaceId == event.surfaceId }) {
+                history[existing] = record
+            } else {
+                history.append(record)
+            }
+            gfxSurfaceHistory[windowId] = history
             // Team-lead review round 6 (2026-08-23, maximize-scenario real-host regression
             // -- the actual root cause, after suspects 1/2/3 were each ruled out): the
             // instrumented run showed the maximize's own big WindowUpdate (windowWidth=2560
@@ -2285,17 +2338,31 @@ final class RemoteWindowRegistry {
     }
 
     private func handleFrameReady(surfaceId: UInt32) {
+        // MEASUREMENT ONLY (ADR-0018 §5.2 ②), and the reason these four counters live in this
+        // method rather than anywhere else: both `return`s below are SILENT by design, so a
+        // frame the bridge published and this registry then discarded leaves no trace at all --
+        // which is precisely the state the 2026-09-15 About window was in. Counting each exit
+        // where it happens turns "the window never showed the new surface" into a named cause.
+        gfxRegistryCounters[surfaceId, default: GfxRegistryCounters()].ready += 1
         guard let windowId = surfaceToWindow[surfaceId], let window = windows[windowId] else {
             // Either not yet bound to a window, or bound to a window this registry isn't
             // rendering (isMappableWindow filter) — either way, nothing to present;
             // see surfaceToWindow's own doc comment for why this is safe to just skip.
+            // The counter inherits that guard's own conflation of the two reasons rather than
+            // splitting it: this lane measures the existing path, it does not reshape it.
+            gfxRegistryCounters[surfaceId, default: GfxRegistryCounters()].dropUnmapped += 1
             return
         }
         guard let surface = session.copyPublishedSurface(surfaceId) else {
             // Already consumed by an earlier FrameReady for the same publish, or rejected
             // as stale-generation by CRSession itself — nothing new to display.
+            // A run where this is the only nonzero drop has a live window, a published frame
+            // and still nothing on screen -- the one shape that would point at the bridge's
+            // own lease/generation bookkeeping rather than at the server.
+            gfxRegistryCounters[surfaceId, default: GfxRegistryCounters()].dropNoSurface += 1
             return
         }
+        gfxRegistryCounters[surfaceId, default: GfxRegistryCounters()].presents += 1
         window.present(surface: surface, mappedSize: surfaceMappedSize[surfaceId], via: session)
     }
 
@@ -2415,6 +2482,140 @@ final class RemoteWindowRegistry {
     /// reads it.
     func presentCount(windowId: UInt32) -> Int? {
         windows[windowId]?.presentCount
+    }
+
+    // MARK: - GFX frame accounting (ADR-0018 §5.2 ②, measurement only)
+
+    /// One surface a window was mapped to, and the mapped sub-rect size it was announced with.
+    /// Stored per window, once per surface id, at the position that id was FIRST mapped at; see
+    /// `gfxSurfaceHistory` and the `.surfaceMapped` handler for why a repeat updates in place.
+    private struct MappedSurfaceRecord {
+        let surfaceId: UInt32
+        /// `nil` when the mapping never carried a usable size -- kept optional rather than
+        /// defaulted to zero so a row says `n/a` instead of claiming a 0x0 surface.
+        let mappedSize: CGSize?
+    }
+
+    /// What this registry did with the frame-ready events for ONE surfaceId. Every field is a
+    /// mutually exclusive outcome of `handleFrameReady`, so `ready == dropUnmapped +
+    /// dropNoSurface + presents` holds for any surface; a record where it does not is a fourth
+    /// exit somebody added without counting it.
+    private struct GfxRegistryCounters {
+        /// Frame-ready events seen for this surface, whatever became of them.
+        var ready = 0
+        /// Of those: no live window to present to (not mapped yet, or mapped to a window this
+        /// registry does not render). The existing guard does not separate those two reasons.
+        var dropUnmapped = 0
+        /// Of those: a live window, but the bridge had no surface to hand over (already
+        /// consumed, or refused as belonging to an older connection generation).
+        var dropNoSurface = 0
+        /// Of those: handed to `RemoteWindow.present`, i.e. actually shown.
+        var presents = 0
+    }
+
+    /// One printable line's worth of frame accounting for one surface of one window -- the join
+    /// of the bridge's counters (what the server drew and what the bridge published) with this
+    /// registry's (what it did with each published frame). Diagnostics only; no production path
+    /// builds or reads one.
+    struct GfxFrameRow {
+        /// The window this surface was mapped to, or `nil` for a surface that carried registry
+        /// events without ever being mapped to any window.
+        let windowId: UInt32?
+        let surfaceId: UInt32
+        /// 1-based position in this window's mapping history -- the order in which the window's
+        /// surfaces were FIRST mapped, which is the remap sequence the lane reasons about. `0`
+        /// on a row that belongs to no rendered window.
+        let order: Int
+        /// Whether this is the window's current mapping RIGHT NOW. Derived from the live
+        /// `surfaceToWindow` mapping, the same lookup `mappedSize(forWindowId:)` and `[f1]` use,
+        /// and that mapping is 1:1 per window -- so exactly one of a window's rows can say yes,
+        /// even after a re-map back to an earlier surface (gate r1 B-1).
+        let isCurrent: Bool
+        let mappedSize: CGSize?
+        /// Whether the bridge's fixed-capacity counter table had a slot for this surface. When
+        /// false the four bridge counters below are meaningless zeros and must be reported as
+        /// "not measured", never as "nothing happened".
+        let tracked: Bool
+        let updates: UInt64
+        let dirty: UInt64
+        let publishes: UInt64
+        /// Of those publishes: readiness events the drain's generation filter discarded before
+        /// this registry could see them (adr/0005 §4). Bridge-side, like the three above.
+        let stale: UInt64
+        let ready: Int
+        let dropUnmapped: Int
+        let dropNoSurface: Int
+        let presents: Int
+    }
+
+    /// Every surface `windowId` has ever been mapped to, oldest first, each joined with both
+    /// sides' counters. Empty for a window that has never been mapped to any surface.
+    ///
+    /// This is the lane's whole output surface, and it exists because no single existing
+    /// diagnostic can answer ADR-0018 §5.2 ②'s question: `[edge]`/`[edge-presents]` describe the
+    /// window's LAST PRESENTED surface, `[f1]` describes its CURRENT mapping, and a window whose
+    /// remap was never presented is precisely one where those two are different surfaces. Read-
+    /// only: allocates rows, writes no state, and calls into the session only through its
+    /// read-only counter getter.
+    func gfxFrameRows(windowId: UInt32) -> [GfxFrameRow] {
+        let history = gfxSurfaceHistory[windowId] ?? []
+        // The window's CURRENT surface, resolved once from the live 1:1 mapping rather than
+        // per record -- one lookup, one answer, so `isCurrent` is true for at most one row
+        // whatever the history contains (gate r1 B-1).
+        let currentSurfaceId = surfaceToWindow.first(where: { $0.value == windowId })?.key
+        return history.enumerated().map { index, record in
+            gfxFrameRow(
+                windowId: windowId, record: record, order: index + 1,
+                isCurrent: record.surfaceId == currentSurfaceId)
+        }
+    }
+
+    /// Surfaces that carried frame-ready events and belong to no RENDERED window, oldest id
+    /// first. Normally empty.
+    ///
+    /// Two different situations land here and the row DOES NOT DISTINGUISH THEM (gate r1 I-2):
+    /// a surface never mapped to any window at all, and one mapped to a windowId this registry
+    /// has no `RemoteWindow` for (filtered out by `isMappableWindow`, or deleted since). Both
+    /// are exactly the cases `handleFrameReady`'s first guard conflates, and both would
+    /// otherwise be printed nowhere -- the harness prints rows per LIVE window, so a surface
+    /// owned by a window that is not rendered has no line of its own. Telling the two apart
+    /// needs a windowId the row deliberately does not carry; what the row does establish is
+    /// that the frames existed and were dropped, which is the measurement the lane needs.
+    func gfxFrameOrphanRows() -> [GfxFrameRow] {
+        var ownedByRenderedWindow: Set<UInt32> = []
+        for (windowId, history) in gfxSurfaceHistory where windows[windowId] != nil {
+            for record in history { ownedByRenderedWindow.insert(record.surfaceId) }
+        }
+        return gfxRegistryCounters.keys
+            .filter { !ownedByRenderedWindow.contains($0) }
+            .sorted()
+            .map { surfaceId in
+                gfxFrameRow(
+                    windowId: nil, record: MappedSurfaceRecord(surfaceId: surfaceId, mappedSize: nil),
+                    order: 0, isCurrent: false)
+            }
+    }
+
+    /// The one place a row is built, so the mapped and the orphan shapes cannot drift apart in
+    /// what they mean by any field they share.
+    private func gfxFrameRow(
+        windowId: UInt32?, record: MappedSurfaceRecord, order: Int, isCurrent: Bool
+    ) -> GfxFrameRow {
+        var updates: UInt64 = 0
+        var dirty: UInt64 = 0
+        var publishes: UInt64 = 0
+        var stale: UInt64 = 0
+        // Left untouched by the bridge when it answers "not tracked" -- reported as such below
+        // rather than as measured zeros.
+        let tracked = session.gfxSurfaceCounters(
+            record.surfaceId, updates: &updates, dirty: &dirty, publishes: &publishes, stale: &stale)
+        let counters = gfxRegistryCounters[record.surfaceId] ?? GfxRegistryCounters()
+        return GfxFrameRow(
+            windowId: windowId, surfaceId: record.surfaceId, order: order, isCurrent: isCurrent,
+            mappedSize: record.mappedSize, tracked: tracked, updates: updates, dirty: dirty,
+            publishes: publishes, stale: stale, ready: counters.ready,
+            dropUnmapped: counters.dropUnmapped, dropNoSurface: counters.dropNoSurface,
+            presents: counters.presents)
     }
 
     /// Diagnostics only (adr/0010 §4, `Tools/window-smoke`'s popup scenario) -- `windowId`'s

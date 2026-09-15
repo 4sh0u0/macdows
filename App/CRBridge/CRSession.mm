@@ -40,6 +40,9 @@
 #include <winpr/wlog.h>
 
 #include "crdpq.h"
+/* ADR-0018 §5.2 ②: the per-surfaceId GFX frame counters this file's UpdateWindowFromSurface
+ * hook feeds. Measurement only -- nothing in the frame path reads them back. */
+#include "crgfx_counters.h"
 #include "CRSurfaceSlots.h"
 
 /* W4a review M4: callback-body logging goes through WLog (FreeRDP's own logging
@@ -453,6 +456,16 @@ typedef NS_ENUM(NSInteger, CRSessionState) {
      * lane's own post/drain ordering is the happens-before edge (adr/0005 §1), the store's
      * mutex only keeps its slot table internally consistent. */
     crdpq_icon_store_t *_iconStore;
+    /* ADR-0018 §5.2 ②, MEASUREMENT ONLY: how many times the GFX frame hook ran for each
+     * surfaceId, how many of those carried a non-empty invalid region, and how many the bridge
+     * published onward. Created once here and never cleared -- unlike _surfaceSlots/_iconStore
+     * one line up, it holds no per-connection resource, and the whole point of a counter is
+     * that it can still be read after the run that produced it (same
+     * cumulative-for-this-instance contract as -staleEventsDiscardedCount). Written on T_dvc
+     * from crb_gfx_update_window_from_surface, read on any thread through
+     * -gfxSurfaceCounters:updates:dirty:publishes:; the table's own lock is the whole
+     * synchronization story (crgfx_counters.h's threading note). */
+    crgfx_counters_t *_gfxFrameCounters;
     /* Manual-reset (W4a review H2) -- WinPR's POSIX event backend on this platform never
      * actually implements auto-reset (winpr/libwinpr/synch/event.c:279-280 logs "auto-reset
      * events not yet implemented" and creates a plain, never-auto-cleared event regardless
@@ -526,6 +539,11 @@ static CRSurfaceSlotTable *crb_surface_slots(CRBridgeContext *p)
 static crdpq_icon_store_t *crb_icon_store(CRBridgeContext *p)
 {
     return crb_session(p)->_iconStore;
+}
+
+static crgfx_counters_t *crb_gfx_counters(CRBridgeContext *p)
+{
+    return crb_session(p)->_gfxFrameCounters;
 }
 
 /* ==================================================================================== *
@@ -1308,6 +1326,19 @@ static UINT crb_gfx_update_window_from_surface(RdpgfxClientContext *context, gdi
 
         UINT32 nbRects = 0;
         const RECTANGLE_16 *wireRects = region16_rects(&surface->invalidRegion, &nbRects);
+
+        /* ADR-0018 §5.2 ②, MEASUREMENT ONLY -- the one thing only this callsite can answer:
+         * did the SERVER draw into this surface? gdi/gfx.c calls UpdateWindowFromSurface for
+         * every windowMapped surface at every EndFrame whether or not anything changed
+         * (gfx.c's gdi_UpdateSurfaces), so an entry here means "the frame ended", while a
+         * non-empty invalid region means "and this surface was part of it". A window that was
+         * remapped onto a new surface and never repainted is therefore updates > 0 with
+         * dirty == 0 -- indistinguishable, downstream, from a frame this client dropped, which
+         * is exactly the fork ADR-0018 §5.2 ② opens the lane to decide. Read before the
+         * region is consumed and cleared below; the counter table allocates nothing and takes
+         * one uncontended lock, like crsurface_table_write immediately after it. */
+        crgfx_counters_note_update(crb_gfx_counters(p), surface->surfaceId, nbRects > 0);
+
         if (nbRects > 0 && nbRects <= kMaxStackRects)
         {
             for (UINT32 i = 0; i < nbRects; i++)
@@ -1355,6 +1386,15 @@ static UINT crb_gfx_update_window_from_surface(RdpgfxClientContext *context, gdi
         ev.type = CRDPQ_EVENT_FRAME_READY;
         ev.payload.frameReady.surfaceId = surface->surfaceId;
         crdpq_post(crb_control(p), &ev);
+
+        /* ADR-0018 §5.2 ②, MEASUREMENT ONLY -- the hook's EXIT, counted separately from its
+         * entry above. The two are equal for every path this function has today, and that
+         * equality is the measurement: `updates == publishes` in a run record says the bridge
+         * forwarded every frame it was handed, so a surface the registry never presented was
+         * lost on the registry's side of the boundary or was never drawn at all -- never
+         * silently swallowed here. An edit that later returns early between the two points
+         * makes itself visible in the record instead of turning into an unexplained gap. */
+        crgfx_counters_note_publish(crb_gfx_counters(p), surface->surfaceId);
     }
 
     if (p && p->orig_UpdateWindowFromSurface)
@@ -2198,6 +2238,10 @@ static void crb_schedule_drain(void *ctx)
         /* adr/0013 §1: same lifecycle as _surfaceSlots one line up -- created once here,
          * cleared (not destroyed) by -shutdownAndWait, destroyed in -dealloc. */
         _iconStore = crdpq_icon_store_create();
+        /* ADR-0018 §5.2 ②: created with the session and never reset -- see the ivar's own
+         * comment. A NULL here (allocation failure) costs the diagnostic and nothing else;
+         * every crgfx_counters entry point tolerates it. */
+        _gfxFrameCounters = crgfx_counters_create();
     }
     return self;
 }
@@ -2251,6 +2295,14 @@ static void crb_schedule_drain(void *ctx)
     {
         crdpq_frames_destroy(_framesQueue);
         _framesQueue = NULL;
+    }
+    if (_gfxFrameCounters)
+    {
+        /* Plain counters -- no leases, no buffers, nothing that can outlive the table (the
+         * same argument -dealloc already makes for _iconStore). Destroyed only here, which is
+         * what makes "never reset for this instance's lifetime" true. */
+        crgfx_counters_destroy(_gfxFrameCounters);
+        _gfxFrameCounters = NULL;
     }
 }
 
@@ -2503,8 +2555,14 @@ cleanup:
          * the visitor -- the one piece of session state the C-level translation step needs
          * beyond the drained event itself. */
         crdpq_icon_store_t *iconStore;
+        /* ADR-0018 §5.2 ② / gate r1 I-1: the per-surface counter table, so the discard below
+         * can be attributed to the surface that lost the frame instead of only to the
+         * session-wide -staleEventsDiscardedCount. Read-only from this visitor's point of
+         * view -- the table takes its own lock, and this runs on T_main. */
+        crgfx_counters_t *gfxCounters;
     } DrainCtx;
-    DrainCtx dctx = {handler, expectedGeneration, &delivered, &discarded, &unknown, _iconStore};
+    DrainCtx dctx = {handler,  expectedGeneration, &delivered, &discarded, &unknown,
+                     _iconStore, _gfxFrameCounters};
 
     crdpq_drain(
         _controlQueue,
@@ -2513,6 +2571,15 @@ cleanup:
           if (ev->generation != dctx->expectedGeneration)
           {
               (*dctx->discarded)++;
+              /* ADR-0018 §5.2 ②, MEASUREMENT ONLY (gate r1 I-1) -- the LAST exit a published
+               * frame can take before anything downstream could see it. adr/0005 §4 discards
+               * every event left over from an older connection generation right here, so
+               * without this the per-surface record would show a publish and then silence,
+               * with no way to tell a frame discarded by a reconnect from one that never
+               * arrived. Only FRAME_READY is attributed per surface: it is the only event type
+               * whose payload names one. */
+              if (ev->type == CRDPQ_EVENT_FRAME_READY)
+                  crgfx_counters_note_stale(dctx->gfxCounters, ev->payload.frameReady.surfaceId);
               return;
           }
           CRDPEvent *event = CRDPEventFromCrdpEvent(ev, dctx->iconStore);
@@ -2581,6 +2648,20 @@ cleanup:
     /* Passthrough, same shape as -outboundPostDroppedCount above -- the counter lives in
      * the queue itself. Reads 0 once the queue is gone; see the header's caveat. */
     return _outboundQueue ? crdpq_outbound_seal_rejected_count(_outboundQueue) : 0;
+}
+
+- (BOOL)gfxSurfaceCounters:(uint32_t)surfaceId
+                   updates:(uint64_t *)updates
+                     dirty:(uint64_t *)dirty
+                 publishes:(uint64_t *)publishes
+                     stale:(uint64_t *)stale
+{
+    /* Passthrough of the session's own counter table (see the header's doc comment for what
+     * the four numbers mean and why "not tracked" is deliberately not zero). One lock, one
+     * read of all four, so a caller can never see two of them from different instants; safe
+     * from any thread, including while T_dvc is writing. */
+    return crgfx_counters_read(_gfxFrameCounters, surfaceId, updates, dirty, publishes, stale) ? YES
+                                                                                               : NO;
 }
 
 - (nullable IOSurfaceRef)copyPublishedSurface:(uint32_t)surfaceId

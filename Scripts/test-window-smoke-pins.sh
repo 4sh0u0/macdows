@@ -218,6 +218,49 @@ pin 1 "$(code_only | grep -cE '\[edge-presents\] id=\\\(windowId\)' || true)" "[
 pin 1 "$(code_only | grep -cE 'print\(EdgeProfile\.presentsLine\(' || true)" "[edge-presents] printed from one site"
 pin 1 "$(code_only | grep -cE 'registry\.presentCount\(windowId:' || true)" "one registry.presentCount call site"
 
+echo "== ADR-0018 §5.2 (2): the per-surface [gfx-frames] rows (WINDOW_SMOKE_EDGE_PROFILE) =="
+# The row is the lane's whole product and it is MEASUREMENT ONLY, so the same
+# one-place-built / one-place-printed / inside-the-knob-guard shape the [edge] lines already
+# have applies here too. `code_only` drops comment lines, so each pin anchors on a call shape
+# or on a string interpolation rather than on a name (project memory: a doc comment naming a
+# shape counts too).
+pin 1 "$(code_only | grep -cE 'static func framesLine\(row: RemoteWindowRegistry\.GfxFrameRow, at phase: Phase\)' || true)" "framesLine definition"
+# One builder for BOTH shapes -- a window's own surface and the `id=none` orphan. A second
+# `[gfx-frames]` site would be a grammar no pin governs, and the orphan shape's `id=none` comes
+# from the row itself rather than from a second format string.
+pin 1 "$(code_only | grep -cE '\[gfx-frames\] id=\\\(row\.windowId' || true)" "[gfx-frames] text built in one place"
+# shellcheck disable=SC2016  # `$0` is a Swift closure parameter inside the ERE, not shell
+pin 1 "$(code_only | grep -cE 'row\.windowId\.map \{ String\(\$0\) \} \?\? "none"' || true)" "the orphan id token comes from the row, not a second shape"
+# Printed from exactly the two loops below, both inside the sampler.
+pin 2 "$(code_only | grep -cE 'print\(EdgeProfile\.framesLine\(row: row, at: phase\)\)' || true)" "[gfx-frames] printed from the two row loops"
+pin 1 "$(code_only | grep -cE 'for row in registry\.gfxFrameRows\(windowId: snapshot\.windowId\)' || true)" "per-window rows read once, per window"
+pin 1 "$(code_only | grep -cE 'for row in registry\.gfxFrameOrphanRows\(\)' || true)" "orphan rows read once"
+# The orphan pass is finish-only: at first-frame the mapping set is still filling, so a surface
+# mapped a moment later would be printed as orphaned and then contradicted by the finish pass.
+# Checked positionally (same known brittleness as the guard pin above: a reflowed `if` makes
+# this red against correct code, which is the fail-safe direction).
+pin 1 "$(code_only | grep -A1 -E 'if phase == \.finish \{' | grep -cE 'for row in registry\.gfxFrameOrphanRows\(\)' || true)" "the orphan rows are finish-only"
+# THE KNOB PIN THAT MATTERS: with WINDOW_SMOKE_EDGE_PROFILE unset the registry must not be
+# asked for a single row. Both readers exist exactly twice in the whole file -- once each -- and
+# both of those live inside `sampleEdgeProfiles`, whose first statement is the knob guard
+# (pinned above). `-A38` spans that function's body in the comment-filtered stream; a body that
+# outgrows it makes this pin red rather than silently permissive.
+pin 2 "$(code_only | grep -cE 'registry\.gfxFrame(Rows|OrphanRows)\(' || true)" "the two row readers, called from nowhere else"
+pin 2 "$(code_only | grep -A38 -E 'private func sampleEdgeProfiles\(registry: ' | grep -cE 'registry\.gfxFrame(Rows|OrphanRows)\(' || true)" "both row readers sit inside the guarded sampler"
+# The harness reports the registry's numbers and derives none of its own: a locally computed
+# count would measure what this harness observed, not what the client did.
+pin 0 "$(code_only | grep -cE '(gfxFrameCount|framesSeen|presentsSeen)[[:space:]]*\+= 1' || true)" "no harness-side frame counter"
+# gate r1 I-1: the drain's generation filter is the last thing that can eat a published frame,
+# and it sits BETWEEN `publishes=` and `ready=` -- both that it is on the line at all and that it
+# is in that position (a key printed after `ready=` would read as a disposition of a delivered
+# frame rather than as a reason one was never delivered).
+pin 1 "$(code_only | grep -cE 'stale=\\\(row\.stale\)' || true)" "stale= built from the row"
+pin 1 "$(code_only | grep -A2 -E 'publishes=\\\(row\.publishes\)' | grep -cE '\+ " stale=\\\(row\.stale\)"' || true)" "stale= sits between publishes= and ready="
+# The declared size on the row is formatted by the same `[f1]` formatter the stale `[edge]`
+# shape uses, so a mapped size can be compared with an `[f1]` line character for character.
+# shellcheck disable=SC2016  # `$0` is a Swift closure parameter inside the ERE, not shell
+pin 1 "$(code_only | grep -cE 'mapped=\\\(row\.mappedSize\.map \{ fmtSize\(\$0\) \} \?\? "n/a"\)' || true)" "the row's mapped size uses the [f1] formatter, or says n/a"
+
 echo "== summary =="
 printf 'failures=%s\n' "$FAILURES"
 [ "$FAILURES" -eq 0 ]
