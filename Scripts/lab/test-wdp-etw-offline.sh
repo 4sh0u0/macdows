@@ -3,14 +3,17 @@
 # realtime ETW session from the test host's Windows Device Portal. The wrapper is the only thing
 # in this repo that ever holds the host's portal credential in a file, so its guards are the ones
 # that must not be allowed to rot: the fail-closed boundary gate BEFORE any credential exists, the
-# etw-job.env contract, the "an existing certificate pin is never overwritten" rule, the credential
-# file's lifecycle (0600, removed on every exit path) and the log mask that keeps etw.log
-# paste-safe. None of that is covered by test-relay-offline.sh -- the relay and the wrapper share
-# only their idioms, not a line of code.
+# etw-job.env contract, the "an existing certificate pin is never overwritten" rule (and its one
+# sanctioned exception, PIN_TRUST_ROTATION=1, which ARCHIVES a stale pin beside itself rather than
+# overwriting it -- owner ruling 2026-09-16), the credential file's lifecycle (0600, removed on
+# every exit path) and the log mask that keeps etw.log paste-safe. None of that is covered by
+# test-relay-offline.sh -- the relay and the wrapper share only their idioms, not a line of code.
 #
 # Safe in CI, by construction rather than by promise:
-#   1. `osascript`, `open`, `openssl` and `mktemp` are PATH-shimmed, and the suite ASSERTS before
-#      the first case that PATH resolves each of them to the shim. The openssl shim opens no
+#   1. `osascript`, `open`, `openssl`, `mktemp` and `date` are PATH-shimmed, and the suite ASSERTS
+#      before the first case that PATH resolves each of them to the shim. The date shim answers
+#      the rotation archive's stamp format with a FIXED stamp (so an archive's name is a known
+#      value a case can pre-create or assert on) and hands every other format to the real date. The openssl shim opens no
 #      socket; it records its argv and answers `x509` with a fixed fingerprint line. The mktemp
 #      shim records its argv and then execs the real binary, which is what turns "no credential
 #      file survives the run" into the stronger "no credential file was ever created".
@@ -42,11 +45,12 @@
 #      reached" assertion at the end covers the whole run.
 #
 # Each case starts with `begin`, which resets the per-case trace, the sandbox log and the job
-# instance, so no case depends on what the previous one left behind. Four mutation proofs
+# instance, so no case depends on what the previous one left behind. Six mutation proofs
 # (M1 gate bypassed, M2 credential removal disabled, M3 log mask disabled, M4 masking pipeline
-# reverted to block buffering) copy the wrapper with one guard removed and require the case that
-# claims to pin it to FAIL against the mutant. A pin
-# that would also pass against the broken code pins nothing.
+# reverted to block buffering, M5 line grammar removed, M6 the PIN_TRUST_ROTATION gate removed,
+# M7 the rotation's no-clobber archive link weakened to `ln -f`)
+# copy the wrapper with one guard removed and require the case that claims to pin it to FAIL
+# against the mutant. A pin that would also pass against the broken code pins nothing.
 #
 # Exit: 0 if every case passed, 1 otherwise.
 set -uo pipefail
@@ -244,6 +248,18 @@ if [ -n "\${WIN_HOST+x}" ]; then leaked="\$leaked WIN_HOST"; fi
 if [ -n "\${WIN_USER+x}" ]; then leaked="\$leaked WIN_USER"; fi
 if [ -n "\${WIN_PASS+x}" ]; then leaked="\$leaked WIN_PASS"; fi
 printf 'openssl-hostenv%s\n' "\${leaked:- <none>}" >> "\$LABTEST_TRACE"
+# LABTEST_OPENSSL_MODE=silent: the call is recorded (above) but nothing is printed -- what a
+# portal that accepts the TCP connection and then says nothing looks like to the wrapper's
+# pipeline (an empty fingerprint). Case 16g drives the rotation check into that shape.
+# LABTEST_OPENSSL_MODE=stall: s_client never returns on its own (a peer that accepts TCP and
+# stalls the handshake); it must be the wrapper's dial bound that ends it. \`exec\`, so the process
+# the alarm kills is this one and nothing is left behind. x509 then sees a closed pipe and prints
+# nothing, as the real x509 would. Case 16i measures the bound.
+if [ "\${LABTEST_OPENSSL_MODE:-}" = silent ]; then exit 0; fi
+if [ "\${LABTEST_OPENSSL_MODE:-}" = stall ]; then
+    if [ "\${1:-}" = s_client ]; then printf 'openssl-stall\n' >> "\$LABTEST_TRACE"; exec sleep 60; fi
+    exit 0
+fi
 case "\${1:-}" in
 s_client) printf 'LABTEST-STAND-IN-CERTIFICATE\n' ;;
 x509) printf 'SHA256 Fingerprint=%s\n' '$FAKE_FP' ;;
@@ -273,6 +289,23 @@ for a in "$@"; do line="$line [$a]"; done
 printf '%s\n' "$line" >> "$LABTEST_TRACE"
 exec /usr/bin/mktemp "$@"
 SHIM_MKTEMP
+# The rotation archive's UTC stamp, fixed: the wrapper names the archive
+# `<pin>.until-$(date -u +%Y%m%dT%H%M%SZ)-rotation`, and with a known stamp a case can assert the
+# exact name (16b) or pre-create it to force the no-clobber path (16h, M7). Every other date
+# format -- the wrapper's own start=/end= lines use one -- goes to the real binary by absolute
+# path (a PATH lookup from inside a PATH shim would find the shim again).
+ROTATION_STAMP='20260916T000000Z'
+cat > "$SB/bin/date" <<SHIM_DATE || exit 1
+#!/usr/bin/env bash
+# OFFLINE TEST SHIM for date(1): a fixed stamp for the rotation archive's format, the real date
+# for everything else.
+set -u
+if [ "\$#" -eq 2 ] && [ "\$1" = '-u' ] && [ "\$2" = '+%Y%m%dT%H%M%SZ' ]; then
+    printf '%s\n' '$ROTATION_STAMP'
+    exit 0
+fi
+exec /bin/date "\$@"
+SHIM_DATE
 cat > "$SB/bin/osascript" <<'SHIM_OSA' || exit 1
 #!/usr/bin/env bash
 # OFFLINE TEST SHIM: must never be reached (run-long trace, never reset).
@@ -299,7 +332,7 @@ done
 # The load-bearing safety assertion: with the sandbox PATH in force, each shimmed name MUST
 # resolve to the shim -- otherwise a case would run the maintainer's real openssl against the
 # placeholder address, or open a Terminal window. Checked before any case runs.
-for tool in openssl open osascript mktemp; do
+for tool in openssl open osascript mktemp date; do
 	resolved="$(PATH="$SB/bin:$PATH" command -v "$tool" || true)"
 	if [ "$resolved" != "$SB/bin/$tool" ]; then
 		printf 'ABORT: %s resolves to %s, not the shim\n' "$tool" "${resolved:-<nothing>}"
@@ -326,6 +359,7 @@ begin() { # <case label>
 	CASE="$1"
 	: > "$LABTEST_TRACE"
 	rm -f "$LOG" "$JOB" "$PINFILE"
+	rm -f "$PINFILE".until-* "$PINFILE".rotating.* 2>/dev/null || true
 	rm -f "$CREDGLOB"* 2>/dev/null || true
 }
 assert_has() { # <file> <fixed string>
@@ -353,15 +387,36 @@ mktemp_calls() { grep -c '^mktemp ' "$LABTEST_TRACE" 2>/dev/null || true; }
 # How many credential files exist under the sandbox TMPDIR right now. On every path the wrapper
 # takes this must be 0 after the run: either it never made one, or it removed the one it made.
 cred_files() { find "$SBTMP" -name 'macdows-etw-cred.*' -type f 2>/dev/null | wc -l | tr -d ' '; }
+# The rotation archives next to the pin file (`<pin>.until-<UTC stamp>-rotation`): how many, and
+# the path of the first. A case that rotates expects exactly one; every other case expects none.
+archive_count() { find "$SBWDP" -name 'portal-cert-sha256.txt.until-*' -type f 2>/dev/null | wc -l | tr -d ' '; }
+archive_path() { find "$SBWDP" -name 'portal-cert-sha256.txt.until-*' -type f 2>/dev/null | head -n 1; }
+# A file's permission bits, portably (macOS stat and GNU stat disagree on every flag; python3 is
+# already required by the boundary gate).
+file_mode() { python3 -c 'import os, sys; print("%04o" % (os.stat(sys.argv[1]).st_mode & 0o7777))' "$1" 2>/dev/null; }
+file_inode() { python3 -c 'import os, sys; print(os.stat(sys.argv[1]).st_ino)' "$1" 2>/dev/null; }
+# The line number in the trace at which a shim was first invoked -- for ordering claims ("the
+# dial precedes the credential file"). Empty when it never was.
+trace_first() { grep -n "^$1 " "$LABTEST_TRACE" 2>/dev/null | head -n 1 | cut -d: -f1; }
+log_count() { grep -c -- "$1" "$LOG" 2>/dev/null || true; }
 
-write_job() { # <TAG> <DURATION> <PROVIDERS> <PIN_RECORD>  (empty argument = key omitted)
+write_job() { # <TAG> <DURATION> <PROVIDERS> <PIN_RECORD> [PIN_TRUST_ROTATION]  (empty argument = key omitted)
 	{
 		if [ -n "${1:-}" ]; then printf 'TAG=%s\n' "$1"; fi
 		if [ -n "${2:-}" ]; then printf 'DURATION=%s\n' "$2"; fi
 		if [ -n "${3:-}" ]; then printf "PROVIDERS='%s'\n" "$3"; fi
 		if [ -n "${4:-}" ]; then printf 'PIN_RECORD=%s\n' "$4"; fi
+		if [ -n "${5:-}" ]; then printf 'PIN_TRUST_ROTATION=%s\n' "$5"; fi
 	} > "$JOB"
 }
+
+# The two fingerprints the rotation cases are built from. STALE_FP is a pin that the portal (the
+# openssl shim, which always answers FAKE_FP) no longer serves; the *_HEX forms are what the
+# wrapper must write and log after a rotation -- the client's own canonical form, 64 lower-case
+# hex digits (wdp_etw.py `normalise_pin`), so a rotated pin and a `got=` fingerprint read alike.
+STALE_FP='FE:ED:FA:CE:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:01:23:45:67:89:AB:CD:EF:12:34:56:78'
+FAKE_HEX="$(printf '%s' "$FAKE_FP" | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+STALE_HEX="$(printf '%s' "$STALE_FP" | tr -d ':' | tr '[:upper:]' '[:lower:]')"
 
 # The five public Microsoft provider GUIDs the shipped job uses, at level 5.
 GOOD_PROVIDERS='1139c61b-b549-4251-8ed3-27250a1edec8:5;c76baa63-ae81-421c-b425-340b4b24157f:5'
@@ -385,6 +440,7 @@ run_etw() { # <wrapper-path> <boundary-file|""> [client-rc] [client-stderr 0|1] 
 		LABTEST_CLIENT_WS_OPEN="${5:-0}" \
 		LABTEST_RUNNING_FILE="${6:-}" \
 		LABTEST_RELEASE_FILE="${7:-}" \
+		LABTEST_OPENSSL_MODE="${LABTEST_OPENSSL_MODE:-}" \
 		MACDOWS_LAB_BOUNDARY_FILE="$2" \
 		bash "$1" >/dev/null 2>&1
 }
@@ -515,6 +571,12 @@ case_invalid '12 PIN_RECORD out of range' \
 PROVIDERS='$GOOD_PROVIDERS'
 PIN_RECORD=2
 " 'JOB-ENV-INVALID -- PIN_RECORD' 'PIN_RECORD is a 0/1 switch'
+
+case_invalid '12c PIN_TRUST_ROTATION out of range' \
+	"TAG=smoke
+PROVIDERS='$GOOD_PROVIDERS'
+PIN_TRUST_ROTATION=2
+" 'JOB-ENV-INVALID -- PIN_TRUST_ROTATION' 'PIN_TRUST_ROTATION is a 0/1 switch'
 
 # 12b. A TAG that tries to climb out of .build/. TAG names two files (etw-<TAG>.jsonl and the log
 #      copy), so it is the one job value that becomes a path. The `etw-` prefix already makes
@@ -724,6 +786,30 @@ if assert_eq "$sclient" 'openssl [s_client] [-connect] [localhost:50443] [-serve
 	pass "$CASE: a DNS name is dialled unbracketed and WITH -servername, the way the client will dial it"
 fi
 
+# 15d. The recorder shares the dial -- and therefore the bound. Before this lane a PIN_RECORD=1
+#      run against a portal that accepted TCP and stalled TLS hung with no DONE line; now it ends
+#      at PIN-RECORD-FAILED inside the bound, nothing written to the pin file, no client, no
+#      credential file. Same window as 16i: at least the bound, well under the shim's 60 s.
+begin '15d pin recorder against a stalled portal is cut off by the bound'
+write_job smoke 30 "$GOOD_PROVIDERS" 1
+SECONDS=0
+LABTEST_OPENSSL_MODE=stall run_etw "$SBLAB/wdp-etw.command" ""
+elapsed=$SECONDS
+reasons=''
+grep -q '^openssl-stall$' "$LABTEST_TRACE" || reasons="$reasons the-shim-did-not-stall;"
+[ "$elapsed" -ge 10 ] || reasons="$reasons returned-in-${elapsed}s-before-the-bound-could-have-fired;"
+[ "$elapsed" -lt 45 ] || reasons="$reasons took-${elapsed}s-the-bound-did-not-fire;"
+grep -qF 'PIN-RECORD-FAILED' "$LOG" || reasons="$reasons no-record-failed-line;"
+[ "$(last_line)" = 'DONE exit=79' ] || reasons="$reasons last-line=[$(last_line)];"
+[ ! -f "$PINFILE" ] || reasons="$reasons pin-file-written=[$(cat "$PINFILE" 2>/dev/null)];"
+[ "$(client_calls)" = '0' ] || reasons="$reasons client-calls=$(client_calls);"
+[ "$(mktemp_calls)" = '0' ] || reasons="$reasons mktemp-calls=$(mktemp_calls);"
+if [ -z "$reasons" ]; then
+	pass "$CASE: the stalled recorder dial was cut off after ${elapsed}s (bound 15 s), PIN-RECORD-FAILED then PIN-MISSING, no pin written, no client, no credential file, DONE exit=79"
+else
+	fail "$CASE:$reasons"; note "log: $(tr '\n' ';' < "$LOG")"
+fi
+
 # 16. A pin that already exists is NEVER re-recorded, even when the job asks for it: re-recording
 #     against the wrong peer is the one-line way to defeat a pin, so PIN_RECORD is ignored (and
 #     logged as ignored) rather than honoured. openssl must not even be invoked.
@@ -739,6 +825,263 @@ if assert_eq "$(openssl_calls)" '0' 'openssl invocations' \
 	&& assert_eq "$(client_env "WDP_CERT_SHA256=$existing")" '1' 'the existing pin is what the client got' \
 	&& assert_eq "$(last_line)" 'DONE exit=0' 'last log line'; then
 	pass "$CASE: the existing pin is kept, openssl is never invoked, the job's PIN_RECORD=1 is logged as ignored"
+fi
+
+# 16b. PIN_TRUST_ROTATION=1 and the portal's certificate no longer matches the pin on file (owner
+#      ruling 2026-09-16 02:26 JST "the portal certificate needs no per-rotation confirmation;
+#      trust it by default"): BEFORE any credential file exists the wrapper asks the portal for its
+#      fingerprint with the SAME openssl pipeline and argv the recorder uses (case 15 pins that
+#      argv, so the rotation is shown the certificate the capture will be shown), ARCHIVES the old
+#      pin file beside itself as <pin>.until-<UTC stamp>-rotation -- byte-identical, so a rotation
+#      destroys nothing -- writes the served fingerprint as 64 lower-case hex at mode 0600, logs
+#      exactly ONE `CERT-PIN-ROTATED old= new=` line carrying both fingerprints in that same form,
+#      and continues: the client is started once, with the NEW pin, and the run ends DONE exit=0.
+begin '16b PIN_TRUST_ROTATION=1 rotates a stale pin and continues'
+mkdir -p "$SBWDP" || exit 1
+printf '%s\n' "$STALE_FP" > "$PINFILE"
+old_inode="$(file_inode "$PINFILE")"
+write_job smoke 30 "$GOOD_PROVIDERS" 0 1
+run_etw "$SBLAB/wdp-etw.command" ""
+sclient="$(grep '^openssl \[s_client\]' "$LABTEST_TRACE" | head -n 1)"
+archive="$PINFILE.until-$ROTATION_STAMP-rotation"
+reasons=''
+[ "$(openssl_calls)" = '2' ] || reasons="$reasons openssl-calls=$(openssl_calls);"
+[ "$sclient" = 'openssl [s_client] [-connect] [192.0.2.10:50443]' ] || reasons="$reasons s_client-argv=[$sclient];"
+[ "$(archive_count)" = '1' ] || reasons="$reasons archives=$(archive_count);"
+[ -f "$archive" ] || reasons="$reasons archive-not-named-by-the-stamp=[$(basename "$(archive_path)")];"
+[ "$(cat "$archive" 2>/dev/null)" = "$STALE_FP" ] || reasons="$reasons archive-body-not-the-old-pin;"
+# The archive IS the old file (same inode: a hard link, not a copy) and the pin is a new one.
+[ "$(file_inode "$archive")" = "$old_inode" ] || reasons="$reasons archive-is-not-the-old-inode;"
+[ "$(file_inode "$PINFILE")" != "$old_inode" ] || reasons="$reasons pin-file-is-still-the-old-inode;"
+# The dial precedes the credential file: the first openssl line in the trace comes before the
+# first mktemp line (the credential file is the only thing the wrapper mktemps).
+[ -n "$(trace_first openssl)" ] && [ -n "$(trace_first mktemp)" ] && [ "$(trace_first openssl)" -lt "$(trace_first mktemp)" ] || reasons="$reasons dial-not-before-credential-file(openssl@$(trace_first openssl) mktemp@$(trace_first mktemp));"
+[ "$(cat "$PINFILE" 2>/dev/null)" = "$FAKE_HEX" ] || reasons="$reasons new-pin=[$(cat "$PINFILE" 2>/dev/null)];"
+[ "$(file_mode "$PINFILE")" = '0600' ] || reasons="$reasons new-pin-mode=$(file_mode "$PINFILE");"
+grep -qF "[etw] CERT-PIN-ROTATED old=$STALE_HEX new=$FAKE_HEX" "$LOG" || reasons="$reasons no-rotated-line;"
+[ "$(log_count 'CERT-PIN-ROTATED')" = '1' ] || reasons="$reasons rotated-lines=$(log_count 'CERT-PIN-ROTATED');"
+[ "$(client_calls)" = '1' ] || reasons="$reasons client-calls=$(client_calls);"
+[ "$(client_env "WDP_CERT_SHA256=$FAKE_HEX")" = '1' ] || reasons="$reasons client-did-not-get-the-new-pin;"
+[ "$(last_line)" = 'DONE exit=0' ] || reasons="$reasons last-line=[$(last_line)];"
+[ "$(cred_files)" = '0' ] || reasons="$reasons cred-files=$(cred_files);"
+[ -z "$(find "$SBWDP" -name 'portal-cert-sha256.txt.rotating.*' 2>/dev/null)" ] || reasons="$reasons staging-file-left-behind;"
+grep -qF 'asking the portal for its certificate' "$LOG" || reasons="$reasons no-dial-line;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: the old pin hard-linked byte-identical to $(basename "$archive") before the credential file existed, the served fingerprint written as 64 lower-case hex at 0600 under a new inode, one CERT-PIN-ROTATED line, the client run once with the new pin, DONE exit=0"
+else
+	fail "$CASE:$reasons"; note "log: $(tr '\n' ';' < "$LOG")"; note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
+fi
+
+# 16c. The same stale pin WITHOUT the knob -- omitted, and then an explicit 0 -- is the behaviour
+#      the wrapper had before the knob existed, byte for byte: no pre-check dial (openssl is never
+#      invoked), the pin file untouched, nothing archived, the client started once with the OLD
+#      pin and its own CERT-PIN-MISMATCH verdict (the stub answers 79) reaching DONE exit=79. M6
+#      is the proof that this case bites when the knob's gate is removed.
+begin '16c a stale pin without the knob still ends at the client with exit 79'
+reasons=''
+for knob in '' 0; do
+	mkdir -p "$SBWDP" || exit 1
+	rm -f "$PINFILE" "$PINFILE".until-* 2>/dev/null
+	: > "$LABTEST_TRACE"
+	printf '%s\n' "$STALE_FP" > "$PINFILE"
+	write_job smoke 30 "$GOOD_PROVIDERS" 0 "$knob"
+	run_etw "$SBLAB/wdp-etw.command" "" 79
+	label="knob=[${knob:-omitted}]"
+	[ "$(openssl_calls)" = '0' ] || reasons="$reasons $label openssl-calls=$(openssl_calls);"
+	[ "$(archive_count)" = '0' ] || reasons="$reasons $label archives=$(archive_count);"
+	[ "$(cat "$PINFILE" 2>/dev/null)" = "$STALE_FP" ] || reasons="$reasons $label pin-file-changed;"
+	[ "$(client_calls)" = '1' ] || reasons="$reasons $label client-calls=$(client_calls);"
+	[ "$(client_env "WDP_CERT_SHA256=$STALE_FP")" = '1' ] || reasons="$reasons $label client-pin;"
+	[ "$(last_line)" = 'DONE exit=79' ] || reasons="$reasons $label last-line=[$(last_line)];"
+	[ "$(log_count 'ROTAT')" = '0' ] || reasons="$reasons $label rotation-lines=$(log_count 'ROTAT');"
+	[ "$(cred_files)" = '0' ] || reasons="$reasons $label cred-files=$(cred_files);"
+done
+if [ -z "$reasons" ]; then
+	pass "$CASE: with the key omitted and with PIN_TRUST_ROTATION=0 alike -- no dial, pin untouched, no archive, the client run once with the old pin, DONE exit=79, no rotation line"
+else
+	fail "$CASE:$reasons"; note "log: $(tr '\n' ';' < "$LOG")"
+fi
+
+# 16d. PIN_TRUST_ROTATION=1 with a certificate that still matches: the pre-check dials (the shim
+#      answers the pinned fingerprint), compares as VALUES -- the file holds openssl's upper-case
+#      colon form, the comparison must not be fooled by spelling -- and rotates nothing: no
+#      archive, the pin file byte-identical (its spelling included), the client handed the pin
+#      exactly as it was on file, and one line saying the certificate matched.
+begin '16d PIN_TRUST_ROTATION=1 with a matching certificate rotates nothing'
+mkdir -p "$SBWDP" || exit 1
+printf '%s\n' "$FAKE_FP" > "$PINFILE"
+write_job smoke 30 "$GOOD_PROVIDERS" 0 1
+run_etw "$SBLAB/wdp-etw.command" ""
+reasons=''
+[ "$(openssl_calls)" = '2' ] || reasons="$reasons openssl-calls=$(openssl_calls);"
+[ "$(archive_count)" = '0' ] || reasons="$reasons archives=$(archive_count);"
+[ "$(cat "$PINFILE" 2>/dev/null)" = "$FAKE_FP" ] || reasons="$reasons pin-file-changed=[$(cat "$PINFILE" 2>/dev/null)];"
+grep -qF 'PIN_TRUST_ROTATION=1 -- the portal certificate matches the pin on file' "$LOG" || reasons="$reasons no-match-line;"
+[ "$(log_count 'CERT-PIN-ROTATED')" = '0' ] || reasons="$reasons rotated-lines=$(log_count 'CERT-PIN-ROTATED');"
+[ "$(client_calls)" = '1' ] || reasons="$reasons client-calls=$(client_calls);"
+[ "$(client_env "WDP_CERT_SHA256=$FAKE_FP")" = '1' ] || reasons="$reasons client-pin;"
+[ "$(last_line)" = 'DONE exit=0' ] || reasons="$reasons last-line=[$(last_line)];"
+if [ -z "$reasons" ]; then
+	pass "$CASE: the pre-check dialled, the colon-form pin compared equal to the served fingerprint, nothing archived or rewritten, the client got the pin as written, DONE exit=0"
+else
+	fail "$CASE:$reasons"; note "log: $(tr '\n' ';' < "$LOG")"
+fi
+
+# 16e. The knob cannot rescue a pin file the wrapper cannot READ: to the wrapper an unreadable pin
+#      file is no pin (PIN-MISSING, exit 79, exactly as case 14), because rotating FROM nothing
+#      would be the unpinned run the pin exists to refuse. No dial, no archive, the file left as
+#      it was (mode included) for the operator.
+begin '16e PIN_TRUST_ROTATION=1 with an unreadable pin file is still PIN-MISSING'
+mkdir -p "$SBWDP" || exit 1
+printf '%s\n' "$STALE_FP" > "$PINFILE"
+chmod 000 "$PINFILE"
+if [ -r "$PINFILE" ]; then
+	chmod 600 "$PINFILE"
+	fail "$CASE: chmod 000 left the pin file readable (running as root?) -- this pin cannot be measured here"
+else
+	write_job smoke 30 "$GOOD_PROVIDERS" 0 1
+	run_etw "$SBLAB/wdp-etw.command" ""
+	mode_after="$(file_mode "$PINFILE")"
+	chmod 600 "$PINFILE"
+	if assert_has "$LOG" 'PIN-MISSING' && assert_eq "$(last_line)" 'DONE exit=79' 'last log line' \
+		&& assert_eq "$(openssl_calls)" '0' 'openssl invocations' \
+		&& assert_eq "$(client_calls)" '0' 'client invocations' \
+		&& assert_eq "$(mktemp_calls)" '0' 'mktemp calls (no credential file was EVER created)' \
+		&& assert_eq "$(archive_count)" '0' 'rotation archives' \
+		&& assert_eq "$mode_after" '0000' 'pin file mode after the run' \
+		&& assert_eq "$(cat "$PINFILE")" "$STALE_FP" 'pin file body after the run' \
+		&& assert_lacks "$LOG" 'ROTAT'; then
+		pass "$CASE: PIN-MISSING, DONE exit=79, no dial, no client, no archive, the unreadable file left exactly as it was"
+	fi
+fi
+
+# 16f. Nor a pin file that does not hold a fingerprint: PIN-INVALID, exit 79, exactly as case 14b.
+#      Same reason as 16e -- there is no pin to rotate FROM -- and the same "leave it for the
+#      operator" rule: the file is untouched and nothing is archived.
+begin '16f PIN_TRUST_ROTATION=1 with a malformed pin file is still PIN-INVALID'
+mkdir -p "$SBWDP" || exit 1
+printf 'not-a-fingerprint\n' > "$PINFILE"
+write_job smoke 30 "$GOOD_PROVIDERS" 0 1
+run_etw "$SBLAB/wdp-etw.command" ""
+if assert_has "$LOG" 'PIN-INVALID' && assert_eq "$(last_line)" 'DONE exit=79' 'last log line' \
+	&& assert_eq "$(openssl_calls)" '0' 'openssl invocations' \
+	&& assert_eq "$(client_calls)" '0' 'client invocations' \
+	&& assert_eq "$(mktemp_calls)" '0' 'mktemp calls (no credential file was EVER created)' \
+	&& assert_eq "$(archive_count)" '0' 'rotation archives' \
+	&& assert_eq "$(cat "$PINFILE" 2>/dev/null)" 'not-a-fingerprint' 'pin file after the run' \
+	&& assert_lacks "$LOG" 'ROTAT'; then
+	pass "$CASE: PIN-INVALID, DONE exit=79, no dial, no client, no archive, the malformed file left for the operator"
+fi
+
+# 16g. The pre-check dials and the portal does not answer (the shim records the call and prints
+#      nothing, so the pipeline yields an empty fingerprint): the wrapper must not decide on
+#      nothing. The pin on file is KEPT -- not archived, not blanked -- one line says the check
+#      failed, and the capture proceeds against the old pin so that the client's own verdict is
+#      what the run ends with (here the stub answers 79, as the real client would on a mismatch).
+begin '16g PIN_TRUST_ROTATION=1 keeps the pin when the portal returns no fingerprint'
+mkdir -p "$SBWDP" || exit 1
+printf '%s\n' "$STALE_FP" > "$PINFILE"
+write_job smoke 30 "$GOOD_PROVIDERS" 0 1
+LABTEST_OPENSSL_MODE=silent run_etw "$SBLAB/wdp-etw.command" "" 79
+reasons=''
+[ "$(openssl_calls)" = '2' ] || reasons="$reasons openssl-calls=$(openssl_calls);"
+[ "$(archive_count)" = '0' ] || reasons="$reasons archives=$(archive_count);"
+[ "$(cat "$PINFILE" 2>/dev/null)" = "$STALE_FP" ] || reasons="$reasons pin-file-changed=[$(cat "$PINFILE" 2>/dev/null)];"
+grep -qF 'PIN-ROTATION-CHECK-FAILED' "$LOG" || reasons="$reasons no-check-failed-line;"
+[ "$(log_count 'CERT-PIN-ROTATED')" = '0' ] || reasons="$reasons rotated-lines=$(log_count 'CERT-PIN-ROTATED');"
+[ "$(client_calls)" = '1' ] || reasons="$reasons client-calls=$(client_calls);"
+[ "$(client_env "WDP_CERT_SHA256=$STALE_FP")" = '1' ] || reasons="$reasons client-pin;"
+[ "$(last_line)" = 'DONE exit=79' ] || reasons="$reasons last-line=[$(last_line)];"
+[ "$(cred_files)" = '0' ] || reasons="$reasons cred-files=$(cred_files);"
+if [ -z "$reasons" ]; then
+	pass "$CASE: the silent dial is logged as PIN-ROTATION-CHECK-FAILED, the old pin kept and handed to the client, whose 79 is the run's verdict"
+else
+	fail "$CASE:$reasons"; note "log: $(tr '\n' ';' < "$LOG")"
+fi
+
+# 16h. The archive name is already taken (a second rotation inside the same UTC second, or an
+#      operator's own file): the wrapper must clobber NOTHING. `ln` refuses an existing target, so
+#      the rotation fails closed -- PIN-ROTATION-FAILED, the sentinel in the archive untouched,
+#      the OLD pin still the pin (same bytes, same inode), no staging file left -- and the capture
+#      proceeds against the old pin, whose mismatch the client then reports (the stub answers 79).
+#      This is the case that pins the mechanism: `mv` (which would rename over the sentinel) and
+#      `ln -f` (M7) both turn it red, and it is the only coverage the PIN-ROTATION-FAILED branch has.
+begin '16h an archive name already taken fails the rotation closed'
+mkdir -p "$SBWDP" || exit 1
+printf '%s\n' "$STALE_FP" > "$PINFILE"
+old_inode="$(file_inode "$PINFILE")"
+archive="$PINFILE.until-$ROTATION_STAMP-rotation"
+printf 'LABTEST-EARLIER-ARCHIVE-SENTINEL\n' > "$archive"
+write_job smoke 30 "$GOOD_PROVIDERS" 0 1
+run_etw "$SBLAB/wdp-etw.command" "" 79
+reasons=''
+[ "$(openssl_calls)" = '2' ] || reasons="$reasons openssl-calls=$(openssl_calls);"
+[ "$(cat "$archive" 2>/dev/null)" = 'LABTEST-EARLIER-ARCHIVE-SENTINEL' ] || reasons="$reasons earlier-archive-clobbered=[$(cat "$archive" 2>/dev/null)];"
+[ "$(archive_count)" = '1' ] || reasons="$reasons archives=$(archive_count);"
+[ "$(cat "$PINFILE" 2>/dev/null)" = "$STALE_FP" ] || reasons="$reasons pin-file-changed=[$(cat "$PINFILE" 2>/dev/null)];"
+[ "$(file_inode "$PINFILE")" = "$old_inode" ] || reasons="$reasons pin-file-replaced;"
+grep -qF 'PIN-ROTATION-FAILED' "$LOG" || reasons="$reasons no-rotation-failed-line;"
+[ "$(log_count 'CERT-PIN-ROTATED')" = '0' ] || reasons="$reasons rotated-lines=$(log_count 'CERT-PIN-ROTATED');"
+[ -z "$(find "$SBWDP" -name 'portal-cert-sha256.txt.rotating.*' 2>/dev/null)" ] || reasons="$reasons staging-file-left-behind;"
+[ "$(client_calls)" = '1' ] || reasons="$reasons client-calls=$(client_calls);"
+[ "$(client_env "WDP_CERT_SHA256=$STALE_FP")" = '1' ] || reasons="$reasons client-pin;"
+[ "$(last_line)" = 'DONE exit=79' ] || reasons="$reasons last-line=[$(last_line)];"
+if [ -z "$reasons" ]; then
+	pass "$CASE: PIN-ROTATION-FAILED, the earlier archive's sentinel intact, the old pin still the pin (same inode), no staging file, the client run once with the old pin, DONE exit=79"
+else
+	fail "$CASE:$reasons"; note "log: $(tr '\n' ';' < "$LOG")"
+fi
+
+# 16i. The dial is BOUNDED. The stalled shim never returns on its own (\`exec sleep 60\`), so the
+#      only way the wrapper reaches its DONE line inside this case's budget is the alarm the
+#      trampoline armed before it exec'd openssl. Measured as elapsed wall time around the run:
+#      well under the shim's 60 s and at least the bound itself (a run that came back sooner did
+#      not dial at all -- the trace's openssl-stall line says it did). The outcome is 16g's: no
+#      fingerprint, pin kept, the client decides.
+begin '16i a dial that stalls is cut off by the bound and the pin is kept'
+mkdir -p "$SBWDP" || exit 1
+printf '%s\n' "$STALE_FP" > "$PINFILE"
+write_job smoke 30 "$GOOD_PROVIDERS" 0 1
+SECONDS=0
+LABTEST_OPENSSL_MODE=stall run_etw "$SBLAB/wdp-etw.command" "" 79
+elapsed=$SECONDS
+reasons=''
+grep -q '^openssl-stall$' "$LABTEST_TRACE" || reasons="$reasons the-shim-did-not-stall;"
+[ "$elapsed" -ge 10 ] || reasons="$reasons returned-in-${elapsed}s-before-the-bound-could-have-fired;"
+[ "$elapsed" -lt 45 ] || reasons="$reasons took-${elapsed}s-the-bound-did-not-fire;"
+[ "$(last_line)" = 'DONE exit=79' ] || reasons="$reasons last-line=[$(last_line)];"
+grep -qF 'PIN-ROTATION-CHECK-FAILED' "$LOG" || reasons="$reasons no-check-failed-line;"
+[ "$(archive_count)" = '0' ] || reasons="$reasons archives=$(archive_count);"
+[ "$(cat "$PINFILE" 2>/dev/null)" = "$STALE_FP" ] || reasons="$reasons pin-file-changed;"
+[ "$(client_calls)" = '1' ] || reasons="$reasons client-calls=$(client_calls);"
+[ "$(client_env "WDP_CERT_SHA256=$STALE_FP")" = '1' ] || reasons="$reasons client-pin;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: the stalled dial was cut off after ${elapsed}s (bound 15 s, shim would have slept 60 s), PIN-ROTATION-CHECK-FAILED, the pin kept, DONE exit=79"
+else
+	fail "$CASE:$reasons"; note "log: $(tr '\n' ';' < "$LOG")"
+fi
+
+# 16j. PIN_RECORD=1 and PIN_TRUST_ROTATION=1 together, with a stale pin on file: the rotation runs
+#      (the pin exists), the recorder does not (a pin exists -- and after the rotation still
+#      does), so the portal is dialled ONCE: openssl_calls is 2, not 4. The recorder's "ignored"
+#      line and the rotation's line both appear.
+begin '16j PIN_RECORD=1 alongside PIN_TRUST_ROTATION=1 dials once'
+mkdir -p "$SBWDP" || exit 1
+printf '%s\n' "$STALE_FP" > "$PINFILE"
+write_job smoke 30 "$GOOD_PROVIDERS" 1 1
+run_etw "$SBLAB/wdp-etw.command" ""
+reasons=''
+[ "$(openssl_calls)" = '2' ] || reasons="$reasons openssl-calls=$(openssl_calls);"
+[ "$(log_count 'PIN_RECORD=1 ignored')" = '1' ] || reasons="$reasons ignored-lines=$(log_count 'PIN_RECORD=1 ignored');"
+[ "$(log_count 'CERT-PIN-ROTATED')" = '1' ] || reasons="$reasons rotated-lines=$(log_count 'CERT-PIN-ROTATED');"
+[ "$(log_count 'recording the portal certificate pin')" = '0' ] || reasons="$reasons recorder-ran;"
+[ "$(cat "$PINFILE" 2>/dev/null)" = "$FAKE_HEX" ] || reasons="$reasons new-pin=[$(cat "$PINFILE" 2>/dev/null)];"
+[ "$(client_env "WDP_CERT_SHA256=$FAKE_HEX")" = '1' ] || reasons="$reasons client-pin;"
+[ "$(last_line)" = 'DONE exit=0' ] || reasons="$reasons last-line=[$(last_line)];"
+if [ -z "$reasons" ]; then
+	pass "$CASE: one dial (openssl_calls=2), PIN_RECORD=1 logged as ignored, one CERT-PIN-ROTATED line, the recorder never ran, DONE exit=0"
+else
+	fail "$CASE:$reasons"; note "log: $(tr '\n' ';' < "$LOG")"
 fi
 
 # 17. The happy path, pinned element by element: this argument list IS the wrapper's contract with
@@ -1329,9 +1672,60 @@ else
 	fail "$CASE: could not build the mutant (the grammar's elif moved?)"
 fi
 
+# M6. The PIN_TRUST_ROTATION gate removed (the rotation block's `[ "$PIN_TRUST_ROTATION" = "1" ] &&`
+#     deleted, so the pre-check and the rotation run for EVERY job that has a valid pin): case
+#     16c's scenario -- a stale pin and no knob -- must now dial and rotate, i.e. 16c's "no
+#     openssl call, no archive, pin untouched" pins bite. This is the proof that the knob is what
+#     admits the rotation, not merely what names it.
+begin 'M6 rotation-gate mutant'
+MUTANT_ROTATE="$SBLAB/labtest-mutant-rotate.command"
+# shellcheck disable=SC2016  # deliberate literal `$PIN_TRUST_ROTATION` / `$PIN_BAD` for sed
+if sed 's/if \[ "\$PIN_TRUST_ROTATION" = "1" \] && \[ "\$PIN_BAD" -eq 0 \]/if [ "$PIN_BAD" -eq 0 ]/' \
+	"$SBLAB/wdp-etw.command" > "$MUTANT_ROTATE" \
+	&& ! cmp -s "$MUTANT_ROTATE" "$SBLAB/wdp-etw.command" && bash -n "$MUTANT_ROTATE"; then
+	mkdir -p "$SBWDP" || exit 1
+	printf '%s\n' "$STALE_FP" > "$PINFILE"
+	write_job smoke 30 "$GOOD_PROVIDERS" 0
+	run_etw "$MUTANT_ROTATE" "" 79
+	if [ "$(openssl_calls)" = '2' ] && [ "$(archive_count)" = '1' ] && [ "$(cat "$PINFILE" 2>/dev/null)" = "$FAKE_HEX" ]; then
+		pass "$CASE: detected -- without the gate a job with no knob dials, archives and rewrites the pin (case 16c pins the gate)"
+	else
+		fail "$CASE: NOT detected -- case 16c would pass against a wrapper that rotates without the knob (openssl=$(openssl_calls) archives=$(archive_count))"
+		note "log: $(tr '\n' ';' < "$LOG")"
+	fi
+else
+	fail "$CASE: could not build the mutant (the rotation guard line moved?)"
+fi
+
+# M7. The no-clobber archive link weakened (`ln` -> `ln -f`): case 16h's pre-created archive must
+#     now be overwritten by the old pin and the rotation must go through -- i.e. 16h's "sentinel
+#     intact / PIN-ROTATION-FAILED / old pin still the pin" pins bite. (`mv` in that line fails
+#     16h the same way, by renaming over the sentinel; one mutant suffices to show the case bites.)
+begin 'M7 archive no-clobber mutant'
+MUTANT_LN="$SBLAB/labtest-mutant-ln.command"
+# shellcheck disable=SC2016  # deliberate literal `$PINFILE` / `$ARCHIVE` for sed
+if sed 's/&& ln "\$PINFILE" "\$ARCHIVE" 2>\/dev\/null/\&\& ln -f "$PINFILE" "$ARCHIVE" 2>\/dev\/null/' \
+	"$SBLAB/wdp-etw.command" > "$MUTANT_LN" \
+	&& ! cmp -s "$MUTANT_LN" "$SBLAB/wdp-etw.command" && bash -n "$MUTANT_LN"; then
+	mkdir -p "$SBWDP" || exit 1
+	printf '%s\n' "$STALE_FP" > "$PINFILE"
+	archive="$PINFILE.until-$ROTATION_STAMP-rotation"
+	printf 'LABTEST-EARLIER-ARCHIVE-SENTINEL\n' > "$archive"
+	write_job smoke 30 "$GOOD_PROVIDERS" 0 1
+	run_etw "$MUTANT_LN" "" 79
+	if [ "$(cat "$archive" 2>/dev/null)" = "$STALE_FP" ] && [ "$(cat "$PINFILE" 2>/dev/null)" = "$FAKE_HEX" ] && grep -qF 'CERT-PIN-ROTATED' "$LOG"; then
+		pass "$CASE: detected -- ln -f overwrote the earlier archive's sentinel with the old pin and the rotation went through (case 16h pins the no-clobber link)"
+	else
+		fail "$CASE: NOT detected -- case 16h would pass against a wrapper that clobbers an existing archive (archive=[$(cat "$archive" 2>/dev/null)] pin=[$(cat "$PINFILE" 2>/dev/null)])"
+		note "log: $(tr '\n' ';' < "$LOG")"
+	fi
+else
+	fail "$CASE: could not build the mutant (the ln line moved?)"
+fi
+
 # Every case must have reported: a case that neither passed nor failed would otherwise vanish
 # from the tally with exit 0. Placed after the LAST case on purpose.
-EXPECTED_CASES=41
+EXPECTED_CASES=54
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi
