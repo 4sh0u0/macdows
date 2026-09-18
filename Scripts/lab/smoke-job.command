@@ -53,10 +53,20 @@
 #                    arithmetic assumes an exact 2x display is unjudgeable on any other display
 #   ADVERTISED_SCALE D (default) | none | DD | <desktop>[,<device>] -- see smoke_scale_ok
 #   MOVE MAXIMIZE TRAY TRAY_CLICK   0|1, each mapping to the WINDOW_SMOKE_<name> scenario switch
+#   MOVE_KEEP        0|1 -- WINDOW_SMOKE_MOVE_KEEP. 1 suppresses BOTH of the move/resize
+#                    scenario's SC_CLOSEs of its locked target and nothing else, so the window is
+#                    still there for a host-side probe run afterwards (ADR-0018 §5.2 增补二 item
+#                    2's acceptance form). Absent or 0 leaves the knob unset, i.e. today's
+#                    unconditional close. A run that keeps its target does NOT clean up after
+#                    itself; the orchestration's logoff does
 #   EXTRA_APPS       ^[A-Za-z0-9;_-]*$ -- WINDOW_SMOKE_EXTRA_APPS
 #   MOVE_TARGET      window-title substring/alternation for the move leg, at most 255 characters
 #                    (free text otherwise, so only the two shell-active characters are refused; it
-#                    carries CJK by design)
+#                    carries CJK by design). EMPTY selects the harness's About-dialog heuristic
+#                    rather than "no preference", so under MOVE=1 it is admitted ONLY when TAG
+#                    contains `about` (any case): the emptiness decides which WINDOW ROW of the
+#                    border table the run measures, and a job named for another row would
+#                    otherwise file an About-row measurement under that name
 #   APP APP_ARGS     the Windows program and its arguments (ASCII path/argument characters only)
 #   REQUIRE_SYMBOL   ^[A-Za-z0-9_]{1,64}$ or empty; non-empty: Tools/window-smoke/main.swift must
 #                    contain it, else the run is REFUSED. The c2p-run<n> preflight: a knob this run
@@ -133,7 +143,7 @@ TAG_OK=0
 # would still expand inside them. A trailing `\"` can still continue a double-quoted value onto the
 # next line; that is the one shape this grammar cannot see, and it is what the sentinel below is
 # for. Assembled from pieces because the alternatives contain both kinds of quote.
-SMOKE_JOB_KEYS_RE='TAG|BATCH|DISPLAY_LOOKS_LIKE|ADVERTISED_SCALE|MOVE|MAXIMIZE|TRAY|TRAY_CLICK|EDGE_PROFILE|EXTRA_APPS|MOVE_TARGET|APP|APP_ARGS|REQUIRE_SYMBOL'
+SMOKE_JOB_KEYS_RE='TAG|BATCH|DISPLAY_LOOKS_LIKE|ADVERTISED_SCALE|MOVE|MAXIMIZE|TRAY|TRAY_CLICK|EDGE_PROFILE|EXTRA_APPS|MOVE_TARGET|MOVE_KEEP|APP|APP_ARGS|REQUIRE_SYMBOL'
 SMOKE_SQ="'"
 SMOKE_VALUE_BARE='[A-Za-z0-9._:,%@=+/-]*'
 SMOKE_VALUE_DQ='"[^"$`]*"'
@@ -143,7 +153,7 @@ SMOKE_JOB_LINE_RE="^[[:space:]]*(#.*)?\$|^(export )?(${SMOKE_JOB_KEYS_RE})=(${SM
 # from the environment and only the ones the job selected put back: a knob inherited from whatever
 # shell opened Terminal would otherwise turn a run silently, and "ADVERTISED_SCALE=D means the knob
 # is UNSET" is a statement about the child's environment that only holds if this list is complete.
-SMOKE_MANAGED_VARS='WINDOW_SMOKE_LOG WINDOW_SMOKE_ADVERTISED_SCALE WINDOW_SMOKE_MOVE WINDOW_SMOKE_MAXIMIZE WINDOW_SMOKE_TRAY WINDOW_SMOKE_TRAY_CLICK WINDOW_SMOKE_EDGE_PROFILE WINDOW_SMOKE_EXTRA_APPS WINDOW_SMOKE_MOVE_TARGET WINDOW_SMOKE_APP WINDOW_SMOKE_APP_ARGS'
+SMOKE_MANAGED_VARS='WINDOW_SMOKE_LOG WINDOW_SMOKE_ADVERTISED_SCALE WINDOW_SMOKE_MOVE WINDOW_SMOKE_MAXIMIZE WINDOW_SMOKE_TRAY WINDOW_SMOKE_TRAY_CLICK WINDOW_SMOKE_EDGE_PROFILE WINDOW_SMOKE_EXTRA_APPS WINDOW_SMOKE_MOVE_TARGET WINDOW_SMOKE_MOVE_KEEP WINDOW_SMOKE_APP WINDOW_SMOKE_APP_ARGS'
 
 # BRE-escapes a value so it can be used as a sed pattern. WIN_HOST is normally an IP literal, and
 # its dots would otherwise match any character -- close enough to look right and wrong enough to
@@ -301,10 +311,10 @@ else
     # The line NUMBER is reported, never the line: an offending line may be exactly the secret.
     BAD_LINE="$(tr -d '\r' < "$JOB" | grep -nvE "$SMOKE_JOB_LINE_RE" | head -n 1 | cut -d: -f1)"
     if [ -n "$BAD_LINE" ]; then
-        smoke_log "[smoke] JOB-ENV-INVALID -- line $BAD_LINE of smoke-job.env is neither blank, a comment, nor an assignment of a SINGLE WORD to one of the permitted keys (TAG BATCH DISPLAY_LOOKS_LIKE ADVERTISED_SCALE MOVE MAXIMIZE TRAY TRAY_CLICK EDGE_PROFILE EXTRA_APPS MOVE_TARGET APP APP_ARGS REQUIRE_SYMBOL); a value carrying a space, a separator or a backslash must be quoted, or the shell reads what follows it as a command; and a comment must be on a line of its own -- an assignment may not be followed by one, quoted or not. The line itself is not quoted here because it may BE the value that must not be printed. No run attempted"
+        smoke_log "[smoke] JOB-ENV-INVALID -- line $BAD_LINE of smoke-job.env is neither blank, a comment, nor an assignment of a SINGLE WORD to one of the permitted keys (TAG BATCH DISPLAY_LOOKS_LIKE ADVERTISED_SCALE MOVE MAXIMIZE TRAY TRAY_CLICK EDGE_PROFILE EXTRA_APPS MOVE_TARGET MOVE_KEEP APP APP_ARGS REQUIRE_SYMBOL); a value carrying a space, a separator or a backslash must be quoted, or the shell reads what follows it as a command; and a comment must be on a line of its own -- an assignment may not be followed by one, quoted or not. The line itself is not quoted here because it may BE the value that must not be printed. No run attempted"
         SMOKE_RC=65
     else
-        # STEP 2: one subshell, fourteen keys out plus a sentinel (the keys are single-line by
+        # STEP 2: one subshell, fifteen keys out plus a sentinel (the keys are single-line by
         # contract). The job instance is a per-run file under .build/ and is never sourced into
         # THIS shell: it is executed once, in a subshell, and only its keys come back out. That
         # isolates what the job can WRITE -- its variables, functions, traps and `exit` die with
@@ -324,16 +334,17 @@ else
         # reached a program which reads stdin would otherwise block this wrapper FOREVER -- no DONE
         # line, and every orchestrator polling for one waits out its full timeout.
         # shellcheck source=/dev/null
-        JOB_KEYS="$( . "$JOB" >/dev/null 2>&1 </dev/null; printf '%s\n' "${TAG:-}" "${BATCH:-}" "${DISPLAY_LOOKS_LIKE:-}" "${ADVERTISED_SCALE:-}" "${MOVE:-}" "${MAXIMIZE:-}" "${TRAY:-}" "${TRAY_CLICK:-}" "${EXTRA_APPS:-}" "${MOVE_TARGET:-}" "${APP:-}" "${APP_ARGS:-}" "${REQUIRE_SYMBOL:-}" "${EDGE_PROFILE:-}" 'END-OF-JOB-KEYS' )"
+        JOB_KEYS="$( . "$JOB" >/dev/null 2>&1 </dev/null; printf '%s\n' "${TAG:-}" "${BATCH:-}" "${DISPLAY_LOOKS_LIKE:-}" "${ADVERTISED_SCALE:-}" "${MOVE:-}" "${MAXIMIZE:-}" "${TRAY:-}" "${TRAY_CLICK:-}" "${EXTRA_APPS:-}" "${MOVE_TARGET:-}" "${APP:-}" "${APP_ARGS:-}" "${REQUIRE_SYMBOL:-}" "${EDGE_PROFILE:-}" "${MOVE_KEEP:-}" 'END-OF-JOB-KEYS' )"
         TAG=""; BATCH=""; DISPLAY_LOOKS_LIKE=""; ADVERTISED_SCALE=""; MOVE=""; MAXIMIZE=""
         TRAY=""; TRAY_CLICK=""; EXTRA_APPS=""; MOVE_TARGET=""; APP=""; APP_ARGS=""
-        REQUIRE_SYMBOL=""; EDGE_PROFILE=""; JOB_KEYS_END=""
+        REQUIRE_SYMBOL=""; EDGE_PROFILE=""; MOVE_KEEP=""; JOB_KEYS_END=""
         {
             IFS= read -r TAG; IFS= read -r BATCH; IFS= read -r DISPLAY_LOOKS_LIKE
             IFS= read -r ADVERTISED_SCALE; IFS= read -r MOVE; IFS= read -r MAXIMIZE
             IFS= read -r TRAY; IFS= read -r TRAY_CLICK; IFS= read -r EXTRA_APPS
             IFS= read -r MOVE_TARGET; IFS= read -r APP; IFS= read -r APP_ARGS
-            IFS= read -r REQUIRE_SYMBOL; IFS= read -r EDGE_PROFILE; IFS= read -r JOB_KEYS_END
+            IFS= read -r REQUIRE_SYMBOL; IFS= read -r EDGE_PROFILE; IFS= read -r MOVE_KEEP
+            IFS= read -r JOB_KEYS_END
         } <<EOF_JOB_KEYS
 $JOB_KEYS
 EOF_JOB_KEYS
@@ -343,6 +354,7 @@ EOF_JOB_KEYS
         TRAY="${TRAY//$CR/}"; TRAY_CLICK="${TRAY_CLICK//$CR/}"; EXTRA_APPS="${EXTRA_APPS//$CR/}"
         MOVE_TARGET="${MOVE_TARGET//$CR/}"; APP="${APP//$CR/}"; APP_ARGS="${APP_ARGS//$CR/}"
         REQUIRE_SYMBOL="${REQUIRE_SYMBOL//$CR/}"; EDGE_PROFILE="${EDGE_PROFILE//$CR/}"
+        MOVE_KEEP="${MOVE_KEEP//$CR/}"
         JOB_KEYS_END="${JOB_KEYS_END//$CR/}"
         # Defaults. ADVERTISED_SCALE's is D because that is what an ABSENT knob means to the child
         # (product default, ADR-0018 U-1) -- the job file says D to say "do not turn it", and an
@@ -353,6 +365,11 @@ EOF_JOB_KEYS
         # default is OFF for the same reason the child's is -- a run that did not ask to measure
         # must be byte-identical to one built before the diagnostic existed.
         EDGE_PROFILE="${EDGE_PROFILE:-0}"
+        # MOVE_KEEP is the route-B acceptance knob (WINDOW_SMOKE_MOVE_KEEP), and its default is
+        # OFF for the same reason EDGE_PROFILE's is, with one extra consequence: a run that did
+        # not ask to keep its target must CLOSE it, or it leaves a window on the host for the
+        # next run's target lock to find.
+        MOVE_KEEP="${MOVE_KEEP:-0}"
         # TAG's verdict is computed once, here, and reused by the log-copy step at the very bottom.
         if [ "$JOB_KEYS_END" = "END-OF-JOB-KEYS" ] && printf '%s\n' "$TAG" | grep -qE '^[A-Za-z0-9._-]{1,32}$'; then
             TAG_OK=1
@@ -390,6 +407,9 @@ EOF_JOB_KEYS
         elif ! printf '%s\n' "$EDGE_PROFILE" | grep -qE '^[01]$'; then
             smoke_log "[smoke] JOB-ENV-INVALID -- EDGE_PROFILE must be 0 or 1 (1 sets WINDOW_SMOKE_EDGE_PROFILE=1, the O-A measurement-only edge/corner profile; absent or 0 leaves the knob unset); no run attempted"
             SMOKE_RC=65
+        elif ! printf '%s\n' "$MOVE_KEEP" | grep -qE '^[01]$'; then
+            smoke_log "[smoke] JOB-ENV-INVALID -- MOVE_KEEP must be 0 or 1 (1 sets WINDOW_SMOKE_MOVE_KEEP=1, which suppresses both of the move/resize scenario's closes of its locked target so the target survives the run; absent or 0 leaves the knob unset); no run attempted"
+            SMOKE_RC=65
         elif ! printf '%s\n' "$EXTRA_APPS" | grep -qE '^[A-Za-z0-9;_-]*$'; then
             smoke_log "[smoke] JOB-ENV-INVALID -- EXTRA_APPS must match ^[A-Za-z0-9;_-]*\$ (the child splits it on ';'); no run attempted"
             SMOKE_RC=65
@@ -399,6 +419,23 @@ EOF_JOB_KEYS
             # forwards has a stated ceiling, so "how long can a job file's value be" has one answer
             # instead of two, and a window title that ran away is refused at the definition.
             smoke_log "[smoke] JOB-ENV-INVALID -- MOVE_TARGET must be at most 255 characters and must not contain '\$' or a backtick (it is free text otherwise, and carries CJK titles by design); no run attempted"
+            SMOKE_RC=65
+        elif [ "$MOVE" = '1' ] && [ -z "$MOVE_TARGET" ] && ! printf '%s\n' "$TAG" | grep -qi 'about'; then
+            # An EMPTY MOVE_TARGET is not "no preference": it selects the harness's About-dialog
+            # heuristic, which locks the base app's own dialog. So the emptiness decides WHICH
+            # WINDOW ROW the run measures -- and that is the axis the 192-DPI border table is
+            # built on (ADR-0018 §5.2 增补二 item 2: About 11, THICKFRAME 10). A job whose TAG
+            # names another row and whose filter is empty measures the About row under that row's
+            # name, reports DONE exit=0, and NOTHING in its evidence says so: the log carries the
+            # locked window's own title, but the record is filed under the TAG.
+            # Found by the route-B gate r1 (2026-09-18) by mutation: emptying the tracked
+            # THICKFRAME job's filter left every offline check green.
+            # The rule is on the VALUE, so a job that never wrote the key is refused here too;
+            # that a job which MAY be empty must still write the key out is a separate rule, and
+            # it lives in test-smoke-job-offline.sh where the file's TEXT is readable (sourcing
+            # cannot tell "set to empty" from "never set"). TAG is matched case-insensitively and
+            # anywhere in the value, because the tracked About jobs spell it `…-mkeep-about`.
+            smoke_log "[smoke] JOB-ENV-INVALID -- MOVE=1 with an empty MOVE_TARGET selects the About-dialog heuristic, so only a job that DECLARES the About row may leave it empty: TAG must contain 'about' (any case). A job named for any other window row must carry the filter that selects that row, or the run measures the About row under this job's name and no artefact of the run contradicts it; no run attempted"
             SMOKE_RC=65
         elif ! smoke_ascii_arg_ok "$APP" || ! smoke_ascii_arg_ok "$APP_ARGS"; then
             smoke_log "[smoke] JOB-ENV-INVALID -- APP and APP_ARGS must be <=255 Windows path/argument characters (letters, digits, space and . _ : % ( ) + , @ = * ? \\ / -); no run attempted"
@@ -454,11 +491,12 @@ EOF_JOB_KEYS
             if [ "$TRAY" = '1' ]; then CHILD_ENV+=('WINDOW_SMOKE_TRAY=1'); fi
             if [ "$TRAY_CLICK" = '1' ]; then CHILD_ENV+=('WINDOW_SMOKE_TRAY_CLICK=1'); fi
             if [ "$EDGE_PROFILE" = '1' ]; then CHILD_ENV+=('WINDOW_SMOKE_EDGE_PROFILE=1'); fi
+            if [ "$MOVE_KEEP" = '1' ]; then CHILD_ENV+=('WINDOW_SMOKE_MOVE_KEEP=1'); fi
             if [ -n "$EXTRA_APPS" ]; then CHILD_ENV+=("WINDOW_SMOKE_EXTRA_APPS=$EXTRA_APPS"); fi
             if [ -n "$MOVE_TARGET" ]; then CHILD_ENV+=("WINDOW_SMOKE_MOVE_TARGET=$MOVE_TARGET"); fi
             if [ -n "$APP" ]; then CHILD_ENV+=("WINDOW_SMOKE_APP=$APP"); fi
             if [ -n "$APP_ARGS" ]; then CHILD_ENV+=("WINDOW_SMOKE_APP_ARGS=$APP_ARGS"); fi
-            smoke_log "[smoke] run tag=$TAG batch=$BATCH advertised_scale=$ADVERTISED_SCALE move=$MOVE maximize=$MAXIMIZE tray=$TRAY tray_click=$TRAY_CLICK edge_profile=$EDGE_PROFILE extra_apps=${EXTRA_APPS:-<none>} start=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            smoke_log "[smoke] run tag=$TAG batch=$BATCH advertised_scale=$ADVERTISED_SCALE move=$MOVE maximize=$MAXIMIZE tray=$TRAY tray_click=$TRAY_CLICK edge_profile=$EDGE_PROFILE move_keep=$MOVE_KEEP extra_apps=${EXTRA_APPS:-<none>} start=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             smoke_log "[smoke] evidence log: $WS_LOG"
             # The launcher's stdout/stderr is piped into smoke.log so a human polling this wrapper
             # sees the build and the gate live -- hence PIPESTATUS rather than $?, which would be

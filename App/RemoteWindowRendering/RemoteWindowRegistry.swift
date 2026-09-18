@@ -417,6 +417,25 @@ final class RemoteWindowRegistry {
     private static var warnedNoProviderInjected = false
     private static var warnedProviderReportsNoDisplay = false
 
+    /// A third one of the same kind, added by the route-B wiring lane (ADR-0018 §5.2 增补二
+    /// item 2): the move leg's left border is now looked up by style AND by this session's
+    /// advertised `DesktopScaleFactor`, and only 100/200 (and 0, "nothing advertised") have a
+    /// measured column. Its own bit rather than a shared one, for the reason the two above
+    /// state: whichever condition occurred first in the process would otherwise silence the
+    /// others forever.
+    ///
+    /// PER INSTANCE, unlike the two `static` bits above -- gate r1 (2026-09-18) caught the first
+    /// draft writing "once per session" about a `static`. The quantity this one reports is a
+    /// property of ONE session (`session.advertisedDesktopScaleFactor` is assigned per connect,
+    /// `AppDelegate`), and this registry is built per connect against that session, so the
+    /// instance IS the session here. A process-wide bit would let a first connection that
+    /// advertised an unmeasured value silence the report for every later connection in the same
+    /// process -- and a run record, which registers this line as fired/not-fired for the session
+    /// it is reading, would then record "not fired" for a session that did take the fallback.
+    /// The two above stay `static` deliberately: what they report is a property of the PROCESS's
+    /// wiring (no provider injected) or of the machine (no usable display), not of a session.
+    private var warnedUnmeasuredDesktopScaleAdvertisement = false
+
     /// One-shot for `refreshSessionTopology(reason:)`'s ADR §5.A.4 same-source check (r2 review:
     /// it was the one diagnostic in this file without the throttle every other one has). Once per
     /// process is the right grain even though the check itself runs at most once per connect: a
@@ -2227,9 +2246,32 @@ final class RemoteWindowRegistry {
         // split as `isMappableWindow`/`chrome` above. `state.style` is 0 when this window's
         // orders never carried `WINDOW_ORDER_FIELD_STYLE`; that seam documents why 0 keeps the
         // pre-F-R1 value rather than picking a new one.
+        //
+        // ADR-0018 §5.2 增补二 item 2 (the route-B wiring lane, 2026-09-18): HOW MUCH is also a
+        // function of the DPI column this session is in, and that column is decided by what
+        // THIS SESSION ADVERTISED -- `session.advertisedDesktopScaleFactor`, the value the App's
+        // own session setup assigned before `-start` -- not by the local display's scale. The
+        // two agree under the product default and deliberately disagree under the fixture's
+        // `none` knob; `WindowGeometry.DPITier`'s doc comment works through why the
+        // advertisement is the one that decides the frame the server draws. Read ONCE here, like
+        // `state` above, and passed to the same seam that owns both measured columns.
+        let advertised = session.advertisedDesktopScaleFactor
+        if WindowGeometry.DPITier.isUnmeasuredAdvertisement(advertised), !warnedUnmeasuredDesktopScaleAdvertisement {
+            // Not a refusal: the run proceeds on the 96 column, which is what every window got
+            // before the column existed. Said once PER SESSION (the bit is this registry's own,
+            // and this registry belongs to one session -- see its declaration) because the
+            // alternative is a session silently deducting a border nobody measured at its DPI.
+            warnedUnmeasuredDesktopScaleAdvertisement = true
+            Self.logger.warning(
+                "[geometry] left-border tier fallback: advertised desktop scale \(advertised, privacy: .public) is not 100/200, using the 96 DPI row"
+            )
+        }
         let correctedLeft = WindowGeometry.clientWindowMoveLeft(
             fromVisibleLeft: railWindowsRect.x,
-            measuredLeftBorder: Self.clientWindowMoveLeftBorder(forStyle: state.style)
+            measuredLeftBorder: Self.clientWindowMoveLeftBorder(
+                forStyle: state.style,
+                tier: WindowGeometry.DPITier(advertisedDesktopScaleFactor: advertised)
+            )
         )
         let left = Int32(correctedLeft.rounded())
         let top = Int32(railWindowsRect.y.rounded())
@@ -2287,8 +2329,20 @@ final class RemoteWindowRegistry {
     /// re-measurement §7 (a) asks for is still outstanding (`phase3.md:223`, §8.5: no 2x
     /// measurement exists), for both values now instead of one -- F-R1 answered "which window",
     /// not "which DPI".
-    private static func clientWindowMoveLeftBorder(forStyle style: UInt32) -> Double {
-        WindowGeometry.clientWindowMoveLeftBorder(forStyle: style)
+    ///
+    /// AND THEN IT WAS MEASURED (ADR-0018 §5.2 增补二 item 2, the 2026-09-15 host-side probe
+    /// batches): §7 (a)'s outstanding 2x half is answered, so this wrapper now forwards a
+    /// `DPITier` as well and the seam's table has four cells instead of two. THE UNIT LINE
+    /// ABOVE IS UNCHANGED AND STILL TRUE: the tier selects a ROW of a table of remote-px
+    /// constants, so there is still no point conversion and still no `rasterScale` term at this
+    /// site. What decides the row is `CRSession.advertisedDesktopScaleFactor` -- what this
+    /// session told the server -- read once by the caller; the seam's own `DPITier` doc comment
+    /// records why that, and not the local display scale, is the input. The ADR table's OTHER
+    /// column, the client-area inset K, is deliberately NOT wired here: its Y component is
+    /// nonzero for the non-THICKFRAME row even at 96 DPI, and this leg applies no Y correction
+    /// at all.
+    private static func clientWindowMoveLeftBorder(forStyle style: UInt32, tier: WindowGeometry.DPITier) -> Double {
+        WindowGeometry.clientWindowMoveLeftBorder(forStyle: style, tier: tier)
     }
 
     /// The one and only place a mac-screen point becomes a `WindowsPoint`, exactly

@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import MacdowsCore
 
@@ -959,5 +960,156 @@ enum WindowGeometryFixtures {
             WindowsPoint(x: frame.x + 337, y: frame.y + 129),
             WindowsPoint(x: frame.x - 101, y: frame.y - 97),
         ]
+    }
+}
+
+// MARK: - The left border by style x DPI tier (ADR-0018 §5.2 增补二 item 2)
+
+/// The DPI half of ADR-0015 §7 (a)'s trigger, answered at last. `WindowGeometryTests`'s own
+/// `clientWindowMoveLeftBorderIsStyleKeyed` above pins the WINDOW half (the two 1x values, 5 and
+/// 7, measured on one host at one DPI); this suite pins the second axis the ADR's table adds,
+/// and -- the point of keeping both suites -- pins that adding it did NOT move the first.
+///
+/// WHAT THIS SUITE DOES NOT CLAIM: the 192-DPI column has n=1 per cell, and its "style unknown"
+/// cell was never measured at all -- it is the non-THICKFRAME row by the same fail-closed rule
+/// the 96 column already follows, not a reading. The seam's own doc comment carries that.
+@Suite("WindowGeometry.clientWindowMoveLeftBorder, keyed on style x DPI tier")
+struct WindowGeometryDPITierTests {
+    /// F-R1's Notepad: `WS_MAXIMIZEBOX | WS_MINIMIZEBOX | WS_THICKFRAME | WS_SYSMENU`.
+    static let thickFrameStyle: UInt32 = 0x000F_0000
+    /// The About dialog: `WS_POPUP | WS_SYSMENU`, no `WS_THICKFRAME`.
+    static let aboutStyle: UInt32 = 0x8008_0000
+    /// `WS_THICKFRAME` alone -- the bit is what decides, not the rest.
+    static let thickFrameBitAlone: UInt32 = 0x0004_0000
+    /// Chrome bits without `WS_THICKFRAME`.
+    static let chromeWithoutThickFrame: UInt32 = 0x000B_0000
+
+    /// The table, both columns, all four measured cells (ADR-0018 §5.2 增补二 item 2, from the
+    /// 2026-09-15 hostrect and hostrect-keep records' `B = ef.l - wr.l` readings).
+    @Test("the four cells: non-THICKFRAME 7/11, THICKFRAME 5/10")
+    func theFourMeasuredCells() {
+        #expect(WindowGeometry.clientWindowMoveLeftBorder(forStyle: Self.aboutStyle, tier: .dpi96) == 7)
+        #expect(WindowGeometry.clientWindowMoveLeftBorder(forStyle: Self.thickFrameStyle, tier: .dpi96) == 5)
+        #expect(WindowGeometry.clientWindowMoveLeftBorder(forStyle: Self.aboutStyle, tier: .dpi192) == 11)
+        #expect(WindowGeometry.clientWindowMoveLeftBorder(forStyle: Self.thickFrameStyle, tier: .dpi192) == 10)
+        // The bit, not the rest of the style word, is what picks the row -- in BOTH columns.
+        #expect(WindowGeometry.clientWindowMoveLeftBorder(forStyle: Self.thickFrameBitAlone, tier: .dpi96) == 5)
+        #expect(WindowGeometry.clientWindowMoveLeftBorder(forStyle: Self.thickFrameBitAlone, tier: .dpi192) == 10)
+        #expect(WindowGeometry.clientWindowMoveLeftBorder(forStyle: Self.chromeWithoutThickFrame, tier: .dpi96) == 7)
+        #expect(WindowGeometry.clientWindowMoveLeftBorder(forStyle: Self.chromeWithoutThickFrame, tier: .dpi192) == 11)
+        // Stated as the per-column DELTA too: a table that returned one column for both tiers,
+        // or swapped the rows, still produces four plausible-looking border values.
+        #expect(WindowGeometry.clientWindowMoveLeftBorder(forStyle: Self.aboutStyle, tier: .dpi192)
+            - WindowGeometry.clientWindowMoveLeftBorder(forStyle: Self.aboutStyle, tier: .dpi96) == 4)
+        #expect(WindowGeometry.clientWindowMoveLeftBorder(forStyle: Self.thickFrameStyle, tier: .dpi192)
+            - WindowGeometry.clientWindowMoveLeftBorder(forStyle: Self.thickFrameStyle, tier: .dpi96) == 5)
+    }
+
+    /// `style == 0` is "no order ever carried `WINDOW_ORDER_FIELD_STYLE`", not a measurement --
+    /// the seam's own doc comment explains why it keeps the non-THICKFRAME value. Adding a DPI
+    /// axis does not add a measurement for it: it stays on that row in BOTH columns.
+    @Test("style 0 falls to the non-THICKFRAME row in both tiers")
+    func styleZeroFallsToTheNonThickFrameRowInBothTiers() {
+        #expect(WindowGeometry.clientWindowMoveLeftBorder(forStyle: 0, tier: .dpi96) == 7)
+        #expect(WindowGeometry.clientWindowMoveLeftBorder(forStyle: 0, tier: .dpi192) == 11)
+    }
+
+    /// The two 192-DPI values are named, so an edit cannot swap them without a red test -- the
+    /// same discipline `measuredLeftBordersKeepTheirValues` applies to the 96-DPI pair.
+    @Test("the two 192 DPI borders keep their measured values")
+    func measured192BordersKeepTheirValues() {
+        #expect(WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder192 == 11)
+        #expect(WindowGeometry.thickFrameClientWindowMoveLeftBorder192 == 10)
+    }
+
+    /// The tier is decided by what THIS SESSION advertised in `TS_UD_CS_CORE`, not by the local
+    /// display's scale: the fixture's `none` knob advertises nothing while the display is still
+    /// 2x, and those runs were told 96-DPI-equivalent. 200 is the only value with a 192 reading
+    /// behind it; everything else -- 0 (nothing advertised), 100, and any value nobody measured
+    /// -- falls closed onto today's row.
+    @Test("the tier comes from the advertised DesktopScaleFactor, and only 200 leaves the 96 row")
+    func tierIsDerivedFromTheAdvertisedDesktopScale() {
+        #expect(WindowGeometry.DPITier(advertisedDesktopScaleFactor: 200) == .dpi192)
+        #expect(WindowGeometry.DPITier(advertisedDesktopScaleFactor: 100) == .dpi96)
+        #expect(WindowGeometry.DPITier(advertisedDesktopScaleFactor: 0) == .dpi96)
+        #expect(WindowGeometry.DPITier(advertisedDesktopScaleFactor: 150) == .dpi96)
+        #expect(WindowGeometry.DPITier(advertisedDesktopScaleFactor: 300) == .dpi96)
+        #expect(WindowGeometry.DPITier(advertisedDesktopScaleFactor: 1) == .dpi96)
+    }
+
+    /// The predicate behind the call site's one-line fallback log: 0 and 100 are ordinary (they
+    /// ARE today's row, deliberately), 200 has its own row, and anything else is a value this
+    /// project has no reading for and is silently treated as 96 -- which is the thing worth
+    /// saying out loud once.
+    @Test("isUnmeasuredAdvertisement is true for exactly the values that are neither 0, 100 nor 200")
+    func unmeasuredAdvertisementPredicate() {
+        #expect(WindowGeometry.DPITier.isUnmeasuredAdvertisement(150))
+        #expect(WindowGeometry.DPITier.isUnmeasuredAdvertisement(300))
+        #expect(WindowGeometry.DPITier.isUnmeasuredAdvertisement(1))
+        #expect(WindowGeometry.DPITier.isUnmeasuredAdvertisement(99))
+        #expect(WindowGeometry.DPITier.isUnmeasuredAdvertisement(201))
+        #expect(!WindowGeometry.DPITier.isUnmeasuredAdvertisement(0))
+        #expect(!WindowGeometry.DPITier.isUnmeasuredAdvertisement(100))
+        #expect(!WindowGeometry.DPITier.isUnmeasuredAdvertisement(200))
+    }
+
+    /// 1x BYTE-IDENTITY, as one assertion: the legacy one-argument seam -- the only one every
+    /// pre-lane caller and every pre-lane pin goes through -- IS the 96 column, for every style
+    /// row this project has, including the unknown-style fallback and a style word with every
+    /// bit set. A lane that quietly re-pointed it at the 192 column would leave
+    /// `clientWindowMoveLeftBorderIsStyleKeyed` above red; a lane that re-pointed it at a THIRD
+    /// set of numbers would leave this red instead.
+    @Test("the legacy one-argument function is exactly the 96 DPI column, row for row")
+    func legacyFunctionIsTheNinetySixColumn() {
+        let styles: [UInt32] = [
+            0, Self.thickFrameBitAlone, Self.chromeWithoutThickFrame, Self.thickFrameStyle,
+            Self.aboutStyle, 0x800F_0000, 0xFFFF_FFFF,
+        ]
+        for style in styles {
+            #expect(
+                WindowGeometry.clientWindowMoveLeftBorder(forStyle: style)
+                    == WindowGeometry.clientWindowMoveLeftBorder(forStyle: style, tier: .dpi96),
+                "style \(String(style, radix: 16))"
+            )
+        }
+    }
+
+    /// ADR-0018 §5.2 增补二 item 2 and ADR-0015 §7 (a) both rule out "the border scales with the
+    /// display" BY NAME: the two columns are separate readings (7 -> 11 is not 7 x 2), so the
+    /// lookup must stay a table. Pinned on the function's BODY rather than on the file, because
+    /// the doc comment above it legitimately DISCUSSES `rasterScale` -- a bare name count would
+    /// read that prose as code (project memory: source pins must match call shapes, not names).
+    @Test("the tiered lookup's body is a table: no rasterScale term, no multiplication, no division")
+    func theTieredLookupBodyIsATableNotArithmetic() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let src = try String(
+            contentsOf: root.appendingPathComponent("Packages/MacdowsCore/Sources/MacdowsCore/WindowGeometry.swift"),
+            encoding: .utf8
+        )
+        let signature = "public static func clientWindowMoveLeftBorder(forStyle style: UInt32, tier: DPITier) -> Double {"
+        let start = try #require(src.range(of: signature), "the tiered lookup's signature moved -- re-anchor this pin")
+        // Brace-matched from the signature onward, so what is examined is the BODY and nothing
+        // above it. The first brace encountered is the body's own (the signature carries none).
+        var depth = 0
+        var body = ""
+        for character in src[start.lowerBound...] {
+            if character == "{" { depth += 1 }
+            if depth > 0 { body.append(character) }
+            if character == "}" {
+                depth -= 1
+                if depth == 0 { break }
+            }
+        }
+        #expect(body.hasPrefix("{") && body.hasSuffix("}"))
+        #expect(!body.contains("rasterScale"))
+        #expect(!body.contains("*"))
+        #expect(!body.contains("/"))
+        // All four cells are returned by NAME, so each keeps its own record; a literal in the
+        // body would be a number with no provenance.
+        #expect(body.contains("aboutCalibratedClientWindowMoveLeftBorder"))
+        #expect(body.contains("thickFrameClientWindowMoveLeftBorder"))
+        #expect(body.contains("aboutCalibratedClientWindowMoveLeftBorder192"))
+        #expect(body.contains("thickFrameClientWindowMoveLeftBorder192"))
     }
 }

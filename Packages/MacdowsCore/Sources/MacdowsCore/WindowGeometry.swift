@@ -423,6 +423,28 @@ extension WindowGeometry {
     /// `RailComparison.Borders.aboutCalibrated` cites this name, keeping the old one as provenance.
     public static let aboutCalibratedClientWindowMoveLeftBorder: Double = 7
 
+    /// The same inset on the same window class, measured on a **2x session that advertised
+    /// `DesktopScaleFactor=200`** -- ADR-0018 §5.2 增补二 item 2's `B @192 DPI` row for
+    /// non-`WS_THICKFRAME` windows. Source: the host-side window-rectangle probe's own
+    /// `GetWindowRect` / `DWMWA_EXTENDED_FRAME_BOUNDS` pair on the About-class dialog,
+    /// `B = ef.l - wr.l = 11`, **n=1**. Both 2026-09-15 host-rect batches read that pair on
+    /// THIS class and agree on it, and it is their **About cells only** that are cited here:
+    /// `docs/upgrade-gate/2026-09-15-w3-hostrect.md` §3(g)/§6 and
+    /// `.../2026-09-15-w3-hostrect-keep.md` §3(g)/§6. The THICKFRAME constant below cites a
+    /// different (smaller) set of cells, for the reason its own comment gives.
+    ///
+    /// 11 IS THE REASON THERE IS A TABLE. Had it come back 14 this would be
+    /// `aboutCalibratedClientWindowMoveLeftBorder * rasterScale` and no second constant would
+    /// exist. It did not: the border is not linear in the display scale on this row, which is
+    /// the option ADR-0015 §7 (a) rules out by name.
+    ///
+    /// NO SECOND-SOURCE CORROBORATION EXISTS FOR **THIS** CELL (gate r1, 2026-09-18). A draft of
+    /// this comment offered a live move leg as one; that leg was on the other row (see
+    /// `thickFrameClientWindowMoveLeftBorder192`, which is where the observation moved). This row
+    /// stands on the host-side probe alone, and re-measuring it on a 2x session through the
+    /// send/echo path is the outstanding half of §3 item 5 / §8.5 at 192 DPI too.
+    public static let aboutCalibratedClientWindowMoveLeftBorder192: Double = 11
+
     /// The same inset on `WS_THICKFRAME` windows -- F-R1
     /// (`docs/upgrade-gate/2026-09-resize-leg-live.md:32`): a Notepad target (style
     /// `0x000F0000`) was asked for visible left 215, was sent `left=208` under the
@@ -440,6 +462,43 @@ extension WindowGeometry {
     /// own doc comment, a still-registered gap) -- and these measurements are consistent with,
     /// but do not close, that gap; the same doc explains why there is no `right`/width sibling.
     public static let thickFrameClientWindowMoveLeftBorder: Double = 5
+
+    /// The same inset on `WS_THICKFRAME` windows at **`DesktopScaleFactor=200`** -- ADR-0018
+    /// §5.2 增补二 item 2's `B @192 DPI` row for the THICKFRAME class, from the same host-side
+    /// `GetWindowRect` / `DWMWA_EXTENDED_FRAME_BOUNDS` probe as the About-class 11 above
+    /// (`B = ef.l - wr.l = 10`), **n=1** -- but from **ONE** record, not the two that constant
+    /// cites: `docs/upgrade-gate/2026-09-15-w3-hostrect-keep.md` §3(g) (the `5,0,5,5` @96 /
+    /// `10,0,10,10` @192 pair) and §6. The EARLIER batch
+    /// (`.../2026-09-15-w3-hostrect.md` §3(g)/§6) could not judge this row at all: its
+    /// THICKFRAME cells produced no host reading at either scale -- the target was closed by
+    /// that run's own close leg before the probe read it -- which is the gap the `-keep` batch
+    /// was run to fill (gate r1, 2026-09-18: this comment used to claim both records).
+    ///
+    /// CORROBORATED ON THE WIRE, by the one live 2x run that moved a window of THIS class
+    /// (`docs/upgrade-gate/2026-09-09-w3-2x-checkpoint-c2prime.md` §3.2; the run's own adr/0015
+    /// §6.2 measurement lines). Both of that run's legs locked a `style=0x000F0000` target and
+    /// deducted the 96 column (`outboundLeftBorder=5.000`, the only column that existed then):
+    /// move sent `l=377` and was reported back at `offset 387`; resize sent `l=381` and came
+    /// back at `offset 391`. The server's own inset on that window was therefore `10` remote px
+    /// on both legs -- this constant, measured through the send/echo path instead of through the
+    /// host probe, on a different day and a different batch. Both legs also report
+    /// `delta=(dx=5,…)`, which is exactly the under-deduction this table predicts for a 96-column
+    /// send at 192 DPI (`10 - 5`), and `frame=(5,0,5,5)` there is the model that was ASSUMED,
+    /// not a reading. Two numbers in that run that are NOT this quantity: the local
+    /// `rectDelta dx=4.000` (a mac-side rect comparison, and that leg was judged against a
+    /// mid-leg remap observation), and the About row's `11 - 7 = 4`; neither belongs to this
+    /// constant or to the one above.
+    ///
+    /// This row DOES happen to be twice its 96-DPI sibling. Recorded as a coincidence of two
+    /// independent readings, not as a rule: the other row of the same table is not (7 -> 11),
+    /// so a `* rasterScale` implementation would reproduce this number and get the other one
+    /// wrong -- which is precisely how a linear model would have survived a one-row test.
+    ///
+    /// It also does not contradict the 2026-09-06 F round 3 finding that the THICKFRAME 5 "does
+    /// not scale with DPI": that run was a 2x DISPLAY, and what this constant is keyed on is the
+    /// advertised `DesktopScaleFactor` -- see `DPITier`'s own doc comment for why those are two
+    /// different questions, and the 2026-09-18 route-B wiring pre-registration §0 for the ruling.
+    public static let thickFrameClientWindowMoveLeftBorder192: Double = 10
 
     /// F6 (a), as the 2026-09-05 per-style lane rewrote it on F-R1's evidence: the left border
     /// `clientWindowMoveLeft` deducts, chosen from the window's own Win32 `style` bits. This is a
@@ -493,9 +552,102 @@ extension WindowGeometry {
     /// outside that pin it would surface only as a wrong §6.2 measurement line.
     ///
     /// UNIT: **remote px**, the same domain `clientWindowMoveLeft`'s parameters are in.
+    ///
+    /// SECOND AXIS SINCE ADR-0018 §5.2 增补二 item 2: this one-argument spelling is now the
+    /// 96-DPI COLUMN of `clientWindowMoveLeftBorder(forStyle:tier:)`, kept (rather than migrated
+    /// away) because it is the exact behaviour every caller and every pin had before the tier
+    /// existed -- so "the 96 column is byte-identical to the lane before it" is a statement a
+    /// test can make about a real function instead of about a diff.
     public static func clientWindowMoveLeftBorder(forStyle style: UInt32) -> Double {
-        style & StyleTranslator.styleThickFrame != 0
-            ? thickFrameClientWindowMoveLeftBorder
-            : aboutCalibratedClientWindowMoveLeftBorder
+        clientWindowMoveLeftBorder(forStyle: style, tier: .dpi96)
+    }
+
+    /// Which of the two MEASURED DPI columns of the border table (above, and
+    /// `clientWindowMoveLeftBorder(forStyle:tier:)` below) a session is in.
+    ///
+    /// WHY THE ADVERTISED VALUE AND NOT `DisplayTopology.rasterScale`: the two agree only while
+    /// the product default is in effect (`ScaleAdvertisement.productDefault(rasterScale:)` maps
+    /// 1 <-> 100 and 2 <-> 200), and the fixture's own `WINDOW_SMOKE_ADVERTISED_SCALE=none`
+    /// deliberately breaks that agreement -- it advertises NOTHING on a 2x display, so the
+    /// server was told the 100 (96-DPI-equivalent) story while `rasterScale` is still 2. Every
+    /// `E-none` leg of the 2026-09-15/16 checkpoint batches is that combination. Keying on the
+    /// advertisement is keying on what the SERVER was told, which is what decides the frame it
+    /// draws; keying on `rasterScale` would put those runs in the 192 column on the strength of
+    /// a local display setting the server never heard about (owner ruling recorded in the
+    /// 2026-09-18 route-B wiring pre-registration §0, risk 1).
+    ///
+    /// TWO CASES, NOT A RANGE. `ScaleAdvertisement.desktopScaleRange` is `100...500`, and this
+    /// project has a reading for exactly two of those values. Anything else -- 0 (the pair was
+    /// never assigned, i.e. nothing advertised), 100, 150, 500 -- takes the 96 column, which is
+    /// what every window got before this axis existed. That is the same fail-closed instinct
+    /// the style axis already follows for `style == 0`: never invent a value for a case nobody
+    /// measured. `isUnmeasuredAdvertisement` exists so a caller can SAY that it is doing this,
+    /// once, for a value that is neither of the two ordinary ones.
+    public enum DPITier: Equatable, Sendable {
+        /// The 1x / `DesktopScaleFactor=100` / nothing-advertised column: 7 and 5, the values
+        /// measured on the 1x host in 2026-08 and 2026-09 (F-R1 and the About calibration).
+        case dpi96
+        /// The `DesktopScaleFactor=200` column: 11 and 10, measured on the 2x sessions of
+        /// 2026-09-15 (hostrect and hostrect-keep records, `B = ef.l - wr.l`, n=1 per cell).
+        case dpi192
+
+        /// `200` is the only advertised desktop scale with a 192-DPI reading behind it; every
+        /// other value, including 0 ("the pair was never assigned"), is the 96 column.
+        public init(advertisedDesktopScaleFactor: UInt32) {
+            self = advertisedDesktopScaleFactor == 200 ? .dpi192 : .dpi96
+        }
+
+        /// True when `value` is none of `0` (nothing advertised), `100` or `200` -- i.e. when
+        /// the 96 column is being used as a FALLBACK rather than as the column that value
+        /// names. Not an error and not a refusal: the run proceeds on today's numbers. It is
+        /// worth one log line because the alternative is a session silently deducting a border
+        /// nobody measured for its DPI, which is exactly the class of thing the 2x lane spent
+        /// three batches discovering.
+        public static func isUnmeasuredAdvertisement(_ value: UInt32) -> Bool {
+            value != 0 && value != 100 && value != 200
+        }
+    }
+
+    /// The left border `clientWindowMoveLeft` deducts, by the window's own Win32 `style` AND the
+    /// DPI column this session is in -- ADR-0018 §5.2 增补二 item 2's table, whole:
+    ///
+    /// | style | B @96 DPI | B @192 DPI |
+    /// |---|---|---|
+    /// | non-`WS_THICKFRAME` (About; also style-never-received) | 7 | 11 |
+    /// | `WS_THICKFRAME` (Notepad) | 5 | 10 |
+    ///
+    /// NOT A MULTIPLICATION, and that is the finding rather than a style choice: 7 -> 11 is not
+    /// 7 x 2, and 5 -> 10 is. A single `rasterScale` factor reproduces one row and breaks the
+    /// other, which is why ADR-0015 §7 (a) ruled that shape out by name and why this is a
+    /// four-cell lookup with no arithmetic in it at all (pinned:
+    /// `theTieredLookupBodyIsATableNotArithmetic`). The @192 readings come from the host-side
+    /// probe's own `GetWindowRect`/`DWMWA_EXTENDED_FRAME_BOUNDS` pair (`B = ef.l - wr.l`) in the
+    /// 2026-09-15 hostrect and hostrect-keep records, n=1 per cell -- which is also why there is
+    /// no third column: nothing was measured at any other DPI, and `DPITier` has no case for one.
+    ///
+    /// THE STYLE-UNKNOWN x 192 CELL WAS NEVER MEASURED. `style == 0` takes the non-THICKFRAME
+    /// row here exactly as it does at 96 DPI, for the reason the one-argument seam's doc comment
+    /// above works through in full -- the unknown case keeps the row it already had rather than
+    /// acquiring a new number when a second axis appears. STATED AS THE CHOSEN DIRECTION RATHER
+    /// THAN AS A FINDING: `(style 0, .dpi192) = 11`, the About row, is a decision this lane took
+    /// and NOT a measurement -- no run has ever observed a window that withheld
+    /// `WINDOW_ORDER_FIELD_STYLE` on a 192-DPI session, so nothing says 11 is what such a window
+    /// would need. It is chosen because it is the direction that keeps the unknown case on the
+    /// same row at both tiers; a reading that ever contradicts it changes this cell alone.
+    ///
+    /// WHAT IS NOT WIRED HERE: the client-area inset **K** from the same ADR table. K is a
+    /// separate quantity for a separate (not yet built) consumer, and its Y component is nonzero
+    /// for the non-THICKFRAME row even at 96 DPI -- feeding K into the move leg would change 1x
+    /// Y-axis behaviour, which today applies no correction at all. This lookup is B only.
+    ///
+    /// UNIT: **remote px**, the same domain `clientWindowMoveLeft`'s parameters are in -- the
+    /// tier selects a row of the table, it does not convert anything.
+    public static func clientWindowMoveLeftBorder(forStyle style: UInt32, tier: DPITier) -> Double {
+        switch (style & StyleTranslator.styleThickFrame != 0, tier) {
+        case (false, .dpi96): return aboutCalibratedClientWindowMoveLeftBorder
+        case (true, .dpi96): return thickFrameClientWindowMoveLeftBorder
+        case (false, .dpi192): return aboutCalibratedClientWindowMoveLeftBorder192
+        case (true, .dpi192): return thickFrameClientWindowMoveLeftBorder192
+        }
     }
 }
