@@ -1240,12 +1240,17 @@ fi
 begin '26 a CRLF job file'
 {
 	printf 'TAG=labtest\r\nBATCH=labtest\r\nADVERTISED_SCALE=DD\r\nMOVE=1\r\n'
-	printf 'MAXIMIZE=0\r\nTRAY=0\r\nTRAY_CLICK=0\r\nEXTRA_APPS=notepad\r\n'
+	# MOVE_TARGET is carried because this fixture says MOVE=1 and its TAG does not declare the
+	# About row: since case 30b's rule an empty filter under MOVE=1 is admitted only on an
+	# About-row job, and this case is about CR STRIPPING, not about which window the move leg
+	# locks. It pays for itself -- one more CR-terminated value through the same strip.
+	printf 'MAXIMIZE=0\r\nTRAY=0\r\nTRAY_CLICK=0\r\nEXTRA_APPS=notepad\r\nMOVE_TARGET=Notepad\r\n'
 } > "$JOB"
 run_smoke "$SBLAB/smoke-job.command" ""
 if assert_eq "$(child_calls)" '1' 'launcher invocations' \
 	&& assert_eq "$(child_env 'WINDOW_SMOKE_ADVERTISED_SCALE=DD')" '1' 'the knob without a trailing CR' \
 	&& assert_eq "$(child_env 'WINDOW_SMOKE_EXTRA_APPS=notepad')" '1' 'EXTRA_APPS without a trailing CR' \
+	&& assert_eq "$(child_env 'WINDOW_SMOKE_MOVE_TARGET=Notepad')" '1' 'MOVE_TARGET without a trailing CR' \
 	&& [ -f "$SBRUNTIME/smoke-labtest.log" ] && assert_eq "$(last_line)" 'DONE exit=0' 'last log line'; then
 	pass "$CASE: every value is CR-stripped, so the per-TAG log is smoke-labtest.log and not smoke-labtest\$'\\r'.log"
 fi
@@ -1391,6 +1396,34 @@ fi
 #     symbol is planted in the SANDBOX main.swift so the preflight can pass, and separately grepped
 #     for in the REAL Tools/window-smoke/main.swift. A job naming a symbol this checkout does not
 #     have would otherwise refuse on the lab host, after the operator has set up the display.
+# The two rules a MOVE=1 template's MOVE_TARGET DEFINITION has to satisfy, as one function so
+# that case 30 (which applies them to every tracked file) and case 30b (which proves each of them
+# refuses something, on a copy) hold the SAME rule. Both are about the file's own text, which is
+# why neither can live in smoke-job.command: sourcing cannot tell "set to empty" from "never set".
+#
+# (a) DECLARED ROW. An empty MOVE_TARGET is not "no preference" -- it selects the harness's
+#     About-dialog heuristic, and it is how this lane's About-row jobs target the base app's own
+#     dialog (an explicit filter structurally cannot: `MoveResizeTarget.lock` only ever locks a
+#     window that appeared AFTER the extra apps launched). So the emptiness decides WHICH WINDOW
+#     ROW of the 192-DPI border table the run measures, and only a job whose TAG says `about` may
+#     leave it empty. Gate r1 (2026-09-18) found this by mutation: blanking the tracked THICKFRAME
+#     job's filter left the whole suite green, and that job would then have measured the About row
+#     under a name and a step table that both say otherwise. smoke-job.command refuses the same
+#     shape at run time (on the VALUE); this arm is the definition-side half.
+# (b) WRITTEN OUT. A key that may be empty must still be PRESENT, the way smoke-1x-D.env writes an
+#     empty DISPLAY_LOOKS_LIKE, so the file says the emptiness is a choice rather than an omission.
+#     This one is the whole rule for an About-row job, whose TAG satisfies (a) either way.
+move_target_definition_reasons() { # <jobfile> <MOVE> <MOVE_TARGET> <TAG>
+	[ "$2" = '1' ] || return 0
+	[ -z "$3" ] || return 0
+	if ! printf '%s\n' "$4" | grep -qi 'about'; then
+		printf ' MOVE-with-an-empty-MOVE_TARGET-on-a-job-that-does-not-declare-the-About-row(TAG=[%s]);' "$4"
+	fi
+	if ! grep -qE '^[[:space:]]*(export )?MOVE_TARGET=' "$1"; then
+		printf ' MOVE-with-no-MOVE_TARGET-key-at-all(an empty About-heuristic filter must be written out);'
+	fi
+}
+
 begin '30 every tracked jobs/smoke-*.env drives the wrapper'
 jobs_ok=0
 jobs_total=0
@@ -1451,17 +1484,7 @@ for jobfile in "$LAB"/jobs/smoke-*.env; do
 	if [ "$j_move" = '1' ] && [ -z "$j_extra" ]; then
 		reasons="$reasons MOVE-without-a-second-window(EXTRA_APPS=[$j_extra]);"
 	fi
-	# MOVE_TARGET may be empty -- that is the harness's About heuristic, and it is how the
-	# About-row job of the route-B lane targets the base app's own dialog (an explicit filter
-	# structurally cannot: `MoveResizeTarget.lock` only ever locks a window that appeared AFTER
-	# the extra apps launched). What is NOT allowed is the key going MISSING: an empty value has
-	# to be written out, the way smoke-1x-D.env writes an empty DISPLAY_LOOKS_LIKE, so the file
-	# says the emptiness is a choice rather than an omission. Checked against the file's TEXT,
-	# because sourcing cannot tell "set to empty" from "never set".
-	if [ "$j_move" = '1' ] && [ -z "$j_target" ] \
-		&& ! grep -qE '^[[:space:]]*(export )?MOVE_TARGET=' "$jobfile"; then
-		reasons="$reasons MOVE-with-no-MOVE_TARGET-key-at-all(an empty About-heuristic filter must be written out);"
-	fi
+	reasons="$reasons$(move_target_definition_reasons "$jobfile" "$j_move" "$j_target" "$j_tag")"
 	if [ "$j_keep" = '1' ]; then
 		[ "$(child_env 'WINDOW_SMOKE_MOVE_KEEP=1')" = '1' ] || reasons="$reasons MOVE_KEEP;"
 		# A job that keeps its target open must also have run the leg that moved it: MOVE_KEEP
@@ -1488,6 +1511,88 @@ if [ "$jobs_total" -ge 2 ] && [ "$jobs_ok" -eq "$jobs_total" ]; then
 	pass "$CASE: all $jobs_total tracked smoke templates arm the preflights they name, map ADVERTISED_SCALE and MOVE_KEEP as declared and drive the legs they declare"
 else
 	fail "$CASE: $jobs_ok of $jobs_total tracked smoke jobs drove the run they describe (failed:${jobs_failed:- none}; total<2 means jobs/ shrank)"
+fi
+
+# 30b. The empty-MOVE_TARGET rules, each shown REFUSING something. Case 30 above cannot show that:
+#      every tracked template satisfies both rules, so an arm that stopped working would still
+#      leave it green -- which is exactly what gate r1 (2026-09-18) measured, twice, by mutation:
+#      deleting the written-out arm, and blanking the tracked THICKFRAME job's filter, each left
+#      the suite at 0 failed. What the second one would have cost: that job's name, its TAG and
+#      its batch step table all say THICKFRAME, while an empty filter makes the harness lock the
+#      base app's About dialog -- so the 2x acceptance would have measured the About row twice and
+#      filed one of them as the THICKFRAME row. The two rows are the two 192-DPI cells the whole
+#      lane exists to separate (11 vs 10).
+#
+#      Four arms, on COPIES of the tracked files (the tracked files themselves stay untouched and
+#      are case 30's business): one control in the ACCEPT direction, so a rule that refused
+#      everything would be caught here rather than in case 30; then one per rule; plus the arm
+#      that shows the two rules are not the same rule (the About job with its key deleted is
+#      accepted by the wrapper -- its TAG declares the row -- and caught only by the definition
+#      side).
+begin '30b an empty MOVE_TARGET is admitted only on a job that declares the About row'
+mainswift_saved="$(cat "$MAINSWIFT")"
+printf '%s\nlet labtestPlanted_WINDOW_SMOKE_MOVE_KEEP = 1\n' "$mainswift_saved" > "$MAINSWIFT" || exit 1
+notepad_job="$LAB/jobs/smoke-2x-D-move-keep-notepad.env"
+about_job="$LAB/jobs/smoke-2x-D-move-keep-about.env"
+reasons=''
+[ -r "$notepad_job" ] || reasons="$reasons the-THICKFRAME-template-is-gone;"
+[ -r "$about_job" ] || reasons="$reasons the-About-template-is-gone;"
+
+# (i) CONTROL, accept direction: the tracked About job, byte-for-byte, still runs. A rule that
+#     refused every empty filter would be red HERE, not in case 30's aggregate verdict.
+reset_run
+cp "$about_job" "$JOB" || exit 1
+run_smoke "$SBLAB/smoke-job.command" ""
+[ "$(last_line)" = 'DONE exit=0' ] || reasons="$reasons about-job-refused[$(last_line)];"
+[ "$(child_calls)" = '1' ] || reasons="$reasons about-job-child-calls=$(child_calls);"
+[ -z "$(move_target_definition_reasons "$about_job" 1 '' '2xD-mkeep-about')" ] \
+	|| reasons="$reasons about-job-flagged-by-the-definition-rules;"
+
+# (ii) Rule (a), the row a job DECLARES: the THICKFRAME template with its filter blanked, key kept
+#      -- gate r1's mutant H, the edit that used to be invisible. The wrapper refuses it, and the
+#      refusal has to NAME the rule (a reader who is told only "invalid" re-quotes the value).
+reset_run
+sed 's/^MOVE_TARGET=.*/MOVE_TARGET=/' "$notepad_job" > "$JOB" || exit 1
+grep -qxF 'MOVE_TARGET=' "$JOB" || reasons="$reasons the-blanking-edit-did-not-take;"
+run_smoke "$SBLAB/smoke-job.command" ""
+[ "$(last_line)" = 'DONE exit=65' ] || reasons="$reasons blanked-filter-last-line=[$(last_line)];"
+[ "$(child_calls)" = '0' ] || reasons="$reasons blanked-filter-launcher-ran;"
+grep -qF 'only a job that DECLARES the About row may leave it empty' "$SMOKELOG" \
+	|| reasons="$reasons blanked-filter-reason-does-not-name-the-rule;"
+case "$(move_target_definition_reasons "$JOB" 1 '' '2xD-mkeep-notepad')" in
+*does-not-declare-the-About-row*) : ;;
+*) reasons="$reasons blanked-filter-not-flagged-by-the-definition-rules;" ;;
+esac
+
+# (iii) The same job with the MOVE_TARGET LINE DELETED outright. The wrapper judges the VALUE, so
+#       it refuses this one for the same reason: a key that is absent reaches it as empty.
+reset_run
+grep -v '^MOVE_TARGET=' "$notepad_job" > "$JOB"
+grep -qE '^MOVE_TARGET=' "$JOB" && reasons="$reasons the-deletion-edit-did-not-take;"
+run_smoke "$SBLAB/smoke-job.command" ""
+[ "$(last_line)" = 'DONE exit=65' ] || reasons="$reasons deleted-key-on-a-THICKFRAME-job-last-line=[$(last_line)];"
+[ "$(child_calls)" = '0' ] || reasons="$reasons deleted-key-on-a-THICKFRAME-job-launcher-ran;"
+
+# (iv) Rule (b), WRITTEN OUT, on the job the wrapper cannot catch: the About template with its key
+#      deleted. Its TAG declares the About row, so the wrapper is satisfied and the run proceeds --
+#      and the only thing that says the file stopped declaring its emptiness is the definition-side
+#      rule. This is the arm gate r1 found vacuous (its mutant G), and it is non-vacuous here in
+#      both directions: (i) above is the same file with the key present and reports nothing.
+reset_run
+grep -v '^MOVE_TARGET=' "$about_job" > "$JOB"
+run_smoke "$SBLAB/smoke-job.command" ""
+[ "$(last_line)" = 'DONE exit=0' ] || reasons="$reasons deleted-key-on-an-About-job-was-refused-by-the-wrapper[$(last_line)];"
+case "$(move_target_definition_reasons "$JOB" 1 '' '2xD-mkeep-about')" in
+*no-MOVE_TARGET-key-at-all*) : ;;
+*) reasons="$reasons deleted-key-not-flagged-by-the-written-out-rule;" ;;
+esac
+
+printf '%s\n' "$mainswift_saved" > "$MAINSWIFT" || exit 1
+if [ -z "$reasons" ]; then
+	pass "$CASE: the tracked About job runs with its empty filter; the same edit on the THICKFRAME job -- blanked or deleted -- is refused by the wrapper with a line that names the rule; and an About job that stops writing the key out is caught by the definition-side rule the wrapper structurally cannot express"
+else
+	fail "$CASE:$reasons"
+	note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
 fi
 
 # 31. The etw mode is unchanged by this lane's additions: same copy, same removal, same wrapper.
@@ -2831,7 +2936,7 @@ fi
 
 # Every case must have reported: a case that neither passed nor failed would otherwise vanish from
 # the tally with exit 0. Placed after the LAST case on purpose.
-EXPECTED_CASES=86
+EXPECTED_CASES=87
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi

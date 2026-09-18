@@ -2211,8 +2211,14 @@ enum WindowSmokeGateSelfTest {
                 && WindowGeometry.DPITier(advertisedDesktopScaleFactor: 200) == .dpi192
                 && WindowGeometry.DPITier(advertisedDesktopScaleFactor: 100) == .dpi96
                 && WindowGeometry.DPITier(advertisedDesktopScaleFactor: 0) == .dpi96
-                && WindowGeometry.DPITier(advertisedDesktopScaleFactor: 150) == .dpi96,
-            "railComparisonBorderModelsAreTheTwoMeasuredOnes: About-calibrated (7,0,7,7) is the default (right/bottom 7 are a single-run reading, n=1); THICKFRAME (5,0,5,5) is the F-R1 measurement (n=9 independent runs, memo :101); the fixture's WS_THICKFRAME literal and both left values agree with MacdowsCore's production seam (WindowGeometry.clientWindowMoveLeftBorder(forStyle:)) -- pinned, not assumed (review border-per-style-r2 I-3); the wiring's field bits are WND_OFFSET 0x800, WND_SIZE 0x400 and STYLE 0x8; and since ADR-0018 §5.2 增补二 item 2 all FOUR cells of the style x DPI table are pinned (96: 5/7, 192: 10/11, n=1 per 192 cell) together with the tier rule that only an advertised DesktopScaleFactor of 200 leaves the 96 column -- 0 (nothing advertised, the ADVERTISED_SCALE=none form) and 100 and any unmeasured value stay on it"
+                && WindowGeometry.DPITier(advertisedDesktopScaleFactor: 150) == .dpi96
+                // ABOVE 200 too (gate r1 m2): the rule is the LITERAL 200, not "200 or more".
+                // Without this cell a `>= 200` predicate passes this self-check -- and this
+                // self-check is the one that runs on the lab host, where a 300 advertisement
+                // would then silently take a column measured at 192 DPI. MacdowsCore's own
+                // suite kills that mutant; the fixture must kill it too.
+                && WindowGeometry.DPITier(advertisedDesktopScaleFactor: 300) == .dpi96,
+            "railComparisonBorderModelsAreTheTwoMeasuredOnes: About-calibrated (7,0,7,7) is the default (right/bottom 7 are a single-run reading, n=1); THICKFRAME (5,0,5,5) is the F-R1 measurement (n=9 independent runs, memo :101); the fixture's WS_THICKFRAME literal and both left values agree with MacdowsCore's production seam (WindowGeometry.clientWindowMoveLeftBorder(forStyle:)) -- pinned, not assumed (review border-per-style-r2 I-3); the wiring's field bits are WND_OFFSET 0x800, WND_SIZE 0x400 and STYLE 0x8; and since ADR-0018 §5.2 增补二 item 2 all FOUR cells of the style x DPI table are pinned (96: 5/7, 192: 10/11, n=1 per 192 cell) together with the tier rule that only an advertised DesktopScaleFactor of EXACTLY 200 leaves the 96 column -- 0 (nothing advertised, the ADVERTISED_SCALE=none form), 100, an unmeasured 150 and an above-200 value such as 300 all stay on it"
         )
         // style bits from the RAIL WindowCreate (the `[style-dump] style=0x…` value): WS_THICKFRAME (0x00040000)
         // selects the measured THICKFRAME model -- Notepad 0x000F0000 and Realtek 0x800F0000 carry it, About
@@ -3374,6 +3380,23 @@ let moveResizeTargetFilter = ProcessInfo.processInfo.environment["WINDOW_SMOKE_M
 /// the operator who asked twice for it to stay open. `MoveResizeKeep.keptOpenLine` is the single
 /// line both sites print; `Scripts/test-window-smoke-pins.sh` pins that neither `SC_CLOSE` of
 /// this scenario can be reached without passing the guard.
+///
+/// WHAT ELSE A KEPT WINDOW CHANGES, because "the ONE thing the knob suppresses" is true of this
+/// SCENARIO and not of `finish()` (gate r1 m3, 2026-09-18). A target that is still open is still
+/// VISIBLE at finish, and two finish-time consumers take their input from the visible set:
+///   1. `assertPlausibleContentBands(over: visibleWindows, …)` now judges the target too -- the
+///      moved-and-widened window has to clear `SizeBand`'s floor and ceiling in remote px, which
+///      at the sizes these jobs run (the resize leg WIDENS) it does with room to spare;
+///   2. `MultiWindowGate.newContentWindowIds` receives it through `visibleAtFinish` instead of
+///      through `closedByHarness` (`moveResizeCloseTargetId` stays nil on the kept path). That
+///      function's result is the UNION of those two terms, so which one a still-visible target
+///      arrives in does not change the count -- and for the About-row job the target is set
+///      aside by the About-title `exclude` set on either path anyway.
+/// Neither is a verdict this knob set out to move, and neither is disabled here; they are named
+/// so a reader of a kept-open run knows which checks its surviving window went through. The
+/// close VERDICT is not reported at all on this path rather than reported failed (`finish()`'s
+/// block is `if let moveResizeCloseTargetId`), and the judgement unit the records read
+/// (`[move-resize] move leg resolved`) is printed long before either guard.
 let moveResizeKeepTargetOpen = MoveResizeKeep.suppressesTargetClose(
     ProcessInfo.processInfo.environment["WINDOW_SMOKE_MOVE_KEEP"]
 )

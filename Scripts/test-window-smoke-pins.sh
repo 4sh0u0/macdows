@@ -345,6 +345,29 @@ pin 2 "$(code_only | grep -B6 -E 'print\("\[move-resize\] sent SC_CLOSE' | grep 
 # ... and each guard RETURNS before reaching the close (a guard that only printed would keep the
 # close). `-A3` is the guard's whole body: print, phase, return.
 pin 2 "$(code_only | grep -A3 -E 'if moveResizeKeepTargetOpen \{' | grep -cE 'return$' || true)" "each guard returns before the close"
+# PER SITE (gate r1 m4). The two pins above are counts over ONE merged context stream: they say
+# "2 guards appeared in 2 windows", not "each of the two named sites has one". The two close
+# prints are textually DISTINCT -- the rounds-stopped exit carries ` (rounds stopped)` and the
+# round-end one does not -- so each site can be anchored on its own text and asked for its own
+# guard, its own kept-open print and its own return. What this buys over the merged pins: the
+# merged ones stay green if one site grew a second guard while the other lost its only one
+# (mutant D3's shape; it happened not to fit in a 6-line window, which was luck, not design),
+# and they go red for a reason that does not name the site. The merged pins are KEPT: they also
+# hold "exactly two close sites, exactly two guards", which no per-site pin says.
+moveclose_ctx() { # moveclose_ctx <extended regex matching ONE close print>
+	code_only | grep -B6 -E "$1"
+}
+ROUNDS_STOPPED='print\("\[move-resize\] sent SC_CLOSE to windowId=\\\(windowId\) \(rounds stopped\)"\)'
+ROUND_END='print\("\[move-resize\] sent SC_CLOSE to windowId=\\\(windowId\)"\)'
+pin 1 "$(code_only | grep -cE "$ROUNDS_STOPPED" || true)" "the rounds-stopped close print is one site"
+pin 1 "$(code_only | grep -cE "$ROUND_END" || true)" "the round-end close print is one site"
+for site in "rounds-stopped:$ROUNDS_STOPPED" "round-end:$ROUND_END"; do
+	site_name="${site%%:*}"
+	site_re="${site#*:}"
+	pin 1 "$(moveclose_ctx "$site_re" | grep -cE 'if moveResizeKeepTargetOpen \{' || true)" "$site_name close: its own guard above it"
+	pin 1 "$(moveclose_ctx "$site_re" | grep -cE 'print\(MoveResizeKeep\.keptOpenLine\)' || true)" "$site_name close: its own kept-open print"
+	pin 1 "$(moveclose_ctx "$site_re" | grep -cE '^[[:space:]]*return$' || true)" "$site_name close: its guard returns"
+done
 # One line, built once, printed from both sites -- so a record of a kept-open run reads the same
 # whichever exit the scenario took. Anchored on the assignment and on the call shape, never on the
 # bare name (project memory: a doc comment naming the shape counts too; the self-check's own

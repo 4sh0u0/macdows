@@ -427,16 +427,22 @@ extension WindowGeometry {
     /// `DesktopScaleFactor=200`** -- ADR-0018 §5.2 增补二 item 2's `B @192 DPI` row for
     /// non-`WS_THICKFRAME` windows. Source: the host-side window-rectangle probe's own
     /// `GetWindowRect` / `DWMWA_EXTENDED_FRAME_BOUNDS` pair on the About-class dialog,
-    /// `B = ef.l - wr.l = 11` (`docs/upgrade-gate/2026-09-15-w3-hostrect.md` §3(g)/§6 and
-    /// `.../2026-09-15-w3-hostrect-keep.md` §3(g)/§6), **n=1**.
+    /// `B = ef.l - wr.l = 11`, **n=1**. Both 2026-09-15 host-rect batches read that pair on
+    /// THIS class and agree on it, and it is their **About cells only** that are cited here:
+    /// `docs/upgrade-gate/2026-09-15-w3-hostrect.md` §3(g)/§6 and
+    /// `.../2026-09-15-w3-hostrect-keep.md` §3(g)/§6. The THICKFRAME constant below cites a
+    /// different (smaller) set of cells, for the reason its own comment gives.
     ///
     /// 11 IS THE REASON THERE IS A TABLE. Had it come back 14 this would be
     /// `aboutCalibratedClientWindowMoveLeftBorder * rasterScale` and no second constant would
     /// exist. It did not: the border is not linear in the display scale on this row, which is
-    /// the option ADR-0015 §7 (a) rules out by name. Corroborated from the other direction by
-    /// the 2026-09-09 C-2' checkpoint, whose 2x About move leg reported `dx=4.000` -- exactly
-    /// `11 - 7`, the amount a 96-column deduction under-deducts at 192 DPI (a different run, a
-    /// different batch, the same difference).
+    /// the option ADR-0015 §7 (a) rules out by name.
+    ///
+    /// NO SECOND-SOURCE CORROBORATION EXISTS FOR **THIS** CELL (gate r1, 2026-09-18). A draft of
+    /// this comment offered a live move leg as one; that leg was on the other row (see
+    /// `thickFrameClientWindowMoveLeftBorder192`, which is where the observation moved). This row
+    /// stands on the host-side probe alone, and re-measuring it on a 2x session through the
+    /// send/echo path is the outstanding half of §3 item 5 / §8.5 at 192 DPI too.
     public static let aboutCalibratedClientWindowMoveLeftBorder192: Double = 11
 
     /// The same inset on `WS_THICKFRAME` windows -- F-R1
@@ -459,8 +465,29 @@ extension WindowGeometry {
 
     /// The same inset on `WS_THICKFRAME` windows at **`DesktopScaleFactor=200`** -- ADR-0018
     /// §5.2 增补二 item 2's `B @192 DPI` row for the THICKFRAME class, from the same host-side
-    /// probe and the same two records as the About-class 11 above (`B = ef.l - wr.l = 10`),
-    /// **n=1**.
+    /// `GetWindowRect` / `DWMWA_EXTENDED_FRAME_BOUNDS` probe as the About-class 11 above
+    /// (`B = ef.l - wr.l = 10`), **n=1** -- but from **ONE** record, not the two that constant
+    /// cites: `docs/upgrade-gate/2026-09-15-w3-hostrect-keep.md` §3(g) (the `5,0,5,5` @96 /
+    /// `10,0,10,10` @192 pair) and §6. The EARLIER batch
+    /// (`.../2026-09-15-w3-hostrect.md` §3(g)/§6) could not judge this row at all: its
+    /// THICKFRAME cells produced no host reading at either scale -- the target was closed by
+    /// that run's own close leg before the probe read it -- which is the gap the `-keep` batch
+    /// was run to fill (gate r1, 2026-09-18: this comment used to claim both records).
+    ///
+    /// CORROBORATED ON THE WIRE, by the one live 2x run that moved a window of THIS class
+    /// (`docs/upgrade-gate/2026-09-09-w3-2x-checkpoint-c2prime.md` §3.2; the run's own adr/0015
+    /// §6.2 measurement lines). Both of that run's legs locked a `style=0x000F0000` target and
+    /// deducted the 96 column (`outboundLeftBorder=5.000`, the only column that existed then):
+    /// move sent `l=377` and was reported back at `offset 387`; resize sent `l=381` and came
+    /// back at `offset 391`. The server's own inset on that window was therefore `10` remote px
+    /// on both legs -- this constant, measured through the send/echo path instead of through the
+    /// host probe, on a different day and a different batch. Both legs also report
+    /// `delta=(dx=5,…)`, which is exactly the under-deduction this table predicts for a 96-column
+    /// send at 192 DPI (`10 - 5`), and `frame=(5,0,5,5)` there is the model that was ASSUMED,
+    /// not a reading. Two numbers in that run that are NOT this quantity: the local
+    /// `rectDelta dx=4.000` (a mac-side rect comparison, and that leg was judged against a
+    /// mid-leg remap observation), and the About row's `11 - 7 = 4`; neither belongs to this
+    /// constant or to the one above.
     ///
     /// This row DOES happen to be twice its 96-DPI sibling. Recorded as a coincidence of two
     /// independent readings, not as a rule: the other row of the same table is not (7 -> 11),

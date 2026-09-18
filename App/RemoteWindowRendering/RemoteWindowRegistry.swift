@@ -422,8 +422,19 @@ final class RemoteWindowRegistry {
     /// advertised `DesktopScaleFactor`, and only 100/200 (and 0, "nothing advertised") have a
     /// measured column. Its own bit rather than a shared one, for the reason the two above
     /// state: whichever condition occurred first in the process would otherwise silence the
-    /// others forever. `static` (process-wide, never reset), like them.
-    private static var warnedUnmeasuredDesktopScaleAdvertisement = false
+    /// others forever.
+    ///
+    /// PER INSTANCE, unlike the two `static` bits above -- gate r1 (2026-09-18) caught the first
+    /// draft writing "once per session" about a `static`. The quantity this one reports is a
+    /// property of ONE session (`session.advertisedDesktopScaleFactor` is assigned per connect,
+    /// `AppDelegate`), and this registry is built per connect against that session, so the
+    /// instance IS the session here. A process-wide bit would let a first connection that
+    /// advertised an unmeasured value silence the report for every later connection in the same
+    /// process -- and a run record, which registers this line as fired/not-fired for the session
+    /// it is reading, would then record "not fired" for a session that did take the fallback.
+    /// The two above stay `static` deliberately: what they report is a property of the PROCESS's
+    /// wiring (no provider injected) or of the machine (no usable display), not of a session.
+    private var warnedUnmeasuredDesktopScaleAdvertisement = false
 
     /// One-shot for `refreshSessionTopology(reason:)`'s ADR §5.A.4 same-source check (r2 review:
     /// it was the one diagnostic in this file without the throttle every other one has). Once per
@@ -2245,11 +2256,12 @@ final class RemoteWindowRegistry {
         // advertisement is the one that decides the frame the server draws. Read ONCE here, like
         // `state` above, and passed to the same seam that owns both measured columns.
         let advertised = session.advertisedDesktopScaleFactor
-        if WindowGeometry.DPITier.isUnmeasuredAdvertisement(advertised), !Self.warnedUnmeasuredDesktopScaleAdvertisement {
+        if WindowGeometry.DPITier.isUnmeasuredAdvertisement(advertised), !warnedUnmeasuredDesktopScaleAdvertisement {
             // Not a refusal: the run proceeds on the 96 column, which is what every window got
-            // before the column existed. Said once because the alternative is a session
-            // silently deducting a border nobody measured at its DPI.
-            Self.warnedUnmeasuredDesktopScaleAdvertisement = true
+            // before the column existed. Said once PER SESSION (the bit is this registry's own,
+            // and this registry belongs to one session -- see its declaration) because the
+            // alternative is a session silently deducting a border nobody measured at its DPI.
+            warnedUnmeasuredDesktopScaleAdvertisement = true
             Self.logger.warning(
                 "[geometry] left-border tier fallback: advertised desktop scale \(advertised, privacy: .public) is not 100/200, using the 96 DPI row"
             )

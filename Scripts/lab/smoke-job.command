@@ -62,7 +62,11 @@
 #   EXTRA_APPS       ^[A-Za-z0-9;_-]*$ -- WINDOW_SMOKE_EXTRA_APPS
 #   MOVE_TARGET      window-title substring/alternation for the move leg, at most 255 characters
 #                    (free text otherwise, so only the two shell-active characters are refused; it
-#                    carries CJK by design)
+#                    carries CJK by design). EMPTY selects the harness's About-dialog heuristic
+#                    rather than "no preference", so under MOVE=1 it is admitted ONLY when TAG
+#                    contains `about` (any case): the emptiness decides which WINDOW ROW of the
+#                    border table the run measures, and a job named for another row would
+#                    otherwise file an About-row measurement under that name
 #   APP APP_ARGS     the Windows program and its arguments (ASCII path/argument characters only)
 #   REQUIRE_SYMBOL   ^[A-Za-z0-9_]{1,64}$ or empty; non-empty: Tools/window-smoke/main.swift must
 #                    contain it, else the run is REFUSED. The c2p-run<n> preflight: a knob this run
@@ -415,6 +419,23 @@ EOF_JOB_KEYS
             # forwards has a stated ceiling, so "how long can a job file's value be" has one answer
             # instead of two, and a window title that ran away is refused at the definition.
             smoke_log "[smoke] JOB-ENV-INVALID -- MOVE_TARGET must be at most 255 characters and must not contain '\$' or a backtick (it is free text otherwise, and carries CJK titles by design); no run attempted"
+            SMOKE_RC=65
+        elif [ "$MOVE" = '1' ] && [ -z "$MOVE_TARGET" ] && ! printf '%s\n' "$TAG" | grep -qi 'about'; then
+            # An EMPTY MOVE_TARGET is not "no preference": it selects the harness's About-dialog
+            # heuristic, which locks the base app's own dialog. So the emptiness decides WHICH
+            # WINDOW ROW the run measures -- and that is the axis the 192-DPI border table is
+            # built on (ADR-0018 §5.2 增补二 item 2: About 11, THICKFRAME 10). A job whose TAG
+            # names another row and whose filter is empty measures the About row under that row's
+            # name, reports DONE exit=0, and NOTHING in its evidence says so: the log carries the
+            # locked window's own title, but the record is filed under the TAG.
+            # Found by the route-B gate r1 (2026-09-18) by mutation: emptying the tracked
+            # THICKFRAME job's filter left every offline check green.
+            # The rule is on the VALUE, so a job that never wrote the key is refused here too;
+            # that a job which MAY be empty must still write the key out is a separate rule, and
+            # it lives in test-smoke-job-offline.sh where the file's TEXT is readable (sourcing
+            # cannot tell "set to empty" from "never set"). TAG is matched case-insensitively and
+            # anywhere in the value, because the tracked About jobs spell it `…-mkeep-about`.
+            smoke_log "[smoke] JOB-ENV-INVALID -- MOVE=1 with an empty MOVE_TARGET selects the About-dialog heuristic, so only a job that DECLARES the About row may leave it empty: TAG must contain 'about' (any case). A job named for any other window row must carry the filter that selects that row, or the run measures the About row under this job's name and no artefact of the run contradicts it; no run attempted"
             SMOKE_RC=65
         elif ! smoke_ascii_arg_ok "$APP" || ! smoke_ascii_arg_ok "$APP_ARGS"; then
             smoke_log "[smoke] JOB-ENV-INVALID -- APP and APP_ARGS must be <=255 Windows path/argument characters (letters, digits, space and . _ : % ( ) + , @ = * ? \\ / -); no run attempted"

@@ -402,20 +402,50 @@ struct RemoteWindowRegistryLeftBorderTests {
 /// `WindowGeometryDPITierTests.unmeasuredAdvertisementPredicate` in MacdowsCore), the WIRING
 /// (the three suite cases above drive 200/150/100/0 through the real registry and read the sent
 /// rect), and -- here -- that the warning is emitted exactly once, from one place, behind a
-/// warn-once bit of its own, in the same shape as the two `sessionTopologyOrWarn()` bits this
-/// file has used since M1.
+/// warn-once bit of its own. That bit is PER REGISTRY INSTANCE (= per session), which is the one
+/// way it differs from the two `sessionTopologyOrWarn()` bits this file has pinned since M1:
+/// those report a property of the process or of the machine and are deliberately `static`; this
+/// one reports a property of the session that is being warned about (gate r1 m1, 2026-09-18).
 ///
 /// Same technique and same collapsed-substring helper as `ProductScaleDefaultPinTests`.
 @Suite("the left-border DPI-tier fallback says so once (source pins)")
 struct RemoteWindowRegistryLeftBorderTierLogPinTests {
-    private static func registrySource() throws -> String {
+    private static func registryRawSource() throws -> String {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
-        let raw = try String(
+        return try String(
             contentsOf: root.appendingPathComponent("App/RemoteWindowRendering/RemoteWindowRegistry.swift"),
             encoding: .utf8
         )
-        return raw.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    }
+
+    private static func registrySource() throws -> String {
+        try registryRawSource().split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    }
+
+    /// The same file with every `//`-to-end-of-line comment removed BEFORE the whitespace
+    /// collapse, so a count over it sees code only (gate r1 m5, 2026-09-18).
+    ///
+    /// Why a second reader rather than a cleverer needle: the pins below anchor on call SHAPES
+    /// precisely because a bare name also matches the prose of a doc comment (project memory:
+    /// "source pins must match call shapes, not names"). That defends against a comment being
+    /// counted as code; it does NOT defend against a second real READ written in a shape the
+    /// pin does not enumerate -- e.g. `foo(session.advertisedDesktopScaleFactor)` in another
+    /// method of this file, which is neither an assignment nor the enumerated call. Stripping
+    /// the comments turns the bare name back into a usable pin for exactly that case.
+    ///
+    /// Known and accepted blind spot: a `//` inside a string literal would truncate that line.
+    /// The file has no such literal on any line carrying the token pinned below, and a future
+    /// one would make the pin RED (a line lost, not a line gained), which is the safe direction.
+    private static func registrySourceWithoutComments() throws -> String {
+        let stripped = try registryRawSource()
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> Substring in
+                guard let marker = line.range(of: "//") else { return line }
+                return line[line.startIndex..<marker.lowerBound]
+            }
+            .joined(separator: "\n")
+        return stripped.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
     }
 
     private static func occurrences(of needle: String, in haystack: String) -> Int {
@@ -445,15 +475,31 @@ struct RemoteWindowRegistryLeftBorderTierLogPinTests {
             ) == 1
         )
         #expect(Self.occurrences(of: "Self.clientWindowMoveLeftBorder(forStyle: state.style)", in: src) == 0)
+        // ... and the shapes above are not an exhaustive list of ways to read a property, so the
+        // bare token is counted too -- over CODE ONLY (gate r1 m5). A second read written as a
+        // direct argument somewhere else in this file (`foo(session.advertisedDesktopScaleFactor)`)
+        // is caught by this and by nothing above it. Exactly one, the `let advertised` assignment;
+        // the doc comments that name the property in prose are stripped, not counted.
+        let code = try Self.registrySourceWithoutComments()
+        #expect(Self.occurrences(of: "session.advertisedDesktopScaleFactor", in: code) == 1)
     }
 
     @Test("the fallback warning is guarded by the predicate and by a warn-once bit, and fires from one place")
     func theFallbackWarningIsGuardedAndOnce() throws {
         let src = try Self.registrySource()
         #expect(Self.occurrences(of: "WindowGeometry.DPITier.isUnmeasuredAdvertisement(", in: src) == 1)
-        #expect(Self.occurrences(of: "!Self.warnedUnmeasuredDesktopScaleAdvertisement", in: src) == 1)
-        #expect(Self.occurrences(of: "Self.warnedUnmeasuredDesktopScaleAdvertisement = true", in: src) == 1)
-        #expect(Self.occurrences(of: "private static var warnedUnmeasuredDesktopScaleAdvertisement = false", in: src) == 1)
+        #expect(Self.occurrences(of: "!warnedUnmeasuredDesktopScaleAdvertisement", in: src) == 1)
+        #expect(Self.occurrences(of: "warnedUnmeasuredDesktopScaleAdvertisement = true", in: src) == 1)
+        // PER INSTANCE, not per process (gate r1 m1): the registry is built per connect against
+        // one session, and what this line reports is that session's advertisement. A `static`
+        // bit here would make a second connection in the same process silent about its own
+        // fallback -- and a run record registering "fired / did not fire" for a session would
+        // then be recording the FIRST session's answer. Pinned in both directions so the shape
+        // cannot drift back: the declaration is `private var`, and no `Self.`-qualified use of
+        // the bit survives anywhere in the file.
+        #expect(Self.occurrences(of: "private var warnedUnmeasuredDesktopScaleAdvertisement = false", in: src) == 1)
+        #expect(Self.occurrences(of: "private static var warnedUnmeasuredDesktopScaleAdvertisement", in: src) == 0)
+        #expect(Self.occurrences(of: "Self.warnedUnmeasuredDesktopScaleAdvertisement", in: src) == 0)
         // The text a record reads, built in one place. Written as the interpolation's own shape
         // so a doc comment quoting the words does not count (project memory: source pins match
         // call shapes, not names).
