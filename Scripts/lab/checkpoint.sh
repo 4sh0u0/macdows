@@ -658,11 +658,24 @@ mkdir -p "$RUNTIME" 2>/dev/null || cp_die 2 "cannot create $(cp_rel "$RUNTIME")"
 # differently, which is a live shape in this project's tooling), a file this run really wrote reads
 # as a previous run's and a complete batch reports itself INCOMPLETE. The offline suite asserts this
 # for its own sandbox; here it is asserted for .build/lab-runtime, with one probe file written
-# immediately after the stamp, before anything is launched.
-{ printf 'probe written immediately after the start stamp; see CP_START_PROBE\n' > "$CP_START_PROBE"; } 2>/dev/null \
-    || cp_die 2 "cannot write $(cp_rel "$CP_START_PROBE") -- nothing below could write to the runtime directory either"
-[ -n "$(find "$CP_START_PROBE" -maxdepth 0 -newer "$CP_START_STAMP" 2>/dev/null)" ] \
-    || cp_die 2 "runtime filesystem or find cannot order files written in sequence -- $(cp_rel "$CP_START_PROBE") was written after $(cp_rel "$CP_START_STAMP") and does not come out newer than it, so a file this run writes could be reported as a previous run's"
+# after the stamp, before anything is launched.
+# Linux stamps files from a coarse clock (a few ms per tick), so two writes inside one tick carry
+# the SAME mtime and are not ordered -- that is the normal shape there, not a broken volume (Tier 1
+# run 35320158454, 2026-09-18, refused every case this way with a probe written in the same tick).
+# So the probe is rewritten every 20 ms until it comes out newer than the stamp, bounded at ~2 s:
+# once it has, the clock has moved past the stamp's tick and everything a launch below writes is
+# strictly newer -- an equal timestamp can no longer be this run's. Only a probe that never orders
+# is the refusal.
+CP_PROBE_TRIES=0
+while :; do
+    { printf 'probe written after the start stamp; see CP_START_PROBE\n' > "$CP_START_PROBE"; } 2>/dev/null \
+        || cp_die 2 "cannot write $(cp_rel "$CP_START_PROBE") -- nothing below could write to the runtime directory either"
+    [ -z "$(find "$CP_START_PROBE" -maxdepth 0 -newer "$CP_START_STAMP" 2>/dev/null)" ] || break
+    CP_PROBE_TRIES=$((CP_PROBE_TRIES + 1))
+    [ "$CP_PROBE_TRIES" -lt 100 ] \
+        || cp_die 2 "runtime filesystem or find cannot order files written in sequence -- $(cp_rel "$CP_START_PROBE") was rewritten for 2 s after $(cp_rel "$CP_START_STAMP") and never came out newer than it, so a file this run writes could be reported as a previous run's"
+    sleep 0.02
+done
 # From here on, every exit gathers and prints the manifest -- including the overlap refusal below.
 GATHER_ARMED=1
 cp_log "start stamp: $(cp_rel "$CP_START_STAMP") -- only files modified after it are gathered as this batch's"
