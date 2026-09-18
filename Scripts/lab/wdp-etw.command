@@ -338,7 +338,7 @@ etw_drop_cred() {
 # overlap guard in checkpoint.sh reads that line, which comes later) cannot delete each other's
 # staged pin; the trap removes this wrapper's own if a run dies between staging and renaming.
 PIN_STAGE="$PINFILE.rotating.$$"
-# shellcheck disable=SC2329  # invoked by the EXIT trap below
+# shellcheck disable=SC2329,SC2317  # invoked by the EXIT trap below (0.11 emits SC2329, older CI shellcheck emits SC2317 for the same indirect-invocation shape)
 etw_cleanup() {
     etw_drop_cred
     rm -f "$PIN_STAGE"
