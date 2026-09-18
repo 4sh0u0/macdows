@@ -32,14 +32,25 @@
 # fingerprint that differs from the pin on file ARCHIVES the old pin beside itself and writes the
 # new one. Archived, never overwritten -- the rule above still holds for PIN_RECORD, and a
 # rotation destroys no value: the old file survives under a name that records when it stopped
-# being the pin, and the one CERT-PIN-ROTATED line is the audit trail. The trade-off is the
+# being the pin. WHAT RECORDS A ROTATION IS THAT ARCHIVE FILE AND ONE APPENDED LINE IN
+# portal-cert-rotations.log beside it -- not the CERT-PIN-ROTATED line in etw.log. etw.log is
+# truncated by the very next run (the per-TAG copy by the next run with the same TAG), so the log
+# line is the notice a reader sees now and those two files are what is still there tomorrow; the
+# rotations log is only ever appended to, and nothing in this wrapper truncates or rewrites it.
+# The archives accumulate on purpose: nothing here prunes, counts or ages them out, and an
+# operator who wants fewer deletes them BY HAND. A lost archive cannot be recovered, so the
+# choice is never the wrapper's -- which is also why the manual procedure in the runbook writes
+# its own `.until-<date>-<reason>` names into the same directory. The trade-off is the
 # runbook's (host-side-debug-channels): a pin that rotates on its own no longer resists an
 # in-segment man-in-the-middle; it still shows a certificate change within a batch. Without the
 # knob a changed certificate ends exactly where it did before, at the client's exit 79.
-# The dial itself is BOUNDED (ETW_DIAL_SECONDS): `openssl s_client` has no timeout of its own
-# for a peer that accepts the connection and then says nothing, and a wrapper stuck there would
-# never write its DONE line -- the worst shape a refusal can take (see the job-file section). A
-# dial that times out counts as "no fingerprint": the pin is kept and the client decides.
+# THE DIAL IS BOUNDED -- AND SO IS THE RECORDER'S, because they are one function. ETW_DIAL_SECONDS
+# is a CONSTANT of this wrapper (no environment override, no job key: the bound is the client's own
+# HANDSHAKE_TIMEOUT, not an operator's decision). `openssl s_client` has no timeout of its own for
+# a peer that accepts the connection and then says nothing, and a wrapper stuck there would never
+# write its DONE line -- the worst shape a refusal can take (see the job-file section). A dial that
+# times out counts as "no fingerprint": the pin on file is kept (and a pin being RECORDED is simply
+# not written, PIN-RECORD-FAILED), and the client decides.
 #
 # LOG MASK. etw.log is the artefact a human pastes into a report, so every line written to it
 # goes through etw_sink, which rewrites the four classes of value that can reach it: $HOME to
@@ -66,7 +77,12 @@
 #   TAG         capture name, ^[A-Za-z0-9_-]{1,32}$; names etw-<TAG>.jsonl and etw-<TAG>.log
 #   DURATION    capture seconds, positive integer (default 60)
 #   PROVIDERS   <guid>:<level>[;<guid>:<level>...], level 0-5 -- passed to the client verbatim
-#   PIN_RECORD  0|1 (default 0); 1 records the certificate pin ONCE if none exists yet
+#   PIN_RECORD  0|1 (default 0); 1 records the certificate pin ONCE if none exists yet -- through
+#               the SAME bounded dial the rotation uses (ETW_DIAL_SECONDS, above), with or without
+#               the key below: a portal that accepts TCP and then stalls ends the run at
+#               PIN-RECORD-FAILED inside the bound instead of hanging with no DONE line. The pin
+#               is written by rename from a private staging file (0600 from its first byte), so
+#               the pin file is only ever REPLACED, never written into
 #   PIN_TRUST_ROTATION  0|1 (default 0); 1 = trust on rotation (see above): with a well-formed
 #               pin on file, dial the portal first (bounded, ETW_DIAL_SECONDS); a served
 #               fingerprint that differs ARCHIVES the old pin file beside itself as
@@ -76,10 +92,17 @@
 #               `CERT-PIN-ROTATED old=<sha256> new=<sha256>` line and continues the capture
 #               against the new pin. A missing, unreadable or malformed pin is NOT rescued by
 #               it (PIN-MISSING / PIN-INVALID keep their exit 79: there is nothing to rotate
-#               FROM); a portal that does not answer the dial -- or answers after the bound --
-#               leaves the pin alone (PIN-ROTATION-CHECK-FAILED), and so does an archive name
-#               that is already taken or a write that fails (PIN-ROTATION-FAILED): in both the
-#               capture proceeds against the pin on file and the client decides as it always has
+#               FROM -- and an EXISTING pin file that holds no fingerprint, the empty one
+#               included, is PIN-INVALID rather than a pin to record over); a portal that does
+#               not answer the dial -- or answers after the bound -- leaves the pin alone
+#               (PIN-ROTATION-CHECK-FAILED reason=no-answer, or reason=local-tool when the dial
+#               could not run on this Mac at all), and so does an archive name that is already
+#               taken or a write that fails (PIN-ROTATION-FAILED): in both the capture proceeds
+#               against the pin on file and the client decides as it always has. A rotation also
+#               appends its line to portal-cert-rotations.log (above), and a run that rotated and
+#               THEN met the client's exit 79 says so once, as PIN-ROTATED-THEN-MISMATCHED: the
+#               dial and the capture were shown different certificates, so what looks like a
+#               failed pin is one certificate change reported twice
 #
 # DONE exit=<rc> is the run's whole verdict (the window's own status is meaningless -- see the
 # bottom of this file). The wrapper's own codes and the client's share one space:
@@ -114,6 +137,12 @@ LOG="$RUNTIME/etw.log"
 # time out, never last run's DONE exit=0.
 : > "$LOG"
 PINFILE="$WDP/portal-cert-sha256.txt"
+# The durable record of every rotation, beside the pin it is about. etw.log is truncated a few
+# lines below and the per-TAG copy is overwritten by the next run with the same TAG, so a line
+# there answers "what happened just now" and nothing more; this file answers "what has this
+# checkout ever trusted". One APPENDED line per rotation and no other writer -- nothing in this
+# wrapper truncates, rewrites or prunes it.
+ROTLOG="$WDP/portal-cert-rotations.log"
 # What a SHA-256 fingerprint looks like, in ONE place: `openssl x509 -fingerprint`'s colon-separated
 # form or bare hex. The recorder checks it before writing the pin file and the reader checks it
 # again before using one -- same rule both ways, so a pin file can never be trusted on a shape the
@@ -125,7 +154,9 @@ PIN_RE='^([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}$|^[0-9A-Fa-f]{64}$'
 # the dial in its own place -- an alarm SURVIVES exec, so the process the deadline kills is
 # openssl itself. No job control, no background job to reap, no orphan. 15 s is the client's own
 # HANDSHAKE_TIMEOUT (wdp_etw.py), so a portal the client would give up on is one the dial gives
-# up on too.
+# up on too. A CONSTANT, deliberately: it reads no environment override and is not a job key, so
+# no caller can hand a run a longer rope than the client itself has -- and there is no value shape
+# to check because there is no value to supply. Changing the bound is an edit to this line.
 ETW_DIAL_SECONDS=15
 ETW_ALARM_EXEC='import os, signal, sys; signal.alarm(int(sys.argv[1])); os.execvp(sys.argv[2], sys.argv[2:])'
 # THE LINE GRAMMAR (see the header). Three kinds of line are admitted and nothing else: blank, a
@@ -153,6 +184,12 @@ USER_RE=''
 PASS_RE=''
 TAG=''
 TAG_OK=0
+# Did THIS run rotate the pin, and between which two fingerprints. Read once, after the client has
+# returned: a rotation followed by the client's own exit 79 means the dial and the capture were
+# shown different certificates, which is worth saying out loud exactly once.
+ETW_ROTATED=0
+ETW_ROT_OLD=''
+ETW_ROT_NEW=''
 
 # BRE-escapes a value so it can be used as a sed pattern. WIN_HOST is normally an IP literal, and
 # its dots would otherwise match any character -- close enough to look right and wrong enough to
@@ -211,6 +248,14 @@ etw_log() { # <text...>
     printf '%s\n' "$*" | etw_sink
 }
 
+# The rotation's durable line (ROTLOG). Appended and never truncated -- the file IS the history --
+# and masked by the same rules as etw.log, because it is read by the same eyes and a future line
+# could name a path. `umask 077` applies to the CREATION of the file: the first rotation makes it
+# 0600, and a file that already exists keeps the mode it has.
+etw_rotation_record() { # <text...>
+    ( umask 077; printf '%s\n' "$*" | etw_mask >> "$ROTLOG" )
+}
+
 # The pin recorder's network call in one place: the SNI decision below changes the ARGUMENTS, not
 # the pipeline that turns whatever certificate was served into a fingerprint.
 #
@@ -260,6 +305,21 @@ etw_served_fp() {
 # `normalise_pin`) -- so that a pin file written in openssl's colon form and a fingerprint served
 # today compare as VALUES rather than as spellings, and so that a rotated pin and the `got=` of a
 # CERT-PIN-MISMATCH line read alike.
+# WHICH END produced no fingerprint, as far as this Mac can PROVE. An empty answer arrives both
+# from a portal that said nothing and from a dial that never ran -- openssl missing from PATH, a
+# python3 the trampoline cannot exec -- and the two want opposite first moves (go and look at the
+# host / go and look at this machine), so the refusal names only what it can decide here: with
+# either tool of the pipeline missing from PATH the answer never left this Mac
+# (reason=local-tool); otherwise reason=no-answer, which is the honest default -- an exec that
+# fails for a reason `command -v` cannot see reads as no-answer. Neither reason touches the pin.
+etw_dial_reason() {
+    if command -v openssl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+        printf 'no-answer'
+    else
+        printf 'local-tool'
+    fi
+}
+
 etw_pin_hex() { # <fingerprint>
     printf '%s' "$1" | tr -d ':' | tr '[:upper:]' '[:lower:]'
 }
@@ -411,7 +471,14 @@ EOF_JOB_KEYS
             # killed recorder -- would otherwise be handed to the client, which means this wrapper
             # would create the 0600 credential file for a run that can only end at the client's
             # own CERT-PIN-MISSING, one layer away from the file that actually needs fixing.
-            if [ -n "$PIN" ] && ! printf '%s' "$PIN" | grep -qE "$PIN_RE"; then
+            # The empty file is in this class too, and deliberately so: a pin file that EXISTS
+            # but holds nothing is a pin file that was truncated, half-written or emptied by
+            # hand, NOT a missing one. Reading it as missing would hand it to the recorder --
+            # the one path that writes a pin -- so a pin file could be replaced by emptying it,
+            # which is the "never overwrite a pin" rule defeated with a redirection. PIN-INVALID
+            # instead: the operator deletes the file and re-records, and that deletion is the
+            # deliberate act the rule asks for.
+            if ! printf '%s' "$PIN" | grep -qE "$PIN_RE"; then
                 PIN_BAD=1
                 PIN=""
             fi
@@ -444,23 +511,34 @@ EOF_JOB_KEYS
             etw_log "[etw] PIN_TRUST_ROTATION=1 -- asking the portal for its certificate (bounded to ${ETW_DIAL_SECONDS}s)"
             SERVED="$(etw_served_fp)"
             if ! printf '%s' "$SERVED" | grep -qE "$PIN_RE"; then
-                etw_log "[etw] PIN-ROTATION-CHECK-FAILED -- the portal returned no SHA-256 fingerprint within ${ETW_DIAL_SECONDS}s; the pin on file is kept and the capture proceeds against it"
+                etw_log "[etw] PIN-ROTATION-CHECK-FAILED reason=$(etw_dial_reason) -- no SHA-256 fingerprint came back within ${ETW_DIAL_SECONDS}s (the portal did not answer, or the dial itself could not run here -- see the reason); the pin on file is kept and the capture proceeds against it"
             else
                 OLD_HEX="$(etw_pin_hex "$PIN")"
                 NEW_HEX="$(etw_pin_hex "$SERVED")"
                 if [ "$OLD_HEX" = "$NEW_HEX" ]; then
                     etw_log "[etw] PIN_TRUST_ROTATION=1 -- the portal certificate matches the pin on file; nothing rotated"
                 else
-                    ARCHIVE="$PINFILE.until-$(date -u +%Y%m%dT%H%M%SZ)-rotation"
-                    # umask 077 gives the rotated pin mode 0600 from its first byte. A pin the
-                    # recorder writes lands at the process umask instead; the fingerprint is a
-                    # public value either way, and the recorder's line is left as it was.
+                    # ONE stamp, read once: the archive's name and the rotations-log line say
+                    # when this pin stopped being the pin, and two `date` calls either side of a
+                    # second boundary would disagree about it.
+                    ROT_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+                    ARCHIVE="$PINFILE.until-$ROT_STAMP-rotation"
+                    # umask 077 gives the rotated pin mode 0600 from its first byte -- and the
+                    # recorder below now writes the same way, so "the pin is 64 hex at 0600"
+                    # holds for every pin this wrapper produces rather than only the rotated ones.
                     rm -f "$PIN_STAGE"
                     if ( umask 077; printf '%s\n' "$NEW_HEX" > "$PIN_STAGE" ) \
                         && ln "$PINFILE" "$ARCHIVE" 2>/dev/null \
                         && mv "$PIN_STAGE" "$PINFILE"; then
                         PIN="$NEW_HEX"
+                        ETW_ROTATED=1
+                        ETW_ROT_OLD="$OLD_HEX"
+                        ETW_ROT_NEW="$NEW_HEX"
                         etw_log "[etw] CERT-PIN-ROTATED old=$OLD_HEX new=$NEW_HEX"
+                        # The same rotation, in the file that outlives this log. Written only
+                        # here -- after the rename landed -- so the record is of rotations that
+                        # HAPPENED, never of ones that failed halfway.
+                        etw_rotation_record "$ROT_STAMP tag=$TAG old=$OLD_HEX new=$NEW_HEX archive=${ARCHIVE##*/}"
                     else
                         rm -f "$PIN_STAGE"
                         etw_log "[etw] PIN-ROTATION-FAILED -- could not archive the old pin file and write the new one; the pin on file is kept and the capture proceeds against it"
@@ -486,9 +564,25 @@ EOF_JOB_KEYS
             # an empty fingerprint, and writing that would create a pin file that can never be
             # recorded again (an existing pin is never overwritten) and refuses every future run.
             if printf '%s' "$FP" | grep -qE "$PIN_RE"; then
-                printf '%s\n' "$FP" > "$PINFILE"
-                PIN="$FP"
-                etw_log "[etw] pin recorded sha256=$FP"
+                # Staged and renamed, exactly like the rotation above, and for the same two
+                # reasons rather than for a hole this closes: the pin is ATOMIC (a reader sees
+                # the old state or the new one, never a half-written fingerprint) and it is
+                # MODE-CONSISTENT (0600 from its first byte, the mode the contract names, instead
+                # of whatever the process umask happens to be). The in-place `> "$PINFILE"` this
+                # replaces could not in fact be reached with a pin file present -- the recorder
+                # runs only when there is none -- so nothing here was rewriting an inode an
+                # archive might share; one write discipline for both writers is simply the shape
+                # that keeps it that way as the file grows.
+                rm -f "$PIN_STAGE"
+                if ( umask 077; printf '%s\n' "$FP" > "$PIN_STAGE" ) && mv "$PIN_STAGE" "$PINFILE"; then
+                    PIN="$FP"
+                    etw_log "[etw] pin recorded sha256=$FP"
+                else
+                    # Fail closed, like every other pin failure: PIN stays empty, so the run ends
+                    # at PIN-MISSING below rather than proceeding with a pin nobody wrote.
+                    rm -f "$PIN_STAGE"
+                    etw_log "[etw] PIN-RECORD-FAILED -- the portal answered but the pin file could not be written; nothing recorded"
+                fi
             else
                 etw_log "[etw] PIN-RECORD-FAILED -- the portal returned no SHA-256 fingerprint; nothing written to the pin file"
             fi
@@ -541,6 +635,17 @@ EOF_JOB_KEYS
                 python3 "$LAB_DIR/wdp_etw.py" 2>&1 | etw_sink
             ETW_RC=${PIPESTATUS[0]}
             etw_drop_cred
+            # The rotation trusted a SEPARATE TLS connection, taken moments before this one. The
+            # portal regenerates its certificate on every webmanagement start -- the whole reason
+            # the knob exists -- so a restart landing between the two shows the dial certificate A
+            # and the capture certificate B: the pin now on file is A, the client refuses B with
+            # its own exit 79, and the NEXT run rotates again (archiving A). Nothing is lost and
+            # nothing here is retried; what would otherwise be missing is any line saying the two
+            # disagreed, which is what turns "the pin caught a change" into "the pin is broken"
+            # in a scrollback. Exactly one line, only when this run both rotated and then met 79.
+            if [ "$ETW_ROTATED" -eq 1 ] && [ "$ETW_RC" -eq 79 ]; then
+                etw_log "[etw] PIN-ROTATED-THEN-MISMATCHED old=$ETW_ROT_OLD new=$ETW_ROT_NEW -- the certificate served at the pre-dial differs from the one the capture met; the pin on file is the pre-dial one"
+            fi
             etw_log "[etw] end=$(date -u +%Y-%m-%dT%H:%M:%SZ) rc=$ETW_RC"
         fi
     fi
