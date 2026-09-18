@@ -319,6 +319,44 @@ pin 1 "$(code_only | grep -cE 'print\(EdgeProfile\.periodOverflowLine\(' || true
 pin 1 "$(code_only | grep -cE 'if periodsDropped > 0 \{' || true)" "the overflow line is printed only when something was dropped"
 pin 1 "$(code_only | grep -cE 'registry\.gfxPeriodOverflowCount\(windowId: snapshot\.windowId\)' || true)" "the drop count comes from the registry, once per window"
 
+echo "== ADR-0018 §5.2 增补二 item 2: WINDOW_SMOKE_MOVE_KEEP guards BOTH closes of the move target =="
+# WHY THESE ARE SOURCE PINS AND NOT SELF-CHECKS. The knob's DECISION is a pure function and
+# `WindowSmokeGateSelfTest.moveKeepKnobIsLiteralOneOnly` already holds it. What no offline check
+# can hold is the other half -- that the two `SC_CLOSE` sites of the move/resize scenario actually
+# consult it -- because both sit inside a live per-tick state machine that needs a session, a
+# server and a real NSWindow. A run whose guard was dropped from either site looks identical to a
+# correct one until the operator finds the window gone on the host, which is a day later and one
+# batch wasted (the prereg gate's own reason for asking: the second site is reachable only at
+# round > 1, i.e. exactly the runs nobody exercises by accident).
+#
+# The scenario sends SC_CLOSE to its locked target from exactly two places -- the round-end close
+# and the "rounds stopped, no bounded offset" exit -- and each must be unreachable without first
+# passing the guard.
+pin 2 "$(code_only | grep -cE 'print\("\[move-resize\] sent SC_CLOSE' || true)" "the move target has exactly two close sites"
+pin 2 "$(code_only | grep -cE 'if moveResizeKeepTargetOpen \{' || true)" "both close sites are guarded by the knob"
+# POSITIONAL, and the numbers are measured: in the comment-filtered stream the guard's `if` sits
+# exactly 6 lines above each `sent SC_CLOSE` print (guard, print, phase, return, closing brace,
+# sendSysCommand). A guard DELETED from either site makes this read 1; a guard moved BELOW its
+# close, or a third unguarded close, also makes it read 1. KNOWN BRITTLENESS, in the fail-safe
+# direction and stated for the same reason the `-A1` pins above state theirs: reflowing either
+# block makes this red against correct code, and the fix is to re-measure the span here rather
+# than to doubt the guard.
+pin 2 "$(code_only | grep -B6 -E 'print\("\[move-resize\] sent SC_CLOSE' | grep -cE 'if moveResizeKeepTargetOpen \{' || true)" "each close sits below its own guard"
+# ... and each guard RETURNS before reaching the close (a guard that only printed would keep the
+# close). `-A3` is the guard's whole body: print, phase, return.
+pin 2 "$(code_only | grep -A3 -E 'if moveResizeKeepTargetOpen \{' | grep -cE 'return$' || true)" "each guard returns before the close"
+# One line, built once, printed from both sites -- so a record of a kept-open run reads the same
+# whichever exit the scenario took. Anchored on the assignment and on the call shape, never on the
+# bare name (project memory: a doc comment naming the shape counts too; the self-check's own
+# equality assertion carries the TEXT, which is why the text itself is not what is counted).
+pin 1 "$(code_only | grep -cE 'static let keptOpenLine = "\[move-resize\] keep=1 target left open \(WINDOW_SMOKE_MOVE_KEEP\)"' || true)" "the kept-open line is built in one place"
+pin 2 "$(code_only | grep -cE 'print\(MoveResizeKeep\.keptOpenLine\)' || true)" "the kept-open line is printed from the two guards"
+pin 0 "$(code_only | grep -cE 'print\("\[move-resize\] keep=' || true)" "no site prints a second copy of that text"
+# The decision is one pure function with one live binding, and the environment is read once.
+pin 1 "$(code_only | grep -cE 'static func suppressesTargetClose\(' || true)" "suppressesTargetClose definition"
+pin 1 "$(code_only | grep -cE 'let moveResizeKeepTargetOpen = MoveResizeKeep\.suppressesTargetClose\(' || true)" "one live binding of the knob"
+pin 1 "$(code_only | grep -cE 'environment\["WINDOW_SMOKE_MOVE_KEEP"\]' || true)" "WINDOW_SMOKE_MOVE_KEEP is read once"
+
 echo "== summary =="
 printf 'failures=%s\n' "$FAILURES"
 [ "$FAILURES" -eq 0 ]

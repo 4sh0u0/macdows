@@ -2194,8 +2194,25 @@ enum WindowSmokeGateSelfTest {
                 && WindowGeometry.clientWindowMoveLeftBorder(forStyle: 0x000B_0000) == WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder
                 && RailComparison.Borders.forStyleBits(0x000B_0000) == RailComparison.Borders.aboutCalibrated
                 && Double(RailComparison.Borders.thickFrameMeasured.left) == WindowGeometry.thickFrameClientWindowMoveLeftBorder
-                && Double(RailComparison.Borders.aboutCalibrated.left) == WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder,
-            "railComparisonBorderModelsAreTheTwoMeasuredOnes: About-calibrated (7,0,7,7) is the default (right/bottom 7 are a single-run reading, n=1); THICKFRAME (5,0,5,5) is the F-R1 measurement (n=9 independent runs, memo :101); the fixture's WS_THICKFRAME literal and both left values agree with MacdowsCore's production seam (WindowGeometry.clientWindowMoveLeftBorder(forStyle:)) -- pinned, not assumed (review border-per-style-r2 I-3); the wiring's field bits are WND_OFFSET 0x800, WND_SIZE 0x400 and STYLE 0x8"
+                && Double(RailComparison.Borders.aboutCalibrated.left) == WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder
+                // ADR-0018 §5.2 增补二 item 2: the seam now has a second axis, and the fixture's
+                // own two Borders models are its 96 COLUMN. All four cells are pinned here
+                // because the fixture reserves bounds with the same lookup the send path uses
+                // (startMoveLeg), so a table that silently answered the 96 column at 192 DPI
+                // would under-reserve on exactly the runs this lane exists to measure.
+                && WindowGeometry.clientWindowMoveLeftBorder(forStyle: RailComparison.Borders.wsThickFrame, tier: .dpi96) == 5
+                && WindowGeometry.clientWindowMoveLeftBorder(forStyle: 0x000B_0000, tier: .dpi96) == 7
+                && WindowGeometry.clientWindowMoveLeftBorder(forStyle: RailComparison.Borders.wsThickFrame, tier: .dpi192) == 10
+                && WindowGeometry.clientWindowMoveLeftBorder(forStyle: 0x000B_0000, tier: .dpi192) == 11
+                // ... and the tier is derived from what THIS SESSION ADVERTISED, not from the
+                // display: `WINDOW_SMOKE_ADVERTISED_SCALE=none` on a 2x panel advertises nothing
+                // (0) and must stay in the 96 column -- the case a tier keyed on the local
+                // display's scale instead would get wrong on every E-none leg.
+                && WindowGeometry.DPITier(advertisedDesktopScaleFactor: 200) == .dpi192
+                && WindowGeometry.DPITier(advertisedDesktopScaleFactor: 100) == .dpi96
+                && WindowGeometry.DPITier(advertisedDesktopScaleFactor: 0) == .dpi96
+                && WindowGeometry.DPITier(advertisedDesktopScaleFactor: 150) == .dpi96,
+            "railComparisonBorderModelsAreTheTwoMeasuredOnes: About-calibrated (7,0,7,7) is the default (right/bottom 7 are a single-run reading, n=1); THICKFRAME (5,0,5,5) is the F-R1 measurement (n=9 independent runs, memo :101); the fixture's WS_THICKFRAME literal and both left values agree with MacdowsCore's production seam (WindowGeometry.clientWindowMoveLeftBorder(forStyle:)) -- pinned, not assumed (review border-per-style-r2 I-3); the wiring's field bits are WND_OFFSET 0x800, WND_SIZE 0x400 and STYLE 0x8; and since ADR-0018 §5.2 增补二 item 2 all FOUR cells of the style x DPI table are pinned (96: 5/7, 192: 10/11, n=1 per 192 cell) together with the tier rule that only an advertised DesktopScaleFactor of 200 leaves the 96 column -- 0 (nothing advertised, the ADVERTISED_SCALE=none form) and 100 and any unmeasured value stay on it"
         )
         // style bits from the RAIL WindowCreate (the `[style-dump] style=0x…` value): WS_THICKFRAME (0x00040000)
         // selects the measured THICKFRAME model -- Notepad 0x000F0000 and Realtek 0x800F0000 carry it, About
@@ -2268,6 +2285,27 @@ enum WindowSmokeGateSelfTest {
                 // surrounding whitespace (a launcher's `export X=" 5 "`) must not silently turn K into 1 (review georounds-r2 I-2)
                 && GeometryRounds.parseRounds(" 5 ") == 5 && GeometryRounds.parseGap(" 1.5\n") == 1.5,
             "geometryRoundsKnobsParseDefensively: WINDOW_SMOKE_GEOMETRY_ROUNDS unset/empty/non-numeric/<1 is 1 (today's single pass), WINDOW_SMOKE_GEOMETRY_ROUND_GAP unset/empty/non-numeric is 2.0 and never negative"
+        )
+        // --- WINDOW_SMOKE_MOVE_KEEP: the locked target's SC_CLOSE suppressor (ADR-0018 §5.2 增补二) ---
+        // Only the literal "1". Every other spelling -- including the ones an operator is most
+        // likely to reach for (`true`, `yes`, `01`) and the one a job file writes when it means
+        // OFF (`0`) -- leaves today's unconditional close, so an unset run is byte-identical.
+        expect(
+            MoveResizeKeep.suppressesTargetClose("1")
+                && !MoveResizeKeep.suppressesTargetClose(nil)
+                && !MoveResizeKeep.suppressesTargetClose("")
+                && !MoveResizeKeep.suppressesTargetClose("0")
+                && !MoveResizeKeep.suppressesTargetClose("01")
+                && !MoveResizeKeep.suppressesTargetClose("true")
+                && !MoveResizeKeep.suppressesTargetClose("yes")
+                && !MoveResizeKeep.suppressesTargetClose(" 1 "),
+            "moveKeepKnobIsLiteralOneOnly: WINDOW_SMOKE_MOVE_KEEP suppresses the move/resize scenario's SC_CLOSE of its locked target -- BOTH sites, the round end and the rounds-stopped exit -- on the literal \"1\" and on nothing else (unset, empty, 0, 01, true, yes and a padded 1 all keep today's unconditional close) -- the same opt-in spelling WINDOW_SMOKE_MOVE and WINDOW_SMOKE_EDGE_PROFILE use. COVERAGE BOUNDARY, registered not worked around: this pins the DECISION; that the two close sites consult it is live-only code no offline check can enter, and is covered instead by the CALL-SITE pins in Scripts/test-window-smoke-pins.sh and the REQUIRE_SYMBOL=WINDOW_SMOKE_MOVE_KEEP preflight in the job files that turn the knob"
+        )
+        // ... and the line both sites print is ONE constant, so a reader of a kept-open run gets
+        // the same text whichever exit the scenario took.
+        expect(
+            MoveResizeKeep.keptOpenLine == "[move-resize] keep=1 target left open (WINDOW_SMOKE_MOVE_KEEP)",
+            "moveKeepPrintsOneLineFromOnePlace: a suppressed close prints exactly `[move-resize] keep=1 target left open (WINDOW_SMOKE_MOVE_KEEP)`, built once and printed from both close sites (Scripts/test-window-smoke-pins.sh pins that each site prints it and returns before the SC_CLOSE)"
         )
         let roundsVerdictAll = GeometryRounds.verdict(perRound: [true, true])
         let roundsVerdictOne = GeometryRounds.verdict(perRound: [true, false, true])
@@ -3306,6 +3344,63 @@ let moveResizeScenarioEnabled = ProcessInfo.processInfo.environment["WINDOW_SMOK
 /// program as an extra app instead. Pure matching/lock logic lives in `MoveResizeTarget` so the
 /// self-test can pin it; the wiring itself is live-only.
 let moveResizeTargetFilter = ProcessInfo.processInfo.environment["WINDOW_SMOKE_MOVE_TARGET"]
+
+/// `WINDOW_SMOKE_MOVE_KEEP=1`: suppress the move/resize scenario's `SC_CLOSE` of its LOCKED
+/// TARGET, and nothing else. Every other leg -- the move, the resize, the geometry rounds, their
+/// verdicts -- runs exactly as it does today, and the window is simply left open when the
+/// scenario finishes.
+///
+/// WHY IT EXISTS (ADR-0018 §5.2 增补二 item 2's acceptance form, ruled 2026-09-18): the 2x
+/// acceptance needs a host-side rectangle probe to read the target AFTER the move leg, which
+/// requires the target to still exist. The pre-existing `-keep` job files answered the same need
+/// by setting `MOVE=0`, i.e. by not running the move leg at all -- which cannot answer a question
+/// ABOUT the move leg. There was no knob for "move, then leave it open" because the close leg was
+/// unconditional ("always attempt the close leg here").
+///
+/// UNSET IS BYTE-IDENTICAL. Only the literal `1` turns it on -- unset, empty, `0`, `true` and
+/// `01` all leave today's behaviour, and nothing is printed on that path (`MoveResizeKeep`
+/// below is the whole rule; `moveKeepKnobIsLiteralOneOnly` pins it). The suppressed close prints
+/// one line instead of the two `SC_CLOSE` lines, so a record can tell "kept open on purpose"
+/// from "the close never fired".
+///
+/// BOTH CLOSE SITES, one line (prereg gate r1, 2026-09-18). This scenario sends `SC_CLOSE` to the
+/// locked target from exactly two places -- the round-end close, and the "rounds stopped, no
+/// bounded offset for this position" exit that only a `round > 1` run can reach -- and the knob
+/// suppresses both. The first draft suppressed only the round end, on the argument that the
+/// second exit is cleanup after a leg that could not run; that is true of the LEG and false of
+/// the WINDOW, which is what a host-side probe reads afterwards. A run that took the second exit
+/// still completed round 1's move leg, so its kept window is exactly as readable as the other's,
+/// and a knob that silently stopped applying at `K > 1` would close the target under precisely
+/// the operator who asked twice for it to stay open. `MoveResizeKeep.keptOpenLine` is the single
+/// line both sites print; `Scripts/test-window-smoke-pins.sh` pins that neither `SC_CLOSE` of
+/// this scenario can be reached without passing the guard.
+let moveResizeKeepTargetOpen = MoveResizeKeep.suppressesTargetClose(
+    ProcessInfo.processInfo.environment["WINDOW_SMOKE_MOVE_KEEP"]
+)
+
+/// The whole of `WINDOW_SMOKE_MOVE_KEEP`'s rule, as a pure function the self-test can reach --
+/// the top-level `let` above is evaluated long after `WindowSmokeGateSelfTest.run()` has already
+/// exited, so a self-check can only pin the DECISION, not the binding.
+///
+/// Its own type rather than a bare `== "1"` at the call site for one reason: the close site is
+/// live-only code that no offline check can enter, so the only thing a self-check can hold is
+/// this function -- and it can only hold it if it exists. A reader should know that the
+/// remaining gap (that the close site actually consults it) is covered by the `REQUIRE_SYMBOL`
+/// preflight in the two job files that use the knob, not by a self-check.
+enum MoveResizeKeep {
+    /// `1` and only `1`. Same spelling as every other opt-in switch in this file
+    /// (`WINDOW_SMOKE_MOVE`, `WINDOW_SMOKE_MAXIMIZE`, `WINDOW_SMOKE_EDGE_PROFILE`), so a job
+    /// file that says `MOVE_KEEP=0` and one that omits the key are the same run.
+    static func suppressesTargetClose(_ raw: String?) -> Bool { raw == "1" }
+
+    /// The ONE line a suppressed close prints, in ONE place: both close sites print this exact
+    /// constant, so a record cannot tell them apart -- deliberately, because what the record is
+    /// being told is "the target is still open", which is the same fact either way, and a second
+    /// copy of the text could drift from the first. A literal rather than a function because it
+    /// interpolates nothing; the windowId is already on the `[move-resize] target locked:` line
+    /// this run printed earlier.
+    static let keptOpenLine = "[move-resize] keep=1 target left open (WINDOW_SMOKE_MOVE_KEEP)"
+}
 
 /// Title matching for the move/resize scenario's target lock (see `moveResizeTargetFilter`).
 /// When the per-tick driver may call `finish()`. The per-scenario deadlines used to double as
@@ -6594,17 +6689,27 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 topInset: MoveResizeGate.menuBarInsetPoints
             )
             // The left border the send path deducts is style-keyed REMOTE PX since the 2026-09-05
-            // per-style lane: `WindowGeometry.clientWindowMoveLeftBorder(forStyle:)` -- 5 under
-            // WS_THICKFRAME, 7 otherwise -- the same MacdowsCore seam the registry calls, so this is
+            // per-style lane, and DPI-tier-keyed as well since ADR-0018 §5.2 增补二 item 2:
+            // `WindowGeometry.clientWindowMoveLeftBorder(forStyle:tier:)` -- 5/7 in the 96 column,
+            // 10/11 in the 192 one -- the same MacdowsCore seam the registry calls, so this is
             // no longer a second copy of the number (review cm4-r1 I-4 closed). `windowStyleBits`
             // holds the target's WindowCreate style, and only in runs that launch extra apps or run
             // the popup scenario (its write site); a style-bearing WindowUpdate never updates it.
-            // Otherwise it reads 0 and the seam yields the About-calibrated 7 even for a THICKFRAME
-            // target -- an over-reservation of 2 remote px (2 pt at this host's 1x) against the 20 pt
-            // margin, i.e. the safe direction,
+            // Otherwise it reads 0 and the seam yields the non-THICKFRAME value even for a THICKFRAME
+            // target -- an over-reservation of 2 (96 column) or 1 (192 column) remote px against the
+            // 20 pt margin, i.e. the safe direction,
             // not "exactly as production" (production reads `PendingWindowState.style`, which updates
-            // carry too). The bounds are in pt, so convert (I-3).
-            let leftBorderRemotePx = WindowGeometry.clientWindowMoveLeftBorder(forStyle: windowStyleBits[windowId] ?? 0)
+            // carry too).
+            // THE TIER COMES FROM THE SAME PLACE PRODUCTION READS IT: this session's own advertised
+            // `DesktopScaleFactor`, assigned above from the knob (or from the product default) before
+            // `-start`. Deliberately not the local display scale -- an `ADVERTISED_SCALE=none` run at
+            // 2x told the server the 96-DPI story, and this reservation has to match what the send
+            // path will actually deduct, not what the panel is doing.
+            // The bounds are in pt, so convert (I-3).
+            let leftBorderRemotePx = WindowGeometry.clientWindowMoveLeftBorder(
+                forStyle: windowStyleBits[windowId] ?? 0,
+                tier: WindowGeometry.DPITier(advertisedDesktopScaleFactor: session.advertisedDesktopScaleFactor)
+            )
             let leftBorderPt = CGFloat(leftBorderRemotePx) / CGFloat(topology.rasterScale)
             moveResizeBoundsInPoints = bounds
             offset = MoveResizeGate.moveOffset(original: originalContent, within: bounds, leftBorder: leftBorderPt, margin: MoveResizeGate.desktopMarginPoints)
@@ -6634,6 +6739,18 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             // Caveat (review georounds-r3 m-3): without WINDOW_SMOKE_MOVE_TARGET the move target is the same
             // About window the maximize scenario drives, so this close also ends its remaining rounds -- a
             // K > 1 run should set WINDOW_SMOKE_MOVE_TARGET (the C-form wrappers do).
+            //
+            // WINDOW_SMOKE_MOVE_KEEP=1 suppresses this close too (prereg gate r1, 2026-09-18). It is the
+            // SECOND of the scenario's two closes of the locked target and it is reachable only at round > 1,
+            // which is exactly a run that HAS a completed move leg behind it -- so a host-side probe reading
+            // the kept window afterwards has something to be read against, and "the knob was armed" must not
+            // depend on which of the two exits the scenario happened to take. Same line, same
+            // `moveResizeCloseTargetId`-stays-nil shape as the round-end site below.
+            if moveResizeKeepTargetOpen {
+                print(MoveResizeKeep.keptOpenLine)
+                moveResizePhase = .done
+                return
+            }
             session.sendSysCommand(windowId, command: SC.close)
             print("[move-resize] sent SC_CLOSE to windowId=\(windowId) (rounds stopped)")
             moveResizeCloseTargetId = windowId
@@ -6867,6 +6984,17 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 print("[move-resize] round \(moveResizeRoundsCompleted)/\(geometryRounds) done; next round after a \(geometryRoundGap)s gap "
                     + "surfaceMapEvents=\(gfxTargetHints.surfaceMapEventsSeen) (cumulative, all windows, all scenarios)")
                 moveResizePhase = .awaitingNextRound(windowId: windowId, roundEndedAt: Date())
+                return
+            }
+            // WINDOW_SMOKE_MOVE_KEEP=1 (ADR-0018 §5.2 增补二 item 2's acceptance form): the ONE
+            // thing the knob suppresses. `moveResizeCloseTargetId` stays nil, which is exactly
+            // how `finish()` already expresses "the close leg was not sent" -- its Fix 2
+            // assertion is gated on that id, so a kept-open run reports no close verdict rather
+            // than a failed one. The cleanup this close normally provides is the operator's
+            // instead: a kept-open target survives into the next run, which is the point.
+            if moveResizeKeepTargetOpen {
+                print(MoveResizeKeep.keptOpenLine)
+                moveResizePhase = .done
                 return
             }
             // Fix 2 (team-lead review): always attempt the close leg here, matching the

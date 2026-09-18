@@ -842,6 +842,25 @@ else
 	fail "$CASE: accepted:$bad"
 fi
 
+# 10c. MOVE_KEEP, the route-B acceptance knob (WINDOW_SMOKE_MOVE_KEEP), holds to the same domain
+#      as EDGE_PROFILE and for the same reason: it is the wrapper's own refusal, with its own
+#      message, so a shared check would report a refusal that does not name the key that caused it.
+begin '10c MOVE_KEEP is 0 or 1'
+bad="$(reject_values MOVE_KEEP '2' 'yes' '01' 'true')"
+# ... and 1 is ACCEPTED. Without this arm the case would pass on a wrapper that does not know the
+# key at all -- every value would be refused by the LINE GRAMMAR, for a reason that has nothing to
+# do with the key's shape, and the case would report a domain it never measured.
+reset_run
+job_base
+job_override 'MOVE_KEEP=1'
+run_smoke "$SBLAB/smoke-job.command" ""
+if [ "$(last_line)" != 'DONE exit=0' ]; then bad="$bad [1 -> $(last_line), expected DONE exit=0]"; fi
+if [ -z "$bad" ]; then
+	pass "$CASE: 1 is accepted; 2, yes, 01 and true are each refused (an EMPTY value is not an error: like an absent key it means both of the scenario's closes still fire)"
+else
+	fail "$CASE: wrong verdicts:$bad"
+fi
+
 begin '11 EXTRA_APPS charset'
 # shellcheck disable=SC2016  # the literals are the values under test
 bad="$(reject_values EXTRA_APPS 'notepad calc' 'notepad|calc' 'note$pad' 'note.pad')"
@@ -1044,8 +1063,12 @@ begin '22 switches at 0 do not reach the child at all'
 job_base
 run_smoke "$SBLAB/smoke-job.command" ""
 reasons=''
+# WINDOW_SMOKE_MOVE_KEEP is in this list although job_base carries no MOVE_KEEP line at all:
+# that is the "key absent" arm -- a key the job file never mentions must leave the child's
+# environment exactly as a key set to 0 does.
 for forbidden in WINDOW_SMOKE_MOVE WINDOW_SMOKE_MAXIMIZE WINDOW_SMOKE_TRAY WINDOW_SMOKE_TRAY_CLICK \
-	WINDOW_SMOKE_EXTRA_APPS WINDOW_SMOKE_MOVE_TARGET WINDOW_SMOKE_APP WINDOW_SMOKE_APP_ARGS; do
+	WINDOW_SMOKE_EXTRA_APPS WINDOW_SMOKE_MOVE_TARGET WINDOW_SMOKE_APP WINDOW_SMOKE_APP_ARGS \
+	WINDOW_SMOKE_MOVE_KEEP; do
 	if child_has_var "$forbidden"; then reasons="$reasons $forbidden;"; fi
 done
 if [ -z "$reasons" ] && [ "$(child_calls)" = '1' ]; then
@@ -1101,6 +1124,61 @@ if child_has_var WINDOW_SMOKE_EDGE_PROFILE; then reasons="$reasons INHERITED-KNO
 [ "$(child_calls)" = '1' ] || reasons="$reasons inherited-launcher-calls=$(child_calls);"
 if [ -z "$reasons" ]; then
 	pass "$CASE: EDGE_PROFILE=1 puts WINDOW_SMOKE_EDGE_PROFILE=1 in the child and edge_profile=1 in the run line, 0 leaves the variable absent, and a knob inherited from the launching shell is stripped -- the child's environment is a function of the job file alone"
+else
+	fail "$CASE:$reasons"
+	note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
+fi
+
+# 22c. MOVE_KEEP's mapping, in the same four shapes 22b holds EDGE_PROFILE to. This knob does
+#      change what the child DOES (it suppresses the round-end SC_CLOSE), so "the child's
+#      environment is a function of the job file alone" is load-bearing twice over here: a knob
+#      inherited from the launching shell would leave a window open on the host that the job file
+#      says nothing about, and the next run would lock onto it.
+begin '22c MOVE_KEEP maps to the child knob, and only the job file can arm it'
+reasons=''
+job_base
+job_override 'MOVE_KEEP=1'
+run_smoke "$SBLAB/smoke-job.command" ""
+[ "$(child_env 'WINDOW_SMOKE_MOVE_KEEP=1')" = '1' ] || reasons="$reasons on-not-mapped;"
+[ "$(last_line)" = 'DONE exit=0' ] || reasons="$reasons on-last-line=[$(last_line)];"
+grep -qF 'move_keep=1' "$SMOKELOG" || reasons="$reasons on-not-in-the-run-line;"
+# 0 is expressed by ABSENCE, exactly like the four scenario switches and EDGE_PROFILE.
+reset_run
+job_base
+job_override 'MOVE_KEEP=0'
+run_smoke "$SBLAB/smoke-job.command" ""
+if child_has_var WINDOW_SMOKE_MOVE_KEEP; then reasons="$reasons off-reached-the-child;"; fi
+grep -qF 'move_keep=0' "$SMOKELOG" || reasons="$reasons off-not-in-the-run-line;"
+# The key absent entirely: same child environment as 0, and the run line still says so.
+reset_run
+job_base
+run_smoke "$SBLAB/smoke-job.command" ""
+if child_has_var WINDOW_SMOKE_MOVE_KEEP; then reasons="$reasons absent-reached-the-child;"; fi
+grep -qF 'move_keep=0' "$SMOKELOG" || reasons="$reasons absent-not-in-the-run-line;"
+# And the inherited knob: set in the WRAPPER's own environment, absent from the job file. The
+# managed-variable list is what removes it.
+reset_run
+job_base
+env -i \
+	HOME="$SBHOME" \
+	PATH="$SB/bin:$PATH" \
+	TMPDIR="$SBTMP" \
+	TERM_PROGRAM= \
+	LABTEST_TRACE="$LABTEST_TRACE" \
+	LABTEST_REFUSED_TRACE="$LABTEST_REFUSED_TRACE" \
+	LABTEST_SMOKE_LOG="$SMOKELOG" \
+	LABTEST_TAG_LOG="$SBRUNTIME/smoke-labtest.log" \
+	LABTEST_OSASCRIPT_EXPECTED="$OSASCRIPT_EXPECTED" \
+	LABTEST_DISPLAY_TEXT="$DISPLAY_TEXT" \
+	LABTEST_CHILD_RC=0 \
+	LABTEST_CHILD_LEAK=0 \
+	MACDOWS_LAB_BOUNDARY_FILE= \
+	WINDOW_SMOKE_MOVE_KEEP=1 \
+	bash "$SBLAB/smoke-job.command" >/dev/null 2>&1
+if child_has_var WINDOW_SMOKE_MOVE_KEEP; then reasons="$reasons INHERITED-KNOB-REACHED-THE-CHILD;"; fi
+[ "$(child_calls)" = '1' ] || reasons="$reasons inherited-launcher-calls=$(child_calls);"
+if [ -z "$reasons" ]; then
+	pass "$CASE: MOVE_KEEP=1 puts WINDOW_SMOKE_MOVE_KEEP=1 in the child and move_keep=1 in the run line, 0 and an absent key both leave the variable absent, and a knob inherited from the launching shell is stripped"
 else
 	fail "$CASE:$reasons"
 	note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
@@ -1330,12 +1408,13 @@ for jobfile in "$LAB"/jobs/smoke-*.env; do
 	# the job file's own assignments never touch the suite's variables. Declared empty first so
 	# a key a template stops carrying cannot be read as the PREVIOUS template's value.
 	j_tag=''; j_batch=''; j_looks=''; j_scale=''; j_move=''; j_extra=''; j_target=''; j_sym=''
+	j_keep=''
 	eval "$(
 		# shellcheck source=/dev/null
 		. "$jobfile" >/dev/null 2>&1
-		printf 'j_tag=%q; j_batch=%q; j_looks=%q; j_scale=%q; j_move=%q; j_extra=%q; j_target=%q; j_sym=%q\n' \
+		printf 'j_tag=%q; j_batch=%q; j_looks=%q; j_scale=%q; j_move=%q; j_extra=%q; j_target=%q; j_sym=%q; j_keep=%q\n' \
 			"${TAG:-}" "${BATCH:-}" "${DISPLAY_LOOKS_LIKE:-}" "${ADVERTISED_SCALE:-}" \
-			"${MOVE:-0}" "${EXTRA_APPS:-}" "${MOVE_TARGET:-}" "${REQUIRE_SYMBOL:-}"
+			"${MOVE:-0}" "${EXTRA_APPS:-}" "${MOVE_TARGET:-}" "${REQUIRE_SYMBOL:-}" "${MOVE_KEEP:-0}"
 	)"
 	reasons=''
 	if [ -n "$j_sym" ]; then
@@ -1365,12 +1444,31 @@ for jobfile in "$LAB"/jobs/smoke-*.env; do
 		reasons="$reasons ADVERTISED_SCALE;"
 	fi
 	if [ "$j_move" = '1' ] && [ "$(child_env 'WINDOW_SMOKE_MOVE=1')" != '1' ]; then reasons="$reasons MOVE;"; fi
-	# Internal consistency of the definition itself, not of the wrapper: the MOVE leg aims at a
-	# SECOND window, which only EXTRA_APPS produces, and MOVE_TARGET is the title filter that
-	# picks it. A template with MOVE=1 and neither runs, reports DONE exit=0, and measures one
-	# window shape twice -- and the run record cannot tell that from the target never appearing.
-	if [ "$j_move" = '1' ] && { [ -z "$j_extra" ] || [ -z "$j_target" ]; }; then
-		reasons="$reasons MOVE-without-a-second-window(EXTRA_APPS=[$j_extra] MOVE_TARGET-set=$([ -n "$j_target" ] && echo yes || echo no));"
+	# Internal consistency of the definition itself, not of the wrapper: the MOVE leg needs the
+	# multi-window prerequisite, which only EXTRA_APPS provides. A template with MOVE=1 and no
+	# EXTRA_APPS runs, reports DONE exit=0, and measures one window shape twice -- and the run
+	# record cannot tell that from the target never appearing.
+	if [ "$j_move" = '1' ] && [ -z "$j_extra" ]; then
+		reasons="$reasons MOVE-without-a-second-window(EXTRA_APPS=[$j_extra]);"
+	fi
+	# MOVE_TARGET may be empty -- that is the harness's About heuristic, and it is how the
+	# About-row job of the route-B lane targets the base app's own dialog (an explicit filter
+	# structurally cannot: `MoveResizeTarget.lock` only ever locks a window that appeared AFTER
+	# the extra apps launched). What is NOT allowed is the key going MISSING: an empty value has
+	# to be written out, the way smoke-1x-D.env writes an empty DISPLAY_LOOKS_LIKE, so the file
+	# says the emptiness is a choice rather than an omission. Checked against the file's TEXT,
+	# because sourcing cannot tell "set to empty" from "never set".
+	if [ "$j_move" = '1' ] && [ -z "$j_target" ] \
+		&& ! grep -qE '^[[:space:]]*(export )?MOVE_TARGET=' "$jobfile"; then
+		reasons="$reasons MOVE-with-no-MOVE_TARGET-key-at-all(an empty About-heuristic filter must be written out);"
+	fi
+	if [ "$j_keep" = '1' ]; then
+		[ "$(child_env 'WINDOW_SMOKE_MOVE_KEEP=1')" = '1' ] || reasons="$reasons MOVE_KEEP;"
+		# A job that keeps its target open must also have run the leg that moved it: MOVE_KEEP
+		# on a MOVE=0 template would be a no-op that reads, in the job file, like the opposite.
+		[ "$j_move" = '1' ] || reasons="$reasons MOVE_KEEP-without-MOVE;"
+	else
+		child_has_var WINDOW_SMOKE_MOVE_KEEP && reasons="$reasons MOVE_KEEP-armed-without-the-key;"
 	fi
 	if [ -n "$j_extra" ] && [ "$(child_env "WINDOW_SMOKE_EXTRA_APPS=$j_extra")" != '1' ]; then reasons="$reasons EXTRA_APPS;"; fi
 	if [ -n "$j_target" ] && [ "$(child_env "WINDOW_SMOKE_MOVE_TARGET=$j_target")" != '1' ]; then reasons="$reasons MOVE_TARGET;"; fi
@@ -1387,7 +1485,7 @@ printf '%s\n' "$mainswift_saved" > "$MAINSWIFT" || exit 1
 # One verdict for the case, and a floor on the count: jobs/ shrinking to nothing must not read as
 # "all tracked jobs passed".
 if [ "$jobs_total" -ge 2 ] && [ "$jobs_ok" -eq "$jobs_total" ]; then
-	pass "$CASE: all $jobs_total tracked smoke templates arm the preflights they name, map ADVERTISED_SCALE as declared and drive the legs they declare"
+	pass "$CASE: all $jobs_total tracked smoke templates arm the preflights they name, map ADVERTISED_SCALE and MOVE_KEEP as declared and drive the legs they declare"
 else
 	fail "$CASE: $jobs_ok of $jobs_total tracked smoke jobs drove the run they describe (failed:${jobs_failed:- none}; total<2 means jobs/ shrank)"
 fi
@@ -2733,7 +2831,7 @@ fi
 
 # Every case must have reported: a case that neither passed nor failed would otherwise vanish from
 # the tally with exit 0. Placed after the LAST case on purpose.
-EXPECTED_CASES=84
+EXPECTED_CASES=86
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi
