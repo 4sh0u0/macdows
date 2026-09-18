@@ -46,14 +46,16 @@
 #      branch is not taken; the osascript shim records into a run-long trace that is never reset,
 #      and the "never reached" assertion at the end covers the whole run.
 #
-# Nine mutation proofs (M1 gate bypassed, M2 key whitelist bypassed, M3 overlap guard removed,
+# Eleven mutation proofs (M1 gate bypassed, M2 key whitelist bypassed, M3 overlap guard removed,
 # M4 the window closed before the DONE line is written, M5 the overlap guard reading the process
 # table instead of the capture's own pid line, M6 the manifest reading the template's batch instead
 # of the run's, M7 the missing-artefact count removed, M8 the batch override appended without a
 # separating newline, M9 the manifest's freshness check removed so a previous run's leftovers are
-# gathered as this batch's) copy the script under test with one guard removed and require the case
-# that claims to pin it to FAIL against the mutant. A pin that would also pass against the broken
-# code pins nothing.
+# gathered as this batch's, M10 the start stamp put back to one fixed name so a second checkpoint
+# overwrites the stamp of the run already in flight, M11 the host-written snapshot report judged by
+# its mtime instead of by the clear-then-present proof) copy the script under test with one guard
+# removed and require the case that claims to pin it to FAIL against the mutant. A pin that would
+# also pass against the broken code pins nothing.
 #
 # Exit: 0 if every case passed, 1 otherwise.
 set -uo pipefail
@@ -166,12 +168,15 @@ LOG="${WINDOW_SMOKE_LOG:-}"
 # evidence log -- a build that died after its own DONE line, a WINDOW_SMOKE_LOG on a full disk. The
 # wrapper still says DONE exit=0, so this is the shape where a missing artefact is otherwise
 # completely silent, and it is what the checkpoint's INCOMPLETE verdict exists for.
+# APPENDED, never truncated, because that is what Scripts/run-window-smoke.command does: every
+# write in it is `>>` and nothing removes the file. A stub that truncated would hide the whole
+# same-name-rerun question (34e-34g) -- the earlier run's rows would vanish for free.
 if [ -n "$LOG" ] && [ "${LABTEST_CHILD_NO_WS_LOG:-0}" != "1" ]; then
 	mkdir -p "$(dirname "$LOG")"
 	{
 		printf '[launcher] labtest stub\n'
 		printf 'DONE exit=%s\n' "${LABTEST_CHILD_RC:-0}"
-	} > "$LOG"
+	} >> "$LOG"
 fi
 # The four values the wrapper's mask exists for, printed to stdout and stderr on purpose: the
 # wrapper pipes this launcher's output into smoke.log, and case 24 measures what survives.
@@ -218,7 +223,8 @@ cat > "$SB/bin/labtest-fake-relay" <<'FAKE_RELAY' || exit 1
 # LF-only fixture here let a broken LF-only comparison in checkpoint.sh pass every pin while
 # calling every real report INCOMPLETE). LABTEST_RELAY_SNAPSHOT_LF=1 gives the LF-only complete
 # shape (case 41i, cheap extra coverage); LABTEST_RELAY_SNAPSHOT_INCOMPLETE=1 gives a report that
-# never reached its own end (case 41h).
+# never reached its own end (case 41h); LABTEST_RELAY_SNAPSHOT_BACKDATE=1 backdates the report's
+# mtime, which is what the HOST's own clock can write through the redirected drive (case 41j).
 set -u
 R="$LABTEST_RUNTIME"
 mkdir -p "$R/share"
@@ -231,6 +237,13 @@ if [ "${LABTEST_RELAY_DONES:-1}" = "1" ]; then
 		printf 'RESULT: DONE\n' > "$R/share/server-snapshot-out.txt"
 	else
 		printf 'RESULT: DONE\r\n' > "$R/share/server-snapshot-out.txt"
+	fi
+	if [ "${LABTEST_RELAY_SNAPSHOT_BACKDATE:-0}" = "1" ]; then
+		# The report is written by the HOST through the redirected drive, and the drive client sets
+		# the local file's times from the ones the server sends -- so its mtime is the host's clock,
+		# which this lab's host runs behind after a boot until it is corrected. A fixed date rather
+		# than an offset, so the case is a statement and not a race.
+		touch -t 202001010000 "$R/share/server-snapshot-out.txt"
 	fi
 	printf 'DONE exit=%s\n' "${LABTEST_RELAY_RC:-0}" >> "$R/relay.log"
 fi
@@ -598,6 +611,7 @@ run_lab() { # <output file> <script> <args...>
 		LABTEST_RELAY_DELAY="${LABTEST_RELAY_DELAY:-1}" \
 		LABTEST_RELAY_SNAPSHOT_INCOMPLETE="${LABTEST_RELAY_SNAPSHOT_INCOMPLETE:-0}" \
 		LABTEST_RELAY_SNAPSHOT_LF="${LABTEST_RELAY_SNAPSHOT_LF:-0}" \
+		LABTEST_RELAY_SNAPSHOT_BACKDATE="${LABTEST_RELAY_SNAPSHOT_BACKDATE:-0}" \
 		CHECKPOINT_TIMEOUT_ETW_OPEN="${CHECKPOINT_TIMEOUT_ETW_OPEN:-20}" \
 		CHECKPOINT_TIMEOUT_SMOKE="${CHECKPOINT_TIMEOUT_SMOKE:-40}" \
 		CHECKPOINT_TIMEOUT_ETW_DONE="${CHECKPOINT_TIMEOUT_ETW_DONE:-30}" \
@@ -1556,10 +1570,18 @@ for artefact in smoke-labtest.log relay-labtest.log server-snapshot-labtest.txt 
 	grep -qE "^\[checkpoint\]       $artefact  MISSING .*  -- REQUIRED\$" "$SB/out.txt" \
 		|| reasons="$reasons not-reported-missing[$artefact];"
 done
-for artefact in smoke-labtest.log relay-labtest.log server-snapshot-labtest.txt; do
+# The two logs this Mac writes are judged by mtime and say so. The snapshot report is the one
+# artefact the HOST writes, and it is judged by step (e)'s own clear-then-present proof instead
+# (see CP_START_STAMP): with (e) never launched there is no proof, and the line says THAT rather
+# than claiming to know how the host's clock compares with this Mac's.
+for artefact in smoke-labtest.log relay-labtest.log; do
 	grep -qE "^\[checkpoint\]       $artefact  MISSING \(.*predates this checkpoint.*\)" "$SB/out.txt" \
 		|| reasons="$reasons not-named-stale[$artefact];"
 done
+grep -qE '^\[checkpoint\]       server-snapshot-labtest\.txt  MISSING \(.*step \(e\) never launched.*\)' "$SB/out.txt" \
+	|| reasons="$reasons snapshot-not-named-as-a-previous-checkpoints;"
+grep -qF 'server-snapshot-labtest.txt  MISSING (.build/lab-runtime/share/server-snapshot-out.txt predates' "$SB/out.txt" \
+	&& reasons="$reasons snapshot-judged-by-mtime;"
 # The capture's own log IS this run's -- written after the stamp -- and its verdict is the one the
 # verdicts line carries; the two leftovers' DONE lines are not. (The per-TAG copy of that log is
 # deliberately NOT asserted on: wdp-etw.command writes DONE and THEN copies, and the (b) abort
@@ -1580,13 +1602,16 @@ else
 	note "$(tail -n 14 "$SB/out.txt")"
 fi
 
-# 34e. THE ONE SOURCE NO PRE-LAUNCH rm CLEARS. window-smoke-<TAG>.log's source IS the batch directory
-#      (see WS_LOG_SRC), and nothing removes it before the run. A second checkpoint under the SAME
-#      batch name (a rerun of a broken pair) whose launcher then never writes its evidence log finds
-#      the earlier run's file already under the name it is about to report, and 34c's INCOMPLETE
-#      verdict would vanish behind it. Same rule, same outcome: the file predates this checkpoint,
-#      so it is MISSING -- and it is neither deleted nor rewritten.
-begin '34e a same-name rerun does not report the earlier run window-smoke log as this run'
+# 34e. THE ONE SOURCE NO PRE-LAUNCH rm CLEARS. window-smoke-<TAG>.log's source IS the batch
+#      directory (see WS_LOG_SRC), nothing removes it before the run, and the launcher only ever
+#      APPENDS to it (Scripts/run-window-smoke.command writes with >>). A second checkpoint under
+#      the SAME batch name -- a rerun of a broken pair -- therefore finds the earlier run's file
+#      sitting under the very name it is about to report. It is moved aside before anything is
+#      launched, so the name this run reports is a file that was never written: a plain MISSING with
+#      the move stated on the same manifest line, 34c's INCOMPLETE verdict intact behind it, and the
+#      earlier run's bytes preserved under a name that says whose they are. Here the launcher never
+#      writes its evidence log at all; 34f is the same rerun with a launcher that does.
+begin '34e a same-name rerun moves the earlier run window-smoke log aside before it launches'
 mkdir -p "$SBEVIDENCE/labtest" || exit 1
 printf 'STALE-FROM-A-PREVIOUS-RUN\n' > "$SBEVIDENCE/labtest/window-smoke-labtest.log" || exit 1
 export LABTEST_OPEN_EXEC=1
@@ -1596,12 +1621,18 @@ rc=$?
 unset LABTEST_OPEN_EXEC LABTEST_CHILD_NO_WS_LOG
 reasons=''
 [ "$rc" -eq 8 ] || reasons="$reasons rc=$rc;"
-grep -qE '^\[checkpoint\]       window-smoke-labtest\.log  MISSING \(.*predates this checkpoint.*\)  -- REQUIRED$' "$SB/out.txt" \
-	|| reasons="$reasons not-reported-stale;"
+grep -qE '^\[checkpoint\]       window-smoke-labtest\.log  MISSING \(.*\) -- an earlier run.s log of this name was moved aside to window-smoke-labtest\.log\.before-[0-9TZ]*  -- REQUIRED$' "$SB/out.txt" \
+	|| reasons="$reasons not-reported-missing-with-the-move-stated;"
 grep -qF 'INCOMPLETE: 1 artefact(s) missing' "$SB/out.txt" || reasons="$reasons no-incomplete-line;"
 grep -qF 'checkpoint labtest complete' "$SB/out.txt" && reasons="$reasons claims-complete;"
-[ "$(cat "$SBEVIDENCE/labtest/window-smoke-labtest.log" 2>/dev/null)" = 'STALE-FROM-A-PREVIOUS-RUN' ] \
-	|| reasons="$reasons leftover-touched;"
+[ -e "$SBEVIDENCE/labtest/window-smoke-labtest.log" ] && reasons="$reasons EARLIER-LOG-STILL-UNDER-THIS-RUN-NAME;"
+ASIDE_N="$(find "$SBEVIDENCE/labtest" -maxdepth 1 -name 'window-smoke-labtest.log.before-*' | wc -l | tr -d ' ')"
+if [ "$ASIDE_N" = '1' ]; then
+	ASIDE="$(find "$SBEVIDENCE/labtest" -maxdepth 1 -name 'window-smoke-labtest.log.before-*')"
+	[ "$(cat "$ASIDE" 2>/dev/null)" = 'STALE-FROM-A-PREVIOUS-RUN' ] || reasons="$reasons aside-is-not-the-earlier-run-bytes;"
+else
+	reasons="$reasons aside-files=$ASIDE_N;"
+fi
 # The other five are this run's and are gathered as before.
 for artefact in etw-labtest.jsonl etw-labtest.log smoke-labtest.log relay-labtest.log \
 	server-snapshot-labtest.txt; do
@@ -1609,10 +1640,85 @@ for artefact in etw-labtest.jsonl etw-labtest.log smoke-labtest.log relay-labtes
 done
 grep -qF '(c) run: DONE exit=0' "$SB/out.txt" || reasons="$reasons run-did-not-report;"
 if [ -z "$reasons" ]; then
-	pass "$CASE: the earlier run's window-smoke log under the same batch name is reported MISSING as predating this checkpoint, left untouched, and the checkpoint is INCOMPLETE (exit 8) rather than complete on its strength"
+	pass "$CASE: the earlier run's log under the same batch name is moved aside before anything is launched, kept byte for byte, and this run's own name is reported MISSING with the move stated -- the checkpoint is INCOMPLETE (exit 8) rather than complete on an earlier run's strength"
 else
 	fail "$CASE:$reasons"
 	note "$(tail -n 14 "$SB/out.txt")"
+fi
+
+# 34f. THE SAME RERUN WITH A LAUNCHER THAT RUNS. This is the normal rerun, and the one the mtime
+#      rule alone cannot see: the launcher APPENDS, so the file's mtime moves, the freshness check
+#      says "this run's", and the manifest reports one log that in fact holds both runs' rows, both
+#      [launcher] lines and both DONE lines -- the same false-evidence class this lane exists to
+#      close, with a clean manifest over the top of it (gate r1 I-1). After the move-aside the
+#      launcher starts from nothing, so the gathered log carries this run's rows and no others.
+begin '34f a same-name rerun log holds only this run rows'
+mkdir -p "$SBEVIDENCE/labtest" || exit 1
+printf 'STALE-FROM-A-PREVIOUS-RUN\n[launcher] the earlier run\nDONE exit=7\n' > "$SBEVIDENCE/labtest/window-smoke-labtest.log" || exit 1
+cp "$SBEVIDENCE/labtest/window-smoke-labtest.log" "$SB/ws-earlier.txt" || exit 1
+export LABTEST_OPEN_EXEC=1
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+rc=$?
+unset LABTEST_OPEN_EXEC
+reasons=''
+GATHERED="$SBEVIDENCE/labtest/window-smoke-labtest.log"
+[ "$rc" -eq 0 ] || reasons="$reasons rc=$rc;"
+grep -qF '[launcher] labtest stub' "$GATHERED" 2>/dev/null || reasons="$reasons gathered-log-is-not-this-run;"
+grep -qF 'DONE exit=0' "$GATHERED" 2>/dev/null || reasons="$reasons gathered-log-has-no-verdict-of-its-own;"
+grep -qF 'STALE-FROM-A-PREVIOUS-RUN' "$GATHERED" 2>/dev/null && reasons="$reasons EARLIER-RUN-ROWS-IN-THIS-RUN-LOG;"
+grep -qF 'DONE exit=7' "$GATHERED" 2>/dev/null && reasons="$reasons EARLIER-RUN-VERDICT-IN-THIS-RUN-LOG;"
+ASIDE_N="$(find "$SBEVIDENCE/labtest" -maxdepth 1 -name 'window-smoke-labtest.log.before-*' | wc -l | tr -d ' ')"
+if [ "$ASIDE_N" = '1' ]; then
+	ASIDE="$(find "$SBEVIDENCE/labtest" -maxdepth 1 -name 'window-smoke-labtest.log.before-*')"
+	cmp -s "$ASIDE" "$SB/ws-earlier.txt" || reasons="$reasons aside-is-not-the-earlier-run-bytes;"
+	grep -qF "moved aside to $(basename "$ASIDE")" "$SB/out.txt" || reasons="$reasons move-not-logged;"
+else
+	reasons="$reasons aside-files=$ASIDE_N;"
+fi
+grep -qE 'window-smoke-labtest\.log  [0-9]+ bytes -- an earlier run.s log of this name was moved aside to ' "$SB/out.txt" \
+	|| reasons="$reasons manifest-line-does-not-state-the-move;"
+grep -qF 'checkpoint labtest complete' "$SB/out.txt" || reasons="$reasons no-completion-line;"
+grep -qF "$SBHOME" "$SB/out.txt" && reasons="$reasons absolute-home-path-printed;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: the log this run gathers carries this run's rows and its own verdict only, the earlier run's bytes survive under the aside name, and both the scrollback and the manifest line say the move happened"
+else
+	fail "$CASE:$reasons"
+	note "$(tail -n 14 "$SB/out.txt")"
+fi
+
+# 34g. NEVER OVERWRITE, REFUSE. The aside name carries a UTC second, so two reruns inside the same
+#      second would collide -- and the one thing a move-aside must not do is choose which run's
+#      evidence to destroy. If the name is taken this refuses with exit 2 BEFORE anything is
+#      launched, leaving both files exactly where they are. The window of names is computed with
+#      python3 because the two platforms' `date` disagree on arithmetic (-v against -d) and the
+#      suite already requires python3 for the boundary gate.
+begin '34g a rerun refuses when the move-aside name is taken'
+mkdir -p "$SBEVIDENCE/labtest" || exit 1
+printf 'STALE-FROM-A-PREVIOUS-RUN\n' > "$SBEVIDENCE/labtest/window-smoke-labtest.log" || exit 1
+for stamp in $(python3 -c 'import time
+t = time.time()
+print("\n".join(time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(t + i)) for i in range(0, 8)))'); do
+	printf 'COLLISION\n' > "$SBEVIDENCE/labtest/window-smoke-labtest.log.before-$stamp" || exit 1
+done
+export LABTEST_OPEN_EXEC=1
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+rc=$?
+unset LABTEST_OPEN_EXEC
+reasons=''
+[ "$rc" -eq 2 ] || reasons="$reasons rc=$rc;"
+[ "$(open_calls)" = '0' ] || reasons="$reasons LAUNCHED-SOMETHING;"
+grep -qF 'the name it would be moved aside to' "$SB/out.txt" || reasons="$reasons no-refusal-reason;"
+[ "$(cat "$SBEVIDENCE/labtest/window-smoke-labtest.log" 2>/dev/null)" = 'STALE-FROM-A-PREVIOUS-RUN' ] \
+	|| reasons="$reasons EARLIER-LOG-TOUCHED;"
+for f in "$SBEVIDENCE/labtest"/window-smoke-labtest.log.before-*; do
+	[ "$(cat "$f" 2>/dev/null)" = 'COLLISION' ] || reasons="$reasons ASIDE-NAME-OVERWRITTEN[$(basename "$f")];"
+done
+grep -qF "$SBHOME" "$SB/out.txt" && reasons="$reasons absolute-home-path-printed;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: exit 2 with the reason named and nothing launched; neither the earlier run's log nor the file already holding the aside name is touched"
+else
+	fail "$CASE:$reasons"
+	note "$(cat "$SB/out.txt")"
 fi
 
 # 35. THE OVERLAP GUARD. Two realtime captures against the same portal disable each other's
@@ -1785,6 +1891,162 @@ grep -qF 'listing only, nothing gathered' "$SB/out.txt" || reasons="$reasons no-
 [ "$(open_calls)" = '0' ] || reasons="$reasons opened-something;"
 if [ -z "$reasons" ]; then
 	pass "$CASE: the refusal states 'listing only, nothing gathered', the previous run's leftovers in .build/lab-runtime/ are neither read into the manifest as this batch's nor copied anywhere, and the pre-existing empty batch directory is still empty"
+else
+	fail "$CASE:$reasons"
+	note "$(cat "$SB/out.txt")"
+fi
+
+# The fixture 36e and M10 share: a checkpoint ALREADY IN FLIGHT (call it run A) -- its start stamp,
+# two artefacts written after that stamp, and a capture whose log carries a live pid and no verdict,
+# which is what makes a SECOND checkpoint refuse. The stamp is seeded under BOTH names: the
+# per-invocation one the script writes now, and the single fixed one it used to write. A fixture
+# that seeded only the first could not see a script that went back to the fixed name, because such a
+# script removes its own stamp on the way out and the clobbering would leave nothing behind.
+seed_run_a_in_flight() {
+	mkdir -p "$SBRUNTIME" || exit 1
+	rm -f "$SBRUNTIME"/checkpoint-start.*
+	printf 'batch=labtest start=labtest-run-a\n' > "$SBRUNTIME/checkpoint-start.4242.stamp" || exit 1
+	printf 'batch=labtest start=labtest-run-a\n' > "$SBRUNTIME/checkpoint-start.stamp" || exit 1
+	cp "$SBRUNTIME/checkpoint-start.stamp" "$SB/run-a-stamp.txt" || exit 1
+	sleep 0.01
+	printf 'RUN-A-IN-FLIGHT\nDONE exit=0\n' > "$SBRUNTIME/smoke-labtest.log" || exit 1
+	printf 'RUN-A-IN-FLIGHT\nDONE exit=0\n' > "$SBRUNTIME/relay.log" || exit 1
+	cp "$SBRUNTIME/smoke-labtest.log" "$SB/run-a-artefact.txt" || exit 1
+	sleep 0.01
+	# The reference every "was it touched" question below is asked against: made after run A's files
+	# and before run B starts, so anything of run A's that is newer than it was written by run B.
+	: > "$SB/before-run-b.txt"
+	sleep 30 &
+	LIVE_PID=$!
+	{
+		printf '[etw] etw capture tag=labtest duration=5s providers=1 start=labtest\n'
+		printf '[etw] pid=%s\n' "$LIVE_PID"
+	} > "$SBRUNTIME/etw.log"
+}
+
+# 36e. A REFUSED SECOND CHECKPOINT MUST NOT DISTURB THE ONE IN FLIGHT. Nothing serialises
+#      checkpoints, and the start stamp used to be one fixed name written BEFORE the overlap guard:
+#      a second run started by hand or by an orchestrator wrote its own start time over run A's
+#      stamp and only then refused with exit 3 -- the very case the guard exists for. Run A's gather
+#      then compared its own artefacts against the intruder's stamp and reported its real log, its
+#      real capture and its real report as a previous run's: rc 8, and downstream the pair marked
+#      BROKEN (gate r1 B-1). The stamp is now per invocation and removed on every exit, so a refusal
+#      leaves the runtime directory exactly as it found it. (M10 pins it.)
+begin '36e a refused second checkpoint leaves the run in flight stamp and artefacts untouched'
+seed_run_a_in_flight
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+rc=$?
+kill "$LIVE_PID" 2>/dev/null
+wait "$LIVE_PID" 2>/dev/null
+reasons=''
+[ "$rc" -eq 3 ] || reasons="$reasons rc=$rc;"
+[ "$(open_calls)" = '0' ] || reasons="$reasons LAUNCHED-SOMETHING;"
+# Run B took its own stamp with it: the only checkpoint-start files left are run A's two.
+STAMPS="$(find "$SBRUNTIME" -maxdepth 1 -name 'checkpoint-start.*' | sed 's|.*/||' | sort | tr '\n' ',')"
+[ "$STAMPS" = 'checkpoint-start.4242.stamp,checkpoint-start.stamp,' ] || reasons="$reasons stamp-set=[$STAMPS];"
+cmp -s "$SBRUNTIME/checkpoint-start.stamp" "$SB/run-a-stamp.txt" || reasons="$reasons RUN-A-STAMP-REWRITTEN;"
+cmp -s "$SBRUNTIME/smoke-labtest.log" "$SB/run-a-artefact.txt" || reasons="$reasons run-a-artefact-rewritten;"
+# Byte-identical is not the whole question: a rewrite with the same bytes still moves the mtime, and
+# the mtime is what the freshness rule reads. Nothing of run A's may be newer than the reference.
+for f in checkpoint-start.stamp checkpoint-start.4242.stamp smoke-labtest.log relay.log; do
+	[ -n "$(find "$SBRUNTIME/$f" -maxdepth 0 -newer "$SB/before-run-b.txt" 2>/dev/null)" ] \
+		&& reasons="$reasons TOUCHED-BY-RUN-B[$f];"
+done
+# ... and the comparison run A's own gather is about to make still answers the same way, under
+# either stamp name: that expression is cp_fresh, spelled out.
+for f in smoke-labtest.log relay.log; do
+	for stamp in checkpoint-start.stamp checkpoint-start.4242.stamp; do
+		[ -n "$(find "$SBRUNTIME/$f" -maxdepth 0 -newer "$SBRUNTIME/$stamp" 2>/dev/null)" ] \
+			|| reasons="$reasons RUN-A-ARTEFACT-NO-LONGER-ADMITTED[$f/$stamp];"
+	done
+done
+if [ -z "$reasons" ]; then
+	pass "$CASE: exit 3 with nothing launched; run A's stamp under both names and both its artefacts are byte-identical and un-restamped, run B's own stamp left with it, and run A's artefacts are still newer than run A's stamp -- the gather it is about to run still admits them"
+else
+	fail "$CASE:$reasons"
+	note "$(cat "$SB/out.txt")"
+fi
+
+# 36f. A RUNTIME DIRECTORY THAT CANNOT TAKE THE STAMP REFUSES WITHOUT NAMING A MAINTAINER PATH. The
+#      file header promises repo-relative output because this script's stdout is teed into the
+#      evidence directory and pasted into records, whose only masking rule rewrites addresses. A
+#      failing `mkdir` or a failing `> path` is diagnosed by the SHELL, not by this script, and that
+#      diagnostic carries the absolute path -- so the suppression has to sit where it catches the
+#      redirection itself (gate r1 I-2). Two halves, because there are two failing calls: the
+#      directory cannot be created (a regular file in its place, which bites whatever the user is),
+#      and the directory cannot be written (mode 555, which does not bite root -- so that half is
+#      armed only once a probe shows it does).
+begin '36f an unwritable runtime directory refuses with no absolute path in the output'
+reasons=''
+rm -rf "$SBRUNTIME" || exit 1
+printf 'a regular file where the runtime directory belongs\n' > "$SBRUNTIME" || exit 1
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+rc=$?
+[ "$rc" -eq 2 ] || reasons="$reasons mkdir-half-rc=$rc;"
+[ "$(open_calls)" = '0' ] || reasons="$reasons mkdir-half-launched-something;"
+grep -qF 'FAILED: cannot create' "$SB/out.txt" || reasons="$reasons mkdir-half-no-refusal-line;"
+grep -qF "$SBHOME" "$SB/out.txt" && reasons="$reasons MKDIR-HALF-ABSOLUTE-PATH-PRINTED;"
+grep -qF 'Not a directory' "$SB/out.txt" && reasons="$reasons mkdir-half-raw-shell-diagnostic;"
+rm -f "$SBRUNTIME" || exit 1
+mkdir -p "$SBRUNTIME" || exit 1
+chmod 555 "$SBRUNTIME" || exit 1
+if : > "$SBRUNTIME/labtest-write-probe" 2>/dev/null; then
+	rm -f "$SBRUNTIME/labtest-write-probe"
+	chmod 755 "$SBRUNTIME" || exit 1
+	note "the unwritable-directory half was not armed: this user writes into a mode 555 directory (root), so only the mkdir half was measured"
+else
+	: > "$LABTEST_TRACE"
+	run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+	rc=$?
+	chmod 755 "$SBRUNTIME" || exit 1
+	[ "$rc" -eq 2 ] || reasons="$reasons stamp-half-rc=$rc;"
+	[ "$(open_calls)" = '0' ] || reasons="$reasons stamp-half-launched-something;"
+	grep -qF 'FAILED: cannot write' "$SB/out.txt" || reasons="$reasons stamp-half-no-refusal-line;"
+	grep -qF "$SBHOME" "$SB/out.txt" && reasons="$reasons STAMP-HALF-ABSOLUTE-PATH-PRINTED;"
+	grep -qF 'Permission denied' "$SB/out.txt" && reasons="$reasons STAMP-HALF-RAW-SHELL-DIAGNOSTIC;"
+fi
+if [ -z "$reasons" ]; then
+	pass "$CASE: both refusals exit 2 before anything is launched, each naming the repo-relative path it could not use, and neither the shell's own diagnostic nor any absolute path reaches the combined output"
+else
+	fail "$CASE:$reasons"
+	note "$(cat "$SB/out.txt")"
+fi
+
+# 36g. THE ORDERING PROOF ON THE FILESYSTEM THAT MATTERS. This suite asserts once, at the top, that
+#      `find -newer` orders two files written 10 ms apart in ITS sandbox -- which says nothing about
+#      .build/lab-runtime on the machine a real checkpoint runs on, and an EQUAL timestamp is not
+#      newer (so on a coarse volume a file this run really wrote reads as a previous run's). The
+#      script therefore writes one probe next to its stamp and requires `find` to order the pair
+#      before it launches anything (gate r1 m-4). Here `find` answers nothing at all, which is what
+#      both failure shapes -- a coarse filesystem and a differently-behaved find on PATH -- look
+#      like from inside the script. The shim lives only for this case: shims reach the scripts under
+#      test through run_lab's PATH, and this one is removed again below.
+begin '36g a find that cannot order two files written in sequence refuses before any launch'
+cat > "$SB/bin/find" <<'SHIM_FIND' || exit 1
+#!/usr/bin/env bash
+# OFFLINE TEST SHIM for find(1), case 36g only: records argv and answers NOTHING, the way a `find`
+# that cannot separate two files written in sequence does. Removed at the end of the case.
+set -u
+line='find'
+for a in "$@"; do line="$line [$a]"; done
+printf '%s\n' "$line" >> "$LABTEST_TRACE"
+exit 0
+SHIM_FIND
+chmod +x "$SB/bin/find" || exit 1
+bash -n "$SB/bin/find" || exit 1
+export LABTEST_OPEN_EXEC=1
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+rc=$?
+unset LABTEST_OPEN_EXEC
+rm -f "$SB/bin/find"
+reasons=''
+[ "$rc" -eq 2 ] || reasons="$reasons rc=$rc;"
+[ "$(open_calls)" = '0' ] || reasons="$reasons LAUNCHED-SOMETHING;"
+grep -qF 'cannot order files written in sequence' "$SB/out.txt" || reasons="$reasons no-refusal-reason;"
+grep -qF "$SBHOME" "$SB/out.txt" && reasons="$reasons absolute-home-path-printed;"
+[ -e "$SB/bin/find" ] && reasons="$reasons shim-not-removed;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: the probe written next to the start stamp is checked against it in production, and a find that cannot order the pair refuses with exit 2 before the capture is started"
 else
 	fail "$CASE:$reasons"
 	note "$(cat "$SB/out.txt")"
@@ -2031,6 +2293,42 @@ if [ "$rc" -eq 0 ] && grep -qE 'server-snapshot-labtest\.txt  [0-9]+ bytes \(com
 else
 	fail "$CASE: rc=$rc"
 	note "$(grep 'server-snapshot-labtest.txt' "$SB/out.txt")"
+fi
+
+# 41j. THE ONE ARTEFACT THIS MAC DOES NOT WRITE. server-snapshot.ps1 writes the report on the HOST,
+#      into the redirected share, and the drive client sets the local file's times from the ones it
+#      is sent -- so the report's mtime is the host's clock, which this lab's host runs behind after a
+#      boot until it is corrected. Under an mtime rule a COMPLETE report is then reported MISSING,
+#      counted REQUIRED, never copied, and deleted by the next checkpoint's pre-launch rm: evidence
+#      that cannot be reproduced without another live session, lost to an unmeasured premise (gate
+#      r1 B-2). Step (e) proves that file's freshness instead: it removes it, checks it is gone and
+#      records that it did, so "cleared by this run and present again" is the whole test. Here the
+#      relay backdates the report by six years and it is still this run's. (M11 pins the proof; 34d
+#      is the other half -- with (e) never launched the flag is 0 and the report is MISSING.)
+begin '41j a snapshot report the host backdated is still this run own'
+: > "$SB/before-run.txt"
+sleep 0.01
+export LABTEST_OPEN_EXEC=1
+export LABTEST_RELAY_SNAPSHOT_BACKDATE=1
+run_lab "$SB/out.txt" "$SBLAB/checkpoint.sh" labtest
+rc=$?
+unset LABTEST_OPEN_EXEC LABTEST_RELAY_SNAPSHOT_BACKDATE
+reasons=''
+GATHERED="$SBEVIDENCE/labtest/server-snapshot-labtest.txt"
+# The fixture really is the one this case is named for: an mtime rule would have refused this file.
+[ -n "$(find "$SBRUNTIME/share/server-snapshot-out.txt" -maxdepth 0 -newer "$SB/before-run.txt" 2>/dev/null)" ] \
+	&& reasons="$reasons fixture-not-backdated;"
+[ "$rc" -eq 0 ] || reasons="$reasons rc=$rc;"
+[ -f "$GATHERED" ] || reasons="$reasons NOT-GATHERED;"
+grep -qF 'RESULT: DONE' "$GATHERED" 2>/dev/null || reasons="$reasons gathered-file-is-not-the-report;"
+grep -qE 'server-snapshot-labtest\.txt  [0-9]+ bytes \(complete\)' "$SB/out.txt" || reasons="$reasons manifest-line;"
+grep -qF 'server-snapshot-labtest.txt  MISSING' "$SB/out.txt" && reasons="$reasons REPORTED-MISSING;"
+grep -qF 'checkpoint labtest complete' "$SB/out.txt" || reasons="$reasons no-completion-line;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: a complete report whose mtime predates the whole run is gathered as this run's on the strength of step (e)'s clear-then-present proof, and the manifest marks it (complete)"
+else
+	fail "$CASE:$reasons"
+	note "$(grep -F 'server-snapshot-labtest.txt' "$SB/out.txt")"
 fi
 
 # 42. The checkpoint job file is held to the same standard as the smoke one: a key outside its
@@ -2380,9 +2678,62 @@ else
 	fail "$CASE: could not build the mutant (cp_fresh moved?)"
 fi
 
+# M10. THE START STAMP PUT BACK TO ONE FIXED NAME (`checkpoint-start.stamp`, which is what it was):
+#      a second checkpoint writes its own start time over the stamp of the run already in flight,
+#      before the overlap guard refuses it -- i.e. case 36e's pin bites. The mutant takes the NAME
+#      and nothing else: the write, its placement and the removal all stay, so what it isolates is
+#      the per-invocation rule rather than the stamp.
+begin 'M10 fixed-stamp mutant'
+MUTANT_STAMP="$SBLAB/labtest-mutant-stamp.sh"
+# shellcheck disable=SC2016  # sed must see the literals $RUNTIME and $$
+if sed 's|^CP_START_STAMP="$RUNTIME/checkpoint-start.$$.stamp"$|CP_START_STAMP="$RUNTIME/checkpoint-start.stamp"|' \
+	"$SBLAB/checkpoint.sh" > "$MUTANT_STAMP" \
+	&& ! cmp -s "$MUTANT_STAMP" "$SBLAB/checkpoint.sh" && bash -n "$MUTANT_STAMP"; then
+	seed_run_a_in_flight
+	run_lab "$SB/out.txt" "$MUTANT_STAMP" labtest
+	rc=$?
+	kill "$LIVE_PID" 2>/dev/null
+	wait "$LIVE_PID" 2>/dev/null
+	if [ "$rc" -eq 3 ] && ! cmp -s "$SBRUNTIME/checkpoint-start.stamp" "$SB/run-a-stamp.txt"; then
+		pass "$CASE: detected -- the refused second checkpoint rewrote (or removed) the stamp of the run in flight on its way to refusing, which is what case 36e pins"
+	else
+		fail "$CASE: NOT detected -- case 36e would pass against a checkpoint whose start stamp is one fixed name"
+		note "rc=$rc stamp now: [$(cat "$SBRUNTIME/checkpoint-start.stamp" 2>/dev/null)]"
+	fi
+else
+	fail "$CASE: could not build the mutant (the start stamp name moved?)"
+fi
+
+# M11. THE HOST-WRITTEN REPORT JUDGED BY ITS MTIME AGAIN (cp_fresh in place of the clear-then-present
+#      proof), which is the rule this fold replaced: a complete report carrying the host's clock is
+#      reported MISSING, counted REQUIRED and never copied -- and the next checkpoint's pre-launch rm
+#      deletes it -- i.e. case 41j's pin bites. The mutant takes the snapshot arm only; every other
+#      artefact keeps the mtime rule, which is where it is sound.
+begin 'M11 snapshot-mtime mutant'
+MUTANT_SNAP="$SBLAB/labtest-mutant-snapshot.sh"
+# shellcheck disable=SC2016  # sed must see the literals $SNAPSHOT_CLEARED and $1
+if sed 's|^    snapshot) \[ "$SNAPSHOT_CLEARED" -eq 1 \] ;;$|    snapshot) cp_fresh "$1" ;;|' \
+	"$SBLAB/checkpoint.sh" > "$MUTANT_SNAP" \
+	&& ! cmp -s "$MUTANT_SNAP" "$SBLAB/checkpoint.sh" && bash -n "$MUTANT_SNAP"; then
+	export LABTEST_OPEN_EXEC=1
+	export LABTEST_RELAY_SNAPSHOT_BACKDATE=1
+	run_lab "$SB/out.txt" "$MUTANT_SNAP" labtest
+	rc=$?
+	unset LABTEST_OPEN_EXEC LABTEST_RELAY_SNAPSHOT_BACKDATE
+	if [ "$rc" -eq 8 ] && grep -qF 'server-snapshot-labtest.txt  MISSING' "$SB/out.txt" \
+		&& [ ! -e "$SBEVIDENCE/labtest/server-snapshot-labtest.txt" ]; then
+		pass "$CASE: detected -- a complete report the host backdated is reported MISSING, counted REQUIRED and never copied (case 41j pins the proof)"
+	else
+		fail "$CASE: NOT detected -- case 41j would pass against a manifest that judges the host-written report by its mtime"
+		note "rc=$rc $(grep -F 'server-snapshot-labtest.txt' "$SB/out.txt")"
+	fi
+else
+	fail "$CASE: could not build the mutant (the snapshot freshness proof moved?)"
+fi
+
 # Every case must have reported: a case that neither passed nor failed would otherwise vanish from
 # the tally with exit 0. Placed after the LAST case on purpose.
-EXPECTED_CASES=76
+EXPECTED_CASES=84
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi

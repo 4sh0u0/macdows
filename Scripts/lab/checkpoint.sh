@@ -59,9 +59,20 @@
 #      a step's own code is more specific and wins.
 # Every exit prints a manifest of this batch's artefacts -- including the refusals that stop the run
 # before it starts, which exit through cp_die. That is done from an EXIT trap, so it is one property
-# of the script rather than a promise each path has to keep. (The one exception is 2: it fires before
-# the batch directory and the two TAGs are known, i.e. before there is anything to list or anywhere
-# to put it, and no run has happened.)
+# of the script rather than a promise each path has to keep. The exceptions are all exit 2, and they
+# fall into two classes now rather than one:
+#   SILENT -- a malformed job file (before the batch directory and the two TAGs are known: nothing to
+#     list and nowhere to put it), and the runtime-directory refusals immediately after those checks
+#     (the start stamp or its probe cannot be written, or this filesystem's `find` cannot order two
+#     files written in sequence -- see CP_START_STAMP). The batch name is in hand for the second
+#     class, but the trap is armed a few lines later, and nothing has been launched either way.
+#   READ-ONLY MANIFEST -- the two refusals that fire after the arming point: the window-smoke log
+#     that cannot be moved aside (see WS_ASIDE) and the snapshot report that cannot be cleared (step
+#     (e)). They print the same listing-only manifest every cp_die prints. The snapshot one is the
+#     single refusal that can fire after a step was LAUNCHED, and its manifest still gathers nothing:
+#     this run's own files stay in .build/lab-runtime/ under their own names, where the next
+#     checkpoint's pre-launch `rm` clears them, rather than being copied into a batch whose verdict
+#     is a refusal.
 #
 # A cp_die REFUSAL'S MANIFEST IS READ-ONLY. Nothing was launched for this batch, so it lists whatever
 # the batch directory ALREADY holds under each artefact's name and copies nothing into it -- in
@@ -165,11 +176,35 @@ cp_job_value() { # <job file> <key>
 # one source no `rm` ever clears (window-smoke-<TAG>.log's source is the batch directory itself,
 # and a rerun under the same batch name finds the earlier run's copy exactly there).
 #
-# Fail-closed by construction: a real artefact can only be judged stale if its last write predates
-# the stamp, which no launch this script performs can produce; a stale one can only pass if something
-# rewrote it after the stamp, at which point it is this run's to explain. The host writes the
-# snapshot report through the redirected drive, so its mtime is this Mac's clock, not the host's.
-CP_START_STAMP="$RUNTIME/checkpoint-start.stamp"
+# Fail-closed by construction FOR THE FILES THIS MAC WRITES, which is every gathered source but
+# one: a real artefact can only be judged stale if its last write predates the stamp, which no launch
+# this script performs can produce; a stale one can only pass if something rewrote it after the
+# stamp, at which point it is this run's to explain.
+#
+# THE SNAPSHOT REPORT IS THE EXCEPTION, and is not judged by mtime at all. The HOST writes it,
+# through the redirected drive, and the drive client sets the local file's times from the ones the
+# server sends (ThirdParty/FreeRDP's drive channel implements FileBasicInformation by calling
+# SetFileTime on the local file) -- so that mtime can be the host's clock, which this lab's host runs
+# behind after a boot until it is corrected. A COMPLETE report would then be called a previous run's,
+# counted REQUIRED, never copied, and deleted by the next checkpoint's pre-launch `rm`: evidence that
+# cannot be reproduced without another live session, lost to a premise nobody measured (gate r1 B-2).
+# Step (e) PROVES that one file's freshness instead of estimating it -- it removes the report, checks
+# it is gone and sets SNAPSHOT_CLEARED, so "cleared by this run and present again afterwards" is the
+# whole proof (see cp_this_runs). With (e) never launched the flag stays 0 and the report is a
+# previous checkpoint's, which is the verdict the mtime rule gave for that shape anyway.
+#
+# PER INVOCATION, not per runtime directory. Nothing serialises checkpoints, and this file name used
+# to be fixed: a second checkpoint, started by hand or by an orchestrator, wrote the SAME stamp with
+# its own start time before it reached the overlap guard that exists to refuse it, and the run
+# already in flight then compared its own artefacts against the intruder's stamp and reported its
+# real log, its real capture and its real report as a previous run's -- rc 8, and the pair marked
+# BROKEN downstream (gate r1 B-1). The pid in the name makes that impossible, and cp_on_exit removes
+# the stamp (and the probe below) on every path, so a refused invocation leaves the runtime directory
+# exactly as it found it.
+CP_START_STAMP="$RUNTIME/checkpoint-start.$$.stamp"
+# Written immediately after the stamp and compared against it: the production check that this
+# filesystem and this `find` really do order two files written in sequence (see the write below).
+CP_START_PROBE="$RUNTIME/checkpoint-start.$$.probe"
 
 cp_fresh() { # <path> -- 0 iff the file exists and was modified after this run's start stamp
     [ -f "$1" ] || return 1
@@ -321,6 +356,12 @@ MISSING=0
 FAIL_CODE=0
 FAIL_STEP=''
 LISTING_ONLY=0
+# Set by step (e) once it has removed the previous report and checked the removal landed: the
+# snapshot report's whole freshness proof (see CP_START_STAMP and cp_this_runs).
+SNAPSHOT_CLEARED=0
+# The name an earlier run's window-smoke log was moved aside to, set only once the move has actually
+# happened (see WS_LOG_SRC's move-aside block). Empty means there was nothing to move.
+WS_ASIDE=''
 
 # One artefact. `required` is what separates "this batch is short of something" from "this run did
 # not ask for it": a missing REQUIRED artefact is counted and becomes the run's verdict, a missing
@@ -331,49 +372,80 @@ LISTING_ONLY=0
 # is true only for window-smoke's own artefact (its source IS the batch directory; see WS_LOG_SRC)
 # or for a directory a previous, completed run of the SAME batch name left behind.
 #
-# <annotate>: 1 for exactly one artefact, server-snapshot-<TAG>.txt (see the call below, and
-# cp_snapshot_suffix just below this function). Its relay DONE line only says the RDP SESSION
-# ended -- not that the host finished writing the report -- which is exactly the gap the
-# 2026-09-15 offset-20260915 batch fell into: a relay that outlived RELAY_TIMEOUT still leaves a
-# COMPLETE report on disk, and gather() had no way to say so.
+# IS THIS FILE THIS RUN'S? Two proofs, because the artefacts have two authors. Everything this Mac
+# writes is judged by mtime against this run's start stamp. The snapshot report is written by the
+# HOST and its mtime can be the host's clock, so it is judged by the only thing this script watched
+# happen: step (e) removed that file and checked it was gone, so a file present now was written
+# after the removal. See CP_START_STAMP for why the difference is not a convenience.
+# shellcheck disable=SC2329,SC2317  # reached only through the EXIT trap, via cp_gather -> gather
+cp_this_runs() { # <path> <kind: ''|snapshot|window-smoke>
+    case "$2" in
+    snapshot) [ "$SNAPSHOT_CLEARED" -eq 1 ] ;;
+    *) cp_fresh "$1" ;;
+    esac
+}
+
+# <kind> is '' for the artefacts that need no special handling, and names the two that do:
+#   snapshot      server-snapshot-<TAG>.txt -- judged by cp_this_runs' second proof, and annotated
+#                 with whether the report itself is complete (see cp_snapshot_suffix just below).
+#                 Its relay DONE line only says the RDP SESSION ended -- not that the host finished
+#                 writing the report -- which is exactly the gap the 2026-09-15 offset-20260915 batch
+#                 fell into: a relay that outlived RELAY_TIMEOUT still leaves a COMPLETE report on
+#                 disk, and gather() had no way to say so.
+#   window-smoke  window-smoke-<TAG>.log -- the one source no pre-launch `rm` clears and the one the
+#                 launcher APPENDS to, so a rerun under the same batch name has an earlier run's copy
+#                 moved aside before anything is launched (see WS_ASIDE). Both the byte line and the
+#                 MISSING line say so: the batch directory then holds two files of nearly the same
+#                 name, and the record has to say which is which.
 # shellcheck disable=SC2329,SC2317  # reached only through the EXIT trap, via cp_gather (SC2317: shellcheck 0.9 on Tier 1 follows the trap chain and reads this body as unreachable; 0.11 does not)
-gather() { # <source> <destination name> <required 0|1> [annotate 0|1]
-    local src="$1" dst="$EVIDENCE/$2" required="$3" annotate="${4:-0}" why='' suffix=''
+gather() { # <source> <destination name> <required 0|1> [kind '' | snapshot | window-smoke]
+    local src="$1" dst="$EVIDENCE/$2" required="$3" kind="${4:-}" why='' suffix='' aside=''
+    if [ "$kind" = 'window-smoke' ] && [ -n "$WS_ASIDE" ]; then
+        aside=" -- an earlier run's log of this name was moved aside to $WS_ASIDE"
+    fi
     if [ "$LISTING_ONLY" -eq 1 ]; then
         if [ -f "$dst" ]; then
-            if [ "$annotate" -eq 1 ]; then suffix="$(cp_snapshot_suffix "$dst")"; fi
-            cp_log "      $2  $(wc -c < "$dst" | tr -d ' ') bytes$suffix"
+            if [ "$kind" = 'snapshot' ]; then suffix="$(cp_snapshot_suffix "$dst")"; fi
+            cp_log "      $2  $(wc -c < "$dst" | tr -d ' ') bytes$suffix$aside"
             return 0
         fi
         why='MISSING -- listing only, nothing gathered'
     elif [ ! -f "$src" ]; then
         why="MISSING ($(cp_rel "$src"))"
-    elif ! cp_fresh "$src"; then
-        # Present, and older than this run's start stamp: a previous run's file under this run's
-        # name (see CP_START_STAMP). Not read, not copied, not removed -- reported for what it is,
-        # and counted exactly like a file that was never written.
-        why="MISSING ($(cp_rel "$src") predates this checkpoint -- a previous run's, left in place, nothing copied)"
-    elif [ "$src" != "$dst" ] && ! cp -f "$src" "$dst"; then
+    elif ! cp_this_runs "$src" "$kind"; then
+        # Present, and not this run's by whichever proof applies to it (see cp_this_runs). Not read,
+        # not copied, not removed -- reported for what it is, and counted exactly like a file that
+        # was never written.
+        if [ "$kind" = 'snapshot' ]; then
+            why="MISSING ($(cp_rel "$src") -- step (e) never launched, so this report is a previous checkpoint's, left in place, nothing copied)"
+        else
+            why="MISSING ($(cp_rel "$src") predates this checkpoint -- a previous run's, left in place, nothing copied)"
+        fi
+    elif [ "$src" != "$dst" ] && ! cp -f "$src" "$dst" 2>/dev/null; then
         # A required artefact that could not be COPIED is just as absent from the evidence
-        # directory as one that was never written, and is counted the same way.
+        # directory as one that was never written, and is counted the same way. `2>/dev/null` for
+        # the reason the stamp write has it: cp's own diagnostic names an absolute path.
         why='COPY-FAILED'
     fi
-    # Nothing was copied under this name by this run, yet the name is already there: a rerun under
-    # the same batch name left an earlier run's copy, and a reader of the directory alone would take
-    # it for this run's. Said on the manifest line, so the directory and the record cannot disagree.
+    # Nothing was copied under this name by this run, yet the name is already there. Which run's it
+    # is depends on how this branch was reached, and the line may only claim what that branch knows.
     if [ -n "$why" ] && [ "$src" != "$dst" ] && [ -f "$dst" ]; then
-        why="$why; the $2 already in the batch directory is an earlier run's, not this one's"
+        if [ "$why" = 'COPY-FAILED' ]; then
+            why="$why; a file of this name is present in the batch directory, provenance unknown -- the copy that failed may have written part of it"
+        else
+            why="$why; the $2 already in the batch directory is an earlier run's, not this one's"
+        fi
     fi
     if [ -z "$why" ]; then
-        if [ "$annotate" -eq 1 ]; then suffix="$(cp_snapshot_suffix "$dst")"; fi
-        cp_log "      $2  $(wc -c < "$dst" | tr -d ' ') bytes$suffix"
+        if [ "$kind" = 'snapshot' ]; then suffix="$(cp_snapshot_suffix "$dst")"; fi
+        cp_log "      $2  $(wc -c < "$dst" | tr -d ' ') bytes$suffix$aside"
         return 0
     fi
     if [ "$required" -eq 1 ]; then
         MISSING=$((MISSING + 1))
-        cp_log "      $2  $why  -- REQUIRED"
+        cp_log "      $2  $why$aside  -- REQUIRED"
     else
-        cp_log "      $2  $why"
+        cp_log "      $2  $why$aside"
     fi
     return 1
 }
@@ -413,10 +485,10 @@ cp_gather() {
     gather "$ETW_JSONL" "etw-$ETW_TAG.jsonl" 0
     gather "$ETW_TAG_LOG" "etw-$ETW_TAG.log" 0
     gather "$SMOKE_TAG_LOG" "smoke-$SMOKE_TAG.log" 1
-    gather "$WS_LOG_SRC" "window-smoke-$SMOKE_TAG.log" 1
+    gather "$WS_LOG_SRC" "window-smoke-$SMOKE_TAG.log" 1 window-smoke
     if [ "$SNAPSHOT" = '1' ]; then
         gather "$RELAY_LOG" "relay-$SMOKE_TAG.log" 1
-        gather "$SNAPSHOT_OUT" "server-snapshot-$SMOKE_TAG.txt" 1 1
+        gather "$SNAPSHOT_OUT" "server-snapshot-$SMOKE_TAG.txt" 1 snapshot
     fi
     cp_log "verdicts: capture=[$(cp_done_line "$ETW_LOG")] run=[$(cp_done_line "$SMOKE_TAG_LOG" "$SMOKE_LOG")] snapshot=[$(cp_done_line "$RELAY_LOG")]"
     # The capture's JSONL carries server and channel names and is NEVER quotable as-is; the
@@ -446,6 +518,12 @@ cp_on_exit() {
             cp_log "checkpoint $JOB_NAME complete"
         fi
     fi
+    # THIS INVOCATION'S stamp and probe, on every path (see CP_START_STAMP): they are private to the
+    # run that wrote them, and a stamp left behind is one more file the next reader of the runtime
+    # directory has to date. `2>/dev/null` for the reason the writes have it -- a refused `rm` is
+    # diagnosed by rm itself, with an absolute path in it. The verdict is already in $rc and this
+    # cannot change it.
+    rm -f "$CP_START_STAMP" "$CP_START_PROBE" 2>/dev/null
     exit "$rc"
 }
 trap cp_on_exit EXIT
@@ -563,9 +641,28 @@ WS_LOG_SRC="$EVIDENCE/window-smoke-$SMOKE_TAG.log"
 # leftover of a previous run is not. A data write rather than a bare `touch`, so the mtime moves
 # even when the previous checkpoint left a stamp of the same size; the content is for a human
 # reading the runtime directory and is never parsed.
-mkdir -p "$RUNTIME" || cp_die 2 "cannot create $(cp_rel "$RUNTIME")"
-printf 'batch=%s start=%s\n' "$BATCH" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$CP_START_STAMP" \
+#
+# WHY THE `2>/dev/null` IS WHERE IT IS. A failing `mkdir`, and a failing `> path`, are diagnosed by
+# mkdir and by THE SHELL -- not by this script -- and those diagnostics carry the absolute path,
+# i.e. the maintainer's home directory, into a stdout that is teed into the evidence directory and
+# pasted into records (the masking on the way there rewrites addresses and nothing else). cp_die's
+# own message is repo-relative and says as much as a reader needs. `> path 2>/dev/null` does NOT
+# suppress the shell's diagnostic -- the redirections are applied left to right and the failing one
+# is the first -- so the write is wrapped in a group with the suppression on the group.
+mkdir -p "$RUNTIME" 2>/dev/null || cp_die 2 "cannot create $(cp_rel "$RUNTIME")"
+{ printf 'batch=%s start=%s\n' "$BATCH" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$CP_START_STAMP"; } 2>/dev/null \
     || cp_die 2 "cannot write $(cp_rel "$CP_START_STAMP") -- nothing below could write to the runtime directory either"
+# THE ORDERING CHECK, ON THE FILESYSTEM THAT ACTUALLY MATTERS. Every artefact below is judged by
+# `find -newer "$CP_START_STAMP"`, and an EQUAL timestamp is not newer -- so on a volume whose
+# timestamps cannot separate two files written in sequence (or under a `find` on PATH that answers
+# differently, which is a live shape in this project's tooling), a file this run really wrote reads
+# as a previous run's and a complete batch reports itself INCOMPLETE. The offline suite asserts this
+# for its own sandbox; here it is asserted for .build/lab-runtime, with one probe file written
+# immediately after the stamp, before anything is launched.
+{ printf 'probe written immediately after the start stamp; see CP_START_PROBE\n' > "$CP_START_PROBE"; } 2>/dev/null \
+    || cp_die 2 "cannot write $(cp_rel "$CP_START_PROBE") -- nothing below could write to the runtime directory either"
+[ -n "$(find "$CP_START_PROBE" -maxdepth 0 -newer "$CP_START_STAMP" 2>/dev/null)" ] \
+    || cp_die 2 "runtime filesystem or find cannot order files written in sequence -- $(cp_rel "$CP_START_PROBE") was written after $(cp_rel "$CP_START_STAMP") and does not come out newer than it, so a file this run writes could be reported as a previous run's"
 # From here on, every exit gathers and prints the manifest -- including the overlap refusal below.
 GATHER_ARMED=1
 cp_log "start stamp: $(cp_rel "$CP_START_STAMP") -- only files modified after it are gathered as this batch's"
@@ -622,6 +719,33 @@ if cp_etw_capture_live; then
     cp_die 3 "an ETW capture is still in flight ($(cp_rel "$ETW_LOG") has no DONE line and the capture's process is alive). Two captures overlapping disable each other's providers -- wait for it, or close its window, and run this again"
 fi
 
+# ---- an earlier run's window-smoke log, moved aside ------------------------------------------
+# WS_LOG_SRC's source IS the batch directory (see above), nothing removes it before the run, and the
+# launcher only ever APPENDS to it (every write in Scripts/run-window-smoke.command is `>>`). A
+# rerun under the same batch name would therefore leave ONE file holding both runs' rows, both
+# `[launcher]` start lines and both `DONE exit=` lines -- with its mtime moved by this run's appends,
+# so the freshness rule calls all of it this run's. That is the false-evidence class this lane
+# exists to close (gate r1 I-1), and the fix is to start from nothing: the earlier run's copy is
+# moved aside under a name that says what it is, and is NEVER overwritten -- if that name is taken
+# this refuses rather than choosing which run's evidence to destroy. Placed after the overlap guard
+# and before the first `rm -f` of step (b), so a refusal here is still a refusal before any launch.
+if [ -e "$WS_LOG_SRC" ]; then
+    # Aside means BESIDE THE FILE ITSELF -- the aside path is derived from WS_LOG_SRC and never from
+    # $EVIDENCE, so the move cannot depend on a directory that does not exist yet and the earlier
+    # run's bytes stay in the directory a reader already has open.
+    WS_ASIDE_NAME="$(basename "$WS_LOG_SRC").before-$(date -u +%Y%m%dT%H%M%SZ)"
+    WS_ASIDE_PATH="$(dirname "$WS_LOG_SRC")/$WS_ASIDE_NAME"
+    if [ -e "$WS_ASIDE_PATH" ]; then
+        cp_die 2 "$(cp_rel "$WS_LOG_SRC") is an earlier run's and the name it would be moved aside to ($WS_ASIDE_NAME) is taken -- nothing has been launched; move or remove one of them and run this again"
+    fi
+    mv "$WS_LOG_SRC" "$WS_ASIDE_PATH" 2>/dev/null \
+        || cp_die 2 "cannot move $(cp_rel "$WS_LOG_SRC") aside to $WS_ASIDE_NAME -- nothing has been launched"
+    # Only now: the manifest line for that artefact reads this, and it must not say a move happened
+    # unless one did.
+    WS_ASIDE="$WS_ASIDE_NAME"
+    cp_log "an earlier run's $(cp_rel "$WS_LOG_SRC") was already there; moved aside to $WS_ASIDE so this run's log carries this run's rows only"
+fi
+
 # ---- (b) the capture -------------------------------------------------------------------------
 # The previous capture's JSONL is removed BEFORE the launch, not after: the wait below treats the
 # file's appearance as "the socket is open", and last run's file would satisfy it instantly.
@@ -676,8 +800,17 @@ fi
 # ---- (e) the snapshot -------------------------------------------------------------------------
 if [ "$FAIL_CODE" -eq 0 ] && [ "$SNAPSHOT" = '1' ]; then
     # The host writes its report into the redirected share; last run's copy must not be what the
-    # manifest gathers.
-    rm -f "$SNAPSHOT_OUT"
+    # manifest gathers -- and this removal is also the whole FRESHNESS PROOF for that one artefact
+    # (see CP_START_STAMP): its mtime can be the host's clock, so "this run cleared it and it is
+    # here again" is the only thing this script can state from its own observation. The check is
+    # what makes it a proof: an `rm -f` that silently failed would otherwise set the flag over a
+    # previous checkpoint's report. This is the one cp_die that can fire after a step was LAUNCHED,
+    # and its manifest is read-only like every other refusal's (see the header).
+    rm -f "$SNAPSHOT_OUT" 2>/dev/null
+    if [ -e "$SNAPSHOT_OUT" ]; then
+        cp_die 2 "cannot clear $(cp_rel "$SNAPSHOT_OUT") before the snapshot runs -- without that removal this run's report cannot be told from a previous checkpoint's"
+    fi
+    SNAPSHOT_CLEARED=1
     cp_log "(e) starting the server snapshot"
     if "$LAB/run-scenario.sh" relay server-snapshot; then
         if cp_wait_done "$RELAY_TIMEOUT" "$RELAY_LOG"; then
