@@ -18,7 +18,11 @@ concurrency:
 jobs:
   tier1:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 10, not 5: the offline suites alone take ~4.5 min on ubuntu-latest (checkpoint lane ~100 s,
+    # ETW capture ~46 s since the 15 s dial-bound cases, display-mode 40-60 s), and run 35317795132
+    # (2026-09-18) was cancelled at 5:01 with every step green. A job-level timeout ends as
+    # "cancelled", not "failure" -- read a cancelled run as a timeout first.
+    timeout-minutes: 10
     steps:
       # Pinned to commit SHA, not a mutable tag, per project policy on supply-chain
       # pinning for third-party Actions. Version in the trailing comment for humans.
