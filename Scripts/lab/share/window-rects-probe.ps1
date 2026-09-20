@@ -56,6 +56,7 @@
         [host-metrics] dpi= for= cxsizeframe= cysizeframe= cxpaddedborder= cycaption=
                        cxfixedframe= cyfixedframe= cxborder= cyborder=
                             (one line per DPI in ProbeFixedMetricDpi, plus the session's)
+        [host-desktop] cx= cy= vx= vy= vcx= vcy= wa=
         [host-enum] read-utc= ps= enumerated= visible= rect-ok= selected= cap= truncated=
         [host-rect] hwnd= pid= proc= class= style= exstyle= owner= dpi= wr= ef= cs= cr=
                     title-len= title-sha8= [hr=]              (one line per selected window)
@@ -68,6 +69,30 @@
     still enumerates, still prints its rows and still ends RESULT: DONE, because the rows of a
     virtualized run are evidence OF the virtualization and throwing them away would hide it. The
     reader decides; the report only refuses to look fine.
+
+    [host-desktop] IS THE SESSION'S DESKTOP, NOT A WINDOW. cx/cy are SM_CXSCREEN/SM_CYSCREEN --
+    the PRIMARY display's size; vx/vy/vcx/vcy are SM_X/YVIRTUALSCREEN and SM_CX/CYVIRTUALSCREEN,
+    the bounding box of every display (its origin can be negative when a second display sits left
+    of or above the primary); wa is SPI_GETWORKAREA, the primary display minus the taskbar. The
+    row exists because a client that joins a retained session with a different declared scale
+    makes the server re-lay-out the session: without the desktop size of the moment, a window
+    that moved between the smoke run and this probe is indistinguishable from one that never was
+    where the wire said it was.
+
+    Those numbers are PHYSICAL PIXELS in the same coordinate system as [host-rect]'s wr= and ef=,
+    for exactly the reason given above: per-monitor-v2 awareness is declared before any of them is
+    read, so GetSystemMetrics is not virtualized. The corollary is that usable= governs this row
+    too -- a report whose [host-probe] says usable=false must not be read as a measurement of the
+    desktop size any more than as a measurement of K. No second judgement key is introduced for
+    it; usable= is the one verdict in the file and it covers every coordinate in the file.
+
+    The row is produced BEFORE the enumeration (and so before the CHECKPOINT: started write), so
+    a run that hangs in EnumWindows -- the one call here that can block -- still leaves the
+    desktop size behind. Its seven values are independent calls: any one of them can come back
+    n/a without costing the others, and a work area missing an edge renders wa=n/a whole. A
+    refused GetSystemMetrics RETURNS 0 instead of throwing, so the four size keys (cx cy vcx vcy)
+    render a 0 as n/a -- a desktop cannot be zero wide. The two virtual-screen ORIGINS keep their
+    0: vx=0 vy=0 is what a single-display host really reports.
 
     for= tells the session's own metrics line apart from the fixed ones. Without it a 1x session
     (system DPI 96) or a 2x session (192) printed two byte-identical [host-metrics] lines and a
@@ -98,7 +123,10 @@
       [host-probe] ... + RESULT: FAILED metrics/<Type>
                                               the process facts were read, the metric lines were
                                               not
-      [host-probe] ... + three [host-metrics] ... + RESULT: FAILED enumerate|select|detail|report/<Type>
+      [host-probe] ... + three [host-metrics] ... + RESULT: FAILED desktop/<Type>
+                                              the metric lines exist, the desktop row does not
+      [host-probe] ... + three [host-metrics] ... + [host-desktop] ...
+                     + RESULT: FAILED enumerate|select|detail|report/<Type>
                                               everything before the windows survived
 
     So a one-line file is a real and expected result, not a truncated report. Only CHECKPOINT:
@@ -176,6 +204,34 @@ $script:ProbeMetricIndex = [ordered]@{
 # The two fixed DPIs every report carries next to the session's own, so a 1x and a 2x run can be
 # compared without knowing what either session's DPI was: 96 = 100 %, 192 = 200 %.
 $script:ProbeFixedMetricDpi = @(96, 192)
+
+# GetSystemMetrics indices for the [host-desktop] line, in the order it prints them. These are
+# plain GetSystemMetrics (no -ForDpi variant): they answer "how big is this session's desktop
+# right now", which is a property of the session, not of a DPI one might ask about. Kept in a
+# map of its own rather than folded into ProbeMetricIndex, whose entries are all per-DPI WINDOW
+# FRAME constants -- mixing screen sizes into that table would make the [host-metrics] line mean
+# two different things at once.
+$script:ProbeDesktopMetricIndex = [ordered]@{
+    cx  = 0   # SM_CXSCREEN        -- primary display width
+    cy  = 1   # SM_CYSCREEN        -- primary display height
+    vx  = 76  # SM_XVIRTUALSCREEN  -- virtual screen left (negative when a display sits left of the primary)
+    vy  = 77  # SM_YVIRTUALSCREEN  -- virtual screen top
+    vcx = 78  # SM_CXVIRTUALSCREEN -- virtual screen width (all displays)
+    vcy = 79  # SM_CYVIRTUALSCREEN -- virtual screen height (all displays)
+}
+
+# SPI_GETWORKAREA: the primary display minus the taskbar and any other appbar, written by
+# SystemParametersInfo into a caller-supplied RECT. 0x0030 = 48.
+$script:ProbeSpiGetWorkArea = 0x0030
+
+# The [host-desktop] keys whose 0 means "the call was refused", not "the answer is zero".
+# GetSystemMetrics signals failure by RETURNING 0 and does not throw, so Invoke-ProbeCall -- which
+# only turns exceptions into n/a -- cannot see it, and a refused SM_CXSCREEN would otherwise print
+# cx=0 as if it had been measured (gate r1 m5). A width or a height of 0 is impossible on a real
+# desktop. The two VIRTUAL-SCREEN ORIGINS are deliberately absent: vx/vy are 0 on every
+# single-display host and negative when a display sits left of or above the primary, so 0 is a
+# real answer there and must survive.
+$script:ProbeDesktopPositiveKeys = @('cx', 'cy', 'vcx', 'vcy')
 
 # Sanitised tokens (class, proc) are cut here and marked with a trailing ~.
 $script:ProbeTokenMaxLength = 64
@@ -518,6 +574,49 @@ function Format-HostMetricsRow {
     return ($parts.ToArray() -join ' ')
 }
 
+function Select-ProbeDesktopMetric {
+    <#
+      One [host-desktop] metric after the return-0 rule: $null (i.e. n/a) when a positive-only
+      key came back 0, the value otherwise. Pure, and the ONLY place the rule lives, so the
+      collection and the row can never disagree about what a 0 means. See
+      ProbeDesktopPositiveKeys for why the two virtual-screen origins are exempt.
+    #>
+    [CmdletBinding()]
+    param([string] $Name, [AllowNull()] $Value)
+    if ($null -eq $Value) { return $null }
+    if ($script:ProbeDesktopPositiveKeys -contains $Name) {
+        try {
+            if ([int64]$Value -eq 0) { return $null }
+        } catch {
+            return $null
+        }
+    }
+    return $Value
+}
+
+function Format-HostDesktopRow {
+    <#
+      "[host-desktop] cx= cy= vx= vy= vcx= vcy= wa=" -- the session's desktop at the moment the
+      probe ran, in the same physical pixels as [host-rect] (see .DESCRIPTION for why, and for
+      why usable= governs this row too).
+
+      The keys of ProbeDesktopMetricIndex drive both the collection and this line, so a metric
+      can never be collected under one index and printed under another. wa is rendered by
+      Format-Rect, which refuses to print half a rectangle. A missing record renders the whole
+      row as n/a rather than disappearing: the report's shape must not depend on whether the
+      collection succeeded, or a reader could not tell an old grammar from a failed call.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()] $Desktop)
+    $parts = New-Object System.Collections.ArrayList
+    [void]$parts.Add('[host-desktop]')
+    foreach ($name in $script:ProbeDesktopMetricIndex.Keys) {
+        [void]$parts.Add($name + '=' + (Format-ProbeInt -Value (Get-ProbeProp -Object $Desktop -Name $name)))
+    }
+    [void]$parts.Add('wa=' + (Format-Rect -Rect (Get-ProbeProp -Object $Desktop -Name 'wa')))
+    return ($parts.ToArray() -join ' ')
+}
+
 function Format-HostEnumRow {
     <#
       "[host-enum] read-utc= ps= enumerated= visible= rect-ok= selected= cap= truncated=".
@@ -606,6 +705,7 @@ function Format-ProbeReport {
     param(
         [AllowNull()] $Probe,
         [AllowNull()][AllowEmptyCollection()] $Metrics,
+        [AllowNull()] $Desktop,
         [AllowNull()] $Stats,
         [AllowNull()][AllowEmptyCollection()] $Windows,
         [string] $Result
@@ -617,6 +717,9 @@ function Format-ProbeReport {
     if ($null -ne $Metrics) {
         foreach ($m in @($Metrics)) { [void]$lines.Add((Format-HostMetricsRow -Metrics $m)) }
     }
+    # Unconditional, unlike the metrics block: exactly one desktop line per report, even when the
+    # record is missing (see Format-HostDesktopRow).
+    [void]$lines.Add((Format-HostDesktopRow -Desktop $Desktop))
     [void]$lines.Add((Format-HostEnumRow `
         -ReadUtc (Get-ProbeProp -Object $Stats -Name 'ReadUtc') `
         -PsVersion (Get-ProbeProp -Object $Stats -Name 'PsVersion') `
@@ -745,6 +848,15 @@ namespace MacdowsLab
         private static extern uint GetDpiForSystem();
         [DllImport("user32.dll", SetLastError = true)]
         private static extern int GetSystemMetricsForDpi(int nIndex, uint dpi);
+        // The plain, un-DPI'd metric: what this session's desktop measures right now. Not a
+        // fallback for GetSystemMetricsForDpi -- a different question (see [host-desktop]).
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int GetSystemMetrics(int nIndex);
+        // SPI_GETWORKAREA writes into the caller's rectangle, so pvParam is a ref RECT rather
+        // than an out: SystemParametersInfo is one entry point shared by actions that read and
+        // actions that write, and the signature has to be the reading shape for this one.
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "SystemParametersInfoW")]
+        private static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref RECT pvParam, uint fWinIni);
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
         [DllImport("user32.dll")]
@@ -794,6 +906,21 @@ namespace MacdowsLab
         public static int MetricForDpi(int index, int dpi)
         {
             return GetSystemMetricsForDpi(index, (uint)dpi);
+        }
+
+        public static int MetricOf(int index)
+        {
+            return GetSystemMetrics(index);
+        }
+
+        // Boxed RECT or null, like WindowRectOf: the action code comes from the PowerShell side
+        // so SPI_GETWORKAREA is written down in exactly one place, the constants block the test
+        // suite pins. fWinIni is 0 -- there is nothing to broadcast on a read.
+        public static object WorkAreaOf(int action)
+        {
+            RECT r = new RECT();
+            if (SystemParametersInfo((uint)action, 0, ref r, 0)) { return r; }
+            return null;
         }
 
         public static IntPtr[] EnumTopLevel()
@@ -1000,6 +1127,33 @@ function New-ProbeMetricsRecord {
     return [pscustomobject]$record
 }
 
+function New-ProbeDesktopRecord {
+    <#
+      The [host-desktop] line's worth of facts: the six screen metrics named by
+      ProbeDesktopMetricIndex and the work area. Seven independent calls, each through
+      Invoke-ProbeCall, so one refused call costs its own field and nothing else. Reached only
+      from the run, i.e. never under -NoRun.
+
+      Invoke-ProbeCall alone is NOT enough here: GetSystemMetrics reports failure by returning 0
+      rather than by throwing, so every metric is additionally passed through
+      Select-ProbeDesktopMetric, which turns a 0 on a positive-only key into n/a (gate r1 m5).
+      The same hazard exists in New-ProbeMetricsRecord's GetSystemMetricsForDpi calls and is NOT
+      addressed here: those are frame constants, several of which are legitimately 0 at 96 DPI,
+      so the same rule cannot be applied to them without losing real measurements.
+    #>
+    [CmdletBinding()]
+    param()
+    $record = [ordered]@{}
+    foreach ($name in $script:ProbeDesktopMetricIndex.Keys) {
+        $index = [int]$script:ProbeDesktopMetricIndex[$name]
+        $raw = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::MetricOf($index) }
+        $record[$name] = Select-ProbeDesktopMetric -Name $name -Value $raw
+    }
+    $action = [int]$script:ProbeSpiGetWorkArea
+    $record['wa'] = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::WorkAreaOf($action) }
+    return [pscustomobject]$record
+}
+
 function Invoke-WindowRectsProbe {
     <#
       The run: declare awareness, read the process-wide facts, checkpoint the file, enumerate,
@@ -1054,6 +1208,12 @@ function Invoke-WindowRectsProbe {
             [void]$metrics.Add($record)
             [void]$header.Add((Format-HostMetricsRow -Metrics $record))
         }
+        # Before the checkpoint, and so before the one call that can block: a run that hangs in
+        # EnumWindows still leaves the desktop size behind (see [host-desktop] in .DESCRIPTION).
+        $stage = 'desktop'
+        $desktop = New-ProbeDesktopRecord
+        [void]$header.Add((Format-HostDesktopRow -Desktop $desktop))
+
         # Checkpoint: from here on the drive cannot hold the PREVIOUS run's complete report under
         # this run's name. A partial file has no RESULT line at all, so it can never be misread
         # as a finished one.
@@ -1086,7 +1246,7 @@ function Invoke-WindowRectsProbe {
             RectOk     = $counts.RectOk
             Cap        = $script:ProbeMaxRows
         }
-        $lines = Format-ProbeReport -Probe $probe -Metrics @($metrics.ToArray()) -Stats $stats -Windows $rows.ToArray() -Result 'RESULT: DONE'
+        $lines = Format-ProbeReport -Probe $probe -Metrics @($metrics.ToArray()) -Desktop $desktop -Stats $stats -Windows $rows.ToArray() -Result 'RESULT: DONE'
         Write-ProbeReport -Lines $lines -OutPath $OutPath
     } catch {
         $reason = $stage + '/' + $_.Exception.GetType().Name
