@@ -161,6 +161,27 @@ function New-FixtureMetrics {
     }
 }
 
+function New-FixtureDesktop {
+    <#
+      A desktop record as New-ProbeDesktopRecord builds it: the six GetSystemMetrics screen
+      indices plus the work area RECT. The defaults describe a single 200 % display whose
+      virtual screen starts at the origin and whose work area is the screen minus a taskbar.
+    #>
+    param([AllowNull()] $WorkArea = 'default')
+    if ($WorkArea -is [string] -and $WorkArea -eq 'default') {
+        $WorkArea = New-FixtureRect -Left 0 -Top 0 -Right 2560 -Bottom 1520
+    }
+    return [pscustomobject]@{
+        cx  = 2560
+        cy  = 1600
+        vx  = 0
+        vy  = 0
+        vcx = 2560
+        vcy = 1600
+        wa  = $WorkArea
+    }
+}
+
 function New-FixtureStats {
     param([int] $Enumerated = 9, [int] $Visible = 4, [int] $RectOk = 3, [int] $Cap = 64)
     return [pscustomobject]@{
@@ -178,10 +199,11 @@ function New-FixtureProbe {
     return [pscustomobject]@{ Awareness = 2; SetVia = 'v2'; SystemDpi = 192; SessionId = 3; ProcessId = 1234 }
 }
 
-# The three line grammars, as regular expressions, written down once and reused. A field renamed
+# The line grammars, as regular expressions, written down once and reused. A field renamed
 # or reordered in the script fails every case that uses them.
 $script:ProbeLinePattern = '^\[host-probe\] awareness=\S+ set-via=(v2|shcore|none) system-dpi=\S+ session=\S+ pid=\S+ usable=(true|false)$'
 $script:MetricsLinePattern = '^\[host-metrics\] dpi=\S+ for=(session|fixed) cxsizeframe=\S+ cysizeframe=\S+ cxpaddedborder=\S+ cycaption=\S+ cxfixedframe=\S+ cyfixedframe=\S+ cxborder=\S+ cyborder=\S+$'
+$script:DesktopLinePattern = '^\[host-desktop\] cx=\S+ cy=\S+ vx=\S+ vy=\S+ vcx=\S+ vcy=\S+ wa=\S+$'
 $script:EnumLinePattern = '^\[host-enum\] read-utc=\S+ ps=\S+ enumerated=\d+ visible=\d+ rect-ok=\d+ selected=\d+ cap=\d+ truncated=(true|false)$'
 $script:RectLinePattern = '^\[host-rect\] hwnd=\S+ pid=\S+ proc=\S+ class=\S+ style=\S+ exstyle=\S+ owner=\S+ dpi=\S+ wr=\S+ ef=\S+ cs=\S+ cr=\S+ title-len=\S+ title-sha8=\S+( hr=\S+)?$'
 
@@ -245,6 +267,27 @@ Test-Case 'the sizing frame and the fixed (dialog) frame are two DIFFERENT metri
     foreach ($gone in @('cxframe', 'cyframe')) {
         Assert-True (-not (@($script:ProbeMetricIndex.Keys) -contains $gone)) "[$gone] is an alias of the sizing pair and must not be printed"
     }
+}
+
+Test-Case 'the desktop map names the six screen fields in report order' {
+    $keys = @($script:ProbeDesktopMetricIndex.Keys)
+    $want = @('cx', 'cy', 'vx', 'vy', 'vcx', 'vcy')
+    Assert-Equal $want.Count $keys.Count 'desktop field count'
+    for ($i = 0; $i -lt $want.Count; $i++) { Assert-Equal $want[$i] $keys[$i] "desktop field $i" }
+}
+
+Test-Case 'the desktop map uses the documented SM_* indices and SPI_GETWORKAREA is 0x0030' {
+    # Same reason as the frame metrics above: these numbers are the whole contract with user32,
+    # they are written down once in the script and pinned once here. cx/cy are the PRIMARY
+    # display, vx/vy/vcx/vcy the bounding box of all displays -- reading 78/79 as the primary
+    # size (or 0/1 as the virtual one) would silently change what the row means.
+    Assert-Equal 0  $script:ProbeDesktopMetricIndex['cx'] 'SM_CXSCREEN'
+    Assert-Equal 1  $script:ProbeDesktopMetricIndex['cy'] 'SM_CYSCREEN'
+    Assert-Equal 76 $script:ProbeDesktopMetricIndex['vx'] 'SM_XVIRTUALSCREEN'
+    Assert-Equal 77 $script:ProbeDesktopMetricIndex['vy'] 'SM_YVIRTUALSCREEN'
+    Assert-Equal 78 $script:ProbeDesktopMetricIndex['vcx'] 'SM_CXVIRTUALSCREEN'
+    Assert-Equal 79 $script:ProbeDesktopMetricIndex['vcy'] 'SM_CYVIRTUALSCREEN'
+    Assert-Equal 48 $script:ProbeSpiGetWorkArea 'SPI_GETWORKAREA = 0x0030'
 }
 
 Test-Case 'the metrics for= closed set is exactly session / fixed' {
@@ -645,6 +688,54 @@ Test-Case 'a metrics record with no DPI renders every field as n/a, keeping the 
     Assert-Match $script:MetricsLinePattern $line
 }
 
+New-Section 'Format-HostDesktopRow'
+
+Test-Case 'the desktop line prints the six screen metrics in map order and then the work area' {
+    $line = Format-HostDesktopRow -Desktop (New-FixtureDesktop)
+    Assert-Equal '[host-desktop] cx=2560 cy=1600 vx=0 vy=0 vcx=2560 vcy=1600 wa=0,0,2560,1520' $line
+    Assert-Match $script:DesktopLinePattern $line
+}
+
+Test-Case 'a work area missing one edge renders wa=n/a, never half a rectangle' {
+    # Format-Rect already owns this rule; the case exists because the work area is the one field
+    # of this row that is a rectangle, and a half-rendered one would shift every later token.
+    $d = New-FixtureDesktop
+    $d.wa = [pscustomobject]@{ Left = 0; Top = 0; Right = 2560 }
+    $line = Format-HostDesktopRow -Desktop $d
+    Assert-Match ' wa=n/a$' $line
+    Assert-Match $script:DesktopLinePattern $line
+}
+
+Test-Case 'a desktop record whose every call failed renders every field as n/a, keeping the line shape' {
+    $line = Format-HostDesktopRow -Desktop ([pscustomobject]@{ cx = $null; cy = $null; vx = $null; vy = $null; vcx = $null; vcy = $null; wa = $null })
+    Assert-Equal '[host-desktop] cx=n/a cy=n/a vx=n/a vy=n/a vcx=n/a vcy=n/a wa=n/a' $line
+    Assert-Match $script:DesktopLinePattern $line
+}
+
+Test-Case 'a null desktop record still renders the whole row, so the report shape never depends on the collection' {
+    $line = Format-HostDesktopRow -Desktop $null
+    Assert-Equal '[host-desktop] cx=n/a cy=n/a vx=n/a vy=n/a vcx=n/a vcy=n/a wa=n/a' $line
+    Assert-Match $script:DesktopLinePattern $line
+}
+
+Test-Case 'a virtual screen that starts left of or above the primary keeps its minus sign and carries no thousands separator' {
+    # A second display placed to the left makes SM_XVIRTUALSCREEN negative, and a culture with
+    # a group separator would render 3840 as 3,840 and split the token in two. Format-ProbeInt
+    # is invariant; this is the row that proves it for the coordinates most likely to be large
+    # and negative at once.
+    $d = New-FixtureDesktop
+    $d.vx = -1920
+    $d.vy = -180
+    $d.vcx = 4480
+    $d.vcy = 1600
+    $d.wa = New-FixtureRect -Left -1920 -Top -180 -Right 2560 -Bottom 1420
+    $line = Format-HostDesktopRow -Desktop $d
+    Assert-Equal '[host-desktop] cx=2560 cy=1600 vx=-1920 vy=-180 vcx=4480 vcy=1600 wa=-1920,-180,2560,1420' $line
+    Assert-Match $script:DesktopLinePattern $line
+    Assert-Match '^\[host-desktop\]( (cx|cy|vx|vy|vcx|vcy)=-?\d+){6} wa=-?\d+(,-?\d+){3}$' $line `
+        'every value is a bare invariant integer -- a grouped 4,480 would split the token in two'
+}
+
 New-Section 'New-ProbeMetricsPlan'
 
 Test-Case 'the plan is the session DPI first (exactly one session line) and then one fixed line per pre-registered DPI' {
@@ -802,21 +893,35 @@ Test-Case 'title-len and title-sha8 are both derived from the one Title field, s
 
 New-Section 'Format-ProbeReport'
 
-Test-Case 'the report is probe line, metrics lines, enum line, rect lines, RESULT -- in that order' {
+Test-Case 'the report is probe line, metrics lines, desktop line, enum line, rect lines, RESULT -- in that order' {
     $metrics = @(New-ProbeMetricsPlan -SessionDpi 192 | ForEach-Object { New-FixtureMetrics -Dpi $_.Dpi -For $_.For })
-    $lines = @(Format-ProbeReport -Probe (New-FixtureProbe) -Metrics $metrics -Stats (New-FixtureStats) -Windows @((New-FixtureWindow), (New-FixtureWindow)) -Result 'RESULT: DONE')
-    Assert-Equal 8 $lines.Count 'probe + three metrics + enum + two rects + RESULT'
+    $lines = @(Format-ProbeReport -Probe (New-FixtureProbe) -Metrics $metrics -Desktop (New-FixtureDesktop) -Stats (New-FixtureStats) -Windows @((New-FixtureWindow), (New-FixtureWindow)) -Result 'RESULT: DONE')
+    Assert-Equal 9 $lines.Count 'probe + three metrics + desktop + enum + two rects + RESULT'
     Assert-Match $script:ProbeLinePattern $lines[0]
     for ($i = 1; $i -le 3; $i++) { Assert-Match $script:MetricsLinePattern $lines[$i] }
-    Assert-Match $script:EnumLinePattern $lines[4]
-    Assert-Match $script:RectLinePattern $lines[5]
+    Assert-Match $script:DesktopLinePattern $lines[4]
+    Assert-Match $script:EnumLinePattern $lines[5]
     Assert-Match $script:RectLinePattern $lines[6]
+    Assert-Match $script:RectLinePattern $lines[7]
     Assert-Equal 'RESULT: DONE' $lines[$lines.Count - 1]
+}
+
+Test-Case 'the desktop line sits between the last metrics line and the enum line, exactly once' {
+    # Position is load-bearing: [host-desktop] must be produced before the enumeration so a run
+    # that hangs in EnumWindows still leaves the desktop size behind in its checkpoint file, and
+    # the assembly order here is what the checkpoint header mirrors.
+    $metrics = @(New-ProbeMetricsPlan -SessionDpi 96 | ForEach-Object { New-FixtureMetrics -Dpi $_.Dpi -For $_.For })
+    $lines = @(Format-ProbeReport -Probe (New-FixtureProbe) -Metrics $metrics -Desktop (New-FixtureDesktop) -Stats (New-FixtureStats) -Windows @() -Result 'RESULT: DONE')
+    $desktop = @($lines | Where-Object { $_ -like '[[]host-desktop[]]*' })
+    Assert-Equal 1 $desktop.Count 'exactly one desktop line per report'
+    $at = [Array]::IndexOf($lines, $desktop[0])
+    Assert-Match $script:MetricsLinePattern $lines[$at - 1] 'the line before it is the last metrics line'
+    Assert-Match $script:EnumLinePattern $lines[$at + 1] 'the line after it is the enum line'
 }
 
 Test-Case 'a whole report of a 2x session carries three distinguishable metrics lines and one usable verdict' {
     $metrics = @(New-ProbeMetricsPlan -SessionDpi 192 | ForEach-Object { New-FixtureMetrics -Dpi $_.Dpi -For $_.For })
-    $lines = @(Format-ProbeReport -Probe (New-FixtureProbe) -Metrics $metrics -Stats (New-FixtureStats) -Windows @((New-FixtureWindow)) -Result 'RESULT: DONE')
+    $lines = @(Format-ProbeReport -Probe (New-FixtureProbe) -Metrics $metrics -Desktop (New-FixtureDesktop) -Stats (New-FixtureStats) -Windows @((New-FixtureWindow)) -Result 'RESULT: DONE')
     $metricLines = @($lines | Where-Object { $_ -like '[[]host-metrics[]]*' })
     Assert-Equal 3 $metricLines.Count
     Assert-Equal 3 (@($metricLines | Select-Object -Unique)).Count 'the 192 session line and the 192 fixed line must not be byte-identical'
@@ -828,25 +933,26 @@ Test-Case 'a whole report of a 2x session carries three distinguishable metrics 
 Test-Case 'selected= counts the rows that are actually printed, not what the caller claimed' {
     # The stats record says three windows survived the filters; two are handed over. selected=
     # must follow the rows, or a reader could believe a window was reported that never was.
-    $lines = @(Format-ProbeReport -Probe (New-FixtureProbe) -Metrics @((New-FixtureMetrics -Dpi 96)) -Stats (New-FixtureStats -Enumerated 9 -Visible 4 -RectOk 3) -Windows @((New-FixtureWindow), (New-FixtureWindow)) -Result 'RESULT: DONE')
-    $enum = $lines[2]
+    $lines = @(Format-ProbeReport -Probe (New-FixtureProbe) -Metrics @((New-FixtureMetrics -Dpi 96)) -Desktop (New-FixtureDesktop) -Stats (New-FixtureStats -Enumerated 9 -Visible 4 -RectOk 3) -Windows @((New-FixtureWindow), (New-FixtureWindow)) -Result 'RESULT: DONE')
+    $enum = $lines[3]
     Assert-Match ' rect-ok=3 selected=2 cap=64 truncated=true$' $enum
     $rects = @($lines | Where-Object { $_ -like '[[]host-rect[]]*' })
     Assert-Equal 2 $rects.Count 'as many rect lines as selected='
 }
 
 Test-Case 'a report with no windows still carries its header, its counts and its RESULT' {
-    $lines = @(Format-ProbeReport -Probe (New-FixtureProbe) -Metrics @((New-FixtureMetrics -Dpi 96)) -Stats (New-FixtureStats -Enumerated 0 -Visible 0 -RectOk 0) -Windows @() -Result 'RESULT: DONE')
-    Assert-Equal 4 $lines.Count
-    Assert-Match ' enumerated=0 visible=0 rect-ok=0 selected=0 cap=64 truncated=false$' $lines[2]
-    Assert-Equal 'RESULT: DONE' $lines[3]
+    $lines = @(Format-ProbeReport -Probe (New-FixtureProbe) -Metrics @((New-FixtureMetrics -Dpi 96)) -Desktop (New-FixtureDesktop) -Stats (New-FixtureStats -Enumerated 0 -Visible 0 -RectOk 0) -Windows @() -Result 'RESULT: DONE')
+    Assert-Equal 5 $lines.Count
+    Assert-Match ' enumerated=0 visible=0 rect-ok=0 selected=0 cap=64 truncated=false$' $lines[3]
+    Assert-Equal 'RESULT: DONE' $lines[4]
 }
 
 Test-Case 'the RESULT line is whatever the run decided, including the failure shape' {
-    $lines = @(Format-ProbeReport -Probe (New-FixtureProbe) -Metrics $null -Stats (New-FixtureStats) -Windows $null -Result 'RESULT: FAILED enumerate/InvalidOperationException')
-    Assert-Equal 3 $lines.Count
-    Assert-Equal 'RESULT: FAILED enumerate/InvalidOperationException' $lines[2]
-    Assert-Match ' selected=0 ' $lines[1]
+    $lines = @(Format-ProbeReport -Probe (New-FixtureProbe) -Metrics $null -Desktop $null -Stats (New-FixtureStats) -Windows $null -Result 'RESULT: FAILED enumerate/InvalidOperationException')
+    Assert-Equal 4 $lines.Count
+    Assert-Equal 'RESULT: FAILED enumerate/InvalidOperationException' $lines[3]
+    Assert-Match ' selected=0 ' $lines[2]
+    Assert-Match $script:DesktopLinePattern $lines[1] 'a report with no desktop record still carries the row, all n/a'
 }
 
 # -------------------------------------------------------------------------------------------
@@ -868,6 +974,7 @@ Test-Case 'the written file is byte-for-byte the rendered lines, pure ASCII, wit
         $w2.ExtendedFrameHr = -2147024809
         $lines = @(Format-ProbeReport -Probe (New-FixtureProbe) `
             -Metrics @(New-ProbeMetricsPlan -SessionDpi 192 | ForEach-Object { New-FixtureMetrics -Dpi $_.Dpi -For $_.For }) `
+            -Desktop (New-FixtureDesktop) `
             -Stats (New-FixtureStats) -Windows @((New-FixtureWindow), $w2) -Result 'RESULT: DONE')
         Write-ProbeReport -Lines $lines -OutPath $out
 
@@ -894,11 +1001,15 @@ Test-Case 'a checkpoint file has no RESULT line at all, so it can never be read 
     [void][IO.Directory]::CreateDirectory($dir)
     $out = Join-Path $dir 'window-rects-out.txt'
     try {
-        $header = @((Format-HostProbeRow -Probe (New-FixtureProbe)), (Format-HostMetricsRow -Metrics (New-FixtureMetrics -Dpi 96)))
+        $header = @(
+            (Format-HostProbeRow -Probe (New-FixtureProbe)),
+            (Format-HostMetricsRow -Metrics (New-FixtureMetrics -Dpi 96)),
+            (Format-HostDesktopRow -Desktop (New-FixtureDesktop)))
         Write-ProbeReport -Lines (@($header) + @('CHECKPOINT: started')) -OutPath $out
         $read = @([IO.File]::ReadAllLines($out))
-        Assert-Equal 3 $read.Count
-        Assert-Equal 'CHECKPOINT: started' $read[2]
+        Assert-Equal 4 $read.Count
+        Assert-Match $script:DesktopLinePattern $read[2] 'the checkpoint already carries the desktop size'
+        Assert-Equal 'CHECKPOINT: started' $read[3]
         Assert-Equal 0 (@($read | Where-Object { $_ -like 'RESULT:*' })).Count 'a partial file carries no RESULT line'
     } finally {
         if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
@@ -952,12 +1063,14 @@ Test-Case 'a later failure keeps every line produced so far and names the stage 
         function Measure-ProbeWindows { param($Windows) throw (New-Object System.InvalidOperationException 'injected') }
         Invoke-WindowRectsProbe -OutPath $OutFile
     })
-    Assert-Equal 5 $lines.Count 'the probe line, three metrics lines and the trailer'
+    Assert-Equal 6 $lines.Count 'the probe line, three metrics lines, the desktop line and the trailer'
     Assert-Match $script:ProbeLinePattern $lines[0]
     Assert-Match ' usable=false$' $lines[0] 'a run with no awareness declaration is never usable'
     for ($i = 1; $i -le 3; $i++) { Assert-Match $script:MetricsLinePattern $lines[$i] }
     Assert-Match '^\[host-metrics\] dpi=n/a for=session ' $lines[1]
-    Assert-Equal 'RESULT: FAILED select/InvalidOperationException' $lines[4]
+    Assert-Equal '[host-desktop] cx=n/a cy=n/a vx=n/a vy=n/a vcx=n/a vcy=n/a wa=n/a' $lines[4] `
+        'every native call failed here, so the row survives as all n/a rather than vanishing'
+    Assert-Equal 'RESULT: FAILED select/InvalidOperationException' $lines[5]
     Assert-Equal 0 (@($lines | Where-Object { $_ -like '[[]host-rect[]]*' })).Count 'no window was reported'
     Assert-Equal 0 (@($lines | Where-Object { $_ -like 'CHECKPOINT:*' })).Count 'the failure write replaced the checkpoint file'
 }
@@ -1089,10 +1202,50 @@ Test-Case 'the DPI awareness declaration precedes every window and DPI call in t
     $body = $script:SubjectSource.Substring($start)
     $awareness = $body.IndexOf('SetPerMonitorAwareV2')
     Assert-True ($awareness -gt 0) 'the run declares per-monitor awareness'
-    foreach ($later in @('SetAwarenessViaShcore', 'CurrentAwareness()', 'SystemDpi()', 'New-ProbeMetricsRecord', 'EnumTopLevel()', 'Get-ProbeWindowBase', 'Add-ProbeWindowDetail')) {
+    foreach ($later in @('SetAwarenessViaShcore', 'CurrentAwareness()', 'SystemDpi()', 'New-ProbeMetricsRecord', 'New-ProbeDesktopRecord', 'EnumTopLevel()', 'Get-ProbeWindowBase', 'Add-ProbeWindowDetail')) {
         $at = $body.IndexOf($later)
         Assert-True ($at -gt $awareness) "[$later] must be called after the awareness declaration (found at $at, awareness at $awareness)"
     }
+}
+
+Test-Case 'the desktop size is collected BEFORE the checkpoint write, so a run that hangs in EnumWindows still reports it' {
+    # The whole reason the row is produced this early: EnumWindows is the one call in this script
+    # that can block, and a hung run leaves only the checkpoint file behind. Source order is the
+    # only offline evidence for it.
+    $start = $script:SubjectSource.IndexOf('function Invoke-WindowRectsProbe')
+    Assert-True ($start -gt 0) 'the run function is present'
+    $body = $script:SubjectSource.Substring($start)
+    $desktop = $body.IndexOf('New-ProbeDesktopRecord')
+    $checkpoint = $body.IndexOf("'CHECKPOINT: started'")
+    $enumerate = $body.IndexOf('EnumTopLevel()')
+    Assert-True ($desktop -gt 0) 'the run collects a desktop record'
+    Assert-True ($checkpoint -gt $desktop) 'the checkpoint is written after the desktop record exists'
+    Assert-True ($enumerate -gt $checkpoint) 'the enumeration comes after the checkpoint'
+}
+
+Test-Case 'the desktop row reaches the host through GetSystemMetrics and SystemParametersInfo, with the constants passed in from here' {
+    # The P/Invoke half cannot be exercised on this runner. What CAN be pinned is that the two
+    # new entry points exist, that the work area is read through a ref RECT (SPI_GETWORKAREA
+    # writes into the caller's rectangle) and that neither wrapper hard-codes an index: the
+    # numbers live in ProbeDesktopMetricIndex / ProbeSpiGetWorkArea, which the constants section
+    # above pins.
+    foreach ($needle in @(
+        'private static extern int GetSystemMetrics(int nIndex);',
+        'ref RECT pvParam',
+        'public static int MetricOf(int index)',
+        'public static object WorkAreaOf(int action)')) {
+        Assert-True ($script:SubjectSource.Contains($needle)) "the C# surface must declare [$needle]"
+    }
+    $start = $script:SubjectSource.IndexOf('function New-ProbeDesktopRecord')
+    $end = $script:SubjectSource.IndexOf('function Invoke-WindowRectsProbe')
+    Assert-True ($start -gt 0 -and $end -gt $start) 'both functions are present in that order'
+    $body = $script:SubjectSource.Substring($start, $end - $start)
+    Assert-True ($body.Contains('$script:ProbeDesktopMetricIndex')) 'the indices come from the pinned map'
+    Assert-True ($body.Contains('$script:ProbeSpiGetWorkArea')) 'SPI_GETWORKAREA comes from the pinned constant'
+    # Call SHAPES, not the name: the function's own doc comment names Invoke-ProbeCall too, and a
+    # bare name count would be red or green for the wrong reason (lab lesson, 2026-09-08).
+    $calls = [regex]::Matches($body, 'Invoke-ProbeCall\s*(-Call\s*)?\{')
+    Assert-Equal 2 $calls.Count 'both the metric loop and the work area go through Invoke-ProbeCall'
 }
 
 Test-Case 'nothing runs unless -NoRun is absent: the only top-level call is inside that guard' {

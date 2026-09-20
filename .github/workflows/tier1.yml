@@ -364,6 +364,9 @@ jobs:
           pwsh -NoProfile -File Scripts/lab/share/server-snapshot.Tests.ps1
           pwsh -NoProfile -File Scripts/lab/share/Set-RdsGraphicsAnalytic.Tests.ps1
           pwsh -NoProfile -File Scripts/lab/share/window-rects-probe.Tests.ps1
+          pwsh -NoProfile -File Scripts/lab/share/window-loop.Tests.ps1
+          pwsh -NoProfile -File Scripts/lab/share/window-loop-start.Tests.ps1
+          pwsh -NoProfile -File Scripts/lab/share/window-loop-collect.Tests.ps1
 
       - name: Patch queue validation
         # One implementation for the build script and CI: rule 1 (upstream record or the
