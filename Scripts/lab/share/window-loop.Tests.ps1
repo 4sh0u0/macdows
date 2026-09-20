@@ -187,6 +187,7 @@ Test-Case 'the local file names are the ones the launcher and the collector agre
     Assert-Equal 'window-loop-out.txt' $script:LoopOutName
     Assert-Equal 'window-loop.stop' $script:LoopSentinelName
     Assert-Equal 'window-rects-probe.ps1' $script:LoopProbeName
+    Assert-Equal 'window-loop-out.prev.txt' $script:LoopOutPrevName
 }
 
 Test-Case 'the defaults are 420 s at 250 ms, i.e. about 1680 samples at four per second' {
@@ -626,10 +627,32 @@ Test-Case 'every sample is flushed as it is written, so a killed run leaves a re
     # The load-bearing unknown of this lane is whether a detached process survives the relay
     # disconnect at all. A buffered writer would turn "it survived for four minutes and was then
     # killed" into an empty file, i.e. into the same evidence as "it never started".
+    #
+    # Scoped to the SAMPLING LOOP, not to the whole function (gate r1 m1): Invoke-WindowLoop has
+    # four Flush() calls -- head, tick, result and catch -- so a whole-body search claims a
+    # per-tick property it is not checking, and a mutant that deletes the tick flush stays green.
     $start = $script:SubjectSource.IndexOf('function Invoke-WindowLoop')
+    Assert-True ($start -gt 0) 'the run function is present'
     $body = $script:SubjectSource.Substring($start)
     Assert-True ($body.Contains('AutoFlush')) 'the writer flushes on every line'
-    Assert-True ($body -match '\$writer\.Flush\(\)') 'and the tick loop flushes explicitly too'
+    $loopFrom = $body.IndexOf('while ($true) {')
+    $loopTo = $body.IndexOf("`$stage = 'result'")
+    Assert-True ($loopFrom -gt 0 -and $loopTo -gt $loopFrom) 'the sampling loop and the result stage are both present'
+    $tickBody = $body.Substring($loopFrom, $loopTo - $loopFrom)
+    Assert-Equal 1 ([regex]::Matches($tickBody, '\$writer\.Flush\(\)')).Count 'the tick loop flushes exactly once per sample'
+}
+
+Test-Case 'the sampler never opens the PREVIOUS half timeline, which the collector rotated away' {
+    # window-loop-out.prev.txt is the previous half's evidence, parked there by
+    # window-loop-collect.ps1 after a successful write-back (gate r1 B2). The sampler declares
+    # the name only so the three-way name pin covers it; writing it would destroy the very file
+    # the rotation exists to preserve.
+    Assert-Match "(?m)^\s*\`$script:LoopOutPrevName = 'window-loop-out\.prev\.txt'\s*$" $script:SubjectSource `
+        'the name is declared here so a rename in the collector turns this suite red too'
+    Assert-Equal 1 ([regex]::Matches($script:SubjectSource, '\$script:LoopOutPrevName')).Count `
+        'declared once and referenced nowhere else: the sampler must never open that file'
+    Assert-Equal 1 ([regex]::Matches($script:SubjectSource, 'out\.prev')).Count `
+        'and the literal appears nowhere but in that one declaration'
 }
 
 Test-Case 'nothing runs unless -NoRun is absent: the only top-level call is inside that guard' {

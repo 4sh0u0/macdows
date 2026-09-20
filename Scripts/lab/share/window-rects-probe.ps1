@@ -89,7 +89,10 @@
     The row is produced BEFORE the enumeration (and so before the CHECKPOINT: started write), so
     a run that hangs in EnumWindows -- the one call here that can block -- still leaves the
     desktop size behind. Its seven values are independent calls: any one of them can come back
-    n/a without costing the others, and a work area missing an edge renders wa=n/a whole.
+    n/a without costing the others, and a work area missing an edge renders wa=n/a whole. A
+    refused GetSystemMetrics RETURNS 0 instead of throwing, so the four size keys (cx cy vcx vcy)
+    render a 0 as n/a -- a desktop cannot be zero wide. The two virtual-screen ORIGINS keep their
+    0: vx=0 vy=0 is what a single-display host really reports.
 
     for= tells the session's own metrics line apart from the fixed ones. Without it a 1x session
     (system DPI 96) or a 2x session (192) printed two byte-identical [host-metrics] lines and a
@@ -220,6 +223,15 @@ $script:ProbeDesktopMetricIndex = [ordered]@{
 # SPI_GETWORKAREA: the primary display minus the taskbar and any other appbar, written by
 # SystemParametersInfo into a caller-supplied RECT. 0x0030 = 48.
 $script:ProbeSpiGetWorkArea = 0x0030
+
+# The [host-desktop] keys whose 0 means "the call was refused", not "the answer is zero".
+# GetSystemMetrics signals failure by RETURNING 0 and does not throw, so Invoke-ProbeCall -- which
+# only turns exceptions into n/a -- cannot see it, and a refused SM_CXSCREEN would otherwise print
+# cx=0 as if it had been measured (gate r1 m5). A width or a height of 0 is impossible on a real
+# desktop. The two VIRTUAL-SCREEN ORIGINS are deliberately absent: vx/vy are 0 on every
+# single-display host and negative when a display sits left of or above the primary, so 0 is a
+# real answer there and must survive.
+$script:ProbeDesktopPositiveKeys = @('cx', 'cy', 'vcx', 'vcy')
 
 # Sanitised tokens (class, proc) are cut here and marked with a trailing ~.
 $script:ProbeTokenMaxLength = 64
@@ -560,6 +572,26 @@ function Format-HostMetricsRow {
         [void]$parts.Add($name + '=' + (Format-ProbeInt -Value (Get-ProbeProp -Object $Metrics -Name $name)))
     }
     return ($parts.ToArray() -join ' ')
+}
+
+function Select-ProbeDesktopMetric {
+    <#
+      One [host-desktop] metric after the return-0 rule: $null (i.e. n/a) when a positive-only
+      key came back 0, the value otherwise. Pure, and the ONLY place the rule lives, so the
+      collection and the row can never disagree about what a 0 means. See
+      ProbeDesktopPositiveKeys for why the two virtual-screen origins are exempt.
+    #>
+    [CmdletBinding()]
+    param([string] $Name, [AllowNull()] $Value)
+    if ($null -eq $Value) { return $null }
+    if ($script:ProbeDesktopPositiveKeys -contains $Name) {
+        try {
+            if ([int64]$Value -eq 0) { return $null }
+        } catch {
+            return $null
+        }
+    }
+    return $Value
 }
 
 function Format-HostDesktopRow {
@@ -1101,13 +1133,21 @@ function New-ProbeDesktopRecord {
       ProbeDesktopMetricIndex and the work area. Seven independent calls, each through
       Invoke-ProbeCall, so one refused call costs its own field and nothing else. Reached only
       from the run, i.e. never under -NoRun.
+
+      Invoke-ProbeCall alone is NOT enough here: GetSystemMetrics reports failure by returning 0
+      rather than by throwing, so every metric is additionally passed through
+      Select-ProbeDesktopMetric, which turns a 0 on a positive-only key into n/a (gate r1 m5).
+      The same hazard exists in New-ProbeMetricsRecord's GetSystemMetricsForDpi calls and is NOT
+      addressed here: those are frame constants, several of which are legitimately 0 at 96 DPI,
+      so the same rule cannot be applied to them without losing real measurements.
     #>
     [CmdletBinding()]
     param()
     $record = [ordered]@{}
     foreach ($name in $script:ProbeDesktopMetricIndex.Keys) {
         $index = [int]$script:ProbeDesktopMetricIndex[$name]
-        $record[$name] = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::MetricOf($index) }
+        $raw = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::MetricOf($index) }
+        $record[$name] = Select-ProbeDesktopMetric -Name $name -Value $raw
     }
     $action = [int]$script:ProbeSpiGetWorkArea
     $record['wa'] = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::WorkAreaOf($action) }

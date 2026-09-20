@@ -290,6 +290,17 @@ Test-Case 'the desktop map uses the documented SM_* indices and SPI_GETWORKAREA 
     Assert-Equal 48 $script:ProbeSpiGetWorkArea 'SPI_GETWORKAREA = 0x0030'
 }
 
+Test-Case 'the four screen SIZES are the positive-only keys; the two virtual ORIGINS are not' {
+    # GetSystemMetrics reports failure by RETURNING 0, not by throwing, so Invoke-ProbeCall --
+    # which only translates exceptions -- cannot see it (gate r1 m5). A width or height of 0 is
+    # impossible on a real desktop and is therefore read as a refused call; SM_X/YVIRTUALSCREEN
+    # is legitimately 0 on a single-display host and must survive.
+    $p = @($script:ProbeDesktopPositiveKeys)
+    Assert-Equal 4 $p.Count
+    foreach ($k in @('cx', 'cy', 'vcx', 'vcy')) { Assert-True ($p -contains $k) "[$k] is a size and cannot be 0" }
+    foreach ($k in @('vx', 'vy')) { Assert-True (-not ($p -contains $k)) "[$k] is an origin and 0 is a real answer" }
+}
+
 Test-Case 'the metrics for= closed set is exactly session / fixed' {
     $v = @($script:ProbeMetricsForValues)
     Assert-Equal 2 $v.Count
@@ -716,6 +727,35 @@ Test-Case 'a null desktop record still renders the whole row, so the report shap
     $line = Format-HostDesktopRow -Desktop $null
     Assert-Equal '[host-desktop] cx=n/a cy=n/a vx=n/a vy=n/a vcx=n/a vcy=n/a wa=n/a' $line
     Assert-Match $script:DesktopLinePattern $line
+}
+
+Test-Case 'a screen SIZE of 0 renders n/a -- GetSystemMetrics reports failure by returning 0' {
+    # gate r1 m5. Driven through Select-ProbeDesktopMetric, which is the one place the rule
+    # lives, so the row and the collection cannot disagree about what 0 means.
+    foreach ($k in @('cx', 'cy', 'vcx', 'vcy')) {
+        Assert-Equal $null (Select-ProbeDesktopMetric -Name $k -Value 0) "[$k]=0 is a refused call, not a measurement"
+    }
+    $d = New-FixtureDesktop
+    $d.cx = 0
+    $d.vcy = 0
+    $line = Format-HostDesktopRow -Desktop ([pscustomobject]@{
+        cx = (Select-ProbeDesktopMetric -Name 'cx' -Value $d.cx)
+        cy = (Select-ProbeDesktopMetric -Name 'cy' -Value $d.cy)
+        vx = (Select-ProbeDesktopMetric -Name 'vx' -Value $d.vx)
+        vy = (Select-ProbeDesktopMetric -Name 'vy' -Value $d.vy)
+        vcx = (Select-ProbeDesktopMetric -Name 'vcx' -Value $d.vcx)
+        vcy = (Select-ProbeDesktopMetric -Name 'vcy' -Value $d.vcy)
+        wa = $d.wa })
+    Assert-Equal '[host-desktop] cx=n/a cy=1600 vx=0 vy=0 vcx=2560 vcy=n/a wa=0,0,2560,1520' $line
+    Assert-Match $script:DesktopLinePattern $line
+}
+
+Test-Case 'a virtual-screen ORIGIN of 0 survives: it is what a single-display host really reports' {
+    Assert-Equal 0 (Select-ProbeDesktopMetric -Name 'vx' -Value 0)
+    Assert-Equal 0 (Select-ProbeDesktopMetric -Name 'vy' -Value 0)
+    Assert-Equal (-1920) (Select-ProbeDesktopMetric -Name 'vx' -Value (-1920)) 'and a negative origin is untouched'
+    Assert-Equal 2560 (Select-ProbeDesktopMetric -Name 'cx' -Value 2560) 'a real width is untouched'
+    Assert-Equal $null (Select-ProbeDesktopMetric -Name 'cx' -Value $null) 'a thrown call is still null'
 }
 
 Test-Case 'a virtual screen that starts left of or above the primary keeps its minus sign and carries no thousands separator' {
@@ -1242,6 +1282,7 @@ Test-Case 'the desktop row reaches the host through GetSystemMetrics and SystemP
     $body = $script:SubjectSource.Substring($start, $end - $start)
     Assert-True ($body.Contains('$script:ProbeDesktopMetricIndex')) 'the indices come from the pinned map'
     Assert-True ($body.Contains('$script:ProbeSpiGetWorkArea')) 'SPI_GETWORKAREA comes from the pinned constant'
+    Assert-True ($body.Contains('Select-ProbeDesktopMetric')) 'every metric goes through the return-0 rule (gate r1 m5)'
     # Call SHAPES, not the name: the function's own doc comment names Invoke-ProbeCall too, and a
     # bare name count would be red or green for the wrong reason (lab lesson, 2026-09-08).
     $calls = [regex]::Matches($body, 'Invoke-ProbeCall\s*(-Call\s*)?\{')

@@ -110,7 +110,7 @@ function New-FixtureArgs {
 }
 
 function New-FixtureStart {
-    param()
+    param([bool] $HeadSeen = $true)
     return [pscustomobject]@{
         Utc         = '2026-09-18T09:00:00.0000000Z'
         ProcessId   = 4242
@@ -118,10 +118,11 @@ function New-FixtureStart {
         IntervalMs  = 250
         DeadlineUtc = '2026-09-18T09:07:00.0000000Z'
         Staged      = 2
+        HeadSeen    = $HeadSeen
     }
 }
 
-$script:StartLinePattern = '^\[loop-start\] utc=\S+ pid=\S+ max-seconds=\S+ interval-ms=\S+ deadline-utc=\S+ staged=\S+$'
+$script:StartLinePattern = '^\[loop-start\] utc=\S+ pid=\S+ max-seconds=\S+ interval-ms=\S+ deadline-utc=\S+ staged=\S+ head=(true|false)$'
 
 # -------------------------------------------------------------------------------------------
 # Pre-registered constants
@@ -138,6 +139,18 @@ Test-Case 'the file names are the ones the loop and the collector agree on' {
     Assert-Equal 'window-loop-out.txt' $script:LoopOutName
     Assert-Equal 'window-loop.stop' $script:LoopSentinelName
     Assert-Equal 'window-loop-start.done' $script:LoopStartDoneName
+    Assert-Equal 'window-loop-out.prev.txt' $script:LoopOutPrevName
+    Assert-Equal 'window-loop.stdout.txt' $script:LoopStdoutName
+    Assert-Equal 'window-loop.stderr.txt' $script:LoopStderrName
+}
+
+Test-Case 'the liveness poll is bounded at 3 s and polled every 250 ms, well inside the job TIMEOUT of 30 s' {
+    # gate r1 B1: the marker has to carry evidence that the child actually began executing, and
+    # it has to do so without risking the connection the marker still has to travel over.
+    Assert-Equal 3000 $script:LoopStartHeadWaitMs
+    Assert-Equal 250 $script:LoopStartHeadPollMs
+    Assert-True ($script:LoopStartHeadWaitMs -lt 30000) 'the poll cannot outlast the start job TIMEOUT'
+    Assert-Equal '[loop-head] ' $script:LoopHeadPrefix 'the liveness judgement is the sampler own first line'
 }
 
 Test-Case 'exactly two files are staged onto the host, and they are the loop and the probe' {
@@ -217,8 +230,32 @@ New-Section 'Format-LoopStartRow'
 
 Test-Case 'the done marker carries the launch facts and nothing else' {
     $line = Format-LoopStartRow -Start (New-FixtureStart)
-    Assert-Equal '[loop-start] utc=2026-09-18T09:00:00.0000000Z pid=4242 max-seconds=420 interval-ms=250 deadline-utc=2026-09-18T09:07:00.0000000Z staged=2' $line
+    Assert-Equal '[loop-start] utc=2026-09-18T09:00:00.0000000Z pid=4242 max-seconds=420 interval-ms=250 deadline-utc=2026-09-18T09:07:00.0000000Z staged=2 head=true' $line
     Assert-Match $script:StartLinePattern $line
+}
+
+Test-Case 'head= is the one key that says the child BEGAN EXECUTING, and it is last in the row' {
+    # gate r1 B1. Without it the interpretation table reads "marker present + out missing" as
+    # "the launch worked, the process did not survive" -- but that combination is reachable from
+    # a staged copy that will not run, a leftover lock on the samples file, or a launch the shell
+    # refused, none of which say anything about surviving a disconnect. head=false names those.
+    $seen = Format-LoopStartRow -Start (New-FixtureStart -HeadSeen $true)
+    $unseen = Format-LoopStartRow -Start (New-FixtureStart -HeadSeen $false)
+    Assert-Match ' staged=2 head=true$' $seen
+    Assert-Match ' staged=2 head=false$' $unseen
+    Assert-Match $script:StartLinePattern $seen
+    Assert-Match $script:StartLinePattern $unseen
+    Assert-True ($seen -ne $unseen) 'the two verdicts are visibly different'
+}
+
+Test-Case 'Test-LoopHeadPresent recognises the sampler first line and nothing else' {
+    Assert-True (Test-LoopHeadPresent -Lines @('[loop-head] utc=2026-09-18T09:00:00.0000000Z ps=5.1.26200.1 pid=4242 session=3 interval-ms=250 max-seconds=420 deadline-utc=2026-09-18T09:07:00.0000000Z awareness=2 set-via=v2'))
+    Assert-True (-not (Test-LoopHeadPresent -Lines @())) 'an empty file is not a head'
+    Assert-True (-not (Test-LoopHeadPresent -Lines $null)) 'a missing file is not a head'
+    Assert-True (-not (Test-LoopHeadPresent -Lines @('RESULT: FAILED probe/CommandNotFoundException'))) `
+        'a run that died before the head is NOT alive-evidence'
+    Assert-True (-not (Test-LoopHeadPresent -Lines @(' [loop-head] x'))) 'a leading space is not the grammar'
+    Assert-True (-not (Test-LoopHeadPresent -Lines @('[loop-headX] x')))
 }
 
 Test-Case 'RED LINE: the done marker carries no path at all -- not a separator anywhere on it' {
@@ -237,17 +274,21 @@ Test-Case 'RED LINE: the done marker carries no path at all -- not a separator a
 }
 
 Test-Case 'a marker whose facts are missing keeps the line shape rather than losing a key' {
+    # head= is the exception to the n/a rule on this line: it is a judgement the launcher always
+    # makes (it either saw the head within the bound or it did not), so a missing record is
+    # head=false, never head=n/a. A reader gating on head=true can then never be fooled by an
+    # absent field.
     $line = Format-LoopStartRow -Start $null
-    Assert-Equal '[loop-start] utc=n/a pid=n/a max-seconds=n/a interval-ms=n/a deadline-utc=n/a staged=n/a' $line
+    Assert-Equal '[loop-start] utc=n/a pid=n/a max-seconds=n/a interval-ms=n/a deadline-utc=n/a staged=n/a head=false' $line
     Assert-Match $script:StartLinePattern $line
 }
 
 Test-Case 'staged= is the count that was verified, so a half-copied pair is visible' {
     $s = New-FixtureStart
     $s.Staged = 1
-    Assert-Match ' staged=1$' (Format-LoopStartRow -Start $s) 'one file of two means the loop will not find the probe'
+    Assert-Match ' staged=1 head=' (Format-LoopStartRow -Start $s) 'one file of two means the loop will not find the probe'
     $s.Staged = 0
-    Assert-Match ' staged=0$' (Format-LoopStartRow -Start $s)
+    Assert-Match ' staged=0 head=' (Format-LoopStartRow -Start $s)
 }
 
 # -------------------------------------------------------------------------------------------
@@ -282,18 +323,34 @@ Test-Case 'the script takes exactly the three documented parameters' {
     Assert-Equal 250 $params[1].DefaultValue.Value
 }
 
-Test-Case 'the loop is launched detached and hidden, with -PassThru so its pid can be reported' {
-    Assert-Match 'Start-Process\s+-FilePath\s+\$psExe\s+-ArgumentList\s+\$argList\s+-PassThru\s+-WindowStyle\s+Hidden' $script:SubjectCode
+Test-Case 'the loop is launched in the precedent shape: hidden, -PassThru, both streams redirected' {
+    # gate r1 B1(2) / m7. tsallowlist-matrix-verify.ps1:817-823 is the one launch in this repo
+    # that has run on the host, and it carries both redirects. Redirection is also what makes
+    # PS 5.1 take the CreateProcess path instead of ShellExecuteEx, which is the difference
+    # between a child whose startup errors land in a file and one whose refusal is invisible.
+    Assert-Match 'Start-Process\s+-FilePath\s+\$psExe\s+-ArgumentList\s+\$argList\s+-PassThru\s+-WindowStyle\s+Hidden\s+`?\s*-RedirectStandardOutput\s+\$stdoutPath\s+-RedirectStandardError\s+\$stderrPath' $script:SubjectCode
     # The CALL shape, not the name: the guard below the launch names Start-Process in its own
     # throw message, and a bare name count would be two for a reason that is not a second launch.
     Assert-Equal 1 ([regex]::Matches($script:SubjectCode, 'Start-Process\s+-FilePath')).Count 'exactly one launch'
 }
 
-Test-Case 'nothing is redirected to the redirected drive: the loop writes host-local only' {
-    # -RedirectStandardOutput onto the share would hand the detached process a handle to a drive
-    # that disappears with the connection -- the one thing guaranteed to kill it at exactly the
-    # moment the measurement starts. Counted on the code, not the prose that explains it.
-    Assert-Equal 0 ([regex]::Matches($script:SubjectCode, 'RedirectStandard')).Count 'no stream redirection at all'
+Test-Case 'both redirect targets are HOST-LOCAL and are NOT quoted' {
+    # Two separate rules. (1) Host-local: a handle onto the redirected drive dies with the
+    # connection, which is the one thing guaranteed to kill the sampler exactly when the
+    # measurement starts -- so both targets are built from $dir, never from the share root.
+    # (2) Unquoted: unlike -ArgumentList, which Start-Process joins into one command line,
+    # -RedirectStandardOutput is bound as a parameter VALUE; a literal quote becomes part of the
+    # file name. Measured on this runner: a quoted target threw DirectoryNotFoundException and
+    # created nothing, while the unquoted one wrote its file.
+    Assert-Match '(?m)^\s*\$stdoutPath = Join-Path \$dir \$script:LoopStdoutName\s*$' $script:SubjectCode
+    Assert-Match '(?m)^\s*\$stderrPath = Join-Path \$dir \$script:LoopStderrName\s*$' $script:SubjectCode
+    Assert-Equal 0 ([regex]::Matches($script:SubjectCode, 'RedirectStandard\w+\s+[^$\r\n]')).Count `
+        'each redirect takes a bare variable -- no quoting, no inline expression'
+    $shareRefs = [regex]::Matches($script:SubjectCode, '\$script:LoopShareRoot')
+    foreach ($m in $shareRefs) {
+        $line = $script:SubjectCode.Substring($m.Index, [Math]::Min(80, $script:SubjectCode.Length - $m.Index))
+        Assert-True (-not ($line -match 'Stdout|Stderr')) 'no redirect target is built from the share root'
+    }
 }
 
 Test-Case 'the share is named once, as a constant, and is never globbed' {
@@ -342,9 +399,19 @@ Test-Case 'the marker is written AFTER the launch, so its pid is the loop that r
     $body = $script:SubjectSource.Substring($start)
     $copy = $body.IndexOf('Copy-Item')
     $launch = $body.IndexOf('Start-Process')
+    $poll = $body.IndexOf('Test-LoopHeadPresent')
     $marker = $body.IndexOf('Format-LoopStartRow')
     Assert-True ($copy -gt 0 -and $launch -gt $copy) 'the files are staged before the launch'
-    Assert-True ($marker -gt $launch) 'the marker is rendered after the launch'
+    Assert-True ($poll -gt $launch) 'the liveness poll runs after the launch'
+    Assert-True ($marker -gt $poll) 'and the marker is rendered after the poll, so head= is a fact'
+}
+
+Test-Case 'the liveness poll is bounded by a wall clock, not only by an iteration count' {
+    $start = $script:SubjectCode.IndexOf('function Invoke-WindowLoopStart')
+    $body = $script:SubjectCode.Substring($start)
+    Assert-Match 'AddMilliseconds\(\$script:LoopStartHeadWaitMs\)' $body 'the bound comes from the pinned constant'
+    Assert-Equal 1 ([regex]::Matches($body, 'Start-Sleep')).Count 'exactly one sleep, in the one poll loop'
+    Assert-Match 'Start-Sleep -Milliseconds \$script:LoopStartHeadPollMs' $body
 }
 
 Test-Case 'nothing runs unless -NoRun is absent: the only top-level call is inside that guard' {

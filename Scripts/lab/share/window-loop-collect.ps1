@@ -18,10 +18,21 @@
        batch the whole timeout to report the same thing. The bound is a wall-clock deadline, not
        an iteration count, and it sits well inside the job's own TIMEOUT so the connection is
        never killed mid-copy.
-    3. CARRY. Writes the samples, verbatim, to \\tsclient\lab\window-loop-out.txt, with one
-       [collect] trailer appended. The samples are already sanitised by the loop (numbers, class
-       and process tokens, title-len and title-sha8 only) -- this script adds nothing of its own
-       to them.
+    3. CARRY. Writes the samples, verbatim, to \\tsclient\lab\window-loop-out.txt. The samples
+       are already sanitised by the loop (numbers, class and process tokens, title-len and
+       title-sha8 only) -- this script adds nothing of its own to them.
+    4. ROTATE, then TRAILER. Once, and only once, the carry has succeeded, the host-local samples
+       file is RENAMED to window-loop-out.prev.txt; then the [collect] trailer is appended, with
+       renamed= reporting what actually happened.
+
+       Why the rotation exists. window-loop-start.ps1 is the only other thing that clears the
+       local samples file. A half whose launcher never ran -- RAIL refused the job, the
+       connection failed -- would therefore find the PREVIOUS half's complete timeline sitting
+       there, see the RESULT: DONE it ends with, stop waiting at once and carry it back under a
+       freshly minted read-utc=, looking perfectly healthy. A whole timeline attributed to the
+       wrong half, the wrong target, possibly the wrong scale. Renaming rather than deleting
+       keeps that evidence on the host; the order (carry, then rename) means a failed carry
+       leaves the samples exactly where a retry can find them.
 
     THE CLEAN NEGATIVE. If there is no local samples file at all -- the loop never started, or
     did not survive the relay disconnect, which is the load-bearing unknown of this lane -- the
@@ -35,9 +46,11 @@
     answer again (the loop opened its output and died before its first line), and gets the
     trailer alone with no out-missing line.
 
-    The trailer's keys: read-utc= is when the samples were read, so a stale file left by an
-    earlier pair is identifiable; result-seen= is whether the loop ended in an orderly way, i.e.
-    false means the process was killed; lines= counts the SAMPLE lines, never the trailer.
+    The trailer's keys: read-utc= is when the samples were read -- note that it identifies a
+    stale file on the SHARE, and says nothing about a stale file on the host, which is what the
+    rotation is for; result-seen= is whether the loop ended in an orderly way, i.e. false means
+    the process was killed; lines= counts the SAMPLE lines, never the trailer; renamed= is
+    whether the host-local file was rotated (see step 4).
 
     OPERATOR STEP. Remove the previous \\tsclient\lab\window-loop-out.txt before launching:
     run-scenario.sh deliberately never removes host-written *-out.txt, and a job the host
@@ -47,8 +60,11 @@
     Windows PowerShell 5.1: no ??, no ternary.
 
 .PARAMETER WaitSeconds
-    How long to wait for the loop's RESULT line after the sentinel is dropped. 45 s sits inside
-    the job's TIMEOUT of 60 s with room for the RAIL handshake and the copy.
+    How long to wait for the loop's RESULT line after the sentinel is dropped. Only ONE outcome
+    ever spends it in full -- a samples file with no RESULT line, i.e. the sampler was killed,
+    which is this lane's load-bearing evidence -- so it has to fit inside the job's TIMEOUT
+    together with the handshake: WaitSeconds + CollectJobMarginSeconds <= TIMEOUT, pinned by the
+    suite against the job templates themselves.
 
 .PARAMETER NoRun
     Define the functions and constants but touch nothing. window-loop-collect.Tests.ps1
@@ -77,6 +93,9 @@ $script:LoopLocalDirName = 'macdows-lab'
 $script:LoopOutName = 'window-loop-out.txt'
 $script:LoopSentinelName = 'window-loop.stop'
 $script:LoopProbeName = 'window-rects-probe.ps1'
+# Where the samples are rotated to once they have been carried back (gate r1 B2). Renaming, not
+# deleting: a write-back that failed must leave the timeline on the host to be retried.
+$script:LoopOutPrevName = 'window-loop-out.prev.txt'
 
 # The name this lane's samples arrive under on the share.
 $script:LoopShareOutName = 'window-loop-out.txt'
@@ -89,6 +108,16 @@ $script:CollectResultPrefix = 'RESULT: '
 
 # Poll period for the bounded wait, in milliseconds.
 $script:CollectPollMs = 1000
+
+# The slack a collect JOB needs on top of WaitSeconds, in seconds: the RAIL handshake and
+# powershell's start-up before this script's first line, plus one write of the samples back over
+# the redirected drive. Archived handshakes, measured as the batch log's relay-start stamp against
+# the probe's own read-utc= (which is itself late in the probe's flow, so these are upper bounds
+# read as lower ones): 8.5 s, 8.9 s and 12.6 s (routeb-20260918 1x-about, p1 notepad, p1 about).
+# 30 s is more than twice the largest of those with room for a megabyte-scale write. The suite
+# reads the job templates and pins WaitSeconds + this <= TIMEOUT, so the two cannot drift apart
+# (gate r1 I1).
+$script:CollectJobMarginSeconds = 30
 
 # -------------------------------------------------------------------------------------------
 # Pure helpers (no host state; exercised off-Windows by the test suite)
@@ -117,43 +146,71 @@ function Test-OutHasResult {
 
 function Format-CollectTrailer {
     <#
-      "[collect] read-utc= result-seen=<true|false> lines=<n>" -- the one line this script adds
-      to the evidence, and the only thing on the file that is the collector's own claim.
+      "[collect] read-utc= result-seen=<true|false> lines=<n> renamed=<true|false>" -- the one
+      line this script adds to the evidence, and the only thing on the file that is the
+      collector's own claim.
+
+      renamed= is about the HOST-LOCAL samples file, not about this one: true means it has been
+      rotated to LoopOutPrevName, so the next half cannot collect this half's timeline a second
+      time (gate r1 B2). renamed=false on a collection that DID carry samples means the rotation
+      failed and the next half is at risk; renamed=false on an out-missing collection is simply
+      "there was nothing to rotate". It is last on the line because it is the only key here that
+      describes the host rather than the file it appears in.
     #>
     [CmdletBinding()]
-    param([AllowNull()] $ReadUtc, [bool] $ResultSeen, [int] $Lines)
+    param([AllowNull()] $ReadUtc, [bool] $ResultSeen, [int] $Lines, [bool] $Renamed)
     $seen = 'false'
     if ($ResultSeen) { $seen = 'true' }
+    $rotated = 'false'
+    if ($Renamed) { $rotated = 'true' }
     $parts = New-Object System.Collections.ArrayList
     [void]$parts.Add('[collect]')
     [void]$parts.Add('read-utc=' + (ConvertTo-ProbeToken -Value $ReadUtc))
     [void]$parts.Add('result-seen=' + $seen)
     [void]$parts.Add('lines=' + (Format-ProbeInt -Value $Lines))
+    [void]$parts.Add('renamed=' + $rotated)
     return ($parts.ToArray() -join ' ')
+}
+
+function New-CollectPayload {
+    <#
+      Everything the file carries EXCEPT the trailer: the samples verbatim, or -- when there were
+      no samples to read at all ($null, as opposed to an empty array) -- the pre-registered
+      out-missing line. An empty array yields an empty payload, which is a third answer again
+      (the sampler opened its output and died before its first line).
+
+      Separate from the trailer because the run cannot write them in one call: renamed= is only
+      known after the payload has reached the share and the local file has been rotated.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyCollection()] $OutLines)
+    $lines = New-Object System.Collections.ArrayList
+    if ($null -eq $OutLines) {
+        [void]$lines.Add($script:CollectMissingLine)
+    } else {
+        foreach ($line in @($OutLines)) { [void]$lines.Add([string]$line) }
+    }
+    return @($lines.ToArray())
 }
 
 function New-CollectLines {
     <#
-      The whole file to write back: the samples verbatim plus one trailer, or -- when there were
-      no samples to read at all ($null, as opposed to an empty array) -- the pre-registered
-      out-missing line plus that same trailer.
+      The whole file: the payload plus its trailer. The run writes the two pieces separately (see
+      New-CollectPayload); this is the assembled form the suite drives, and one case pins that
+      the two are byte-for-byte the same thing.
 
       result-seen= and lines= are DERIVED here from the very array that is about to be written,
       never taken from the caller, so the trailer cannot describe a different file from the one
       it trails.
     #>
     [CmdletBinding()]
-    param([AllowNull()][AllowEmptyCollection()] $OutLines, [AllowNull()] $ReadUtc)
-    $lines = New-Object System.Collections.ArrayList
+    param([AllowNull()][AllowEmptyCollection()] $OutLines, [AllowNull()] $ReadUtc, [bool] $Renamed)
     $samples = @()
-    if ($null -eq $OutLines) {
-        [void]$lines.Add($script:CollectMissingLine)
-    } else {
-        $samples = @($OutLines)
-        foreach ($line in $samples) { [void]$lines.Add([string]$line) }
-    }
+    if ($null -ne $OutLines) { $samples = @($OutLines) }
+    $lines = New-Object System.Collections.ArrayList
+    foreach ($line in @(New-CollectPayload -OutLines $OutLines)) { [void]$lines.Add($line) }
     [void]$lines.Add((Format-CollectTrailer -ReadUtc $ReadUtc `
-        -ResultSeen (Test-OutHasResult -Lines $samples) -Lines $samples.Count))
+        -ResultSeen (Test-OutHasResult -Lines $samples) -Lines $samples.Count -Renamed $Renamed))
     return @($lines.ToArray())
 }
 
@@ -210,11 +267,40 @@ function Invoke-WindowLoopCollect {
     }
 
     # -- carry ---------------------------------------------------------------------------
+    # UTF-8 without BOM, like every other report this lab writes back. This call is the one that
+    # must succeed before anything on the host is touched: if it throws, the exception propagates
+    # and the samples are still on the host to be retried.
     $readUtc = (Get-Date).ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
-    $lines = New-CollectLines -OutLines $outLines -ReadUtc $readUtc
     $share = Join-Path $script:LoopShareRoot $script:LoopShareOutName
-    # UTF-8 without BOM, like every other report this lab writes back.
-    [IO.File]::WriteAllLines($share, [string[]]$lines)
+    [IO.File]::WriteAllLines($share, [string[]](New-CollectPayload -OutLines $outLines))
+
+    # -- rotate --------------------------------------------------------------------------
+    # AFTER the carry, never before (gate r1 B2). The launcher is the only other thing that
+    # clears this file, so without the rotation a half whose launcher never ran would collect the
+    # PREVIOUS half's complete timeline -- RESULT line and all -- and report it as healthy under
+    # a freshly minted read-utc=. Renaming rather than deleting keeps the evidence on the host;
+    # -Force overwrites an older prev, which belongs to a half that has already been carried.
+    $renamed = $false
+    if ($null -ne $outLines) {
+        try {
+            Move-Item -LiteralPath $loopOutPath -Destination (Join-Path $dir $script:LoopOutPrevName) -Force
+            $renamed = $true
+        } catch {
+            # The rotation is best-effort: the timeline is already on the share, and saying so on
+            # the trailer is more use than failing a job that has done its work.
+            $renamed = $false
+        }
+    }
+
+    # -- trailer -------------------------------------------------------------------------
+    # Appended last, so renamed= reports what really happened rather than what was intended. A
+    # share file that ends without a [collect] line is itself a visible shape: the carry
+    # succeeded and this append did not.
+    $samples = @()
+    if ($null -ne $outLines) { $samples = @($outLines) }
+    $trailer = Format-CollectTrailer -ReadUtc $readUtc `
+        -ResultSeen (Test-OutHasResult -Lines $samples) -Lines $samples.Count -Renamed $renamed
+    [IO.File]::AppendAllLines($share, [string[]]@($trailer), (New-Object System.Text.UTF8Encoding($false)))
 }
 
 if (-not $NoRun) {

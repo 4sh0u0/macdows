@@ -132,6 +132,11 @@ $script:LoopLocalDirName = 'macdows-lab'
 $script:LoopOutName = 'window-loop-out.txt'
 $script:LoopSentinelName = 'window-loop.stop'
 $script:LoopProbeName = 'window-rects-probe.ps1'
+# The name window-loop-collect.ps1 rotates the samples to once it has carried them back, so a
+# half whose launcher never ran cannot have the PREVIOUS half's timeline collected as its own
+# (gate r1 B2). Declared here only to keep the three-way name pin whole: this script must never
+# open that file, and its suite pins that the name is referenced nowhere below.
+$script:LoopOutPrevName = 'window-loop-out.prev.txt'
 
 # -------------------------------------------------------------------------------------------
 # Pure helpers (no host state; exercised off-Windows by the test suite)
