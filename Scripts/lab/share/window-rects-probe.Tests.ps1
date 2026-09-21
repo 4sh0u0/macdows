@@ -1127,6 +1127,31 @@ Test-Case 'the failure trailer carries the stage and the exception type only -- 
 }
 
 # -------------------------------------------------------------------------------------------
+# Add-ProbeWindowDetail -- the window rectangle is re-read here, next to the frame
+# -------------------------------------------------------------------------------------------
+
+New-Section 'Add-ProbeWindowDetail'
+
+Test-Case 'the detail pass RE-READS the window rectangle and keeps the enumeration one beside it' {
+    # The enumeration pass reads a rectangle for every top-level window and the selection then
+    # sorts and caps them, so on a busy desktop dozens of calls separate that read from the
+    # frame / client reads. A re-layout landing in that gap produced rows whose wr= was older
+    # than their ef=/cs=/cr= (observed on four of seven anchor rows). WindowRect is now the
+    # SECOND read, taken next to the frame, and WindowRectFirst carries the enumeration value
+    # the selection was decided on, so the two can be compared.
+    #
+    # This runner has no P/Invoke surface, so every native call inside the function degrades to
+    # n/a: WindowRect coming back $null IS the evidence that it was re-read rather than copied,
+    # and WindowRectFirst coming back with the fixture rectangle is the evidence the first read
+    # was kept.
+    $base = New-FixtureBase -Hwnd 983040 -Rect (New-FixtureRect -Left 54 -Top 0 -Right 754 -Bottom 500)
+    $detail = Add-ProbeWindowDetail -Window $base -ProcessNameCache @{}
+    Assert-Equal 'n/a' (Format-Rect -Rect (Get-ProbeProp -Object $detail -Name 'WindowRect')) 'wr is the re-read, which this runner refuses'
+    Assert-Equal '54,0,754,500' (Format-Rect -Rect (Get-ProbeProp -Object $detail -Name 'WindowRectFirst')) 'the enumeration rectangle is kept'
+    Assert-Equal 983040 (Get-ProbeProp -Object $detail -Name 'Hwnd') 'the identity still comes from the base record'
+}
+
+# -------------------------------------------------------------------------------------------
 # Boxed struct fields -- the shape the host path actually feeds the geometry formatters
 # -------------------------------------------------------------------------------------------
 
@@ -1231,6 +1256,29 @@ Test-Case 'Add-Type appears exactly once and only inside Initialize-ProbeNative'
     $end = $script:SubjectSource.IndexOf('function Get-ProbeProcessName')
     Assert-True ($start -gt 0 -and $end -gt $start) 'both functions are present in that order'
     Assert-True ($matches[0].Index -gt $start -and $matches[0].Index -lt $end) 'the Add-Type call lies inside Initialize-ProbeNative'
+}
+
+Test-Case 'inside the detail pass the window rectangle is read BEFORE the frame, and the client reads follow it' {
+    # The ordering IS the fix: wr, ef, cs and cr have to be four adjacent calls so a re-layout
+    # cannot land between them. Nothing offline can observe the interval, so source order is
+    # the evidence -- scoped to this one function body, because WindowRectOf is also called by
+    # Get-ProbeWindowBase above it.
+    $start = $script:SubjectSource.IndexOf('function Add-ProbeWindowDetail')
+    $end = $script:SubjectSource.IndexOf('function New-ProbeMetricsRecord')
+    Assert-True ($start -gt 0 -and $end -gt $start) 'the detail function and its successor are both present, in that order'
+    $body = $script:SubjectSource.Substring($start, $end - $start)
+    $wr = $body.IndexOf('WindowRectOf(')
+    $ef = $body.IndexOf('ExtendedFrameOf(')
+    $cs = $body.IndexOf('ClientOriginOf(')
+    $cr = $body.IndexOf('ClientRectOf(')
+    Assert-True ($wr -gt 0) 'the window rectangle is re-read inside the detail pass'
+    Assert-True ($wr -lt $ef) "the re-read (at $wr) must precede the frame read (at $ef)"
+    Assert-True ($ef -lt $cs -and $cs -lt $cr) 'the client origin and client rectangle follow the frame'
+    Assert-Equal 1 ([regex]::Matches($body, 'WindowRectOf\(')).Count 'exactly one re-read per window'
+    # and nothing slow sits inside that run of four: the process name lookup, which can hit
+    # Get-Process, is taken after them.
+    $procName = $body.IndexOf('Get-ProbeProcessName')
+    Assert-True ($procName -gt $cr) "the process-name lookup (at $procName) must come after the four geometry reads"
 }
 
 Test-Case 'the DPI awareness declaration precedes every window and DPI call in the run' {

@@ -122,8 +122,13 @@ function New-FixtureHead {
 }
 
 function New-FixtureTick {
-    param([int] $Seq = 0, [int] $RectOk = 2, [int] $Selected = 2)
-    return [pscustomobject]@{
+    <#
+      Torn and DesktopChanged are added ONLY when asked for, so every case that does not pass
+      them drives the shape a tick record had before those fields existed -- which is the same
+      shape a partially built record has when a sample threw halfway through.
+    #>
+    param([int] $Seq = 0, [int] $RectOk = 2, [int] $Selected = 2, [AllowNull()] $Torn = $null, [AllowNull()] $DesktopChanged = $null)
+    $tick = [pscustomobject]@{
         Seq      = $Seq
         Utc      = '2026-09-18T09:00:00.2500000Z'
         Cx       = 2560
@@ -132,6 +137,24 @@ function New-FixtureTick {
         RectOk   = $RectOk
         Selected = $Selected
     }
+    if ($null -ne $Torn) { Add-Member -InputObject $tick -MemberType NoteProperty -Name 'Torn' -Value $Torn }
+    if ($null -ne $DesktopChanged) { Add-Member -InputObject $tick -MemberType NoteProperty -Name 'DesktopChanged' -Value $DesktopChanged }
+    return $tick
+}
+
+function New-FixtureDetail {
+    <#
+      A detailed record as Add-ProbeWindowDetail builds it AFTER the re-read: WindowRect is the
+      second read, taken next to the frame, and WindowRectFirst is the one the enumeration pass
+      sorted and capped on. -Torn makes the two disagree by one pixel in each edge, which is the
+      smallest re-layout the loop has to be able to see.
+    #>
+    param([long] $Hwnd = 983040, [switch] $Torn)
+    $w = New-FixtureWindow
+    $w.Hwnd = $Hwnd
+    Add-Member -InputObject $w -MemberType NoteProperty -Name 'WindowRectFirst' -Value (New-FixtureRect -Left 54 -Top 0 -Right 754 -Bottom 500)
+    if ($Torn) { $w.WindowRect = New-FixtureRect -Left 55 -Top 1 -Right 755 -Bottom 501 }
+    return $w
 }
 
 function New-FixtureWindow {
@@ -161,7 +184,7 @@ function New-FixtureWindow {
 # reordered in the script fails every case that uses them. seq= is the join key between a tick
 # and its rows, so it is pinned as a bare decimal in both.
 $script:LoopHeadPattern = '^\[loop-head\] utc=\S+ ps=\S+ pid=\S+ session=\S+ interval-ms=\d+ max-seconds=\d+ deadline-utc=\S+ awareness=\S+ set-via=(v2|shcore|none)$'
-$script:LoopTickPattern = '^\[loop-tick\] seq=\d+ utc=\S+ cx=\S+ cy=\S+ wa=\S+( truncated=true)?$'
+$script:LoopTickPattern = '^\[loop-tick\] seq=\d+ utc=\S+ cx=\S+ cy=\S+ wa=\S+( truncated=true)?( torn=\d+)?( desktop-changed=1)?$'
 $script:TickRectPattern = '^\[tick-rect\] seq=\d+ hwnd=\S+ pid=\S+ proc=\S+ class=\S+ style=\S+ dpi=\S+ wr=\S+ ef=\S+ cs=\S+ cr=\S+ owner=\S+ title-len=\S+ title-sha8=\S+$'
 $script:LoopDonePattern = '^RESULT: DONE seq=\d+ reason=(sentinel|deadline)$'
 
@@ -277,6 +300,116 @@ Test-Case 'truncated=true is appended -- and only appended -- when the cap dropp
 Test-Case 'seq is a bare decimal that counts from zero and never carries a separator' {
     Assert-Match '^\[loop-tick\] seq=0 ' (Format-LoopTickRow -Tick (New-FixtureTick -Seq 0))
     Assert-Match '^\[loop-tick\] seq=1680 ' (Format-LoopTickRow -Tick (New-FixtureTick -Seq 1680))
+}
+
+Test-Case 'GOLDEN: a quiet tick renders the pre-torn line byte for byte, with and without truncated' {
+    # The first promise of the torn work: a run in which nothing moved must produce EXACTLY the
+    # file it produced before the tail fields existed. Both expectations below are the literal
+    # strings the script emitted at 58a48ac, pasted in, so any field that starts appearing
+    # unconditionally -- torn=0 most of all -- is red here rather than in a batch six hours in.
+    Assert-Equal '[loop-tick] seq=0 utc=2026-09-18T09:00:00.2500000Z cx=2560 cy=1600 wa=0,0,2560,1520' `
+        (Format-LoopTickRow -Tick (New-FixtureTick))
+    Assert-Equal '[loop-tick] seq=9 utc=2026-09-18T09:00:00.2500000Z cx=2560 cy=1600 wa=0,0,2560,1520 truncated=true' `
+        (Format-LoopTickRow -Tick (New-FixtureTick -Seq 9 -RectOk 70 -Selected 64))
+    # and the same when the counts ARE there and say nothing happened
+    Assert-Equal '[loop-tick] seq=0 utc=2026-09-18T09:00:00.2500000Z cx=2560 cy=1600 wa=0,0,2560,1520' `
+        (Format-LoopTickRow -Tick (New-FixtureTick -Torn 0 -DesktopChanged $false))
+}
+
+Test-Case 'torn= appears only when a window rectangle moved across the two reads, and carries the count' {
+    # A torn tick is one whose rows cannot be read as one instant: the enumeration pass and the
+    # detail pass saw different geometry, so the reader has to step the anchor back a tick. The
+    # count is on the TICK because a re-layout happens once and hits every row of that sample.
+    Assert-Match ' wa=0,0,2560,1520 torn=1$' (Format-LoopTickRow -Tick (New-FixtureTick -Torn 1))
+    Assert-Match ' wa=0,0,2560,1520 torn=2$' (Format-LoopTickRow -Tick (New-FixtureTick -Torn 2))
+    Assert-Match ' wa=0,0,2560,1520 torn=64$' (Format-LoopTickRow -Tick (New-FixtureTick -Torn 64))
+    Assert-Match $script:LoopTickPattern (Format-LoopTickRow -Tick (New-FixtureTick -Torn 2))
+    Assert-Match ' wa=0,0,2560,1520$' (Format-LoopTickRow -Tick (New-FixtureTick -Torn 0)) 'nothing moved, so the field costs nothing'
+    Assert-Match ' wa=0,0,2560,1520$' (Format-LoopTickRow -Tick (New-FixtureTick -Torn 'not-a-number')) 'an uncountable value claims nothing'
+}
+
+Test-Case 'desktop-changed=1 appears only when the re-read disagreed, and never reports the re-read values' {
+    $line = Format-LoopTickRow -Tick (New-FixtureTick -DesktopChanged $true)
+    Assert-Equal '[loop-tick] seq=0 utc=2026-09-18T09:00:00.2500000Z cx=2560 cy=1600 wa=0,0,2560,1520 desktop-changed=1' $line
+    Assert-Match $script:LoopTickPattern $line
+    Assert-Match ' wa=0,0,2560,1520$' (Format-LoopTickRow -Tick (New-FixtureTick -DesktopChanged $false))
+}
+
+Test-Case 'the three tail fields appear in the ONE order truncated / torn / desktop-changed' {
+    # A reader gates on the end of the line, so the order is part of the grammar, not a detail
+    # of how the row is built. All three at once is the case that pins it.
+    $line = Format-LoopTickRow -Tick (New-FixtureTick -Seq 97 -RectOk 70 -Selected 64 -Torn 3 -DesktopChanged $true)
+    Assert-Equal '[loop-tick] seq=97 utc=2026-09-18T09:00:00.2500000Z cx=2560 cy=1600 wa=0,0,2560,1520 truncated=true torn=3 desktop-changed=1' $line
+    Assert-Match $script:LoopTickPattern $line
+    Assert-Equal 9 (@($line -split ' ')).Count 'six fields plus the three tail flags'
+    # and each pair on its own, so the order pin cannot be satisfied by luck
+    Assert-Match ' truncated=true torn=3$' (Format-LoopTickRow -Tick (New-FixtureTick -RectOk 70 -Selected 64 -Torn 3))
+    Assert-Match ' truncated=true desktop-changed=1$' (Format-LoopTickRow -Tick (New-FixtureTick -RectOk 70 -Selected 64 -DesktopChanged $true))
+    Assert-Match ' torn=3 desktop-changed=1$' (Format-LoopTickRow -Tick (New-FixtureTick -Torn 3 -DesktopChanged $true))
+}
+
+# -------------------------------------------------------------------------------------------
+# Test-LoopRectTorn / Measure-LoopTornWindows / Test-LoopDesktopChanged
+# -------------------------------------------------------------------------------------------
+
+New-Section 'torn and desktop-change decisions'
+
+Test-Case 'a rectangle is torn when the two reads disagree on ANY edge, and only then' {
+    $a = New-FixtureRect -Left 54 -Top 0 -Right 754 -Bottom 500
+    Assert-True (-not (Test-LoopRectTorn -Before $a -After (New-FixtureRect -Left 54 -Top 0 -Right 754 -Bottom 500)))
+    foreach ($moved in @(
+        (New-FixtureRect -Left 55 -Top 0 -Right 754 -Bottom 500),
+        (New-FixtureRect -Left 54 -Top 1 -Right 754 -Bottom 500),
+        (New-FixtureRect -Left 54 -Top 0 -Right 755 -Bottom 500),
+        (New-FixtureRect -Left 54 -Top 0 -Right 754 -Bottom 501))) {
+        Assert-True (Test-LoopRectTorn -Before $a -After $moved) 'one edge is enough'
+    }
+}
+
+Test-Case 'a read that failed on one side only is torn; two failed reads claim nothing' {
+    # n/a against a rectangle means the window died or the call was refused between the two
+    # reads, which is exactly the kind of tick an anchor must not be taken from. Two failures
+    # in a row say nothing about movement, so they are not counted as one.
+    $a = New-FixtureRect -Left 54 -Top 0 -Right 754 -Bottom 500
+    Assert-True (Test-LoopRectTorn -Before $a -After $null)
+    Assert-True (Test-LoopRectTorn -Before $null -After $a)
+    Assert-True (-not (Test-LoopRectTorn -Before $null -After $null))
+    # half a rectangle is n/a to the formatter, so it is n/a here too
+    Assert-True (-not (Test-LoopRectTorn -Before $null -After ([pscustomobject]@{ Left = 0; Top = 0; Right = 10 })))
+}
+
+Test-Case 'the tick count is how many of the selected windows moved, counted over the same records the rows use' {
+    Assert-Equal 0 (Measure-LoopTornWindows -Windows @())
+    Assert-Equal 0 (Measure-LoopTornWindows -Windows $null)
+    Assert-Equal 0 (Measure-LoopTornWindows -Windows @((New-FixtureDetail), (New-FixtureDetail -Hwnd 2)))
+    Assert-Equal 1 (Measure-LoopTornWindows -Windows @((New-FixtureDetail -Torn), (New-FixtureDetail -Hwnd 2)))
+    Assert-Equal 2 (Measure-LoopTornWindows -Windows @((New-FixtureDetail -Torn), (New-FixtureDetail -Hwnd 2 -Torn)))
+}
+
+Test-Case 'a record from before the re-read existed counts as not torn, never as torn' {
+    # WindowRectFirst absent means nothing can be claimed; claiming torn there would mark every
+    # tick of an older file.
+    Assert-Equal 0 (Measure-LoopTornWindows -Windows @((New-FixtureWindow)))
+}
+
+Test-Case 'the desktop changed when cx, cy OR the work area moved across the detail pass' {
+    $wa = New-FixtureRect -Left 0 -Top 0 -Right 2560 -Bottom 1520
+    $same = @{ BeforeCx = 2560; BeforeCy = 1440; BeforeWorkArea = $wa; AfterCx = 2560; AfterCy = 1440; AfterWorkArea = $wa }
+    Assert-True (-not (Test-LoopDesktopChanged @same))
+    Assert-True (Test-LoopDesktopChanged -BeforeCx 2560 -BeforeCy 1440 -BeforeWorkArea $wa -AfterCx 1280 -AfterCy 1440 -AfterWorkArea $wa) 'cx moved'
+    Assert-True (Test-LoopDesktopChanged -BeforeCx 2560 -BeforeCy 1440 -BeforeWorkArea $wa -AfterCx 2560 -AfterCy 1410 -AfterWorkArea $wa) 'cy moved'
+    # the work area alone is enough: a taskbar that resizes without the screen resizing still
+    # means the session was re-laid-out under the rows being read
+    Assert-True (Test-LoopDesktopChanged -BeforeCx 2560 -BeforeCy 1440 -BeforeWorkArea $wa `
+        -AfterCx 2560 -AfterCy 1440 -AfterWorkArea (New-FixtureRect -Left 0 -Top 0 -Right 2560 -Bottom 1400)) 'the work area alone moved'
+}
+
+Test-Case 'a metric that could not be read on ONE side is a change; refused on both sides is not' {
+    $wa = New-FixtureRect -Left 0 -Top 0 -Right 2560 -Bottom 1520
+    Assert-True (Test-LoopDesktopChanged -BeforeCx 2560 -BeforeCy 1440 -BeforeWorkArea $wa -AfterCx $null -AfterCy 1440 -AfterWorkArea $wa)
+    Assert-True (Test-LoopDesktopChanged -BeforeCx 2560 -BeforeCy 1440 -BeforeWorkArea $wa -AfterCx 2560 -AfterCy 1440 -AfterWorkArea $null)
+    Assert-True (-not (Test-LoopDesktopChanged -BeforeCx $null -BeforeCy $null -BeforeWorkArea $null -AfterCx $null -AfterCy $null -AfterWorkArea $null)) `
+        'a runner that refuses every metric call must not mark every tick'
 }
 
 # -------------------------------------------------------------------------------------------
@@ -456,7 +589,7 @@ function New-StubProbe {
       $script: constants reachable from there is the single riskiest assumption in this script.
       Nothing but a real run can answer it.
     #>
-    param([string] $Directory)
+    param([string] $Directory, [int] $Windows = 0, [int] $Torn = 0)
     $path = Join-Path $Directory 'stub-probe.ps1'
     $escaped = $script:ProbeScriptPath.Replace("'", "''")
     $body = @"
@@ -464,6 +597,58 @@ param([switch] `$NoRun)
 . '$escaped' -NoRun
 function Initialize-ProbeNative { }
 "@
+    if ($Windows -gt 0) {
+        # Synthetic windows, injected at the SELECTION: EnumTopLevel is a .NET static method and
+        # cannot be overridden from here, so a stubbed run sees no handles at all and would
+        # otherwise never write a [tick-rect] row. Overriding the selection and the detail pass
+        # is enough to drive both -- and the detail pass is where "the first read and the second
+        # read disagree" can be synthesised, which no offline runner can produce for real. The
+        # counts below are written into the file as literals so the stub depends on no scope.
+        $body += @"
+
+function Select-ProbeWindows {
+    param(`$Windows, `$Cap)
+    `$out = New-Object System.Collections.ArrayList
+    for (`$i = 0; `$i -lt $Windows; `$i++) {
+        [void]`$out.Add([pscustomobject]@{
+            Handle = `$null
+            Hwnd = (983040 + `$i)
+            Visible = `$true
+            WindowRect = [pscustomobject]@{ Left = 10; Top = 20; Right = 110; Bottom = 120 }
+        })
+    }
+    return @(`$out.ToArray())
+}
+
+function Add-ProbeWindowDetail {
+    param(`$Window, `$ProcessNameCache)
+    `$first = `$Window.WindowRect
+    `$second = `$first
+    if ((([int]`$Window.Hwnd) - 983040) -lt $Torn) {
+        `$second = [pscustomobject]@{ Left = 11; Top = 21; Right = 111; Bottom = 121 }
+    }
+    return [pscustomobject]@{
+        Handle = `$null
+        Hwnd = `$Window.Hwnd
+        Visible = `$true
+        WindowRect = `$second
+        WindowRectFirst = `$first
+        ProcessId = 4242
+        ProcessName = 'notepad'
+        ClassName = 'Notepad'
+        Style = 0x16CF0000
+        ExStyle = 0
+        Owner = 0
+        Dpi = 96
+        ExtendedFrame = `$null
+        ExtendedFrameHr = 0
+        ClientScreen = `$null
+        ClientRect = `$null
+        Title = 'lab-fixture-alpha'
+    }
+}
+"@
+    }
     [IO.File]::WriteAllText($path, $body)
     return $path
 }
@@ -539,6 +724,90 @@ Test-Case 'the run writes the probe helpers real output -- the dot-source inside
     foreach ($ch in @((($lines -join "`n")).ToCharArray())) {
         Assert-True ([int][char]$ch -lt 128) 'the file is pure ASCII'
     }
+}
+
+Test-Case 'a tick whose windows moved between the two reads says torn= on its OWN tick line' {
+    # End to end, because the thing under test is WHEN the tick line is assembled: the count can
+    # only be on it if the detail pass ran first. A run that writes the tick line before the
+    # rows -- the shape this script had at 58a48ac -- produces the same rows and no torn=.
+    $lines = @(Invoke-LoopFixtureRun -Body {
+        param($Dir, $Out)
+        $sentinel = Join-Path $Dir 'window-loop.stop'
+        [IO.File]::WriteAllText($sentinel, '')
+        Invoke-WindowLoop -OutPath $Out -MaxSeconds 30 -IntervalMs 10 `
+            -SentinelPath $sentinel -ProbePath (New-StubProbe -Directory $Dir -Windows 3 -Torn 1)
+    })
+    Assert-Equal 6 $lines.Count 'head, tick, three rows, RESULT'
+    Assert-Match $script:LoopTickPattern $lines[1]
+    Assert-Match ' torn=1$' $lines[1] 'one of the three windows moved across the two reads'
+    Assert-Equal 3 (@($lines | Where-Object { $_ -like '`[tick-rect`]*' })).Count
+}
+
+Test-Case 'the torn count is the number of windows that moved, not whether any did' {
+    $lines = @(Invoke-LoopFixtureRun -Body {
+        param($Dir, $Out)
+        $sentinel = Join-Path $Dir 'window-loop.stop'
+        [IO.File]::WriteAllText($sentinel, '')
+        Invoke-WindowLoop -OutPath $Out -MaxSeconds 30 -IntervalMs 10 `
+            -SentinelPath $sentinel -ProbePath (New-StubProbe -Directory $Dir -Windows 2 -Torn 2)
+    })
+    Assert-Match ' torn=2$' $lines[1]
+}
+
+Test-Case 'a tick whose windows held still carries no torn= at all, and its rows are unchanged' {
+    $lines = @(Invoke-LoopFixtureRun -Body {
+        param($Dir, $Out)
+        $sentinel = Join-Path $Dir 'window-loop.stop'
+        [IO.File]::WriteAllText($sentinel, '')
+        Invoke-WindowLoop -OutPath $Out -MaxSeconds 30 -IntervalMs 10 `
+            -SentinelPath $sentinel -ProbePath (New-StubProbe -Directory $Dir -Windows 2 -Torn 0)
+    })
+    Assert-Equal 5 $lines.Count
+    Assert-True (-not ($lines[1] -like '*torn=*')) 'nothing moved, so the tick line is the quiet one'
+    Assert-True (-not ($lines[1] -like '*desktop-changed*')) 'no metric could be read at all here, and n/a twice is not a change'
+    Assert-Match $script:LoopTickPattern $lines[1]
+    # Gate r1 I1 (2026-09-21): the line-level golden strings above cover the tick line; these two
+    # cover the rows, so "a quiet run is byte for byte the file it always was" is pinned for the
+    # whole tick group and not only for its first line. The stub's rows are fully determined.
+    Assert-Equal '[tick-rect] seq=0 hwnd=983040 pid=4242 proc=notepad class=Notepad style=0x16CF0000 dpi=96 wr=10,20,110,120 ef=n/a cs=n/a cr=n/a owner=0 title-len=17 title-sha8=00eee4a7' $lines[2] 'a quiet row is byte for byte the row it always was'
+    Assert-Equal '[tick-rect] seq=0 hwnd=983041 pid=4242 proc=notepad class=Notepad style=0x16CF0000 dpi=96 wr=10,20,110,120 ef=n/a cs=n/a cr=n/a owner=0 title-len=17 title-sha8=00eee4a7' $lines[3] 'and so is the second one'
+}
+
+Test-Case 'the row reports the SECOND read, and a torn row differs from the rectangle it was selected on' {
+    # The C half of the fix: wr= on the row is the re-read taken next to ef/cs/cr, not the one
+    # the enumeration pass sorted with. The stub's torn window is selected on 10,20,110,120 and
+    # re-read at 11,21,111,121, so the row must carry the latter.
+    $lines = @(Invoke-LoopFixtureRun -Body {
+        param($Dir, $Out)
+        $sentinel = Join-Path $Dir 'window-loop.stop'
+        [IO.File]::WriteAllText($sentinel, '')
+        Invoke-WindowLoop -OutPath $Out -MaxSeconds 30 -IntervalMs 10 `
+            -SentinelPath $sentinel -ProbePath (New-StubProbe -Directory $Dir -Windows 2 -Torn 1)
+    })
+    $rows = @($lines | Where-Object { $_ -like '`[tick-rect`]*' })
+    Assert-Equal 2 $rows.Count
+    Assert-Match ' wr=11,21,111,121 ' $rows[0] 'the torn window reports the re-read'
+    Assert-Match ' wr=10,20,110,120 ' $rows[1] 'the still window reports the same rectangle either way'
+    foreach ($r in $rows) { Assert-Match $script:TickRectPattern $r 'the row grammar is untouched by any of this' }
+}
+
+Test-Case 'FILE ORDER: the tick line still precedes the rows that carry its seq, tail fields and all' {
+    # Assembling the tick line after the detail pass must not reorder the FILE: a reader groups
+    # by seq and relies on the tick arriving first, and the collector fixtures are written that
+    # way too.
+    $lines = @(Invoke-LoopFixtureRun -Body {
+        param($Dir, $Out)
+        $sentinel = Join-Path $Dir 'window-loop.stop'
+        [IO.File]::WriteAllText($sentinel, '')
+        Invoke-WindowLoop -OutPath $Out -MaxSeconds 30 -IntervalMs 10 `
+            -SentinelPath $sentinel -ProbePath (New-StubProbe -Directory $Dir -Windows 2 -Torn 2)
+    })
+    Assert-Match $script:LoopHeadPattern $lines[0]
+    Assert-Match '^\[loop-tick\] seq=0 ' $lines[1]
+    Assert-Match ' torn=2$' $lines[1]
+    Assert-Match '^\[tick-rect\] seq=0 ' $lines[2]
+    Assert-Match '^\[tick-rect\] seq=0 ' $lines[3]
+    Assert-Equal 'RESULT: DONE seq=0 reason=sentinel' $lines[4]
 }
 
 Test-Case 'a probe that cannot be dot-sourced writes a one-line file naming that stage' {
@@ -640,6 +909,60 @@ Test-Case 'every sample is flushed as it is written, so a killed run leaves a re
     Assert-True ($loopFrom -gt 0 -and $loopTo -gt $loopFrom) 'the sampling loop and the result stage are both present'
     $tickBody = $body.Substring($loopFrom, $loopTo - $loopFrom)
     Assert-Equal 1 ([regex]::Matches($tickBody, '\$writer\.Flush\(\)')).Count 'the tick loop flushes exactly once per sample'
+}
+
+Test-Case 'the tick line is ASSEMBLED after the detail pass and still WRITTEN before its rows' {
+    # Two properties at once, and they pull in opposite directions. torn= and desktop-changed=
+    # are facts the detail pass produces, so the line cannot be built until it has run; the file
+    # must nevertheless keep the tick ahead of its rows, which is the grouping contract. The
+    # rows are therefore buffered for one tick. Source order is the only offline evidence for
+    # the first half beyond the stubbed run.
+    $start = $script:SubjectSource.IndexOf('function Invoke-WindowLoop')
+    Assert-True ($start -gt 0) 'the run function is present'
+    $body = $script:SubjectSource.Substring($start)
+    $loopFrom = $body.IndexOf('while ($true) {')
+    $loopTo = $body.IndexOf("`$stage = 'result'")
+    Assert-True ($loopFrom -gt 0 -and $loopTo -gt $loopFrom) 'the sampling loop is present'
+    $tickBody = $body.Substring($loopFrom, $loopTo - $loopFrom)
+    $detail = $tickBody.IndexOf('Add-ProbeWindowDetail')
+    $assemble = $tickBody.IndexOf('Format-LoopTickRow')
+    $rows = $tickBody.IndexOf('Format-TickRectRow')
+    Assert-True ($detail -gt 0 -and $assemble -gt 0 -and $rows -gt 0) 'all three steps are in the tick body'
+    Assert-True ($detail -lt $assemble) "the detail pass (at $detail) must run before the tick line is built (at $assemble)"
+    Assert-True ($assemble -lt $rows) "the tick line (at $assemble) must be written before its rows (at $rows)"
+}
+
+Test-Case 'the desktop metrics are re-read AFTER the detail pass, and the line still reports the opening values' {
+    # The flag compares the metrics either side of the detail pass; the VALUES on the line stay
+    # the ones the tick opened with, so cx=/cy=/wa= keep meaning "when this sample started" for
+    # every reader that already gates on them.
+    $start = $script:SubjectSource.IndexOf('function Invoke-WindowLoop')
+    $body = $script:SubjectSource.Substring($start)
+    $loopFrom = $body.IndexOf('while ($true) {')
+    $loopTo = $body.IndexOf("`$stage = 'result'")
+    $tickBody = $body.Substring($loopFrom, $loopTo - $loopFrom)
+    $detail = $tickBody.IndexOf('Add-ProbeWindowDetail')
+    $reread = $tickBody.IndexOf('$cxAfter =')
+    Assert-True ($reread -gt $detail) "the re-read (at $reread) must follow the detail pass (at $detail)"
+    # Comment lines are stripped before counting: a name count over prose is not a pin (the
+    # project has been bitten by doc comments feeding a call count twice; gate r1 m2).
+    $tickCode = (($tickBody -split "`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+    Assert-Equal 4 ([regex]::Matches($tickCode, 'MetricOf\(')).Count 'cx and cy, once each side of the detail pass'
+    Assert-Equal 2 ([regex]::Matches($tickCode, 'WorkAreaOf\(')).Count 'the work area, once each side'
+    Assert-Match '(?m)^\s*Cx\s+=\s+\$cx\s*$' $tickBody 'the printed cx is the opening read, not the re-read'
+    Assert-Match '(?m)^\s*Cy\s+=\s+\$cy\s*$' $tickBody
+    Assert-Match '(?m)^\s*WorkArea\s+=\s+\$workArea\s*$' $tickBody
+}
+
+Test-Case 'the header usage block spells the two grammars the script actually emits' {
+    # The usage block drifted once already: owner= was added to the row on 2026-09-21 and the
+    # header kept the pre-owner shape, so a reader working from the file header would have
+    # mis-parsed the rows. The fields are listed here against the same source, which is the
+    # cheapest place to notice the next drift.
+    $usage = $script:SubjectSource.Substring(0, $script:SubjectSource.IndexOf('.PARAMETER OutPath'))
+    Assert-Match '\[loop-tick\] seq= utc= cx= cy= wa= \[truncated=true\] \[torn=<n>\] \[desktop-changed=1\]' $usage
+    Assert-Match '\[tick-rect\] seq= hwnd= pid= proc= class= style= dpi= wr= ef= cs= cr= owner= title-len=' $usage
+    Assert-True ($usage.Contains('title-sha8=')) 'the digest field is documented too'
 }
 
 Test-Case 'the sampler never opens the PREVIOUS half timeline, which the collector rotated away' {

@@ -1068,11 +1068,34 @@ function Add-ProbeWindowDetail {
     <#
       Everything the row needs, read only for the windows that were selected. The DWM call keeps
       both halves of its answer: the bounds when it succeeded, the HRESULT either way.
+
+      THE FOUR RECTANGLES ARE READ FIRST, AND THE WINDOW RECTANGLE IS RE-READ HERE. The
+      enumeration pass took a window rectangle for EVERY top-level window (about 150 of them on
+      the lab host) and the selection then sorted and capped them, so on the old order dozens of
+      native calls and a sort separated that rectangle from the frame and client reads below. A
+      server-side re-layout landing in that gap produced rows whose wr= was already one layout
+      older than their ef=/cs=/cr= -- observed on four of seven anchor rows, batch
+      h2fix-20260921 -- and nothing in the row said so. Reading wr, ef, cs and cr as four
+      adjacent calls, with the process-name lookup (which can reach Get-Process) after them,
+      makes that gap as small as this script can make it.
+
+      The enumeration value is NOT thrown away: WindowRectFirst carries it. It is the rectangle
+      the selection and the cap were decided on, and comparing the two is the only way a caller
+      can tell that a re-layout crossed this read (window-loop.ps1 counts them as torn=).
+      WindowRect -- what every row prints as wr= -- is the SECOND read, the one adjacent to the
+      other three.
+
+      Two consequences for readers, registered rather than hidden (gate r1 I2, 2026-09-21):
+      pid=/proc= come from ProcessIdOf, which now runs AFTER the four rectangles, so they are
+      the later read; and a window that vanishes between the enumeration read and this one is
+      still counted in the tick's rect-ok (decided on the first read) while its row prints
+      wr=n/a (the second read). Before 2026-09-21 both came from the same read and could not
+      disagree.
     #>
     [CmdletBinding()]
     param($Window, [AllowNull()] $ProcessNameCache)
     $handle = Get-ProbeProp -Object $Window -Name 'Handle'
-    $processId = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::ProcessIdOf($handle) }
+    $windowRect = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::WindowRectOf($handle) }
     # The DWM call keeps its own try/catch instead of going through Invoke-ProbeCall: it is the
     # one call whose FAILURE is reported (as hr=), so the exception has to stay in hand. A call
     # that never happened at all -- dwmapi missing, marshalling refused -- reports that
@@ -1087,11 +1110,18 @@ function Add-ProbeWindowDetail {
     } catch {
         $frameHr = $_.Exception.HResult
     }
+    $clientScreen = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::ClientOriginOf($handle) }
+    $clientRect = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::ClientRectOf($handle) }
+
+    # Everything below this line is stable for the lifetime of the window, so it costs the
+    # geometry above nothing to be read after it.
+    $processId = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::ProcessIdOf($handle) }
     return [pscustomobject]@{
         Handle          = $handle
         Hwnd            = Get-ProbeProp -Object $Window -Name 'Hwnd'
         Visible         = Get-ProbeProp -Object $Window -Name 'Visible'
-        WindowRect      = Get-ProbeProp -Object $Window -Name 'WindowRect'
+        WindowRect      = $windowRect
+        WindowRectFirst = Get-ProbeProp -Object $Window -Name 'WindowRect'
         ProcessId       = $processId
         ProcessName     = Get-ProbeProcessName -ProcessId $processId -Cache $ProcessNameCache
         ClassName       = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::ClassOf($handle) }
@@ -1101,8 +1131,8 @@ function Add-ProbeWindowDetail {
         Dpi             = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::WindowDpi($handle) }
         ExtendedFrame   = $frameBounds
         ExtendedFrameHr = $frameHr
-        ClientScreen    = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::ClientOriginOf($handle) }
-        ClientRect      = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::ClientRectOf($handle) }
+        ClientScreen    = $clientScreen
+        ClientRect      = $clientRect
         Title           = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::TitleOf($handle) }
     }
 }
