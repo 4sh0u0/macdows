@@ -1,0 +1,228 @@
+name: Tier 2
+
+# Tier 2 per adr/0006 §6: macOS arm64, the full vendored-dependency chain (OpenSSL ->
+# LGPL-only FFmpeg -> FreeRDP) plus the app build and every test suite that does NOT need a
+# live Windows host. Tier 1 (ubuntu, every push) stays compile-free and keeps the security
+# gates; this is the only lane with a toolchain.
+#
+# Cost note, because it is the reason this lane did not exist until now: adr/0006 §6 sized it
+# against a PRIVATE repo's 10x macOS billing (~300 macOS minutes/month on Pro) and the owner
+# deferred it on that basis. 4sh0u0/macdows is public, and GitHub-hosted standard runners are
+# not billed for public repositories -- which is what makes the path-filtered automatic
+# triggers below affordable. If this repository ever goes private again, revisit the triggers
+# FIRST: a ~25-minute cold job at 10x is a real bill.
+#
+# NOT in this lane, deliberately: anything needing a real Windows host (the probe matrix, the
+# window-smoke / bridge-smoke runs, the lab harness's live legs). adr/0006 §6 keeps those
+# local, and no runner can answer for them.
+
+on:
+  # main only, and its only job is to populate the cache. A pull_request job can restore
+  # caches from its own branch and from the base branch, nothing else -- so without a run on
+  # main, every PR pays the full cold build. The PR trigger below is what actually gates
+  # changes.
+  push:
+    branches: [main]
+    # adr/0006 §6 names ThirdParty/, Scripts/, App/ and Packages/. deps/ (the version lock
+    # every build script reads), Tools/ (replay-diff's own SwiftPM tests run here) and this
+    # file are the same question by a different path, so they are in too. Keep the two lists
+    # below identical -- GitHub Actions does not support YAML anchors, so they are duplicated
+    # by necessity, not by choice.
+    paths:
+      - 'App/**'
+      - 'Packages/**'
+      - 'Scripts/**'
+      - 'ThirdParty/**'
+      - 'Tools/**'
+      - 'deps/**'
+      - '.github/workflows/tier2.yml'
+  pull_request:
+    paths:
+      - 'App/**'
+      - 'Packages/**'
+      - 'Scripts/**'
+      - 'ThirdParty/**'
+      - 'Tools/**'
+      - 'deps/**'
+      - '.github/workflows/tier2.yml'
+  workflow_dispatch:
+  # The upstream-drift sentinel of adr/0006 §6, in its minimal form: once a week, prove that
+  # the pinned FreeRDP/OpenSSL/FFmpeg set still builds against whatever Xcode and macOS image
+  # GitHub ships today. It also keeps the caches warm -- an unused Actions cache is evicted
+  # after 7 days, and a weekly run is inside that window. (The minute/hour are arbitrary,
+  # chosen off the top of the hour to avoid the cron stampede.)
+  schedule:
+    - cron: '23 18 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tier2-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned, not "whatever macos-15 defaults to today": the FreeRDP config hash folds
+  # `xcodebuild -version` in (Scripts/build-freerdp.sh), so an image rotation that moves the
+  # default Xcode silently invalidates every cache and turns a warm 6-minute job into a cold
+  # 30-minute one. Pinning also keeps App/project.yml's SWIFT_VERSION: "6.0" compiled by a
+  # known toolchain. 16.4 is the macos-15 image's current default; bump this deliberately
+  # (the next run after a bump is a cold one, by design).
+  XCODE_APP: /Applications/Xcode_16.4.app
+  # Scripts/bootstrap.sh installs whatever brew formula is missing (xcodegen, on this image).
+  # Let it do that without spending a minute or two on an auto-update of the whole tap first.
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  HOMEBREW_NO_ANALYTICS: "1"
+
+jobs:
+  build:
+    # arm64 standard runner. The whole build is pinned to arm64 anyway
+    # (CMAKE_OSX_ARCHITECTURES=arm64, ffmpeg's --arch=arm64, ARCHS=arm64), so an x86_64
+    # runner could not produce the artifacts this repo targets in the first place.
+    runs-on: macos-15
+    # Sized for a COLD run (every cache missing): the three vendored builds dominate. A warm
+    # run is far under this. Tighten it once the first few runs have produced real numbers --
+    # and remember a job-level timeout ends as "cancelled", not "failure" (tier1.yml's own
+    # timeout comment learned that the hard way).
+    timeout-minutes: 60
+
+    steps:
+      # Pinned to commit SHA, not a mutable tag, per project policy on supply-chain pinning
+      # for third-party Actions. Same pin Tier 1 uses.
+      - name: Checkout (with submodules — the FreeRDP source IS the build input)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          # No fetch-depth: 0 here. Tier 1 needs full history because gitleaks scans a commit
+          # RANGE; this lane only ever builds one tree, and a shallow submodule checkout still
+          # answers `git -C ThirdParty/FreeRDP rev-parse HEAD`, which is all the lock check
+          # and the config hash need.
+
+      - name: Pin the Xcode toolchain
+        run: |
+          set -euo pipefail
+          if [ ! -d "$XCODE_APP" ]; then
+            echo "::error::$XCODE_APP is not installed on this runner, so the pinned toolchain is gone (GitHub rotated the image). Pick one of the Xcodes listed below and update XCODE_APP in this workflow -- do NOT fall back to the image default silently: the FreeRDP config hash folds the Xcode version in, so a silent change is an invisible full-cache invalidation."
+            ls -d /Applications/Xcode*.app || true
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+
+          # Printed, not asserted: the first runs of this lane are also its measurement, and
+          # these four lines are what a future "why did this get slower / why did the cache
+          # miss" question needs. hw.ncpu in particular is what every `make -j` / `ninja -j`
+          # in Scripts/ derives its parallelism from.
+          xcodebuild -version
+          swift --version
+          sw_vers
+          echo "cores: $(sysctl -n hw.ncpu)"
+
+      - name: Compute cache keys
+        id: keys
+        run: |
+          set -euo pipefail
+
+          # NOT recomputed here. Scripts/build-freerdp.sh --print-config-hash is the same
+          # function the build itself uses to choose .build/freerdp/<hash>/, and it already
+          # folds in exactly what adr/0006 §6 asks a cache key to fold: the submodule SHA, the
+          # patch queue's full contents, the script's own text, lib.sh, the lock's
+          # cmake_config/openssl/ffmpeg records and `xcodebuild -version`. A second
+          # implementation in YAML is a second thing to drift -- and a cache key that misses an
+          # input is precisely the "假绿灯" (false green) adr/0006 §6 warns about. The seam
+          # exits before it touches any prefix, so calling it before the caches are restored is
+          # safe (Tier 1's compile-free ubuntu runner calls it the same way).
+          FREERDP="$(./Scripts/build-freerdp.sh --print-config-hash)"
+
+          # OpenSSL and FFmpeg have no such seam: their idempotence is a stamp file INSIDE the
+          # prefix, i.e. inside the thing being cached. So their keys are assembled here from
+          # the same inputs their scripts actually read -- the lock's record (version, sha256,
+          # configure flags) plus the script's own text -- with the pinned Xcode folded in for
+          # the same reason build-freerdp.sh folds it.
+          OPENSSL="$( { jq -c '.openssl' deps/freerdp.lock; cat Scripts/build-openssl.sh; printf 'xcode=%s\n' "$XCODE_APP"; } | shasum -a 256 | cut -c1-16)"
+          FFMPEG="$( { jq -c '.ffmpeg' deps/freerdp.lock; cat Scripts/build-ffmpeg.sh; printf 'xcode=%s\n' "$XCODE_APP"; } | shasum -a 256 | cut -c1-16)"
+
+          {
+            printf 'freerdp=%s\n' "$FREERDP"
+            printf 'openssl=%s\n' "$OPENSSL"
+            printf 'ffmpeg=%s\n' "$FFMPEG"
+          } >>"$GITHUB_OUTPUT"
+
+          echo "freerdp=$FREERDP openssl=$OPENSSL ffmpeg=$FFMPEG"
+
+      # Three caches, not one: the three prefixes have independent lifecycles (an ffmpeg pin
+      # bump must not throw away a perfectly good OpenSSL), which is the same reason
+      # Scripts/lib.sh gives them sibling directories instead of one shared prefix.
+      #
+      # No restore-keys on any of them, deliberately. A partial-match restore is the one thing
+      # that could put a prefix built from DIFFERENT inputs where the stamp check will happily
+      # accept it -- the false green this key formula exists to prevent. Miss, and rebuild.
+      - name: Cache OpenSSL prefix
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .build/deps/prefix
+          key: tier2-openssl-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.openssl }}
+
+      - name: Cache FFmpeg prefix
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .build/deps/ffmpeg-prefix
+          key: tier2-ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.ffmpeg }}
+
+      - name: Cache FreeRDP prefix
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          # The install prefix and its manifest only — NOT .build/freerdp/<hash>/build/, the
+          # CMake/Ninja object tree. adr/0006 §6: "缓存 prefix 而非 ccache". Those two paths are
+          # exactly what build-freerdp.sh's skip branch tests for (the manifest plus
+          # prefix/lib/libfreerdp3.dylib), and it recreates the `current` symlink itself on the
+          # skip path, so nothing else needs to be in here.
+          path: |
+            .build/freerdp/${{ steps.keys.outputs.freerdp }}/prefix
+            .build/freerdp/${{ steps.keys.outputs.freerdp }}/build-manifest.json
+          key: tier2-freerdp-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.freerdp }}
+
+      - name: Bootstrap (brew deps, submodule pin check, OpenSSL + FFmpeg + FreeRDP, xcodegen)
+        # One command, on purpose: Scripts/bootstrap.sh is the documented "clean checkout ->
+        # one command -> buildable Xcode project" entry point, and it already does the
+        # deps/freerdp.lock .commit verification that a CI lane would otherwise reimplement.
+        # Every build step inside it is idempotent, so on a warm run this is mostly a sequence
+        # of stamp checks plus `xcodegen generate`.
+        run: ./Scripts/bootstrap.sh
+
+      - name: Build the app
+        # Through a scheme, never a bare package scheme -- App/project.yml's `schemes:` block
+        # explains at length why (a SYMROOT-redirected build of a raw SwiftPM package scheme
+        # produced "Unable to resolve module dependency: MacdowsCore"). For the same reason
+        # DerivedData is left at its default location: this lane has no reason to redirect it,
+        # and redirecting it is how that failure mode was found in the first place.
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project App/Macdows.xcodeproj \
+            -scheme Macdows \
+            -destination 'platform=macOS,arch=arm64'
+
+      - name: App unit tests (MacdowsAppTests)
+        # The D7 bundle is `bundle.unit-test` with no TEST_HOST, built that way precisely so a
+        # headless `xcodebuild test` can run it (see its comment in App/project.yml: the app
+        # target's launch path activates NSApp and its TCC identity prompts on first connect,
+        # "none of which a headless xcodebuild test can answer").
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -project App/Macdows.xcodeproj \
+            -scheme MacdowsAppTests \
+            -destination 'platform=macOS,arch=arm64'
+
+      - name: MacdowsCore package tests
+        # Pure Swift, no FreeRDP, no AppKit, no display -- the package's own Package.swift
+        # states that as its contract. It cannot run on Tier 1 only because ubuntu has no
+        # Swift toolchain.
+        run: swift test --package-path Packages/MacdowsCore
+
+      - name: replay-diff package tests
+        # Recorded as Tier 2 scope by the 2026-09-01 ruling, for the same ubuntu-has-no-Swift
+        # reason. Offline by construction: its only dependency is a path dependency on the
+        # sibling MacdowsCore package.
+        run: swift test --package-path Tools/replay-diff
