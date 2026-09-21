@@ -21,11 +21,23 @@ import Testing
 //   4. window-smoke -- the `[client-rect]` line's exact shape, its per-group bit gating, and its
 //      emission gate. The update gate is EITHER bit, not both.
 //
-// MEASUREMENT ONLY is itself pinned: nothing in the rendering package, and nothing in
-// `WindowGeometry`, may read any of the four. That is the claim that keeps `rasterScale == 1`
-// product behaviour bit-identical, and it is the one that would decay first if a later lane started
-// wiring before the 1x/2x values exist. The pin enumerates `App/RemoteWindowRendering/` rather than
-// naming files, so a file added to that package is covered the day it lands.
+// MEASUREMENT ONLY is itself pinned: nothing in the rendering package, nothing anywhere else in
+// the app target, and nothing in `WindowGeometry`, may read any of the four. That is the claim
+// that keeps `rasterScale == 1` product behaviour bit-identical, and it is the one that would
+// decay first if a later lane started wiring before the 1x/2x values exist. The pin enumerates
+// directories rather than naming files, so a file added to `App/` is covered the day it lands.
+//
+// The enumeration was widened from `App/RemoteWindowRendering/` to the WHOLE app target on
+// 2026-09-21, after the read-only map (docs/reviews/2026-09-21-w3-map/map-w3-k-and-tear.md §1)
+// asked for first-hand evidence behind its own grep and named the narrow scope as the gap: a
+// consumer added in `App/Macdows/` would have been outside every pin in this repo. It is a widening
+// only -- every assertion this test made before is still made, unchanged, underneath it.
+//
+// This bundle does NOT run in Tier 1 (ubuntu-latest has no Xcode), so the same claim also has a
+// compile-free twin at `Scripts/test-k-consumer-pins.sh`, which runs on every push and covers the
+// ObjC++/C/PowerShell/lab carry sites this file does not enumerate -- by design, not by
+// limitation: a text pin can of course read a `.h` or a `.ps1`, and that job is the shell twin's,
+// which owns the closed allow-list and its frozen counts. This file owns the exact call shapes.
 //
 // There is a STRUCTURAL guarantee underneath that pin, and the next lane -- the one that will
 // actually wire these values -- should know it before it starts. The product rendering path does
@@ -57,6 +69,29 @@ private func swiftFiles(under relative: String) throws -> [String] {
         .filter { $0.hasSuffix(".swift") }
         .sorted()
         .map { "\(relative)/\($0)" }
+}
+
+/// Every product `.swift` file anywhere under `App/`, as repo-relative paths -- the whole app
+/// target, recursively, not one package of it.
+///
+/// Two exclusions, both deliberate. `MacdowsAppTests/` is out because a pin file names the thing it
+/// pins, and this very file would otherwise be its own first failure. Any directory component that
+/// begins with `build` (plus `.build`) is out because those are untracked copies of build
+/// PRODUCTS: on a machine that has built the app they hold stale duplicates of the bridge headers,
+/// and a pin that reads those is asserting against yesterday. The prefix form, rather than the
+/// exact name `build/`, is what the shell twin's `-name 'build*'` prune does, and for the same
+/// reason: a sanitizer build leaves `App/build-asan/` and `App/build-tsan/` beside `App/build/`.
+private func appProductSwiftFiles() throws -> [String] {
+    let appRoot = repoRoot().appendingPathComponent("App")
+    guard let walker = FileManager.default.enumerator(atPath: appRoot.path) else { return [] }
+    var out: [String] = []
+    for case let entry as String in walker where entry.hasSuffix(".swift") {
+        guard !entry.hasPrefix("MacdowsAppTests/") else { continue }
+        let directories = entry.split(separator: "/").dropLast()
+        guard !directories.contains(where: { $0.hasPrefix("build") || $0 == ".build" }) else { continue }
+        out.append("App/\(entry)")
+    }
+    return out.sorted()
 }
 
 @Suite("client-rect plumbing (W3 route B step 1)")
@@ -153,6 +188,28 @@ struct ClientRectPlumbingPinTests {
         // The geometry arithmetic itself: not in that package, and the other half of the claim.
         files.append("Packages/MacdowsCore/Sources/MacdowsCore/WindowGeometry.swift")
         for file in files {
+            let src = try source(file)
+            for name in ["clientOffsetX", "clientOffsetY", "windowClientDeltaX", "windowClientDeltaY"] {
+                #expect(occurrences(of: name, in: src) == 0, "\(file) mentions \(name) -- this step wires nothing")
+            }
+        }
+
+        // Widened 2026-09-21: the same claim over EVERY product Swift file in the app target. The
+        // loop above is kept verbatim rather than folded into this one, so the narrower promise is
+        // still stated in its own words and a future edit to the wider walk cannot quietly drop it.
+        let appFiles = try appProductSwiftFiles()
+        // A floor well below today's count (7 as of 2026-09-21), and deliberately so: its only job
+        // is to fail an EMPTY or collapsed walk. It is not a count pin -- it cannot see files
+        // swapped one for one, and the subset assertion below is what actually holds the shape.
+        #expect(appFiles.count >= 3, "App/ listed \(appFiles.count) product Swift file(s): \(appFiles)")
+        // The wider walk must actually CONTAIN the narrower list. Without this, a recursion bug
+        // that returned only `App/Macdows/*.swift` would still satisfy the count floor and would
+        // report green while never looking at the rendering package at all.
+        #expect(
+            Set(try swiftFiles(under: "App/RemoteWindowRendering")).isSubset(of: Set(appFiles)),
+            "the App-wide walk missed the rendering package: \(appFiles)"
+        )
+        for file in appFiles {
             let src = try source(file)
             for name in ["clientOffsetX", "clientOffsetY", "windowClientDeltaX", "windowClientDeltaY"] {
                 #expect(occurrences(of: name, in: src) == 0, "\(file) mentions \(name) -- this step wires nothing")
