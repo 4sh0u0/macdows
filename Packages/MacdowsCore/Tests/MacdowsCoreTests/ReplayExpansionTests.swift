@@ -366,164 +366,156 @@ struct ReplayExpansionTests {
     /// header rules out). Descriptor format: `windowId|t..c..m..z..r..s..L(n|f)` =
     /// titled/closable/miniaturizable/zoomable/resizable/hasShadow/level.
     ///
-    /// Reading the pinned data (cross-checked against the style evidence already recorded
-    /// in `ReplayTests`' W0① comment): exactly one window per scenario gets full content
-    /// chrome (`t1c1m1z1r1` — the 0xF0000 Notepad/RegEdit-class window 328256), one gets
-    /// dialog chrome (`t1c1m0z0r0Ln` — 590880, the About-Windows-class 0x80080000), the
-    /// four ghost-sliver helpers (983208/132042/132028/66450, style 0x800B0000 +
+    /// U-7 2x rebaseline (2026-09-21): re-exported the same way against the new frozen
+    /// directory (the export ran `StyleTranslator.chrome` over each replay's final
+    /// `WindowModel` state and printed these lines; no literal was hand-edited). The pin's
+    /// shape is unchanged — an exact per-scenario descriptor set.
+    ///
+    /// Reading the pinned data (cross-checked against the style evidence recorded in
+    /// `ReplayTests`' W0① comment): the 0x000F0000 Registry-Editor-class window 394088 gets
+    /// full content chrome (`t1c1m1z1r1`) in s3/s4/s5a/s5b, the About-Windows-class
+    /// 0x80080000 window 327790 gets dialog chrome (`t1c1m0z0r0Ln`) in every scenario, the
+    /// four ghost-sliver helpers (66466/66522/132080/197582, style 0x800B0000 +
     /// WS_EX_TOPMOST) get `t1c1m0z0r0Lf` (SYSMENU implies titled+closable; TOOLWINDOW
     /// suppresses min/zoom; topmost floats), and every bare-WS_POPUP window is untitled
     /// with level tracking its own WS_EX_TOPMOST bit.
     static let expectedChromeDescriptors: [Scenario: Set<String>] = [
         .s1: [
-            "131948|t0c0m0z0r0s1Ln",
-            "131976|t0c0m0z0r0s1Lf",
-            "132028|t1c1m0z0r0s1Lf",
-            "132042|t1c1m0z0r0s1Lf",
-            "132112|t0c0m0z0r0s1Lf",
-            "197612|t0c0m0z0r0s1Lf",
-            "328256|t1c1m1z1r1s1Ln",
-            "328280|t0c0m0z0r0s1Ln",
-            "393802|t0c0m0z0r0s1Lf",
-            "524454|t0c0m0z0r0s1Ln",
-            "590880|t1c1m0z0r0s1Ln",
-            "65982|t0c0m0z0r0s1Lf",
-            "65992|t0c0m0z0r0s1Ln",
-            "65994|t0c0m0z0r0s1Ln",
-            "65996|t0c0m0z0r0s1Ln",
-            "65998|t0c0m0z0r0s1Ln",
-            "66034|t0c0m0z0r0s1Ln",
-            "66066|t0c0m0z0r0s1Ln",
-            "66450|t1c1m0z0r0s1Lf",
+            "131262|t0c0m0z0r0s1Ln",
+            "131462|t0c0m0z0r0s1Ln",
+            "132080|t1c1m0z0r0s1Lf",
+            "197582|t1c1m0z0r0s1Lf",
+            "263022|t0c0m0z0r0s1Ln",
+            "327790|t1c1m0z0r0s1Ln",
+            "65972|t0c0m0z0r0s1Lf",
+            "65982|t0c0m0z0r0s1Ln",
+            "65984|t0c0m0z0r0s1Ln",
+            "65986|t0c0m0z0r0s1Ln",
+            "65988|t0c0m0z0r0s1Ln",
+            "66018|t0c0m0z0r0s1Lf",
+            "66022|t0c0m0z0r0s1Ln",
+            "66028|t0c0m0z0r0s1Ln",
+            "66068|t0c0m0z0r0s1Ln",
             "66462|t0c0m0z0r0s1Lf",
-            "66472|t0c0m0z0r0s1Lf",
-            "918094|t0c0m0z0r0s1Lf",
-            "983208|t1c1m0z0r0s1Lf",
+            "66466|t1c1m0z0r0s1Lf",
+            "66476|t0c0m0z0r0s1Lf",
+            "66484|t0c0m0z0r0s1Lf",
+            "66504|t0c0m0z0r0s1Lf",
+            "66522|t1c1m0z0r0s1Lf",
         ],
         .s2: [
-            "131948|t0c0m0z0r0s1Ln",
-            "131976|t0c0m0z0r0s1Lf",
-            "132028|t1c1m0z0r0s1Lf",
-            "132042|t1c1m0z0r0s1Lf",
-            "132112|t0c0m0z0r0s1Lf",
-            "1573240|t0c0m0z0r0s1Lf",
-            "197612|t0c0m0z0r0s1Lf",
-            "328256|t1c1m1z1r1s1Ln",
-            "393802|t0c0m0z0r0s1Lf",
-            "524454|t0c0m0z0r0s1Ln",
-            "590880|t1c1m0z0r0s1Ln",
-            "65982|t0c0m0z0r0s1Lf",
-            "65992|t0c0m0z0r0s1Ln",
-            "65994|t0c0m0z0r0s1Ln",
-            "65996|t0c0m0z0r0s1Ln",
-            "65998|t0c0m0z0r0s1Ln",
-            "66034|t0c0m0z0r0s1Ln",
-            "66066|t0c0m0z0r0s1Ln",
-            "66450|t1c1m0z0r0s1Lf",
+            "131462|t0c0m0z0r0s1Ln",
+            "131634|t0c0m0z0r0s1Ln",
+            "132080|t1c1m0z0r0s1Lf",
+            "197084|t0c0m0z0r0s1Lf",
+            "197582|t1c1m0z0r0s1Lf",
+            "263022|t0c0m0z0r0s1Ln",
+            "327790|t1c1m0z0r0s1Ln",
+            "65972|t0c0m0z0r0s1Lf",
+            "65982|t0c0m0z0r0s1Ln",
+            "65984|t0c0m0z0r0s1Ln",
+            "65986|t0c0m0z0r0s1Ln",
+            "65988|t0c0m0z0r0s1Ln",
+            "66028|t0c0m0z0r0s1Ln",
+            "66068|t0c0m0z0r0s1Ln",
             "66462|t0c0m0z0r0s1Lf",
-            "66472|t0c0m0z0r0s1Lf",
-            "917764|t0c0m0z0r0s1Ln",
-            "983208|t1c1m0z0r0s1Lf",
+            "66466|t1c1m0z0r0s1Lf",
+            "66476|t0c0m0z0r0s1Lf",
+            "66484|t0c0m0z0r0s1Lf",
+            "66504|t0c0m0z0r0s1Lf",
+            "66522|t1c1m0z0r0s1Lf",
         ],
         .s3: [
-            "131948|t0c0m0z0r0s1Ln",
-            "131976|t0c0m0z0r0s1Lf",
-            "132028|t1c1m0z0r0s1Lf",
-            "132042|t1c1m0z0r0s1Lf",
-            "132112|t0c0m0z0r0s1Lf",
-            "197612|t0c0m0z0r0s1Lf",
-            "2425392|t0c0m0z0r0s1Lf",
-            "328256|t1c1m1z1r1s1Ln",
-            "393802|t0c0m0z0r0s1Lf",
-            "524454|t0c0m0z0r0s1Ln",
-            "5898488|t0c0m0z0r0s1Ln",
-            "590880|t1c1m0z0r0s1Ln",
-            "65982|t0c0m0z0r0s1Lf",
-            "65992|t0c0m0z0r0s1Ln",
-            "65994|t0c0m0z0r0s1Ln",
-            "65996|t0c0m0z0r0s1Ln",
-            "65998|t0c0m0z0r0s1Ln",
-            "66034|t0c0m0z0r0s1Ln",
-            "66066|t0c0m0z0r0s1Ln",
-            "66450|t1c1m0z0r0s1Lf",
+            "131462|t0c0m0z0r0s1Ln",
+            "131744|t0c0m0z0r0s1Ln",
+            "132080|t1c1m0z0r0s1Lf",
+            "197582|t1c1m0z0r0s1Lf",
+            "263022|t0c0m0z0r0s1Ln",
+            "327790|t1c1m0z0r0s1Ln",
+            "393690|t0c0m0z0r0s1Lf",
+            "394088|t1c1m1z1r1s1Ln",
+            "65972|t0c0m0z0r0s1Lf",
+            "65982|t0c0m0z0r0s1Ln",
+            "65984|t0c0m0z0r0s1Ln",
+            "65986|t0c0m0z0r0s1Ln",
+            "65988|t0c0m0z0r0s1Ln",
+            "66028|t0c0m0z0r0s1Ln",
+            "66068|t0c0m0z0r0s1Ln",
             "66462|t0c0m0z0r0s1Lf",
-            "66472|t0c0m0z0r0s1Lf",
-            "983208|t1c1m0z0r0s1Lf",
+            "66466|t1c1m0z0r0s1Lf",
+            "66476|t0c0m0z0r0s1Lf",
+            "66484|t0c0m0z0r0s1Lf",
+            "66504|t0c0m0z0r0s1Lf",
+            "66522|t1c1m0z0r0s1Lf",
         ],
         .s4: [
-            "1048700|t0c0m0z0r0s1Ln",
-            "131948|t0c0m0z0r0s1Ln",
-            "131976|t0c0m0z0r0s1Lf",
-            "132028|t1c1m0z0r0s1Lf",
-            "132042|t1c1m0z0r0s1Lf",
-            "132112|t0c0m0z0r0s1Lf",
-            "1704536|t0c0m0z0r0s1Lf",
-            "197612|t0c0m0z0r0s1Lf",
-            "328256|t1c1m1z1r1s1Ln",
-            "393802|t0c0m0z0r0s1Lf",
-            "524454|t0c0m0z0r0s1Ln",
-            "590880|t1c1m0z0r0s1Ln",
-            "65982|t0c0m0z0r0s1Lf",
-            "65992|t0c0m0z0r0s1Ln",
-            "65994|t0c0m0z0r0s1Ln",
-            "65996|t0c0m0z0r0s1Ln",
-            "65998|t0c0m0z0r0s1Ln",
-            "66034|t0c0m0z0r0s1Ln",
-            "66066|t0c0m0z0r0s1Ln",
-            "66450|t1c1m0z0r0s1Lf",
+            "131462|t0c0m0z0r0s1Ln",
+            "132080|t1c1m0z0r0s1Lf",
+            "1769954|t0c0m0z0r0s1Ln",
+            "197582|t1c1m0z0r0s1Lf",
+            "197680|t0c0m0z0r0s1Lf",
+            "263022|t0c0m0z0r0s1Ln",
+            "327790|t1c1m0z0r0s1Ln",
+            "394088|t1c1m1z1r1s1Ln",
+            "65972|t0c0m0z0r0s1Lf",
+            "65982|t0c0m0z0r0s1Ln",
+            "65984|t0c0m0z0r0s1Ln",
+            "65986|t0c0m0z0r0s1Ln",
+            "65988|t0c0m0z0r0s1Ln",
+            "66028|t0c0m0z0r0s1Ln",
+            "66068|t0c0m0z0r0s1Ln",
             "66462|t0c0m0z0r0s1Lf",
-            "66472|t0c0m0z0r0s1Lf",
-            "983208|t1c1m0z0r0s1Lf",
+            "66466|t1c1m0z0r0s1Lf",
+            "66476|t0c0m0z0r0s1Lf",
+            "66484|t0c0m0z0r0s1Lf",
+            "66504|t0c0m0z0r0s1Lf",
+            "66522|t1c1m0z0r0s1Lf",
         ],
         .s5a: [
-            "131948|t0c0m0z0r0s1Ln",
-            "131976|t0c0m0z0r0s1Lf",
-            "132028|t1c1m0z0r0s1Lf",
-            "132042|t1c1m0z0r0s1Lf",
-            "132112|t0c0m0z0r0s1Lf",
-            "197612|t0c0m0z0r0s1Lf",
-            "2950242|t0c0m0z0r0s1Ln",
-            "328256|t1c1m1z1r1s1Ln",
-            "393802|t0c0m0z0r0s1Lf",
-            "524454|t0c0m0z0r0s1Ln",
-            "590880|t1c1m0z0r0s1Ln",
-            "65982|t0c0m0z0r0s1Lf",
-            "65992|t0c0m0z0r0s1Ln",
-            "65994|t0c0m0z0r0s1Ln",
-            "65996|t0c0m0z0r0s1Ln",
-            "65998|t0c0m0z0r0s1Ln",
-            "66034|t0c0m0z0r0s1Ln",
-            "66066|t0c0m0z0r0s1Ln",
-            "66450|t1c1m0z0r0s1Lf",
+            "131462|t0c0m0z0r0s1Ln",
+            "132080|t1c1m0z0r0s1Lf",
+            "197582|t1c1m0z0r0s1Lf",
+            "2425664|t0c0m0z0r0s1Lf",
+            "263022|t0c0m0z0r0s1Ln",
+            "327790|t1c1m0z0r0s1Ln",
+            "394088|t1c1m1z1r1s1Ln",
+            "65972|t0c0m0z0r0s1Lf",
+            "65982|t0c0m0z0r0s1Ln",
+            "65984|t0c0m0z0r0s1Ln",
+            "65986|t0c0m0z0r0s1Ln",
+            "65988|t0c0m0z0r0s1Ln",
+            "66028|t0c0m0z0r0s1Ln",
+            "66068|t0c0m0z0r0s1Ln",
             "66462|t0c0m0z0r0s1Lf",
-            "66472|t0c0m0z0r0s1Lf",
-            "983208|t1c1m0z0r0s1Lf",
-            "983518|t0c0m0z0r0s1Lf",
+            "66466|t1c1m0z0r0s1Lf",
+            "66476|t0c0m0z0r0s1Lf",
+            "66484|t0c0m0z0r0s1Lf",
+            "66504|t0c0m0z0r0s1Lf",
+            "66522|t1c1m0z0r0s1Lf",
+            "721084|t0c0m0z0r0s1Ln",
         ],
         .s5b: [
-            "131948|t0c0m0z0r0s1Ln",
-            "131976|t0c0m0z0r0s1Lf",
-            "132028|t1c1m0z0r0s1Lf",
-            "132042|t1c1m0z0r0s1Lf",
-            "132112|t0c0m0z0r0s1Lf",
-            "1638650|t0c0m0z0r0s1Ln",
-            "1638988|t0c0m0z0r0s1Lf",
-            "197612|t0c0m0z0r0s1Lf",
-            "328256|t1c1m1z1r1s1Ln",
-            "393802|t0c0m0z0r0s1Lf",
-            "524454|t0c0m0z0r0s1Ln",
-            "590880|t1c1m0z0r0s1Ln",
-            "65982|t0c0m0z0r0s1Lf",
-            "65992|t0c0m0z0r0s1Ln",
-            "65994|t0c0m0z0r0s1Ln",
-            "65996|t0c0m0z0r0s1Ln",
-            "65998|t0c0m0z0r0s1Ln",
-            "66034|t0c0m0z0r0s1Ln",
-            "66066|t0c0m0z0r0s1Ln",
-            "66450|t1c1m0z0r0s1Lf",
+            "131462|t0c0m0z0r0s1Ln",
+            "132080|t1c1m0z0r0s1Lf",
+            "197582|t1c1m0z0r0s1Lf",
+            "263022|t0c0m0z0r0s1Ln",
+            "327790|t1c1m0z0r0s1Ln",
+            "394088|t1c1m1z1r1s1Ln",
+            "65972|t0c0m0z0r0s1Lf",
+            "65982|t0c0m0z0r0s1Ln",
+            "65984|t0c0m0z0r0s1Ln",
+            "65986|t0c0m0z0r0s1Ln",
+            "65988|t0c0m0z0r0s1Ln",
+            "66028|t0c0m0z0r0s1Ln",
+            "66068|t0c0m0z0r0s1Ln",
             "66462|t0c0m0z0r0s1Lf",
-            "66472|t0c0m0z0r0s1Lf",
-            "983208|t1c1m0z0r0s1Lf",
+            "66466|t1c1m0z0r0s1Lf",
+            "66476|t0c0m0z0r0s1Lf",
+            "66484|t0c0m0z0r0s1Lf",
+            "66504|t0c0m0z0r0s1Lf",
+            "66522|t1c1m0z0r0s1Lf",
+            "66668|t0c0m0z0r0s1Lf",
+            "66672|t0c0m0z0r0s1Ln",
         ],
     ]
 
@@ -546,16 +538,22 @@ struct ReplayExpansionTests {
     /// per scenario — exported the same way as `expectedChromeDescriptors` (real
     /// `MinMaxInfoTranslator.constraints` over every event of the fingerprint-verified
     /// frozen samples, deduplicated via `trackSizeDescriptor`, printed, pasted; same
-    /// 2026-09-01 export run). The counts sum to the 122 `ServerMinMaxInfo` events the W2
-    /// event census recorded across the six files. `min=-x-` is both min bounds decoding
-    /// as the 0-sentinel → `nil`.
+    /// 2026-09-21 U-7 export run). The counts sum to the 125 `ServerMinMaxInfo` events in
+    /// the six 2x files. `min=-x-` is both min bounds decoding as the 0-sentinel → `nil`.
+    ///
+    /// U-7 2x rebaseline: the pin shape is unchanged, the values are the 2x session's. The
+    /// max bound is now 2590x1470 everywhere (the 2560x1440 desktop plus the same 30x30
+    /// track-size slack the 1x session showed over its 1024x768 desktop with 1044x788), and
+    /// the non-nil min bound is 262x71 — the tray-flyout helper class's own size, 136x39 in
+    /// the 1x session. s1's third 1x entry (a second max bound, from its 1024x768-era
+    /// windows) has no counterpart here: the 2x s1 never reports two different max bounds.
     static let expectedMinMaxPins: [Scenario: (count: Int, dedupedTranslations: Set<String>)] = [
-        .s1: (20, ["min=-x-,max=2580x1460", "min=136x39,max=1044x788", "min=136x39,max=2580x1460"]),
-        .s2: (20, ["min=-x-,max=1044x788", "min=136x39,max=1044x788"]),
-        .s3: (20, ["min=-x-,max=1044x788", "min=136x39,max=1044x788"]),
-        .s4: (21, ["min=-x-,max=1044x788", "min=136x39,max=1044x788"]),
-        .s5a: (21, ["min=-x-,max=1044x788", "min=136x39,max=1044x788"]),
-        .s5b: (20, ["min=-x-,max=1044x788", "min=136x39,max=1044x788"]),
+        .s1: (21, ["min=-x-,max=2590x1470", "min=262x71,max=2590x1470"]),
+        .s2: (20, ["min=-x-,max=2590x1470", "min=262x71,max=2590x1470"]),
+        .s3: (21, ["min=-x-,max=2590x1470", "min=262x71,max=2590x1470"]),
+        .s4: (21, ["min=-x-,max=2590x1470", "min=262x71,max=2590x1470"]),
+        .s5a: (21, ["min=-x-,max=2590x1470", "min=262x71,max=2590x1470"]),
+        .s5b: (21, ["min=-x-,max=2590x1470", "min=262x71,max=2590x1470"]),
     ]
 
     @Test(
@@ -582,19 +580,48 @@ struct ReplayExpansionTests {
     }
 
     /// Expected server-focus composition + full `FocusAuthority` effect trace per
-    /// scenario — exported like every other frozen pin (a temporary in-target export test
-    /// ran the real `FocusAuthority` over the fingerprint-verified frozen samples,
-    /// 2026-09-01 r1-fix pass, printed these literals, and was deleted; cross-checked
-    /// against a `jq`-level census of `activeWindowId` values, which agrees:
-    /// s1 = 22x 0xFFFFFFFF + 2x 0, s2 = 23x + 2x, s3/s4/s5a/s5b add exactly one 328256
-    /// as their FINAL MonitoredDesktop).
+    /// scenario — exported like every other frozen pin (an export run of the real
+    /// `FocusAuthority` over the fingerprint-verified frozen samples printed these
+    /// literals; cross-checked against a raw census of `activeWindowId` values, which
+    /// agrees: s1 = 2x 0 + 10x 66068 + 1x 131262 + 1x 327790 + 14x 196642, s2 = 2x 0 + 19x
+    /// 327790, s3/s4/s5a = 2x 0 + 20x 327790, s5b = 2x 0 + 21x 327790).
     ///
-    /// This is the frozen-layer half of r1 H3: s1/s2's "no window truth, zero effects" is
-    /// pinned HERE as that session's composition (the portable test's zero-effect branch
-    /// says any no-window feed behaves this way; this pin says the 2026-08-19 s1/s2 ARE
-    /// such feeds), and s3-s5b's `makeKey(328256)` trace is production-derived — a no-op'd
-    /// `serverDesktopUpdate` turns those four rows red on the trace alone.
+    /// U-7 2x rebaseline (2026-09-21): this pin's shape (per-scenario feed count,
+    /// window-truth sequence, full effect trace) is unchanged, but the 1x composition it
+    /// recorded is NOT reproduced by the 2x session and was not silently dropped — the 1x
+    /// table is preserved against its own directory by `legacy1xFocusSignalTrace` below.
+    /// What changed: in the 1x capture every `MonitoredDesktop` but the final one carried
+    /// 0xFFFFFFFF (no window truth at all in s1/s2, exactly one in s3-s5b, which was r1
+    /// H3's frozen-layer evidence); the 2x capture reports a REAL active window on almost
+    /// every MonitoredDesktop, so the truth sequences are long and the effect traces show
+    /// the actual key-window handovers. s1 is the only leg with more than one distinct
+    /// truth (the tray window, the marker window, the About dialog, then a window that
+    /// never appears in the capture at all — a pre-existing shell window, id 196642).
     static let expectedFocusSignal: [Scenario: (feedCount: Int, windowTruths: [UInt32], effects: [String])] = [
+        .s1: (
+            28,
+            Array(repeating: UInt32(66068), count: 10) + [131262, 327790]
+                + Array(repeating: UInt32(196642), count: 14),
+            [
+                "makeKey(66068)", "resignKey(66068)",
+                "makeKey(131262)", "resignKey(131262)",
+                "makeKey(327790)", "resignKey(327790)",
+                "makeKey(196642)",
+            ]
+        ),
+        .s2: (21, Array(repeating: UInt32(327790), count: 19), ["makeKey(327790)", "resignKey(327790)"]),
+        .s3: (22, Array(repeating: UInt32(327790), count: 20), ["makeKey(327790)", "resignKey(327790)", "makeKey(327790)"]),
+        .s4: (22, Array(repeating: UInt32(327790), count: 20), ["makeKey(327790)", "resignKey(327790)", "makeKey(327790)"]),
+        .s5a: (22, Array(repeating: UInt32(327790), count: 20), ["makeKey(327790)", "resignKey(327790)", "makeKey(327790)"]),
+        .s5b: (23, Array(repeating: UInt32(327790), count: 21), ["makeKey(327790)", "resignKey(327790)"]),
+    ]
+
+    /// RETIRED 1x PIN, preserved verbatim (U-7 rebaseline): the 2026-08-19 capture's own
+    /// focus-signal composition — s1/s2 carried no window truth and produced zero effects,
+    /// s3-s5b carried exactly one (window 328256) and produced `makeKey(328256)`. That is
+    /// r1 H3's frozen-layer evidence and it is kept under test against the directory it was
+    /// measured on rather than being deleted with the rebaseline.
+    static let legacy1xExpectedFocusSignal: [Scenario: (feedCount: Int, windowTruths: [UInt32], effects: [String])] = [
         .s1: (24, [], []),
         .s2: (25, [], []),
         .s3: (25, [328256], ["makeKey(328256)"]),
@@ -623,6 +650,32 @@ struct ReplayExpansionTests {
         }
 
         let expected = Self.expectedFocusSignal[scenario]!
+        #expect(feed.count == expected.feedCount, "MonitoredDesktop count mismatch for \(scenario): \(feed.count) != \(expected.feedCount)")
+        #expect(windowTruths == expected.windowTruths, "window-truth sequence mismatch for \(scenario): \(windowTruths) != \(expected.windowTruths)")
+        let trace = effects.map(Self.effectDescriptor)
+        #expect(trace == expected.effects, "effect trace mismatch for \(scenario): \(trace) != \(expected.effects)")
+    }
+
+    @Test(
+        "retired 1x baseline: MonitoredDesktop focus-signal composition and full FocusAuthority effect trace per scenario",
+        .enabled(if: ReplayTests.legacy1xBaselineIntact, ReplayTests.legacy1xPinSkipReason),
+        arguments: Scenario.allCases
+    )
+    func legacy1xFocusSignalTrace(_ scenario: Scenario) throws {
+        let replay = try ReplayTests.replay(scenario, in: ReplayTests.legacy1xSamplesDir)
+        let feed = Self.monitoredDesktopFeed(replay)
+
+        let authority = FocusAuthority()
+        var effects: [FocusAuthorityEffect] = []
+        for entry in feed {
+            effects += authority.serverDesktopUpdate(rawActiveWindowId: entry.raw, at: Double(entry.tMs) / 1000.0)
+        }
+        let windowTruths = feed.compactMap { entry -> UInt32? in
+            if case .window(let id) = ServerActiveWindow(rawActiveWindowId: entry.raw) { return id }
+            return nil
+        }
+
+        let expected = Self.legacy1xExpectedFocusSignal[scenario]!
         #expect(feed.count == expected.feedCount, "MonitoredDesktop count mismatch for \(scenario): \(feed.count) != \(expected.feedCount)")
         #expect(windowTruths == expected.windowTruths, "window-truth sequence mismatch for \(scenario): \(windowTruths) != \(expected.windowTruths)")
         let trace = effects.map(Self.effectDescriptor)

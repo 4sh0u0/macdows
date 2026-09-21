@@ -3,9 +3,12 @@ import Foundation
 
 /// Hand-built `rail-probe`-shaped JSONL used by every suite in this target.
 ///
-/// Synthetic on purpose, and synthetic *here* on purpose: M1 wave-1 ruling U7 freezes
-/// `samples/phase05-rail-events-2026-08-19` byte-for-byte, because that directory is what
-/// the upgrade gate diffs against. Fixtures live under `Tests/`, never under `samples/`.
+/// Synthetic on purpose, and synthetic *here* on purpose: M1 wave-1 ruling U7 freezes the
+/// in-force capture directory byte-for-byte, because that directory is what the upgrade
+/// gate diffs against — `samples/phase05-rail-events-2026-09-21-2x` since the 2026-09-21
+/// U-7 rebaseline, `samples/phase05-rail-events-2026-08-19` before it (that one is
+/// retired, still in the tree, and still fingerprint-guarded). Fixtures live under
+/// `Tests/`, never under `samples/`.
 ///
 /// Every field name and type matches `RailEvent`'s payload structs, so these lines decode
 /// through MacdowsCore's real parser rather than through a lenient stand-in. No value here

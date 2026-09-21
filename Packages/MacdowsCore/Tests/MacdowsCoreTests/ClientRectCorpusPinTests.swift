@@ -8,22 +8,27 @@ import Testing
 // style (a WindowUpdate carries `style = 0` when the style field is not part of the update --
 // `fieldFlags` decides -- so the update's own `style` column says nothing about the window).
 //
-// What the census shows on the frozen corpus (COMPUTED here 2026-09-10, then pinned below):
-//   * 202 window orders total: 138 WindowCreate, 64 WindowUpdate.
-//   * CLIENT_AREA_OFFSET (0x4000) and WND_CLIENT_DELTA (0x8000) each ride on 142 of them --
-//     every one of the 138 creates, plus 4 updates (all in s1-baseline).
-//   * VIS_OFFSET (0x1000) rides on exactly the same 142. The three bits are co-present order for
-//     order in this corpus; `visOffsetOrders` is pinned alongside the other two so that stays a
-//     measured fact rather than an assumption a future consumer inherits.
-//   * CLIENT_AREA_SIZE (0x10000) rides on ZERO of them. That is the finding that shapes the whole
-//     lane: the server never states the client area's SIZE, so no offline fixture can ever check
-//     "content rect == server clientArea" (survey §0, §6.1 A). Only the two ORIGIN pairs exist.
+// What the census showed on the retired 1x corpus (2026-09-10): 202 orders (138 creates, 64
+// updates); CLIENT_AREA_OFFSET, WND_CLIENT_DELTA and VIS_OFFSET each on exactly the same 142;
+// CLIENT_AREA_SIZE on zero.
 //
-// The census counts BITS, not values: no recording in this corpus was made by a probe that logged
-// `clientOffsetX/Y` or `windowClientDeltaX/Y` at all, so every value decodes as 0 here (adr/0008
-// §5's absent-means-zero rule) and a value pin would be pinning the default, not the wire.
-// `ClientRectPayloadTests` covers the decode side; the values become checkable only after a
-// re-record with the probe built from this change.
+// RECOMPUTED on the 2026-09-21 2x corpus (U-7 rebaseline), measured, with one 1x conclusion that
+// does NOT survive the re-record:
+//   * 190 window orders total: 125 WindowCreate, 65 WindowUpdate.
+//   * CLIENT_AREA_OFFSET (0x4000) rides on 126 of them -- all 125 creates plus one update;
+//     WND_CLIENT_DELTA (0x8000) rides on 127. The two bits are therefore NOT co-present order for
+//     order any more (one update carries the delta without the offset), which is exactly why they
+//     have always been counted independently here: window.c:334 and :395 are separate `if`s.
+//   * VIS_OFFSET (0x1000) rides on 126 -- the same count as CLIENT_AREA_OFFSET, one fewer than
+//     WND_CLIENT_DELTA. The 1x "all three co-present" reading was a property of that session.
+//   * CLIENT_AREA_SIZE (0x10000) still rides on ZERO of them. That is the finding that shapes the
+//     whole lane: the server never states the client area's SIZE, so no offline fixture can ever
+//     check "content rect == server clientArea" (survey §0, §6.1 A). Only the ORIGIN pairs exist.
+//
+// The census counts BITS, not values, and keeps doing so on the 2x corpus even though its probe
+// DOES log `clientOffsetX/Y` and `windowClientDeltaX/Y` (W3 route B step 1): what this pin exists
+// to catch is a change in which ORDERS carry the fields. `ClientRectPayloadTests` covers the
+// decode side and the value semantics.
 //
 // Layering (ReplayTests' own rule): the corpus pins are frozen-baseline feature pins
 // (`.enabled(if: ReplayTests.samplesDirIsFrozenBaseline)`); the census helper itself is pinned
@@ -180,7 +185,7 @@ struct ClientRectCorpusPinTests {
     // MARK: frozen-baseline pins (skip, not pass, under a SAMPLES_DIR override)
 
     @Test(
-        "frozen corpus: 202 window orders; CLIENT_AREA_OFFSET, WND_CLIENT_DELTA and VIS_OFFSET each on 142 of them; CLIENT_AREA_SIZE on 0",
+        "frozen corpus: 190 window orders; CLIENT_AREA_OFFSET and VIS_OFFSET on 126, WND_CLIENT_DELTA on 127; CLIENT_AREA_SIZE on 0",
         .enabled(if: ReplayTests.samplesDirIsFrozenBaseline, ReplayTests.featurePinSkipReason)
     )
     func frozenBitCensus() throws {
@@ -188,21 +193,24 @@ struct ClientRectCorpusPinTests {
         for scenario in ReplayTests.Scenario.allCases {
             total += ClientRectCensus.of(try ReplayTests.replay(scenario).events)
         }
-        #expect(total.orders == 202)
-        #expect(total.clientAreaOffsetOrders == 142)
-        #expect(total.wndClientDeltaOrders == 142)
+        #expect(total.orders == 190)
+        #expect(total.clientAreaOffsetOrders == 126)
+        // One MORE than the offset count: the two bits have INDEPENDENT validity bits and this
+        // corpus contains an order that sets only the delta. Pinned as measured; the 1x corpus's
+        // equal counts were a property of that session, not a protocol invariant.
+        #expect(total.wndClientDeltaOrders == 127)
         // Co-presence, order for order, is measured -- not assumed. adr/0010 §0(b) already warns
-        // that visibleOffset and windowOffset are DIFFERENT anchors; this pin records that the
-        // client-rect pair happens to arrive on exactly the same orders as that third anchor, so a
-        // future divergence is a finding rather than a silent behaviour change.
-        #expect(total.visOffsetOrders == 142)
+        // that visibleOffset and windowOffset are DIFFERENT anchors; this pin records how often
+        // that third anchor rides along, so a future divergence is a finding rather than a silent
+        // behaviour change.
+        #expect(total.visOffsetOrders == 126)
         // The survey's decisive §0 correction, made permanent: the server states the client area's
         // ORIGIN and never its SIZE.
         #expect(total.clientAreaSizeOrders == 0)
     }
 
     @Test(
-        "frozen corpus: all 138 creates carry both bits; only 4 of 64 updates do, all on 0x000F0000 / 0x80080000 windows",
+        "frozen corpus: all 125 creates carry both bits; only 1 of 65 updates does, on a 0x800F0000 window",
         .enabled(if: ReplayTests.samplesDirIsFrozenBaseline, ReplayTests.featurePinSkipReason)
     )
     func frozenCreateUpdateSplit() throws {
@@ -210,11 +218,11 @@ struct ClientRectCorpusPinTests {
         for scenario in ReplayTests.Scenario.allCases {
             total += ClientRectCensus.of(try ReplayTests.replay(scenario).events)
         }
-        #expect(total.creates == 138)
-        #expect(total.createsWithBothBits == 138, "every create carries the client-rect origin -- unlike resizeMargin*, which reaches 7 of 138")
-        #expect(total.createBitStyles == [0x000F_0000, 0x8000_0000, 0x8008_0000, 0x800B_0000])
-        #expect(total.updates == 64)
-        #expect(total.updatesWithBothBits == 4)
-        #expect(total.updateBitWindowsCreateStyles == [0x000F_0000, 0x8008_0000])
+        #expect(total.creates == 125)
+        #expect(total.createsWithBothBits == 125, "every create carries the client-rect origin -- unlike resizeMargin*, which reaches 14 of 125")
+        #expect(total.createBitStyles == [0x000F_0000, 0x8000_0000, 0x8008_0000, 0x800B_0000, 0x800F_0000])
+        #expect(total.updates == 65)
+        #expect(total.updatesWithBothBits == 1)
+        #expect(total.updateBitWindowsCreateStyles == [0x800F_0000])
     }
 }

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # replay.sh: run the RAIL/RDPGFX replay regression gate — RailEvent + WindowModel replaying
-# samples/phase05-rail-events-2026-08-19/*.jsonl through Packages/MacdowsCore's
+# samples/phase05-rail-events-2026-09-21-2x/*.jsonl through Packages/MacdowsCore's
 # ReplayTests suite (adr/0005 §6 / adr/0006 §4's hard-coupling point, now closed: the
 # shared window model is a pure function of the event stream, so this is a real regression
 # gate, not just a "server behavior fixture").
 #
 # Usage: Scripts/replay.sh [samples-dir]
-#   samples-dir defaults to samples/phase05-rail-events-2026-08-19 (ReplayTests.swift's own
+#   samples-dir defaults to samples/phase05-rail-events-2026-09-21-2x (ReplayTests.swift's own
 #   default, derived from its own #filePath) if neither an argument nor $SAMPLES_DIR is
 #   given. An explicit argument here wins over an already-exported $SAMPLES_DIR.
 set -euo pipefail
@@ -28,7 +28,7 @@ if [ -n "$SAMPLES_DIR" ]; then
 	SAMPLES_DIR="$(cd "$SAMPLES_DIR" && pwd)"
 	log "Replaying samples from: $SAMPLES_DIR"
 else
-	log "Replaying samples from ReplayTests.swift's own default (samples/phase05-rail-events-2026-08-19)"
+	log "Replaying samples from ReplayTests.swift's own default (samples/phase05-rail-events-2026-09-21-2x)"
 fi
 export SAMPLES_DIR
 

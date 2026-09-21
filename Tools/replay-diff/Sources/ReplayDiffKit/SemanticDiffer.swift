@@ -136,10 +136,18 @@ public enum EventLane: String, Sendable, Equatable, CaseIterable {
     /// MacdowsCore and are almost certainly main-lane, but they occur zero times in the
     /// frozen data, so they are deliberately absent: `ambiguous` costs a little coverage,
     /// an unmeasured lane assignment costs correctness.
+    ///
+    /// U-7 2x rebaseline (2026-09-21), a reviewed edit of exactly the kind the paragraph
+    /// above describes: `LogonErrorInfo` entered the frozen corpus with the new baseline
+    /// (one occurrence, in s1-baseline only) and its thread was MEASURED before it was
+    /// added — it rides tid 0x1fe233dc0, the same single thread every other main-lane name
+    /// of that capture rides. Without this entry the new corpus's traffic would be silently
+    /// demoted to `ambiguous`, which is what `LaneAllowListTests` turned red on.
     public static let mainLaneEventNames: Set<String> = [
         "ClientRailServerStartCmd",
         "ConnectSucceeded",
         "DurationElapsed",
+        "LogonErrorInfo",
         "MonitoredDesktop",
         "NotifyIconCreate",
         "NotifyIconDelete",

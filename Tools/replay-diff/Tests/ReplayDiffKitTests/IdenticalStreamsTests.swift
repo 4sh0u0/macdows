@@ -82,11 +82,34 @@ enum PhaseSamples {
             .deletingLastPathComponent() // -> replay-diff/
             .deletingLastPathComponent() // -> Tools/
             .deletingLastPathComponent() // -> repo root
-            .appendingPathComponent("samples/phase05-rail-events-2026-08-19", isDirectory: true)
+            .appendingPathComponent("samples/phase05-rail-events-2026-09-21-2x", isDirectory: true)
     }
 
     static func url(named name: String) -> URL? {
         let url = directory.appendingPathComponent("\(name).jsonl")
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
+
+    /// The retired 1x capture directory (U-7 rebaseline, 2026-09-21). Kept addressable for
+    /// the one experiment whose pinned numbers — and the runtime CASCADE note that quotes
+    /// them — were measured on that corpus and have not been re-measured on the 2x one.
+    /// Resolved by path only; `$SAMPLES_DIR` deliberately does not reach it.
+    static var legacy1xDirectory: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // -> ReplayDiffKitTests/
+            .deletingLastPathComponent() // -> Tests/
+            .deletingLastPathComponent() // -> replay-diff/
+            .deletingLastPathComponent() // -> Tools/
+            .deletingLastPathComponent() // -> repo root
+            .appendingPathComponent("samples/phase05-rail-events-2026-08-19", isDirectory: true)
+    }
+
+    static func legacy1xURL(named name: String) -> URL? {
+        let url = legacy1xDirectory.appendingPathComponent("\(name).jsonl")
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    /// All six retired 1x captures are present — the gate for the legacy-corpus experiment,
+    /// so deleting the retired directory makes it skip visibly instead of failing.
+    static let legacy1xAvailable: Bool = names.allSatisfy { legacy1xURL(named: $0) != nil }
 }
