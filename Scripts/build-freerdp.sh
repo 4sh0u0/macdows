@@ -396,7 +396,22 @@ fi
 # so an absolute link target is protected too (r2 m-7).
 CURRENT_TARGET=""
 [ -L "$CURRENT_LINK" ] && CURRENT_TARGET="$(basename "$(readlink "$CURRENT_LINK")")"
-mapfile -t OLD_CONFIGS < <(
+# A `read` loop, not `mapfile -t`: mapfile is a bash 4 builtin and macOS ships bash 3.2 as
+# /bin/bash, so on a stock macOS this line was `mapfile: command not found` -> exit 127, AFTER
+# a completely successful build (found on Tier 2's first run, 2026-09-21; every local run had
+# survived it only because a maintainer's Mac has Homebrew's bash 5 ahead of /bin/bash on PATH).
+# This is the only bash-4-only construct in the whole bootstrap chain, and a build script for a
+# macOS-only product has no business needing a newer shell than the platform ships.
+#
+# A directory name that contained a newline would split into two entries here where mapfile
+# would also have split it: these are config-hash directories this script creates itself
+# (16 hex characters), so the case does not arise -- and the `[ -n "$old" ]` guard below plus
+# `rm -rf` on a non-existent path make a split entry harmless rather than dangerous.
+OLD_CONFIGS=()
+while IFS= read -r old_config; do
+	[ -n "$old_config" ] || continue
+	OLD_CONFIGS+=("$old_config")
+done < <(
 	find "$CRDP_BUILD_DIR/freerdp" -mindepth 1 -maxdepth 1 -type d ! -name "$CONFIG_HASH" ${CURRENT_TARGET:+! -name "$CURRENT_TARGET"} -print0 \
 		| xargs -0 -I{} stat -f '%m%t%N' {} 2>/dev/null \
 		| sort -rn -t"$(printf '\t')" -k1,1 \
