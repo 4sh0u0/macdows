@@ -2750,6 +2750,40 @@ enum WindowSmokeGateSelfTest {
             "gfxQueueLineReportsTheControlLaneDropCountPerPhase: [gfx-queue] is the session-wide count of control events the ring dropped, printed once per phase ahead of that phase's per-window rows -- dropped=0 is what rules out the one hazard the per-surface rows cannot see (a lost .surfaceMapped would make a later frame look unmapped), and it is a queue property, so it carries no window or surface id"
         )
 
+        // MARK: - the pre-leg baseline line (pre-registration gate r1 B1)
+
+        var baseline = LatestRailSize()
+        baseline.record(windowId: 4711, fieldFlags: 0x0400 | 0x0800, windowWidth: 522, windowHeight: 514)
+        let baselineOneLine = baseline.baselineLine(forWindowId: 4711)
+        expect(
+            baselineOneLine == "[move-resize] baseline RAIL geometry: windowId=4711 "
+                + "windowWidth=522 windowHeight=514 source=last-order"
+                && !baselineOneLine.contains("\n"),
+            "baselineLineIsOneFrozenLine: the pre-leg baseline is ONE line whose field order and spelling are frozen -- `[move-resize] baseline RAIL geometry: windowId=<id> windowWidth=<w> windowHeight=<h> source=<last-order|none>`, no newline inside it, so a run that locks a target once contributes exactly one such line to the evidence log (the single print site is pinned as source in Scripts/test-window-smoke-pins.sh, together with its position between the id assignment and startMoveLeg)"
+        )
+
+        var baselineUnseen = LatestRailSize()
+        baselineUnseen.record(windowId: 99, fieldFlags: 0x0800, windowWidth: 640, windowHeight: 480)
+        expect(
+            baselineUnseen.size(forWindowId: 4712) == nil
+                && baselineUnseen.size(forWindowId: 99) == nil
+                && baselineUnseen.baselineLine(forWindowId: 4712) == "[move-resize] baseline RAIL geometry: "
+                    + "windowId=4712 windowWidth=n/a windowHeight=n/a source=none",
+            "baselineLineSaysNoneWhenNoSizeOrderWasEverSeen: a window whose orders never carried WINDOW_ORDER_FIELD_WND_SIZE (0x400) has no recorded size at all -- an OFFSET-only order does not create one -- and the line reports `n/a`/`n/a` with `source=none` rather than a 0x0 that a reader could not tell apart from a genuine zero-sized reading"
+        )
+
+        var baselineSequence = LatestRailSize()
+        baselineSequence.record(windowId: 5, fieldFlags: 0x0400, windowWidth: 100, windowHeight: 200)
+        baselineSequence.record(windowId: 5, fieldFlags: 0x0800, windowWidth: 999, windowHeight: 888)
+        let afterOffsetOnly = baselineSequence.size(forWindowId: 5).map { "\($0.width)x\($0.height)" } ?? "nil"
+        baselineSequence.record(windowId: 5, fieldFlags: 0x0400 | 0x0800, windowWidth: 300, windowHeight: 400)
+        expect(
+            afterOffsetOnly == "100x200"
+                && baselineSequence.baselineLine(forWindowId: 5) == "[move-resize] baseline RAIL geometry: "
+                    + "windowId=5 windowWidth=300 windowHeight=400 source=last-order",
+            "baselineLineTakesTheLastSizeBearingOrder: across a sequence the recorded size is the LAST order that actually carried the SIZE bit -- an OFFSET-only order in between neither overwrites it with its own (meaningless, unflagged) windowWidth/windowHeight nor erases it, which is the same delta-order invariant WindowState.merge enforces; the final size-bearing order then replaces it"
+        )
+
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
         // rev-L9 M-4: `Scripts/run-window-smoke.command:192-193` records `DONE exit=<rc>` via `launcher_done` and its callers
         // read that line as the whole verdict. A `WINDOW_SMOKE_SELFTEST=1` leaked into the
@@ -4150,6 +4184,54 @@ private enum SC {
     static let close: UInt16 = 0xF060
 }
 
+/// The last SIZE-bearing RAIL order's `windowWidth`/`windowHeight`, per window id -- and the one
+/// line the move/resize scenario prints from it.
+///
+/// WHY IT EXISTS (pre-registration gate r1 B1, 2026-09-21): the `[move-resize] raw RAIL geometry`
+/// line is printed only for the ALREADY LOCKED target (`event.windowId == moveResizeWindowId`),
+/// and that variable is assigned immediately before `startMoveLeg`, so nothing in an evidence log
+/// states the target's RAIL size BEFORE its first leg. A verdict that has to compare "size after
+/// the leg" against "size before the leg" therefore had no before. This records every window's
+/// last reported size as the orders arrive, and the scenario prints the target's exactly once, at
+/// the moment it locks.
+///
+/// MEASUREMENT ONLY: nothing branches on this, no gate reads it, no exit code depends on it.
+///
+/// WHERE THE RECORDING HAPPENS, and why it is not beside `latestRailSizeElapsed`: that sibling is
+/// updated inside the raw-geometry block, which is itself gated on the locked target, so a table
+/// filled there would still be empty at lock time and the line would read `source=none` on every
+/// real run -- the exact hole this addition exists to close. It is recorded in the drain closure
+/// instead, where every event for every window passes, under the same SIZE-bit condition and with
+/// no conversion of any kind.
+struct LatestRailSize {
+    private var sizes: [UInt32: (width: Int, height: Int)] = [:]
+
+    /// Records `event`'s size ONLY when its field flags actually carry
+    /// `WINDOW_ORDER_FIELD_WND_SIZE`. A delta order's unset bit means "unchanged", never "reset":
+    /// an OFFSET-only order that arrives between two size-bearing ones must not erase or
+    /// overwrite what the earlier one said (self-check (c)).
+    mutating func record(windowId: UInt32, fieldFlags: UInt32, windowWidth: UInt32, windowHeight: UInt32) {
+        guard fieldFlags & RailComparison.OrderField.wndSize != 0 else { return }
+        sizes[windowId] = (width: Int(windowWidth), height: Int(windowHeight))
+    }
+
+    func size(forWindowId windowId: UInt32) -> (width: Int, height: Int)? { sizes[windowId] }
+
+    /// THE FROZEN LINE SYNTAX. Field order and spelling are quoted verbatim by this lane's
+    /// pre-registration, so neither may drift: `source=` takes exactly two values, `last-order`
+    /// when a size-bearing order was seen for this window and `none` when none ever was -- in
+    /// which case both dimensions read `n/a` rather than a zero that would be indistinguishable
+    /// from a real 0x0 reading.
+    func baselineLine(forWindowId windowId: UInt32) -> String {
+        guard let size = size(forWindowId: windowId) else {
+            return "[move-resize] baseline RAIL geometry: windowId=\(windowId) "
+                + "windowWidth=n/a windowHeight=n/a source=none"
+        }
+        return "[move-resize] baseline RAIL geometry: windowId=\(windowId) "
+            + "windowWidth=\(size.width) windowHeight=\(size.height) source=last-order"
+    }
+}
+
 @MainActor
 final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private let host: String
@@ -4677,6 +4759,9 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// When the last size-bearing RAIL order (WINDOW_ORDER_FIELD_WND_SIZE, 0x400) arrived, per window -- the
     /// accumulated size itself carries no timestamp, so this is what dates it (review railcmp-r2 m-4).
     private var latestRailSizeElapsed: [UInt32: TimeInterval] = [:]
+    /// The last SIZE-bearing order's dimensions per window -- see `LatestRailSize`'s own doc
+    /// comment for why this is recorded in the drain closure rather than beside the line above.
+    private var latestRailSize = LatestRailSize()
     private var windowStyleBits: [UInt32: UInt32] = [:]
     /// W3 route B step 1: window ids whose `[client-rect]` line has already been printed for their
     /// FIRST WindowCreate. A window can be re-created within one session (`windowCreateTimestamps`'
@@ -5383,6 +5468,15 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         _ = session.drainEvents { [weak self] event in
             guard let self else { return }
             registry.handle(event)
+            // Every window, every order, before any scenario gate -- the baseline line needs the
+            // target's size from BEFORE it was locked (`LatestRailSize`'s doc comment). Reads two
+            // event fields under one flag test and converts nothing.
+            if event.kind == .windowCreate || event.kind == .windowUpdate {
+                self.latestRailSize.record(
+                    windowId: event.windowId, fieldFlags: event.fieldFlags,
+                    windowWidth: event.windowWidth, windowHeight: event.windowHeight
+                )
+            }
             if event.kind == .frameReady {
                 self.frameReadyCount += 1
                 sawFrameReady = true
@@ -6908,6 +7002,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             moveResizeWindowId = w.windowId
+            // Exactly one baseline line per run, printed AFTER the id is locked (so it names the
+            // window this run will actually move) and BEFORE the first leg is sent (so the size
+            // it reports is genuinely pre-leg). Both halves of that sandwich are pinned as
+            // source in `Scripts/test-window-smoke-pins.sh`.
+            print(latestRailSize.baselineLine(forWindowId: w.windowId))
             startMoveLeg(session: session, windowId: w.windowId, window: window, title: w.title, round: 1, registry: registry)
 
         case .awaitingMoveSettle(let windowId, let target, let sentAt):
@@ -6927,9 +7026,27 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 // this is the one-line summary confirming whether it actually changed
                 // between lock and resolve, without requiring a reader to diff every prior
                 // line by hand.
+                //
+                // THE WORDING WAS A VERDICT AND IS NOT ONE ANY MORE (adr/0018 §5.2 增补五).
+                // This line used to call a mid-leg size change "server prerogative, not a
+                // client request", which named a cause. The 2026-09-21 tracking batch's D2
+                // found a client-side one for the most common instance of it: the client was
+                // sending the visible (ef) SIZE in the wr slot, so the server shrank the
+                // window by the frame on every leg -- exactly a size change this line would
+                // have attributed to the server. Measurement lines do not decide causes, so
+                // this one now says only that the change happened and when. Nothing else
+                // changes: it is still MEASUREMENT ONLY, still outside every gate, and the
+                // run's exit code does not read it.
+                //
+                // THE LITERAL CHANGED ON 2026-09-21, IN THIS (H2') FIX LANE. The previous
+                // literal -- the one ending `(server prerogative, not a client request)` -- is
+                // what the frozen `winsize` pre-registration's L4 clause quotes verbatim, and
+                // what that batch's record copied. Anyone reproducing L4 against a build from
+                // this lane onward will not find that string: it is a historical value, and a
+                // new pre-registration must quote the text above instead of copying L4's.
                 print(
                     "[move-resize] INFO: GFX-mapped size changed during the move leg "
-                        + "(server prerogative, not a client request): "
+                        + "(registered, not judged): "
                         + "\(Int(originalMapped.width))x\(Int(originalMapped.height)) -> "
                         + "\(Int(mapped.width))x\(Int(mapped.height))"
                 )

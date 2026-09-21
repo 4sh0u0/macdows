@@ -402,8 +402,207 @@ extension WindowGeometry {
     /// half of the trigger still outstanding (§3 item 5, §8.5). What F-R1 changed is the
     /// *other* variable: the border was found to move with the window STYLE on a fixed DPI,
     /// which is why the value is now a function rather than a recorded constant.
+    ///
+    /// THE "DOES NOT TOUCH WIDTH/RIGHT" PARAGRAPH ABOVE IS SUPERSEDED (adr/0018 §5.2 增补五).
+    /// It is left standing as the record of what the evidence supported at the time -- "no
+    /// matching evidence, and a symmetric guess would contradict the size correction's sign" was
+    /// an accurate reading of the 2026-08 data. Host-side `GetWindowRect` /
+    /// `DWMWA_EXTENDED_FRAME_BOUNDS` pairs supplied the missing measurement, ONE ROW PER CELL
+    /// of the table below (n=1 per cell; only the `WS_THICKFRAME` @96 cell has a second source
+    /// -- see `clientWindowMoveRect`'s own comment for the rows), and the right/bottom outset
+    /// now lives in
+    /// `clientWindowMoveRect(fromVisibleRect:measuredBorder:)`, which delegates its LEFT edge to
+    /// this function unchanged. THIS function still does exactly one subtraction, on one edge.
     public static func clientWindowMoveLeft(fromVisibleLeft visibleLeft: Double, measuredLeftBorder: Double) -> Double {
         visibleLeft - measuredLeftBorder
+    }
+
+    /// The four edges of one `ClientWindowMove`, in Windows space -- the shape
+    /// `clientWindowMoveRect(fromVisibleRect:measuredBorder:)` returns.
+    ///
+    /// A named type rather than a tuple because the caller narrows all four to `Int32` and
+    /// hands them to a RECT-shaped wire call (`CRSession.sendWindowMove`), where two `Double`s
+    /// of the same magnitude are exactly the kind of thing that gets swapped; and because
+    /// `left`/`right` are edge COORDINATES, not an origin plus a size -- the distinction
+    /// `WindowsRect` cannot make and that this whole finding turns on.
+    ///
+    /// UNIT: **remote pixels**, the same domain `WindowsRect` is in.
+    public struct ClientWindowMoveRect: Equatable, Sendable {
+        public var left: Double
+        public var top: Double
+        public var right: Double
+        public var bottom: Double
+
+        public init(left: Double, top: Double, right: Double, bottom: Double) {
+            self.left = left
+            self.top = top
+            self.right = right
+            self.bottom = bottom
+        }
+    }
+
+    /// The whole outbound rect, from the window's VISIBLE (extended-frame, "ef") rect: the sent
+    /// rect is the visible rect OUTSET by `(B, 0, B, B)` -- adr/0018 §5.2 增补五.
+    ///
+    /// WHAT THIS CORRECTS, and the evidence for it. `clientWindowMoveLeft` above has always
+    /// deducted `B` from the left edge alone, on its own three-run send/echo evidence; the doc
+    /// comment there states, in the paragraph beginning "Also deliberately does NOT touch
+    /// width/right", that no matching evidence existed for the right edge and that a symmetric
+    /// guess would contradict the size correction's sign. **That paragraph is now out of date on
+    /// the facts** (it is kept where it stands as the record of what was known then): the
+    /// 2026-09-21 `winsize` tracking batch read the host's own `GetWindowRect` (wr) and
+    /// `DWMWA_EXTENDED_FRAME_BOUNDS` (ef) for the same window in the same tick and
+    /// differenced them edge by edge -- ONE PROBE ROW PER CELL, **n=1 per cell**, from batch
+    /// `winsize-20260921` (docs record §3.6): About `(7,0,7,7)` @96 (`wr=115,102,737,616`
+    /// `ef=122,102,730,609`) and `(11,0,11,11)` @192 (`wr=41,0,1291,918` `ef=52,0,1280,907`);
+    /// `WS_THICKFRAME` `(5,0,5,5)` @96 (`wr=147,30,1151,745` `ef=152,30,1146,740`) and
+    /// `(10,0,10,10)` @192 (`wr=1,1,1279,689` `ef=11,1,1269,679`). ONLY the THICKFRAME @96 cell
+    /// has a second, independent source -- the 2026-09-15 host-rect-keep record's own row for
+    /// that class (`wr=198,30,1198,743` `ef=203,30,1193,738`, the same `(5,0,5,5)`); the other
+    /// three cells stand on one row each, which is what "n=1 per cell" means here.
+    ///
+    /// THE RIGHT AND BOTTOM MEMBERS ARE BEING CONSUMED FOR THE FIRST TIME. Every earlier use of
+    /// this frame read its LEFT member only (which additionally carries the send/echo evidence
+    /// behind `clientWindowMoveLeft` -- three 2026-08-23 runs, F-R1's nine, C-2 run 4), and the
+    /// border table's own doc comments say in as many words that nothing consumed right/bottom.
+    /// This function is that first consumer, at n=1 per cell.
+    ///
+    /// A `ClientWindowMove` is landed by the server as the WR rect, so the
+    /// rect to send for a target visible rect is that visible rect outset by the same frame.
+    /// The "contradicts the size correction's sign" objection does not apply to this shape: the
+    /// outset is applied to `railRect(from:correction:)`'s OUTPUT (already back at ef size), not
+    /// to the correction, so the two compose rather than duplicate -- exactly the relationship
+    /// `displayRect`/`railRect` have inbound vs outbound.
+    ///
+    /// WHY IT MATTERED IN PRODUCTION (the same batch's D2, 14/14 legs including its 1x
+    /// controls): sending the ef WIDTH in the wr slot made the server land a window whose ef
+    /// rect was `(2B, B)` SMALLER than the one the user had just dragged, with `x` conserved --
+    /// i.e. every move leg shrank the window by one frame. With this outset the sent wr and the
+    /// server's landed ef agree, so a pure move sends back exactly the size it was given.
+    ///
+    /// THE TOP EDGE IS NOT OUTSET, and that is a reading rather than an omission: the frame's
+    /// top member measured **0** in every model this project has read (n=9 on the THICKFRAME
+    /// side via the F-R1 counter, n=1 on the About side via C-2 run 4's `(7,0,7,7)`, and both
+    /// 2026-09-15 host-rect batches at both tiers). It is also why this function still applies
+    /// no `K` (the client-area inset of the same ADR table, whose Y component is nonzero on the
+    /// About row): `K` has a different consumer and wiring it here would change 1x Y behaviour.
+    ///
+    /// `left` IS DELEGATED, not recomputed -- every measurement behind `clientWindowMoveLeft`
+    /// and behind the border table keeps applying byte for byte, which is what makes "1x `left`
+    /// and `top` are unchanged by this lane" a checkable claim rather than an intention.
+    ///
+    /// 1x IS **NOT** BYTE-IDENTICAL OVERALL, and saying so is part of the finding. The claim in
+    /// the paragraph above is scoped to `left`/`top` on purpose: `right` and `bottom` DO move at
+    /// 1x, deliberately, by +B each -- the wire width grows by 2B (About +14, `WS_THICKFRAME`
+    /// +10) and the wire height by B (+7 / +5). Seven pre-lane 1x pins state the old values and
+    /// are updated by this lane, one by one, declared in its gate (adr/0018 §5.2 增补五). What
+    /// IS byte-identical at 1x is rule R (tolerance 0) and the two axes above.
+    ///
+    /// `measuredBorder` IS THE SAME `B` the left edge already used:
+    /// `clientWindowMoveLeftBorder(forStyle:tier:)`'s four-cell lookup. This function takes it
+    /// as a parameter for the same reason `clientWindowMoveLeft` does -- the table is keyed on
+    /// the window's style and on what the session advertised, neither of which this package can
+    /// see -- so the one production call site derives it once and passes it in.
+    ///
+    /// UNIT: **remote pixels** in, remote pixels out. No Y flip and no point conversion happen
+    /// here; both are already done by the time this is called.
+    public static func clientWindowMoveRect(
+        fromVisibleRect visible: WindowsRect, measuredBorder border: Double
+    ) -> ClientWindowMoveRect {
+        ClientWindowMoveRect(
+            left: clientWindowMoveLeft(fromVisibleLeft: visible.x, measuredLeftBorder: border),
+            top: visible.y,
+            right: visible.x + visible.width + border,
+            bottom: visible.y + visible.height + border
+        )
+    }
+
+    /// RULE R (adr/0018 §5.2 增补五): one settled dimension, reported back as the server's own
+    /// last reported value when the two differ by no more than `rasterScale - 1` remote pixels.
+    ///
+    /// THE ARTEFACT IT EXISTS FOR. On a 2x session the same batch recorded an About-class window
+    /// whose RAIL `WINDOW_ORDER_FIELD_WND_SIZE` height was **917** remote px settling locally at
+    /// **918**: 917 / 2 = 458.5 mac points, and the local frame does not keep the half point, so
+    /// converting back multiplies a rounded 459 by 2. Without this rule a pure MOVE would send a
+    /// height one pixel different from the one the server reported, i.e. would ask for a resize
+    /// nobody performed.
+    ///
+    /// THE TOLERANCE IS `rasterScale - 1`, NOT `rasterScale`. One lost half point is worth
+    /// `rasterScale / 2` remote px, so the largest artefact at 2x is 1 px and the largest
+    /// genuine step a user can express is also the smallest nonzero one -- the two are
+    /// distinguishable only up to this bound, and the bound is chosen so that **at 1x it is
+    /// zero**: `1 - 1 == 0`, so no 1x session ever snaps and THIS RULE changes no 1x byte. That
+    /// claim is about this rule and nothing else -- the same lane's outset does deliberately
+    /// move 1x `right`/`bottom` by B (see `clientWindowMoveRect`). A tolerance of `rasterScale`
+    /// would swallow a real 1 px resize at 1x, which is the mutation
+    /// `ruleRSnapsOnlyWithinTolerance`'s 1x row exists to catch.
+    ///
+    /// `lastReported <= 0` NEVER SNAPS. `RemoteWindowRegistry.PendingWindowState.width/height`
+    /// are 0 for a window whose orders never carried the size field, and snapping to 0 would ask
+    /// the server to collapse the window -- the same fail-closed instinct the border table
+    /// follows for `style == 0`: never act on a value nobody reported.
+    ///
+    /// A NON-FINITE OR SUB-UNIT `rasterScale` IS TOLERANCE 0, for the same reason: NaN compares
+    /// false against everything, so an unguarded `abs(...) <= rasterScale - 1` would silently
+    /// never snap, and a scale below 1 would produce a NEGATIVE tolerance whose behaviour reads
+    /// as an accident rather than as a decision. Both are written down as "no snap" instead.
+    ///
+    /// WHAT IT CANNOT SEE, registered rather than papered over: this seam compares a settled
+    /// dimension against the last dimension the server reported, and cannot tell "the user moved
+    /// the window and AppKit lost a half point" from "the server resized the window by 1 px and
+    /// this client has not applied it yet". Both are within tolerance and both resolve to the
+    /// server's value -- which is the harmless direction for the second case (the client is
+    /// agreeing with the server about a size the server itself chose) and the correct one for
+    /// the first. A leg that resizes by more than the tolerance is never affected.
+    ///
+    /// AND A THIRD CASE, WHICH IS A REAL COST RATHER THAN AN AMBIGUITY: on a 2x session a
+    /// GENUINE 1-remote-pixel resize is absorbed by this rule. It is representable there --
+    /// `rasterScale == 2` means a 2x backing store, NSWindow frames align to that grid, so a
+    /// 0.5 pt step (= 1 remote px) is a frame a user or a programmatic resize can actually land
+    /// on -- and it is exactly the magnitude the artefact occupies, so the two are not
+    /// separable by this seam at all. Accepted as a known cost per adr/0018 §5.2 增补五; the
+    /// alternative on the table (snap only when the settled size equals the last APPLIED size)
+    /// needs a state field this lane does not add. `ruleRSnapsOnlyWithinTolerance`'s S1 row is
+    /// the pin for precisely this input -- it reads as "the artefact is absorbed", and it is the
+    /// same input a genuine one-pixel 2x resize would present.
+    ///
+    /// UNIT: **remote pixels** for `local` and `lastReported`; `rasterScale` is remote pixels
+    /// per mac point (`DisplayTopology.rasterScale`), and appears here only as the width of the
+    /// rounding artefact it can produce.
+    public static func snapToLastReportedDimension(
+        local: Double, lastReported: Double, rasterScale: Double
+    ) -> Double {
+        guard lastReported > 0 else { return local }
+        let tolerance = (rasterScale.isFinite && rasterScale >= 1) ? rasterScale - 1 : 0
+        return abs(local - lastReported) <= tolerance ? lastReported : local
+    }
+
+    /// Rule R applied to a whole visible rect: each axis decided on its own by
+    /// `snapToLastReportedDimension`, the origin untouched.
+    ///
+    /// Two axes, two independent decisions -- a leg that genuinely resized the width while the
+    /// height only lost a half point keeps the real width change and snaps only the height.
+    ///
+    /// The ORIGIN is never snapped. Rule R is about the size the server reported
+    /// (`WINDOW_ORDER_FIELD_WND_SIZE`); the position a user just dragged to is the one thing on
+    /// this path that is genuinely client-authoritative, and the same "lost half point" argument
+    /// would, applied to `x`/`y`, pin a window to where the server last saw it.
+    ///
+    /// Taking the rect (rather than letting the caller destructure it) is what keeps the
+    /// outbound size out of the call site's own arithmetic: `RemoteWindowRegistry
+    /// .handleLocalGeometrySettled` hands this function the rect and hands the result to
+    /// `clientWindowMoveRect`, and never names a width or a height of its own -- pinned as
+    /// source in `RemoteWindowRegistryOutboundRectPinTests`.
+    public static func snappedToLastReportedSize(
+        _ visible: WindowsRect, lastReportedWidth: Double, lastReportedHeight: Double, rasterScale: Double
+    ) -> WindowsRect {
+        WindowsRect(
+            x: visible.x, y: visible.y,
+            width: snapToLastReportedDimension(
+                local: visible.width, lastReported: lastReportedWidth, rasterScale: rasterScale),
+            height: snapToLastReportedDimension(
+                local: visible.height, lastReported: lastReportedHeight, rasterScale: rasterScale)
+        )
     }
 
     /// The left inset the server applies to a sent `ClientWindowMove` (modelled as DWM's

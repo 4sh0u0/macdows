@@ -2190,12 +2190,15 @@ final class RemoteWindowRegistry {
     /// 2026-08-23: this method used to receive and convert the raw frame directly, which was
     /// off by exactly this window's chrome insets once W2 gave it a native titlebar). RAIL's
     /// own `RAIL_WINDOW_MOVE_ORDER`/`crdpq_cmd_window_move_t` are RECT-shaped (left/top/
-    /// right/bottom), not x/y/width/height -- `right`/`bottom` are derived here, at this one
-    /// call site, rather than trusting `CRSession.sendWindowMove` to do that arithmetic (see
-    /// that method's own doc comment for why its signature is shaped to make that mistake
-    /// impossible to reintroduce elsewhere). Values are rounded, not truncated, before
-    /// narrowing to `Int32` -- an unrounded truncation would systematically bias every
-    /// settled rect's right/bottom edge down-and-left by up to 1pt.
+    /// right/bottom), not x/y/width/height -- all four edges are derived at this one call
+    /// site, rather than trusting `CRSession.sendWindowMove` to do that arithmetic (see that
+    /// method's own doc comment for why its signature is shaped to make that mistake impossible
+    /// to reintroduce elsewhere). Since adr/0018 §5.2 增补五 the derivation itself is a pure
+    /// MacdowsCore function (`WindowGeometry.clientWindowMoveRect`) and this site contributes no
+    /// arithmetic of its own to any edge; what stays here is the field plumbing and the two
+    /// lookups that need session state. Values are rounded, not truncated, before narrowing to
+    /// `Int32` -- an unrounded truncation would systematically bias every settled rect's
+    /// right/bottom edge down-and-left by up to 1pt.
     ///
     /// Second real-host regression (2026-08-23, W3 round 2 -> round 3): `contentRect` is the
     /// DISPLAYED (GFX-mapped-size) rect (see `macContentRect(for:windowId:)`'s own doc
@@ -2229,14 +2232,38 @@ final class RemoteWindowRegistry {
         let state = geometry[windowId] ?? PendingWindowState()
         let correction = sizeCorrection(for: state, windowId: windowId)
         let railWindowsRect = WindowGeometry.railRect(from: displayedWindowsRect, correction: correction)
-        // Team-lead review round 5 (2026-08-23): `railWindowsRect.x` above is the VISIBLE
-        // left -- `ClientWindowMove`'s own `left` needs the additional, asymmetric,
-        // outbound-only border correction `WindowGeometry.clientWindowMoveLeft`'s own doc
-        // comment works the full algebra for. `right` shifts by the same amount as a direct
-        // consequence of `left` shifting while `railWindowsRect.width` itself is untouched --
-        // see that function's own doc comment for why width/right are deliberately NOT also
-        // adjusted (no matching evidence, and a naive symmetric-border guess for width would
-        // actually contradict the already-validated size-correction sign).
+        // Team-lead review round 5 (2026-08-23): the rect above is this window's VISIBLE
+        // (extended-frame, "ef") rect -- `ClientWindowMove` carries the window's OUTER (wr)
+        // rect, so every edge needs the asymmetric, outbound-only border correction
+        // `WindowGeometry.clientWindowMoveLeft`'s own doc comment works the algebra for on the
+        // left edge.
+        //
+        // ALL FOUR EDGES, NOT JUST `left` (adr/0018 §5.2 增补五). This block used to say that
+        // width/right were deliberately NOT adjusted -- "no matching evidence, and a naive
+        // symmetric-border guess for width would contradict the already-validated
+        // size-correction sign". The first half has been answered and the second does not apply
+        // to this shape:
+        //   * ANSWERED: the 2026-09-21 tracking batch read the host's own `GetWindowRect` (wr)
+        //     and `DWMWA_EXTENDED_FRAME_BOUNDS` (ef) for the same window in the same tick and
+        //     differenced them edge by edge -- ONE PROBE ROW PER CELL of the border table,
+        //     n=1 per cell (batch `winsize-20260921`, docs record §3.6): About `(7,0,7,7)` @96
+        //     and `(11,0,11,11)` @192, `WS_THICKFRAME` `(5,0,5,5)` @96 and `(10,0,10,10)` @192.
+        //     Only the THICKFRAME @96 cell has a second, independent source (the 2026-09-15
+        //     host-rect-keep record's own row for that class). The rows themselves and the
+        //     right/bottom members' own n are in `WindowGeometry.clientWindowMoveRect`'s doc
+        //     comment -- this lane is the FIRST consumer of those two members.
+        //     The frame is `(B, 0, B, B)` -- the SAME B the left edge already deducts, and a top
+        //     member of 0. So the rect to send is the visible rect outset by `(B, 0, B, B)`.
+        //   * DOES NOT APPLY: the outset lands on `railRect(from:correction:)`'s OUTPUT, which
+        //     is already back at ef size, so it composes with the size correction exactly the
+        //     way the inbound `displayRect` does rather than re-litigating its sign.
+        // What the old shape actually sent was the ef SIZE in the wr slot (`right` was
+        // `correctedLeft` plus the visible width, `bottom` the visible top plus the visible
+        // height), so the server landed every move/resize leg's window (2B, B) smaller than the
+        // one the user had just dragged, with x conserved -- the same batch's D2, on 14/14 legs
+        // including its 1x controls. The assembly is one pure function now and this site names
+        // no edge arithmetic at all, which is pinned as source in
+        // `RemoteWindowRegistryOutboundRectPinTests`.
         //
         // F6 (a), the 2026-09-05 per-style lane on F-R1 (found 2026-09-02): HOW MUCH is deducted
         // is not one constant -- it is a
@@ -2266,17 +2293,36 @@ final class RemoteWindowRegistry {
                 "[geometry] left-border tier fallback: advertised desktop scale \(advertised, privacy: .public) is not 100/200, using the 96 DPI row"
             )
         }
-        let correctedLeft = WindowGeometry.clientWindowMoveLeft(
-            fromVisibleLeft: railWindowsRect.x,
-            measuredLeftBorder: Self.clientWindowMoveLeftBorder(
-                forStyle: state.style,
-                tier: WindowGeometry.DPITier(advertisedDesktopScaleFactor: advertised)
-            )
+        let border = Self.clientWindowMoveLeftBorder(
+            forStyle: state.style,
+            tier: WindowGeometry.DPITier(advertisedDesktopScaleFactor: advertised)
         )
-        let left = Int32(correctedLeft.rounded())
-        let top = Int32(railWindowsRect.y.rounded())
-        let right = Int32((correctedLeft + railWindowsRect.width).rounded())
-        let bottom = Int32((railWindowsRect.y + railWindowsRect.height).rounded())
+        // RULE R (adr/0018 §5.2 增补五), after the size correction and before the outset: a
+        // settled dimension within `rasterScale - 1` remote px of the one the server itself last
+        // reported IS that one. `state.width/height` are the last `WINDOW_ORDER_FIELD_WND_SIZE`
+        // this window carried -- the same one-read `state` the border lookup above uses -- and
+        // the artefact the rule exists for is a local frame that lost a half point (a 917
+        // remote-px height is 458.5 points at `rasterScale == 2`, and AppKit keeps 459). Without
+        // it a pure MOVE at 2x would ask the server for a one-pixel resize nobody performed. The
+        // rule's own doc comment carries the tolerance argument, the cases it refuses to snap,
+        // and the genuine 1-remote-px 2x resize it knowingly absorbs. At `rasterScale == 1` the
+        // tolerance is 0, so THIS RULE changes no byte on a 1x session -- said of the rule and
+        // not of the lane: the outset above deliberately moves 1x `right`/`bottom` by B (wire
+        // width +2B, wire height +B), and the seven pre-lane 1x pins that stated the old values
+        // are updated and declared one by one in this lane's gate.
+        let settledVisibleRect = WindowGeometry.snappedToLastReportedSize(
+            railWindowsRect,
+            lastReportedWidth: Double(state.width),
+            lastReportedHeight: Double(state.height),
+            rasterScale: topology.rasterScale
+        )
+        let sent = WindowGeometry.clientWindowMoveRect(
+            fromVisibleRect: settledVisibleRect, measuredBorder: border
+        )
+        let left = Int32(sent.left.rounded())
+        let top = Int32(sent.top.rounded())
+        let right = Int32(sent.right.rounded())
+        let bottom = Int32(sent.bottom.rounded())
         session.sendWindowMove(windowId, left: left, top: top, right: right, bottom: bottom)
         // Team-lead review round 4 (2026-08-23): a MacdowsCoreTests-level offline
         // reproduction of this exact call's own math (using this round's real-host numbers)

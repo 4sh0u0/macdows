@@ -116,9 +116,21 @@ struct RemoteWindowRegistryLeftBorderTests {
     /// A fixture layout, not this machine's: one 1920x1080 1x primary. Injected through the
     /// registry's existing provider parameter, so nothing here reads `NSScreen`.
     private static func fixtureTopology() throws -> DisplayTopology {
+        try fixtureTopology(rasterScale: 1)
+    }
+
+    /// The same fixture layout at a chosen raster scale -- what rule R's cases need, since the
+    /// rule's tolerance is `rasterScale - 1` and is therefore identically zero on the 1x layout
+    /// every other case in this suite uses. Still a fixture and still injected: nothing here
+    /// reads `NSScreen`, and the scale the REGISTRY converts with is this one, not the real
+    /// display's (the windows themselves are ordinary AppKit windows on whatever screen the test
+    /// host has -- which is exactly why every expectation below is derived from the settled
+    /// content rect that is read back, never from an assumed one).
+    private static func fixtureTopology(rasterScale: Double) throws -> DisplayTopology {
         let display = DisplayTopology.Display(
             origin: MacPoint(x: 0, y: 0), size: MacSize(width: 1920, height: 1080),
-            scale: DisplayScale(remotePixelsPerPoint: 1, backingPixelsPerPoint: 1), isPrimary: true
+            scale: DisplayScale(remotePixelsPerPoint: rasterScale, backingPixelsPerPoint: rasterScale),
+            isPrimary: true
         )
         return try #require(DisplayTopology(displays: [display]))
     }
@@ -140,7 +152,18 @@ struct RemoteWindowRegistryLeftBorderTests {
     /// nothing was advertised, which is why the two pre-tier cases above go through the
     /// zero-argument spelling and keep their expectations unchanged.
     private static func makeRegistry(advertisedDesktopScaleFactor: UInt32) throws -> (RemoteWindowRegistry, SentBox) {
-        let topology = try fixtureTopology()
+        try makeRegistry(advertisedDesktopScaleFactor: advertisedDesktopScaleFactor, topology: fixtureTopology())
+    }
+
+    /// The same harness over a chosen topology -- rule R's own cases need a 2x one. The two
+    /// scales are deliberately SEPARATE arguments: `advertisedDesktopScaleFactor` is what the
+    /// server was told (it picks the border column) and the topology's `rasterScale` is what
+    /// this client converts with (it sets rule R's tolerance). The product pairs them, and the
+    /// cases below pass the paired values; keeping them apart is what lets a future case break
+    /// the pairing the way the fixture's own `none` knob does on a live 2x session.
+    private static func makeRegistry(
+        advertisedDesktopScaleFactor: UInt32, topology: DisplayTopology
+    ) throws -> (RemoteWindowRegistry, SentBox) {
         let session = CRSession(host: "", user: "", password: "", program: "")
         session.advertisedDesktopScaleFactor = advertisedDesktopScaleFactor
         let registry = RemoteWindowRegistry(
@@ -167,6 +190,37 @@ struct RemoteWindowRegistryLeftBorderTests {
         var frame = window.frame
         frame.origin.x = originX
         window.setFrame(frame, display: false)
+        return window.contentRect(forFrameRect: window.frame)
+    }
+
+    /// Sets this window's CONTENT height and returns the content rect AppKit actually settled on
+    /// -- rule R's cases need a content height they chose, because the artefact the rule exists
+    /// for is precisely a content dimension that no longer converts back to the size the server
+    /// reported. Goes through `frameRect(forContentRect:)` so no assumption about this window's
+    /// titlebar height is baked in, and the caller asserts the returned height rather than
+    /// trusting it: AppKit may constrain a frame, and a constrained one must fail the case
+    /// loudly instead of quietly changing what is being measured.
+    ///
+    /// `-setFrame:display:` that changes the SIZE posts `didResize`, which feeds the same
+    /// trailing-edge debounce `didMove` does (`RemoteWindow.handleLocalGeometryChanged`), so
+    /// this settles exactly like the move helper above.
+    ///
+    /// THE ORIGIN IS MOVED TOO, and that is load-bearing rather than incidental: AppKit posts
+    /// neither notification for a `setFrame:` that changes nothing, and the height this is
+    /// called with may be the height the window already has -- a window created from a RAIL size
+    /// of 917 remote px at `rasterScale == 2` is 458.5 points tall, which AppKit does not keep,
+    /// so it may ALREADY have settled on 459 before this is called. Without the move, that case
+    /// silently records no send at all and the test fails as a timeout instead of as an
+    /// assertion (observed, first run of this case). It also makes the fixture the shape the
+    /// rule is about: a MOVE leg on a window whose local height no longer converts back to the
+    /// size the server reported.
+    private static func moveAndResizeAndReadSettledContentRect(
+        _ window: NSWindow, toOriginX originX: CGFloat, toContentHeight height: CGFloat
+    ) -> NSRect {
+        var content = window.contentRect(forFrameRect: window.frame)
+        content.origin.x = originX
+        content.size.height = height
+        window.setFrame(window.frameRect(forContentRect: content), display: false)
         return window.contentRect(forFrameRect: window.frame)
     }
 
@@ -223,10 +277,15 @@ struct RemoteWindowRegistryLeftBorderTests {
         // Stated as the signed delta too: this is the one number a swapped/inverted style rule
         // gets backwards while both absolute values still "look like a border deduction".
         #expect(thickFrameMove.left - aboutMove.left == 2)
-        // `right` moves with `left` (same width), and `top`/`bottom` are untouched by the style.
-        #expect(thickFrameMove.right - aboutMove.right == 2)
+        // INTENTIONAL UPDATE, adr/0018 §5.2 增补五: `right` and `bottom` are now the visible
+        // edges OUTSET by the same B, so they move OPPOSITE to `left` -- the THICKFRAME window
+        // (B=5) lands 2 SHORT of the About one (B=7) on both, where before the fix `right`
+        // trailed `left` by +2 and `bottom` was identical. `top` is still untouched (the frame's
+        // top member is 0 in every measured model), and the sign flip is the whole point: a call
+        // site that did not adopt the outset still reports +2 and 0 here.
+        #expect(thickFrameMove.right - aboutMove.right == -2)
         #expect(thickFrameMove.top == aboutMove.top)
-        #expect(thickFrameMove.bottom == aboutMove.bottom)
+        #expect(thickFrameMove.bottom - aboutMove.bottom == -2)
     }
 
     /// The unknown-style case, on the wire: a window whose orders never carried
@@ -284,12 +343,14 @@ struct RemoteWindowRegistryLeftBorderTests {
         #expect(Double(thickFrameMove.left) == (contentX - WindowGeometry.thickFrameClientWindowMoveLeftBorder192).rounded())
         #expect(Double(aboutMove.left) == (contentX - WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder192).rounded())
         #expect(thickFrameMove.left - aboutMove.left == 1)
-        // The tier is a LEFT-border axis only: `right` still moves with `left`, and Y is
-        // untouched -- the ADR table's K (whose Y component is nonzero even at 96 DPI) is
-        // deliberately not wired into this leg.
-        #expect(thickFrameMove.right - aboutMove.right == 1)
+        // INTENTIONAL UPDATE, adr/0018 §5.2 增补五: same sign flip as the 96-column case, one
+        // column over -- B=10 vs B=11 puts the THICKFRAME window 1 SHORT on `right` and on
+        // `bottom` (before the fix: +1 and 0). Y is still untouched: the ADR table's K (whose Y
+        // component is nonzero even at 96 DPI) is deliberately not wired into this leg, and the
+        // outset's own top member is 0.
+        #expect(thickFrameMove.right - aboutMove.right == -1)
         #expect(thickFrameMove.top == aboutMove.top)
-        #expect(thickFrameMove.bottom == aboutMove.bottom)
+        #expect(thickFrameMove.bottom - aboutMove.bottom == -1)
     }
 
     /// 1x BYTE-IDENTITY at the call site, said explicitly rather than inferred from the two
@@ -354,8 +415,10 @@ struct RemoteWindowRegistryLeftBorderTests {
     /// public conversions the registry uses, at BOTH tiers. A Y inset applied at either tier
     /// fails that absolute check; one applied at BOTH tiers (the mutation a cross-tier equality
     /// alone would sleep through) fails it too. The left axis is asserted in the same breath, so
-    /// the case also says what DOES change: `left` by 4 (11 - 7) and `right` with it, while the
-    /// width on the wire is identical.
+    /// the case also says what DOES change: `left` by 4 (11 - 7), and -- since adr/0018 §5.2
+    /// 增补五 -- `right`/`bottom` by 4 in the OPPOSITE direction, so the wire width grows by 2B
+    /// and the wire height by B. The tier-invariant quantity is the VISIBLE rect both columns
+    /// reconstruct to, and that is asserted in place of the old wire-width equality.
     @Test func theTierMovesOnlyTheLeftAxisAndNeverTheTop() async throws {
         let topology = try Self.fixtureTopology()
         let (at192, box192) = try Self.makeRegistry(advertisedDesktopScaleFactor: 200)
@@ -381,13 +444,144 @@ struct RemoteWindowRegistryLeftBorderTests {
         #expect(move192.top == expectedTop)
         #expect(move96.top == expectedTop)
         #expect(move192.top == move96.top)
-        #expect(move192.bottom == move96.bottom)
+        // INTENTIONAL UPDATE, adr/0018 §5.2 增补五: `bottom` is now `top + height + B`, so it
+        // carries the tier the way `left` does and the two columns differ by 11 - 7 = 4 -- it
+        // used to be identical across tiers. `top` above is the assertion that still says the Y
+        // ORIGIN takes no correction from either B or K; this one says the far edge takes the
+        // outset, which is a different claim about a different edge.
+        #expect(move96.bottom - move192.bottom == -4)
         // ... and the axis that DOES move, in the same case: 11 instead of 7.
         #expect(Double(move192.left) == (Double(content192.origin.x) - WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder192).rounded())
         #expect(Double(move96.left) == (Double(content96.origin.x) - WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder).rounded())
         #expect(move96.left - move192.left == 4)
-        #expect(move96.right - move192.right == 4)
-        #expect(move192.right - move192.left == move96.right - move96.left)
+        // INTENTIONAL UPDATE (x2), adr/0018 §5.2 增补五: `right` now moves AWAY from `left`
+        // (outset, not shifted), so the 96 column's right edge is 4 SHORT of the 192 column's
+        // instead of 4 past it; and the width on the wire is `ef.width + 2B`, which is 8 wider
+        // at 192 than at 96 rather than identical. The old equality was the statement "the tier
+        // shifts the window without resizing it"; the wire rect is the OUTER rect, and its
+        // width is a function of the frame, so the statement that survives is the one below --
+        // both columns still describe the SAME visible window.
+        #expect(move96.right - move192.right == -4)
+        #expect((move192.right - move192.left) - (move96.right - move96.left) == 8)
+        // What the old equality was really protecting, restated on the quantity that is
+        // tier-invariant: the VISIBLE width both columns reconstruct to (wire width minus 2B).
+        #expect(
+            (move192.right - move192.left) - 2 * Int32(WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder192)
+                == (move96.right - move96.left) - 2 * Int32(WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder)
+        )
+    }
+
+    // MARK: - The whole rect is outset by (B, 0, B, B) (adr/0018 §5.2 增补五)
+
+    /// The wiring claim of THIS lane, in absolute terms rather than as a difference between two
+    /// windows: all four sent edges, each derived from the window's own settled content rect
+    /// through the same two public conversions the registry uses, with the outset applied.
+    ///
+    /// WHY ABSOLUTE AND NOT ONLY DIFFERENTIAL. The cross-style and cross-tier deltas above are
+    /// differences of two sends, so a call site that outset BOTH windows by the wrong quantity
+    /// -- or that outset neither -- can still produce the right difference. This case pins each
+    /// edge against a number computed outside the registry, which is what actually says "the
+    /// pure function reached the wire". It is the App-side half of
+    /// `WindowGeometryTests.clientWindowMoveRectOutsetsTheVisibleRect`; that one pins the
+    /// arithmetic, this one pins that the arithmetic is the one being sent.
+    @Test func theSentRectIsTheVisibleRectOutsetByTheBorder() async throws {
+        let topology = try Self.fixtureTopology()
+        let (registry, box) = try Self.makeRegistry()
+        registry.handle(
+            WindowOrderStub(windowId: 401, style: Self.aboutStyle, x: 300, y: 200, width: 522, height: 514))
+        let window = try #require(registry.window(forWindowId: 401))
+
+        let content = Self.moveAndReadSettledContentRect(window, toOriginX: 520)
+        try await Self.waitForMoves(box, count: 1)
+
+        let move = try #require(box.moves[401])
+        let border = WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder
+        let visible = WindowGeometry.windowsRect(
+            from: MacRect(
+                x: content.origin.x, y: content.origin.y,
+                width: content.size.width, height: content.size.height),
+            in: topology
+        )
+
+        #expect(Double(move.left) == (visible.x - border).rounded())
+        #expect(Double(move.top) == visible.y.rounded())
+        #expect(Double(move.right) == (visible.x + visible.width + border).rounded())
+        #expect(Double(move.bottom) == (visible.y + visible.height + border).rounded())
+        // The two spans, which is the form the live record judges: wire width is `ef.width + 2B`
+        // and wire height is `ef.height + B`. Before this lane both were the ef values exactly,
+        // which is the D2 shrink-per-leg the fix removes.
+        #expect(Double(move.right - move.left) == visible.width + 2 * border)
+        #expect(Double(move.bottom - move.top) == visible.height + border)
+    }
+
+    // MARK: - Rule R on the wire (adr/0018 §5.2 增补五)
+
+    /// Rule R, driven through the real registry: a 2x session whose window lost a half point
+    /// locally sends back the height the SERVER last reported, not the rounded local one.
+    ///
+    /// The fixture reproduces the recorded shape exactly -- RAIL `WND_SIZE` height 917 remote
+    /// px, which is 458.5 mac points at `rasterScale == 2`, against a local content height of
+    /// 459 points (918 remote px). Both halves are asserted as fixture facts before the outcome
+    /// is, so a case that stopped reproducing the artefact fails as itself rather than as the
+    /// rule.
+    ///
+    /// The width is asserted in the same breath and is NOT snapped by anything: it converts back
+    /// exactly, so it exercises the "already equal" side of the same rule.
+    @Test func ruleRSendsTheServersOwnHeightWhenAHalfPointWasLostAtTwoX() async throws {
+        let topology = try Self.fixtureTopology(rasterScale: 2)
+        let (registry, box) = try Self.makeRegistry(advertisedDesktopScaleFactor: 200, topology: topology)
+        registry.handle(
+            WindowOrderStub(windowId: 411, style: Self.aboutStyle, x: 300, y: 200, width: 522, height: 917))
+        let window = try #require(registry.window(forWindowId: 411))
+
+        let content = Self.moveAndResizeAndReadSettledContentRect(
+            window, toOriginX: 540, toContentHeight: 459)
+        // Fixture facts, not outcomes: the local content really is a half point past what 917
+        // converts to, so the value the registry sees is 918 and not 917.
+        #expect(content.size.height == 459)
+        #expect(Double(content.size.height) * topology.rasterScale == 918)
+        try await Self.waitForMoves(box, count: 1)
+
+        let move = try #require(box.moves[411])
+        let border = WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder192
+        #expect(Double(move.bottom - move.top) == 917 + border)
+        // Said as the negative too: 918 + B is what an unsnapped send produces, and it is the
+        // one-pixel resize request this rule exists to not make.
+        #expect(Double(move.bottom - move.top) != 918 + border)
+        // The unaffected axis, through the same rule: 522 converts back exactly.
+        #expect(Double(move.right - move.left) == 522 + 2 * border)
+    }
+
+    /// The 1x control, same shape and same one-pixel gap: rule R's tolerance is `rasterScale -
+    /// 1`, so on a 1x session it is zero and NOTHING is ever snapped -- the settled 459 is sent
+    /// as 459 even though the server last reported 458.
+    ///
+    /// This is the case that separates the ruled tolerance from the two obvious neighbours: a
+    /// `<= rasterScale` tolerance would snap here (sending 458 + B), and a rule that ignored the
+    /// scale entirely would too.
+    ///
+    /// SCOPED TO RULE R, not to the lane (gate r1 B2). What is byte-identical at 1x is rule R
+    /// and the `left`/`top` axes; `right`/`bottom` at 1x are deliberately +B each, which is
+    /// exactly what the `459 + border` above says -- the pre-lane spelling of this expectation
+    /// would have been a bare `459`. The seven pre-lane 1x pins that stated the old right/bottom
+    /// values are updated in this same file, each with its own INTENTIONAL UPDATE note.
+    @Test func ruleRNeverSnapsOnAOneXSession() async throws {
+        let topology = try Self.fixtureTopology()
+        let (registry, box) = try Self.makeRegistry(advertisedDesktopScaleFactor: 100, topology: topology)
+        registry.handle(
+            WindowOrderStub(windowId: 421, style: Self.aboutStyle, x: 300, y: 200, width: 522, height: 458))
+        let window = try #require(registry.window(forWindowId: 421))
+
+        let content = Self.moveAndResizeAndReadSettledContentRect(
+            window, toOriginX: 560, toContentHeight: 459)
+        #expect(content.size.height == 459)
+        #expect(Double(content.size.height) * topology.rasterScale == 459)
+        try await Self.waitForMoves(box, count: 1)
+
+        let move = try #require(box.moves[421])
+        let border = WindowGeometry.aboutCalibratedClientWindowMoveLeftBorder
+        #expect(Double(move.bottom - move.top) == 459 + border)
+        #expect(Double(move.bottom - move.top) != 458 + border)
     }
 }
 
@@ -509,5 +703,129 @@ struct RemoteWindowRegistryLeftBorderTierLogPinTests {
                 in: src
             ) == 1
         )
+    }
+}
+
+/// The outbound rect is assembled in ONE place, from the pure functions -- pinned as source
+/// (adr/0018 §5.2 增补五).
+///
+/// WHY SOURCE AS WELL AS BEHAVIOUR. The suites above drive the registry and read the sent rect,
+/// which is the real claim; what they cannot see is a SECOND assembly path through the same
+/// file, or a right/bottom edge quietly re-derived from the visible rect's own width beside the
+/// pure function's result. The About-target lane shipped exactly that class of change once
+/// (review about-target-r1 I-1). These pins hold the shape the behaviour cases assume: one call
+/// to the outset function, one call to the snap, one border lookup, and no arithmetic on the
+/// visible rect's size anywhere in the file.
+///
+/// Same technique, same two readers and the same collapsed-substring helper as
+/// `RemoteWindowRegistryLeftBorderTierLogPinTests` above; see that suite's own doc comment for
+/// why the comment-stripped reader exists and what its one known blind spot is.
+@Suite("the outbound ClientWindowMove rect has exactly one assembly point (source pins)")
+struct RemoteWindowRegistryOutboundRectPinTests {
+    private static func registryRawSource() throws -> String {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        return try String(
+            contentsOf: root.appendingPathComponent("App/RemoteWindowRendering/RemoteWindowRegistry.swift"),
+            encoding: .utf8
+        )
+    }
+
+    /// Code only: every `//`-to-end-of-line comment removed BEFORE the whitespace collapse, so a
+    /// count of zero is a statement about the code and not about the prose that explains it --
+    /// which matters more here than anywhere else in this file, because the doc comments on
+    /// `handleLocalGeometrySettled` NAME the old `railWindowsRect.width` expression in order to
+    /// say it is gone.
+    private static func registryCode() throws -> String {
+        let stripped = try registryRawSource()
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> Substring in
+                guard let marker = line.range(of: "//") else { return line }
+                return line[line.startIndex..<marker.lowerBound]
+            }
+            .joined(separator: "\n")
+        return stripped.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    }
+
+    private static func occurrences(of needle: String, in haystack: String) -> Int {
+        haystack.components(separatedBy: needle).count - 1
+    }
+
+    @Test("the four sent edges come from one clientWindowMoveRect call and from nothing else")
+    func theOutboundRectIsAssembledOnce() throws {
+        let code = try Self.registryCode()
+
+        // ONE outset, ONE snap, ONE border lookup -- a second of any of them is a second policy
+        // for the same wire field.
+        #expect(Self.occurrences(of: "WindowGeometry.clientWindowMoveRect(", in: code) == 1)
+        #expect(Self.occurrences(of: "WindowGeometry.snappedToLastReportedSize(", in: code) == 1)
+        #expect(Self.occurrences(of: "Self.clientWindowMoveLeftBorder(", in: code) == 1)
+
+        // THE OLD ARITHMETIC IS GONE, said on the operand rather than on the expression: before
+        // this lane `right` was `correctedLeft + railWindowsRect.width` and `bottom` was
+        // `railWindowsRect.y + railWindowsRect.height`, and the sizes of the visible rect are now
+        // read by nothing in this file -- they are handed to the snap as a whole rect and never
+        // named again. Any re-derivation of an edge from a size has to name one of these.
+        #expect(Self.occurrences(of: "railWindowsRect.width", in: code) == 0)
+        #expect(Self.occurrences(of: "railWindowsRect.height", in: code) == 0)
+
+        // ... and each of the four integers narrows exactly one member of the pure function's
+        // result. A leg that kept one old edge (the single most likely half-adoption) leaves one
+        // of these at 0.
+        #expect(Self.occurrences(of: "Int32(sent.left.rounded())", in: code) == 1)
+        #expect(Self.occurrences(of: "Int32(sent.top.rounded())", in: code) == 1)
+        #expect(Self.occurrences(of: "Int32(sent.right.rounded())", in: code) == 1)
+        #expect(Self.occurrences(of: "Int32(sent.bottom.rounded())", in: code) == 1)
+
+        // One send, which is what makes "one assembly point" a statement about the wire.
+        #expect(Self.occurrences(of: "session.sendWindowMove(", in: code) == 1)
+
+        // THE BORDER REACHES THE OUTSET UNSCALED (gate r1 m3). MacdowsCore's own body pin
+        // forbids a scale factor inside `clientWindowMoveRect`, but that says nothing about the
+        // ARGUMENT this file passes: `measuredBorder: border * topology.rasterScale` satisfies
+        // every count above and is a no-op on every 1x fixture, so it survives all but one
+        // behaviour case here. Pinned as the whole collapsed call shape, plus the two spellings
+        // of a scaling anywhere in the file's code.
+        #expect(
+            Self.occurrences(
+                of: "WindowGeometry.clientWindowMoveRect( fromVisibleRect: settledVisibleRect, "
+                    + "measuredBorder: border )",
+                in: code
+            ) == 1
+        )
+        #expect(Self.occurrences(of: "* rasterScale", in: code) == 0)
+        #expect(Self.occurrences(of: "rasterScale *", in: code) == 0)
+        #expect(Self.occurrences(of: "* topology.rasterScale", in: code) == 0)
+    }
+
+    /// The snap's three inputs are the SERVER's own last reported size and the session's raster
+    /// scale -- pinned because feeding it anything else (the mapped GFX size, the local frame,
+    /// a hard-coded 2) would still satisfy every count above.
+    ///
+    /// PINNED AS THE WHOLE CALL, not as three names. `rasterScale: topology.rasterScale` is
+    /// ALREADY written once in this file by the window-mask path, so a bare `== 1` on that
+    /// argument is red on arrival and a `== 2` would pass while saying nothing about which two
+    /// sites (project memory: source pins must match call shapes, not names -- measured here,
+    /// the argument's count was 2 with exactly one read on this path). The argument count is
+    /// kept below as 2, WITH the other site named, so a third reader of the session raster
+    /// scale is still red.
+    @Test("rule R is fed the last reported RAIL size and the session's raster scale")
+    func theSnapReadsTheLastReportedSizeAndTheRasterScale() throws {
+        let code = try Self.registryCode()
+        #expect(
+            Self.occurrences(
+                of: "WindowGeometry.snappedToLastReportedSize( railWindowsRect, "
+                    + "lastReportedWidth: Double(state.width), lastReportedHeight: Double(state.height), "
+                    + "rasterScale: topology.rasterScale )",
+                in: code
+            ) == 1
+        )
+        #expect(Self.occurrences(of: "lastReportedWidth: Double(state.width)", in: code) == 1)
+        #expect(Self.occurrences(of: "lastReportedHeight: Double(state.height)", in: code) == 1)
+        // Two sites read the session's raster scale: `computeMaskResult`'s
+        // `WindowShape.computeMask(..., rasterScale:)` call, which predates this lane, and rule
+        // R's above. Both take it from the SAME frozen topology snapshot this method already
+        // read, which is the same-read discipline §5.A.4 states for the topology.
+        #expect(Self.occurrences(of: "rasterScale: topology.rasterScale", in: code) == 2)
     }
 }

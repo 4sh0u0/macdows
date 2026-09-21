@@ -380,6 +380,36 @@ pin 1 "$(code_only | grep -cE 'static func suppressesTargetClose\(' || true)" "s
 pin 1 "$(code_only | grep -cE 'let moveResizeKeepTargetOpen = MoveResizeKeep\.suppressesTargetClose\(' || true)" "one live binding of the knob"
 pin 1 "$(code_only | grep -cE 'environment\["WINDOW_SMOKE_MOVE_KEEP"\]' || true)" "WINDOW_SMOKE_MOVE_KEEP is read once"
 
+echo "== the pre-leg baseline RAIL geometry line (pre-registration gate r1 B1) =="
+# The line syntax is FROZEN -- this lane's pre-registration quotes it verbatim -- so what is
+# pinned is (i) that it is built in exactly one place, (ii) that it is printed from exactly one
+# place, (iii) that the print sits between the target-id assignment and the first leg, and
+# (iv) the field order/spelling inside the builder itself.
+#
+# WHY NOT A BARE "the literal appears once in main.swift": the same text also appears in the
+# harness's own self-check assertions, deliberately -- that is what makes the frozen syntax
+# checkable offline. Counting it file-wide would either be red on arrival or force the self-check
+# to stop quoting the text. So the text pins below are scoped to the BUILDER's body, and the
+# file-wide pins are on call shapes (project memory: source pins match call shapes, not names).
+baseline_body() { awk '/func baselineLine\(forWindowId/{f=1} f{print} f && /^    \}$/{exit}' "$SRC"; }
+pin 1 "$(code_only | grep -cE 'func baselineLine\(forWindowId' || true)" "the baseline line is built in one place"
+pin 1 "$(code_only | grep -cE 'print\(latestRailSize\.baselineLine\(forWindowId: w\.windowId\)\)' || true)" "the baseline line is printed from one place"
+pin 0 "$(code_only | grep -cE 'print\("\[move-resize\] baseline RAIL geometry' || true)" "no site prints a second copy of that text"
+pin 1 "$(code_only | grep -cE 'self\.latestRailSize\.record\(' || true)" "the size table is written from one place"
+pin 2 "$(baseline_body | grep -cE '\[move-resize\] baseline RAIL geometry: windowId=' || true)" "both branches use the frozen prefix"
+pin 1 "$(baseline_body | grep -cE 'windowWidth=n/a windowHeight=n/a source=none' || true)" "the never-reported branch says n/a and source=none"
+pin 1 "$(baseline_body | grep -cE 'source=last-order' || true)" "the reported branch says source=last-order"
+pin 0 "$(baseline_body | grep -cE 'source=(unknown|stale|order)"' || true)" "source= takes no third value"
+# ORDER, not just presence: printing BEFORE the assignment would name the previous target (or
+# nothing), and printing after `startMoveLeg` would report a size the leg may already have
+# changed. Both are single-line anchors, and each is pinned to occur exactly once first.
+pin 1 "$(grep -cE '^[[:space:]]*moveResizeWindowId = w\.windowId$' "$SRC" || true)" "the target id is assigned at one site"
+assign_ln="$(grep -nE '^[[:space:]]*moveResizeWindowId = w\.windowId$' "$SRC" | cut -d: -f1)"
+baseline_ln="$(grep -nE 'print\(latestRailSize\.baselineLine\(forWindowId: w\.windowId\)\)' "$SRC" | cut -d: -f1)"
+leg_ln="$(grep -nE 'startMoveLeg\(session: session, windowId: w\.windowId' "$SRC" | cut -d: -f1)"
+pin yes "$([ -n "$assign_ln" ] && [ -n "$baseline_ln" ] && [ "$assign_ln" -lt "$baseline_ln" ] && echo yes || echo no)" "the baseline print is AFTER the id assignment"
+pin yes "$([ -n "$leg_ln" ] && [ -n "$baseline_ln" ] && [ "$baseline_ln" -lt "$leg_ln" ] && echo yes || echo no)" "the baseline print is BEFORE the first leg"
+
 echo "== summary =="
 printf 'failures=%s\n' "$FAILURES"
 [ "$FAILURES" -eq 0 ]
