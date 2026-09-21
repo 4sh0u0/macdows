@@ -81,11 +81,15 @@ jobs:
     # (CMAKE_OSX_ARCHITECTURES=arm64, ffmpeg's --arch=arm64, ARCHS=arm64), so an x86_64
     # runner could not produce the artifacts this repo targets in the first place.
     runs-on: macos-15
-    # Sized for a COLD run (every cache missing): the three vendored builds dominate. A warm
-    # run is far under this. Tighten it once the first few runs have produced real numbers --
-    # and remember a job-level timeout ends as "cancelled", not "failure" (tier1.yml's own
-    # timeout comment learned that the hard way).
-    timeout-minutes: 60
+    # Measured on this lane's first runs (2026-09-21, cold caches): bootstrap 4m13s (brew
+    # xcodegen + OpenSSL + FFmpeg + FreeRDP + xcodegen generate), app build 42s, MacdowsAppTests
+    # 33s. So a cold run is ~10 minutes, a warm one far less, and 30 is generous rather than
+    # arbitrary. Every long step carries its own timeout below as well: the job-level one is the
+    # backstop, and a step-level timeout is what turns a hang into a fast, ATTRIBUTABLE red --
+    # the alternative is what happened on run 2, where one hung test ate the full hour and
+    # ended as "cancelled", not "failure" (exactly the misreading tier1.yml's own timeout
+    # comment warns about), and took the cache-saving post steps down with it.
+    timeout-minutes: 30
 
     steps:
       # Pinned to commit SHA, not a mutable tag, per project policy on supply-chain pinning
@@ -188,6 +192,8 @@ jobs:
         # deps/freerdp.lock .commit verification that a CI lane would otherwise reimplement.
         # Every build step inside it is idempotent, so on a warm run this is mostly a sequence
         # of stamp checks plus `xcodegen generate`.
+        # 4m13s cold, measured; 20 leaves room for a slower runner without hiding a hang.
+        timeout-minutes: 20
         run: ./Scripts/bootstrap.sh
 
       - name: Build the app
@@ -196,6 +202,7 @@ jobs:
         # produced "Unable to resolve module dependency: MacdowsCore"). For the same reason
         # DerivedData is left at its default location: this lane has no reason to redirect it,
         # and redirecting it is how that failure mode was found in the first place.
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           xcodebuild build \
@@ -208,6 +215,7 @@ jobs:
         # headless `xcodebuild test` can run it (see its comment in App/project.yml: the app
         # target's launch path activates NSApp and its TCC identity prompts on first connect,
         # "none of which a headless xcodebuild test can answer").
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           xcodebuild test \
@@ -219,10 +227,33 @@ jobs:
         # Pure Swift, no FreeRDP, no AppKit, no display -- the package's own Package.swift
         # states that as its contract. It cannot run on Tier 1 only because ubuntu has no
         # Swift toolchain.
-        run: swift test --package-path Packages/MacdowsCore
+        #
+        # --no-parallel is not a convenience: all 36 test files here are swift-testing, which
+        # runs test functions CONCURRENTLY by default, and CRDPQueueHardeningTests /
+        # CRDPQueueTests are queue stress tests that deliberately BUSY-WAIT on the calling
+        # thread (`while group.wait(timeout: .now()) == .timedOut { ... }`, one of them with no
+        # yield in the loop at all -- deliberately, so the drain path is exercised under real
+        # contention) while their producers run on DispatchQueue.global(). On a maintainer's
+        # many-core Mac there is always a spare core for the producers. On a standard GitHub
+        # macOS runner, which has a small handful, several of those spinners scheduled at once
+        # starve each other: run 2 of this lane stalled the moment the test functions started
+        # and produced NOT ONE line of output for the next 54 minutes, until the job timeout
+        # killed it (the orphan `swiftpm-testing` process in the cleanup log is the tail of it).
+        # Serialised, each stress test gets the whole machine, which is the shape it was
+        # written for. Nothing is skipped, disabled or quarantined -- every test still runs.
+        #
+        # If this ever needs to go parallel again, the fix belongs in those two files (yield in
+        # the spin, or mark them .serialized), not here.
+        timeout-minutes: 10
+        run: swift test --package-path Packages/MacdowsCore --no-parallel
 
       - name: replay-diff package tests
         # Recorded as Tier 2 scope by the 2026-09-01 ruling, for the same ubuntu-has-no-Swift
         # reason. Offline by construction: its only dependency is a path dependency on the
         # sibling MacdowsCore package.
+        #
+        # Deliberately NOT --no-parallel, unlike its sibling above: nothing under
+        # Tools/replay-diff/Tests spawns a thread or a dispatch queue (checked), so there is no
+        # spinner to starve and no reason to give up the parallel speed-up.
+        timeout-minutes: 10
         run: swift test --package-path Tools/replay-diff
