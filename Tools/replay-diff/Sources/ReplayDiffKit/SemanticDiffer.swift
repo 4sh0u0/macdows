@@ -602,17 +602,27 @@ public struct SemanticDiffer: Sendable {
         let activeDeclarations = options.knownDifferenceTable.newFieldDeclarations.values
             .sorted { $0.eventName < $1.eventName }
         if !activeDeclarations.isEmpty {
-            notes.append(
-                "appended-probe-key declarations (adr/0008 §5) in force: "
-                    + activeDeclarations.map { declaration in
-                        "\(declaration.eventName) — \(declaration.fields.count) key(s) expected on"
-                            + " the \(declaration.side.rawValue) side"
-                            + " [\(declaration.fields.sorted().joined(separator: ", "))]"
-                    }.joined(separator: "; ")
-                    + ". Exempt from field comparison only while absent on the counterpart;"
-                    + " reported once per key per event type, values compared as soon as both sides"
-                    + " carry them."
-            )
+            // Built in named, explicitly-typed steps instead of as one `+` chain, and for a
+            // mechanical reason rather than a stylistic one: as a single expression this hit
+            // "the compiler is unable to type-check this expression in reasonable time" on
+            // Tier 2's macOS runner (2026-09-21) while compiling fine on a faster machine.
+            // That limit is wall-clock, not structural, so the same source compiles or fails
+            // depending on how fast the machine is -- the sibling notes above are shorter
+            // chains and stayed under it. The string produced here is byte-identical: same
+            // literals, same order, same separators.
+            let declarationList: String = activeDeclarations.map { declaration -> String in
+                let side: String = declaration.side.rawValue
+                let fields: String = declaration.fields.sorted().joined(separator: ", ")
+                return "\(declaration.eventName) — \(declaration.fields.count) key(s) expected on"
+                    + " the \(side) side"
+                    + " [\(fields)]"
+            }.joined(separator: "; ")
+            let declarationNote: String = "appended-probe-key declarations (adr/0008 §5) in force: "
+                + declarationList
+                + ". Exempt from field comparison only while absent on the counterpart;"
+                + " reported once per key per event type, values compared as soon as both sides"
+                + " carry them."
+            notes.append(declarationNote)
         }
         let unmodelled = baseline.unmodelledEventNames.union(candidate.unmodelledEventNames)
         if !unmodelled.isEmpty {

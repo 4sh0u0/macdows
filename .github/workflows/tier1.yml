@@ -2,7 +2,7 @@ name: Tier 1
 
 # Tier 1 per adr/0006 §6: every push, ubuntu, 1x cost, 1-2 minutes. Cheap, static
 # checks only — no compilation. The macOS/FreeRDP-build Tier 2 is a separate,
-# selectively-triggered workflow (see adr/0006 §6; not yet added).
+# selectively-triggered workflow: .github/workflows/tier2.yml (see adr/0006 §6).
 
 on:
   push:
