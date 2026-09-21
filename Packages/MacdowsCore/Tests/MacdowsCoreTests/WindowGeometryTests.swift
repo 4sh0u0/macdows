@@ -344,6 +344,19 @@ struct WindowGeometryTests {
     /// scoped to the SIZE-correction chain in isolation, not `handleLocalGeometrySettled`'s
     /// full current behavior; `clientWindowMoveLeftAppliesTheMeasuredBorder` below covers the
     /// round-5 addition on its own.
+    ///
+    /// "EXACT outbound conversion chain" (the second paragraph above) HAS NOT BEEN TRUE SINCE
+    /// ROUND 5 and is further untrue since adr/0018 §5.2 增补五 -- corrected here rather than
+    /// rewritten above, so the round-4 narrative this test carries stays readable. What this
+    /// test reproduces is the SIZE-correction half of that chain, in isolation: mac content rect
+    /// -> `windowsRect(from:anchoredTo:)` -> `railRect(from:correction:)`, then the four
+    /// roundings done LOCALLY here from `railWindowsRect` alone. The real method's last step is
+    /// now `snappedToLastReportedSize` followed by
+    /// `clientWindowMoveRect(fromVisibleRect:measuredBorder:)`, so its `left` is 7 smaller than
+    /// this test's and its `right`/`bottom` are 7 larger. The lane-level coverage of the real
+    /// method's own numbers is `clientWindowMoveRectOutsetsTheVisibleRect` (offline, same
+    /// fixture) and `RemoteWindowRegistryLeftBorderTests` (through the registry); nothing here
+    /// changes, because nothing here calls the registry.
     @Test("handleLocalGeometrySettled's outbound chain reproduces the correct RAIL rect for this run's real move")
     func outboundConversionReproducesRealHostMove() {
         let macRect = MacRect(x: 331, y: 917, width: 536, height: 521)
@@ -489,6 +502,180 @@ struct WindowGeometryTests {
         )
         #expect(sent == 195)
         #expect(sent + serverLeftBorder == visibleLeftTarget)
+    }
+
+    // MARK: - The outbound rect is the visible rect outset by (B, 0, B, B) (adr/0018 §5.2 增补五)
+
+    /// The D2 finding of the `winsize` tracking batch, as arithmetic: what a `ClientWindowMove`
+    /// carries in its `left`/`top`/`right`/`bottom` slots is the window's OUTER (wr) rect, and
+    /// the host-side probe's own `GetWindowRect` / `DWMWA_EXTENDED_FRAME_BOUNDS` pairs read
+    /// `wr = ef` outset by `(B, 0, B, B)` -- ONE ROW PER CELL of the border table, n=1 per cell,
+    /// from batch `winsize-20260921` (docs record §3.6): About (7,0,7,7) @96
+    /// (`wr=115,102,737,616 ef=122,102,730,609`) and (11,0,11,11) @192
+    /// (`wr=41,0,1291,918 ef=52,0,1280,907`); `WS_THICKFRAME` (5,0,5,5) @96
+    /// (`wr=147,30,1151,745 ef=152,30,1146,740`) and (10,0,10,10) @192
+    /// (`wr=1,1,1279,689 ef=11,1,1269,679`). Only the THICKFRAME @96 cell has a second source
+    /// (the 2026-09-15 host-rect-keep record, `wr=198,30,1198,743 ef=203,30,1193,738`). The four
+    /// rows are run through this test's four cases precisely because each is a single reading.
+    ///
+    /// So the WIDTH on the wire is `ef.width + 2B` and the HEIGHT is `ef.height + B`: the left
+    /// edge moves out by B (which `clientWindowMoveLeft` already did on its own evidence), the
+    /// right and bottom edges move out by B as well, and the top edge does not move at all --
+    /// the frame's top member measured 0 in every model this project has read.
+    ///
+    /// The fixture is the About 1x real-host rect this file already carries in
+    /// `outboundConversionReproducesRealHostMove` (visible/ef `(331, 2, 522, 514)`), run through
+    /// all four cells of the table so a single-cell error cannot hide.
+    @Test(
+        "the outbound rect is the visible rect outset by (B, 0, B, B), on every cell of the border table",
+        arguments: [
+            // (style, tier, B, expected left/top/right/bottom)
+            (UInt32(0x8008_0000), WindowGeometry.DPITier.dpi96, 7.0, 324.0, 2.0, 860.0, 523.0),
+            (UInt32(0x000F_0000), WindowGeometry.DPITier.dpi96, 5.0, 326.0, 2.0, 858.0, 521.0),
+            (UInt32(0x8008_0000), WindowGeometry.DPITier.dpi192, 11.0, 320.0, 2.0, 864.0, 527.0),
+            (UInt32(0x000F_0000), WindowGeometry.DPITier.dpi192, 10.0, 321.0, 2.0, 863.0, 526.0),
+        ]
+    )
+    func clientWindowMoveRectOutsetsTheVisibleRect(
+        style: UInt32, tier: WindowGeometry.DPITier, border: Double,
+        expectedLeft: Double, expectedTop: Double, expectedRight: Double, expectedBottom: Double
+    ) {
+        // The border comes from the production table, not from the literal beside it -- the
+        // literal is there so the expected numbers can be read without the table in hand.
+        #expect(WindowGeometry.clientWindowMoveLeftBorder(forStyle: style, tier: tier) == border)
+
+        let visible = WindowsRect(x: 331, y: 2, width: 522, height: 514)
+        let sent = WindowGeometry.clientWindowMoveRect(fromVisibleRect: visible, measuredBorder: border)
+
+        #expect(sent.left == expectedLeft)
+        #expect(sent.top == expectedTop)
+        #expect(sent.right == expectedRight)
+        #expect(sent.bottom == expectedBottom)
+        // Said again as the two spans, which is the form the record's judgement reads: the wire
+        // width is `ef.width + 2B` and the wire height is `ef.height + B`.
+        #expect(sent.right - sent.left == visible.width + 2 * border)
+        #expect(sent.bottom - sent.top == visible.height + border)
+    }
+
+    /// The model as a PROPERTY rather than as four rows: the server lands the window so that its
+    /// visible (ef) rect is the sent (wr) rect inset by `(B, 0, B, B)`. Feeding the sent rect
+    /// back through that inset must reproduce the visible rect this function was given, byte for
+    /// byte -- which is the same "simulate the server's own reconstruction" check
+    /// `clientWindowMoveLeftAppliesTheMeasuredBorder` makes for the left edge alone, extended to
+    /// all four edges. A right/bottom outset with the wrong sign, or one applied to the top,
+    /// fails here without needing a fifth row of numbers.
+    @Test(
+        "the server's own wr -> ef inset reconstructs the visible rect exactly",
+        arguments: [7.0, 5.0, 11.0, 10.0],
+        [
+            WindowsRect(x: 331, y: 2, width: 522, height: 514),
+            WindowsRect(x: 0, y: 0, width: 1, height: 1),
+            // Negative origin: a monitor placed left of / above the primary is expressible in
+            // Windows space, and nothing in this arithmetic may assume a positive quadrant.
+            WindowsRect(x: -120, y: -40, width: 300, height: 200),
+        ]
+    )
+    func theServerInsetReconstructsTheVisibleRect(border: Double, visible: WindowsRect) {
+        let sent = WindowGeometry.clientWindowMoveRect(fromVisibleRect: visible, measuredBorder: border)
+
+        let reconstructed = WindowsRect(
+            x: sent.left + border, y: sent.top,
+            width: (sent.right - border) - (sent.left + border),
+            height: (sent.bottom - border) - sent.top
+        )
+        #expect(reconstructed == visible)
+    }
+
+    /// The left edge is not recomputed here: `clientWindowMoveRect` delegates it to
+    /// `clientWindowMoveLeft`, so every measurement behind that function (the three 2026-08-23
+    /// runs, F-R1's nine, C-2 run 4) keeps applying unchanged. Pinned because "left is still the
+    /// same subtraction" is what makes this lane's 1x `left` byte-identity claim checkable.
+    @Test("the left edge of the outbound rect is exactly clientWindowMoveLeft")
+    func theOutboundLeftIsTheSameSubtractionAsBefore() {
+        let visible = WindowsRect(x: 331, y: 2, width: 522, height: 514)
+        for border in [7.0, 5.0, 11.0, 10.0] {
+            let sent = WindowGeometry.clientWindowMoveRect(fromVisibleRect: visible, measuredBorder: border)
+            #expect(sent.left == WindowGeometry.clientWindowMoveLeft(
+                fromVisibleLeft: visible.x, measuredLeftBorder: border))
+            #expect(sent.top == visible.y)
+        }
+    }
+
+    // MARK: - Rule R: odd-pixel snap to the last reported dimension (adr/0018 §5.2 增补五)
+
+    /// The 2x odd-pixel case the same batch recorded (§6.C: an About window whose RAIL
+    /// `WND_SIZE` height was 917 settled locally at 918 remote px, because 917 / 2 = 458.5 mac
+    /// points and AppKit does not keep the half point). A pure move must not be allowed to
+    /// resize the window by that rounding artefact, so a settled dimension that differs from the
+    /// server's own last reported one by no more than `rasterScale - 1` remote px is reported
+    /// back as the server's value.
+    ///
+    /// `rasterScale - 1` and not `rasterScale`: at 2x the largest error one lost half point can
+    /// produce is 1 remote px, and at 1x the expression is 0, which is what makes THIS RULE a
+    /// no-op on every 1x session. Scoped to the rule, not to the lane: the lane's other half
+    /// (the outset) deliberately does move 1x `right`/`bottom` by B, and the seven pre-lane 1x
+    /// pins that said otherwise are updated in `RemoteWindowRegistryLeftBorderTests` and
+    /// declared in this lane's gate (adr/0018 §5.2 增补五). `left`/`top` and rule R are the
+    /// byte-identical part at 1x.
+    @Test(
+        "rule R snaps only within rasterScale - 1 remote px of the last reported dimension",
+        arguments: [
+            // (local, lastReported, rasterScale, expected)
+            (918.0, 917.0, 2.0, 917.0),  // S1: the recorded 2x artefact, snapped
+            (920.0, 917.0, 2.0, 920.0),  // S2: 3 px out is a real resize, kept
+            (918.0, 917.0, 1.0, 918.0),  // S3: 1x tolerance is 0, nothing is ever snapped
+            (918.0, 0.0, 2.0, 918.0),    // S4: no WND_SIZE ever reported -- never snap to 0
+            // S4b exists because S4 alone does not exercise the guard: 918 is nowhere near 0,
+            // so a rule that dropped the `lastReported > 0` test entirely still returns 918.
+            // The case that decides it is one whose local value is WITHIN tolerance of the
+            // never-reported 0, where snapping would ask the server to collapse the window to
+            // nothing. (Found by mutating the guard to `>= 0`, which survived S4.)
+            (1.0, 0.0, 2.0, 1.0),        // S4b: within tolerance of 0, and still never snapped
+            (918.0, 917.0, Double.nan, 918.0),   // S5a: a non-finite scale is tolerance 0
+            (918.0, 917.0, 0.0, 918.0),          // S5b: a scale below 1 is tolerance 0
+        ]
+    )
+    func ruleRSnapsOnlyWithinTolerance(
+        local: Double, lastReported: Double, rasterScale: Double, expected: Double
+    ) {
+        #expect(WindowGeometry.snapToLastReportedDimension(
+            local: local, lastReported: lastReported, rasterScale: rasterScale) == expected)
+    }
+
+    /// The rule is symmetric in the sign of the difference: a settle 1 px SHORT of the reported
+    /// size snaps the same way a settle 1 px long does. Stated separately because the recorded
+    /// artefact only ever went one way, and an implementation written as `local - lastReported
+    /// <= tolerance` (no absolute value) would pass every row above.
+    @Test("rule R is symmetric: one remote pixel short snaps too, four pixels short does not")
+    func ruleRIsSymmetricInTheSignOfTheDifference() {
+        #expect(WindowGeometry.snapToLastReportedDimension(
+            local: 916, lastReported: 917, rasterScale: 2) == 917)
+        #expect(WindowGeometry.snapToLastReportedDimension(
+            local: 913, lastReported: 917, rasterScale: 2) == 913)
+    }
+
+    /// Width and height are snapped INDEPENDENTLY -- a leg that genuinely resized one axis while
+    /// the other only lost a half point must keep the real change on the axis that has one.
+    ///
+    /// BOTH DIRECTIONS, and the mirror case is not redundant: a seam that snapped the WIDTH only
+    /// (leaving `height: visible.height`) keeps the first case green and is caught only by the
+    /// shape pin -- measured, gate r1 m2's own mutant. The second case judges the height axis by
+    /// VALUE, and the height is where the recorded 2x artefact actually appeared.
+    @Test("the rect-level snap decides each axis on its own")
+    func theRectLevelSnapDecidesEachAxisOnItsOwn() {
+        let settled = WindowsRect(x: 100, y: 50, width: 918, height: 500)
+        let snapped = WindowGeometry.snappedToLastReportedSize(
+            settled, lastReportedWidth: 917, lastReportedHeight: 400, rasterScale: 2)
+
+        #expect(snapped == WindowsRect(x: 100, y: 50, width: 917, height: 500))
+
+        // Mirror: the HEIGHT is the axis within tolerance this time, and the width is a real
+        // change that must survive.
+        let mirrored = WindowGeometry.snappedToLastReportedSize(
+            WindowsRect(x: 100, y: 50, width: 1250, height: 918),
+            lastReportedWidth: 1200, lastReportedHeight: 917, rasterScale: 2)
+
+        #expect(mirrored == WindowsRect(x: 100, y: 50, width: 1250, height: 917))
     }
 
     // MARK: - Maximize-scenario real-host regression (2026-08-23, round 6)
@@ -1111,5 +1298,97 @@ struct WindowGeometryDPITierTests {
         #expect(body.contains("thickFrameClientWindowMoveLeftBorder"))
         #expect(body.contains("aboutCalibratedClientWindowMoveLeftBorder192"))
         #expect(body.contains("thickFrameClientWindowMoveLeftBorder192"))
+    }
+
+}
+
+/// Shape pins on this lane's two new seams (adr/0018 §5.2 增补五), beside the value pins in
+/// `WindowGeometryTests`: what the bodies may and may not contain.
+@Suite("the outbound outset and rule R, as shapes")
+struct WindowGeometryOutboundRectShapeTests {
+
+    /// The outset is a plain ADDITION of the same `B` on three edges, with NO scale factor --
+    /// the same shape claim the tiered lookup above makes about itself, for the same reason: a
+    /// `* rasterScale` here would reproduce one measured cell (THICKFRAME 5 -> 10) and get the
+    /// other wrong (About 7 -> 11), which is exactly the linear model ADR-0015 §7 (a) rules out
+    /// by name. Pinned on the BODY because the arithmetic is what carries the claim; the
+    /// numbers themselves are pinned by `clientWindowMoveRectOutsetsTheVisibleRect`.
+    @Test("the outbound outset adds the measured border, and multiplies nothing")
+    func theOutsetBodyAddsTheBorderAndMultipliesNothing() throws {
+        let body = try Self.body(
+            ofFunctionWithSignature:
+                "public static func clientWindowMoveRect(",
+            in: "Packages/MacdowsCore/Sources/MacdowsCore/WindowGeometry.swift"
+        )
+        #expect(!body.contains("rasterScale"))
+        // `*` AND `/` BOTH: the shape being forbidden is "scaled by something", and a scaling can
+        // be written either way (`border * 2` or `border / 0.5`) -- forbidding only the
+        // multiplication would leave the other spelling of the same mistake unpinned. Neither
+        // operator has any legitimate use in an outset that adds one measured quantity to three
+        // edges (gate r1 m6: this reason used to name only `* rasterScale`).
+        #expect(!body.contains("*"))
+        #expect(!body.contains("/"))
+        // The left edge is DELEGATED, never re-derived: that is what keeps every pre-lane `left`
+        // measurement applying byte for byte.
+        #expect(body.contains("clientWindowMoveLeft(fromVisibleLeft: visible.x, measuredLeftBorder: border)"))
+        // Top is the visible top, untouched -- the frame's top member measured 0 in every model.
+        #expect(body.contains("top: visible.y,"))
+        // Right and bottom each add the border exactly once.
+        #expect(body.components(separatedBy: "+ border").count - 1 == 2)
+    }
+
+    /// Rule R decides the two axes INDEPENDENTLY -- the rect-level seam calls the scalar rule
+    /// exactly twice, and does not touch the origin. A single shared decision (e.g. "snap both
+    /// if either is within tolerance") would keep every scalar case green.
+    @Test("the rect-level snap calls the scalar rule once per axis and leaves the origin alone")
+    func theRectLevelSnapCallsTheScalarRuleOncePerAxis() throws {
+        let body = try Self.body(
+            ofFunctionWithSignature:
+                "public static func snappedToLastReportedSize(",
+            in: "Packages/MacdowsCore/Sources/MacdowsCore/WindowGeometry.swift"
+        )
+        #expect(body.components(separatedBy: "snapToLastReportedDimension(").count - 1 == 2)
+        #expect(body.contains("x: visible.x, y: visible.y,"))
+    }
+
+    /// Brace-matched from a function's signature onward, so what is examined is the BODY and
+    /// nothing above it -- the same reader `WindowGeometryDPITierTests
+    /// .theTieredLookupBodyIsATableNotArithmetic` works inline. Written out a second time here
+    /// rather than refactored out of that pin: that pin is frozen evidence for another lane, and
+    /// a pin that changes shape stops being the same pin.
+    ///
+    /// CODE ONLY: every `//`-to-end-of-line comment is stripped BEFORE the brace match, the same
+    /// discipline `RemoteWindowRegistryOutboundRectPinTests.registryCode()` follows (gate r1 m5:
+    /// the two readers disagreed, and the pins here are NEGATIVE -- `!contains("*")` and friends
+    /// -- so an unstripped reader would turn any future explanatory comment inside one of these
+    /// bodies into a mystery red). Same known blind spot as that reader: a `//` inside a string
+    /// literal truncates its line, which can only LOSE text and so can only make a POSITIVE pin
+    /// red -- the safe direction. (The older inline reader above does not strip, which is why
+    /// its own pins are positive `contains` checks plus three negatives over a body that is a
+    /// pure `switch`.)
+    private static func body(ofFunctionWithSignature signature: String, in relativePath: String) throws -> String {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let raw = try String(contentsOf: root.appendingPathComponent(relativePath), encoding: .utf8)
+        let src = raw
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> Substring in
+                guard let marker = line.range(of: "//") else { return line }
+                return line[line.startIndex..<marker.lowerBound]
+            }
+            .joined(separator: "\n")
+        let start = try #require(src.range(of: signature), "\(signature) moved -- re-anchor this pin")
+        var depth = 0
+        var body = ""
+        for character in src[start.lowerBound...] {
+            if character == "{" { depth += 1 }
+            if depth > 0 { body.append(character) }
+            if character == "}" {
+                depth -= 1
+                if depth == 0 { break }
+            }
+        }
+        #expect(body.hasPrefix("{") && body.hasSuffix("}"))
+        return body
     }
 }
