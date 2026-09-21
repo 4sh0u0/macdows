@@ -45,8 +45,9 @@
 
         [loop-head] utc= ps= pid= session= interval-ms= max-seconds= deadline-utc= awareness=
                     set-via=                                              (exactly once, first)
-        [loop-tick] seq= utc= cx= cy= wa= [truncated=true]            (one line per sample)
-        [tick-rect] seq= hwnd= pid= proc= class= style= dpi= wr= ef= cs= cr= title-len=
+        [loop-tick] seq= utc= cx= cy= wa= [truncated=true] [torn=<n>] [desktop-changed=1]
+                                                                      (one line per sample)
+        [tick-rect] seq= hwnd= pid= proc= class= style= dpi= wr= ef= cs= cr= owner= title-len=
                     title-sha8=                       (one line per selected window per sample)
         RESULT: DONE seq=<n> reason=<sentinel|deadline>
         RESULT: FAILED <stage>/<ExceptionType>
@@ -57,6 +58,19 @@
     which is the number that changes when a joining client re-lays out the session -- and wa is
     SPI_GETWORKAREA. The window set per tick is the probe's Select-ProbeWindows with the probe's
     cap; a tick that hit the cap says truncated=true rather than dropping rows in silence.
+
+    A SAMPLE IS NOT AN INSTANT, AND SAYS SO. One tick reads the desktop metrics, then a window
+    rectangle for every top-level window, then sorts and caps them, then reads each selected
+    window's four rectangles -- hundreds of native calls, during which the server can re-lay-out
+    the session underneath. When that happens the rows mix two layouts, which is exactly the
+    tick a reader must not anchor on, and before 2026-09-21 nothing in the file said so (four of
+    seven anchor rows in batch h2fix-20260921 were torn and were only caught by hand). Two
+    optional tail fields on [loop-tick] now report it: torn=<n> counts the selected windows
+    whose rectangle differed between the enumeration read and the detail read (the probe's
+    Add-ProbeWindowDetail keeps both), and desktop-changed=1 says cx/cy/wa differed when re-read
+    after the detail pass. Neither appears when there is nothing to report, so a quiet run is
+    byte for byte the file it always was. NOTHING IS RE-SAMPLED: a torn tick is reported, not
+    hidden, and the reader steps its anchor back a tick.
 
     STOPPING IS TRIPLE. (1) A hard deadline computed once at start-up and printed on the header,
     so a lost sentinel can never leave a process running in the owner's session; (2) the sentinel
@@ -71,7 +85,11 @@
     never started or died before its first flush; a file with only [loop-head] means the first
     sample threw; ticks with no RESULT line at all mean the process was killed (the load-bearing
     unknown of this lane); RESULT: FAILED <stage>/<Type> is an orderly death, message-free
-    because an exception message can carry a path.
+    because an exception message can carry a path. Since 2026-09-21 a tick is written as ONE
+    group -- its [loop-tick] line and its rows are held until the detail pass has run, then
+    flushed together -- so a kill during the detail pass loses that whole tick instead of
+    leaving a tick line with a partial set of rows: the file then ends on the previous complete
+    tick, and "where it died" is one tick earlier than the last line suggests.
 
     Windows PowerShell 5.1 notes: no ??, no ternary; every native call goes through the probe's
     Invoke-ProbeCall, so a missing export or a window that died between EnumWindows and the call
@@ -195,13 +213,27 @@ function Format-LoopHeadRow {
 
 function Format-LoopTickRow {
     <#
-      "[loop-tick] seq= utc= cx= cy= wa= [truncated=true]" -- one sample's session-wide facts,
-      followed in the file by that sample's [tick-rect] rows carrying the same seq.
+      "[loop-tick] seq= utc= cx= cy= wa= [truncated=true] [torn=<n>] [desktop-changed=1]" -- one
+      sample's session-wide facts, followed in the file by that sample's [tick-rect] rows
+      carrying the same seq.
 
       truncated= is DERIVED here from the two counts the sample took, exactly as the probe's
       [host-enum] line does it, so the flag can never contradict the rows. It is appended rather
       than always present because a tick line is written four times a second: the common case
       pays no bytes for it, and its presence is the whole signal.
+
+      torn= and desktop-changed= follow the same rule for the same reason, and their ORDER is
+      part of the grammar -- truncated, then torn, then desktop-changed -- because a reader
+      gates on the end of the line. torn=<n> is the number of selected windows whose window
+      rectangle differed between the enumeration read and the detail read; zero is written as
+      absence, never as torn=0, so a quiet tick is the line it has always been. desktop-changed
+      is a flag and not a pair of values on purpose: cx=/cy=/wa= keep reporting what the sample
+      OPENED with, which is what every existing reader gates on, and the re-read is never
+      printed.
+
+      A tick record that carries neither field -- the shape this function saw before 2026-09-21,
+      and the shape a half-built record has when a sample threw -- renders the quiet line. A
+      value that is not a number claims nothing rather than pasting itself into the grammar.
     #>
     [CmdletBinding()]
     param([AllowNull()] $Tick)
@@ -222,7 +254,86 @@ function Format-LoopTickRow {
             # stays in its common shape rather than asserting something it cannot know.
         }
     }
+    $torn = Get-ProbeProp -Object $Tick -Name 'Torn'
+    if ($null -ne $torn) {
+        try {
+            if ([int64]$torn -gt 0) { [void]$parts.Add('torn=' + (Format-ProbeInt -Value $torn)) }
+        } catch {
+            # Not a number, so no count can be claimed. Same rule as truncated= above.
+        }
+    }
+    $desktopChanged = Get-ProbeProp -Object $Tick -Name 'DesktopChanged'
+    if ($null -ne $desktopChanged) {
+        try {
+            if ([bool]$desktopChanged) { [void]$parts.Add('desktop-changed=1') }
+        } catch {
+            # Not a truth value; the tick says nothing about the desktop rather than guessing.
+        }
+    }
     return ($parts.ToArray() -join ' ')
+}
+
+function Test-LoopRectTorn {
+    <#
+      Did the window rectangle move between the enumeration read and the detail read?
+
+      The comparison goes through the probe's Format-Rect rather than over the edges directly,
+      so it sees exactly what the row will print: a rectangle missing an edge is n/a to the
+      formatter and is n/a here too, and two failed reads compare equal because "the call was
+      refused twice" says nothing about movement. One failed read against one good one IS a
+      difference -- a window that died or was refused mid-tick is not one this tick measured.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()] $Before, [AllowNull()] $After)
+    return ((Format-Rect -Rect $Before) -ne (Format-Rect -Rect $After))
+}
+
+function Measure-LoopTornWindows {
+    <#
+      How many of one tick's selected windows moved across its two reads -- the number torn=
+      reports, counted over the SAME records the [tick-rect] rows are formatted from, so the
+      count and the rows can never disagree.
+
+      A record with no WindowRectFirst (one built before the re-read existed, or by a caller
+      that does not supply it) counts as not torn: nothing can be claimed from a single read,
+      and claiming torn there would mark every tick of every older file. The same null check
+      also swallows a first read that came back n/a, and the two are deliberately not told
+      apart here: Select-ProbeWindows only hands this function windows whose FIRST read was a
+      rectangle (Test-ProbeWindowRectOk gates the selection), so that branch is unreachable for
+      a selected window and Test-LoopRectTorn's one-sided rule can only ever fire on the
+      SECOND read.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()] $Windows)
+    $torn = 0
+    if ($null -eq $Windows) { return $torn }
+    foreach ($window in @($Windows)) {
+        $first = Get-ProbeProp -Object $window -Name 'WindowRectFirst'
+        if ($null -eq $first) { continue }
+        if (Test-LoopRectTorn -Before $first -After (Get-ProbeProp -Object $window -Name 'WindowRect')) { $torn++ }
+    }
+    return $torn
+}
+
+function Test-LoopDesktopChanged {
+    <#
+      Did the session itself change shape while this tick's rows were being read?
+
+      All three are compared, not just cx/cy: a work area that moves without the screen moving
+      is still a re-layout under the rows, and the reader's join gates on wa= as much as on the
+      screen size. Comparison is again through the formatters, so a metric that was refused on
+      BOTH reads is not a change -- otherwise a host that refuses the call would mark every
+      single tick and the flag would carry no information at all.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()] $BeforeCx, [AllowNull()] $BeforeCy, [AllowNull()] $BeforeWorkArea,
+        [AllowNull()] $AfterCx, [AllowNull()] $AfterCy, [AllowNull()] $AfterWorkArea
+    )
+    if ((Format-ProbeInt -Value $BeforeCx) -ne (Format-ProbeInt -Value $AfterCx)) { return $true }
+    if ((Format-ProbeInt -Value $BeforeCy) -ne (Format-ProbeInt -Value $AfterCy)) { return $true }
+    if ((Format-Rect -Rect $BeforeWorkArea) -ne (Format-Rect -Rect $AfterWorkArea)) { return $true }
+    return $false
 }
 
 function Format-TickRectRow {
@@ -411,18 +522,37 @@ function Invoke-WindowLoop {
             $counts = Measure-ProbeWindows -Windows @($bases.ToArray())
             $selected = @(Select-ProbeWindows -Windows @($bases.ToArray()) -Cap $script:ProbeMaxRows)
 
+            # The detail pass runs BEFORE the tick line is assembled, because torn= and
+            # desktop-changed= are facts it produces. The rows are therefore held for the length
+            # of one tick and written after their tick line: the FILE's order is unchanged --
+            # [loop-tick] first, then its rows, which is the grouping contract -- only the
+            # assembly order is. The buffer is at most the probe's cap, i.e. 64 strings.
+            $details = New-Object System.Collections.ArrayList
+            foreach ($window in $selected) {
+                [void]$details.Add((Add-ProbeWindowDetail -Window $window -ProcessNameCache $cache))
+            }
+
+            # The desktop metrics again, now that the rows have been read. Whatever comes back
+            # is compared, never printed: cx=/cy=/wa= keep reporting the values this sample
+            # opened with, and a disagreement becomes the flag.
+            $cxAfter = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::MetricOf($cxIndex) }
+            $cyAfter = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::MetricOf($cyIndex) }
+            $workAreaAfter = Invoke-ProbeCall { [MacdowsLab.WindowProbeNative]::WorkAreaOf($workAreaAction) }
+
             $tick = [pscustomobject]@{
-                Seq      = $seq
-                Utc      = $utc
-                Cx       = $cx
-                Cy       = $cy
-                WorkArea = $workArea
-                RectOk   = $counts.RectOk
-                Selected = $selected.Count
+                Seq            = $seq
+                Utc            = $utc
+                Cx             = $cx
+                Cy             = $cy
+                WorkArea       = $workArea
+                RectOk         = $counts.RectOk
+                Selected       = $selected.Count
+                Torn           = (Measure-LoopTornWindows -Windows @($details.ToArray()))
+                DesktopChanged = (Test-LoopDesktopChanged -BeforeCx $cx -BeforeCy $cy -BeforeWorkArea $workArea `
+                    -AfterCx $cxAfter -AfterCy $cyAfter -AfterWorkArea $workAreaAfter)
             }
             $writer.WriteLine((Format-LoopTickRow -Tick $tick))
-            foreach ($window in $selected) {
-                $detail = Add-ProbeWindowDetail -Window $window -ProcessNameCache $cache
+            foreach ($detail in @($details.ToArray())) {
                 $writer.WriteLine((Format-TickRectRow -Seq $seq -Window $detail))
             }
             $writer.Flush()
