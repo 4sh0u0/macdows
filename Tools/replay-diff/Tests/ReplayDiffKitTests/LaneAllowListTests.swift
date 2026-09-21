@@ -46,7 +46,10 @@ struct LaneAllowListTests {
                 observed.insert(record.eventName)
             }
         }
-        #expect(observed.count == 17, "expected 17 measured main-lane names, saw \(observed.count)")
+        // 17 on the retired 1x corpus; 18 since the 2026-09-21 2x rebaseline added
+        // `LogonErrorInfo` (one occurrence, s1 only — its thread was measured before the
+        // allow-list entry was written, see `EventLane.mainLaneEventNames`).
+        #expect(observed.count == 18, "expected 18 measured main-lane names, saw \(observed.count)")
         #expect(
             observed.subtracting(EventLane.mainLaneEventNames).isEmpty,
             "measured but not allow-listed: \(observed.subtracting(EventLane.mainLaneEventNames).sorted())"
@@ -131,6 +134,8 @@ struct LaneAllowListTests {
             payload = #""rc":0"#
         case "DurationElapsed":
             payload = #""sinceConnectMs":1234"#
+        case "LogonErrorInfo":
+            payload = #""data":"SESSION_ID","type":"LOGON_MSG_SESSION_CONTINUE""#
         case "MonitoredDesktop":
             payload = #""fieldFlags":2,"activeWindowId":65832,"numWindowIds":1"#
         case "NotifyIconCreate", "NotifyIconUpdate", "NotifyIconDelete":

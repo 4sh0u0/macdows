@@ -36,7 +36,7 @@
 #
 # Usage:
 #   Scripts/upgrade-gate.sh [options]
-#     --baseline DIR       Frozen reference captures (default: samples/phase05-rail-events-2026-08-19)
+#     --baseline DIR       Frozen reference captures (default: samples/phase05-rail-events-2026-09-21-2x)
 #     --candidate DIR      Captures to judge (default: the baseline -- the offline self-diff smoke)
 #     --report-dir DIR     Where to write the artifacts (default: .build/upgrade-gate)
 #     --format text|json   replay-diff output format for the saved report (default: text)
@@ -65,7 +65,7 @@ EXIT_OK=0
 EXIT_GATE_FAILED=1
 EXIT_CANNOT_RUN=2
 
-DEFAULT_BASELINE_DIR="$CRDP_REPO_ROOT/samples/phase05-rail-events-2026-08-19"
+DEFAULT_BASELINE_DIR="$CRDP_REPO_ROOT/samples/phase05-rail-events-2026-09-21-2x"
 DIFF_PACKAGE_DIR="$CRDP_REPO_ROOT/Tools/replay-diff"
 
 BASELINE_DIR="$DEFAULT_BASELINE_DIR"
@@ -84,7 +84,7 @@ upgrade-gate.sh -- the one-command W2 upgrade gate driver (offline; never dials 
   Scripts/upgrade-gate.sh [options]
 
     --baseline DIR       Frozen reference captures
-                         (default: samples/phase05-rail-events-2026-08-19)
+                         (default: samples/phase05-rail-events-2026-09-21-2x)
     --candidate DIR      Captures to judge (default: the baseline, i.e. the offline
                          self-diff smoke, which is NOT an upgrade release)
     --report-dir DIR     Artifact directory (default: .build/upgrade-gate)

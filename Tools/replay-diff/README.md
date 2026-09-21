@@ -13,7 +13,7 @@ Direct use, once built:
 
 ```sh
 "$(swift build --package-path Tools/replay-diff --show-bin-path)/replay-diff" \
-    samples/phase05-rail-events-2026-08-19 /path/to/re-record
+    samples/phase05-rail-events-2026-09-21-2x /path/to/re-record
 ```
 
 Both arguments are either two `.jsonl` files or two directories of them (paired by base
@@ -192,7 +192,7 @@ one-off table is never indistinguishable from a run without one.
   even in a parse-failure report. Output from a live re-record is still capture-derived —
   read it before copying anything into a tracked drill record.
 - **The baseline stays frozen.** Test fixtures live under `Tests/`, never under `samples/`
-  (M1 wave-1 ruling U7): `samples/phase05-rail-events-2026-08-19` is what the gate diffs
+  (M1 wave-1 ruling U7): `samples/phase05-rail-events-2026-09-21-2x` is what the gate diffs
   against and must stay byte-identical.
 
 ## Known limitation: the ordinal-shift cascade (collapsed for uniquely-titled windows, W2 batch 2)

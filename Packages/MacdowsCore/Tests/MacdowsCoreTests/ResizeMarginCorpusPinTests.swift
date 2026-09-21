@@ -9,16 +9,26 @@ import Testing
 // when the style field is not part of the update -- `fieldFlags` decides -- so the update's own
 // `style` column says nothing about the window).
 //
-// What the census shows on the frozen corpus (recomputed 2026-09-08, pinned below):
-//   * WindowCreate: 138 orders, 7 with both margin bits -- all seven WS_POPUP helper windows
-//     (style 0x80000000, sizes 1009x4 / 0x0); 6 THICKFRAME creates, none with the bits.
-//   * WindowUpdate: 64 orders, 6 with both margin bits -- one per scenario, ALL on the same
-//     THICKFRAME window (id 328256, create style 0x000F0000).
-// So the margins DO reach the one window that could use them, via updates, not creates -- the
-// 2026-09-08 survey counted creates only and concluded the opposite (its own §6 flagged the
-// gap). rail-probe does not log the margin VALUES at all (no `resizeMargin*` field in any
-// sample line), so whether the values are usable stays open until the probe logs them
-// (adr/0008 §5 append-only) and a re-record exists -- that is what ADR-0018 U-5 now asks.
+// What the census showed on the retired 1x corpus (2026-09-08): WindowCreate 138 orders, 7 with
+// both margin bits, all WS_POPUP helpers (style 0x80000000, 1009x4 / 0x0), 6 THICKFRAME creates
+// none of them margin-bearing; WindowUpdate 64 orders, 6 with both bits, one per scenario, all on
+// the same THICKFRAME window (id 328256, create style 0x000F0000).
+//
+// RECOMPUTED on the 2026-09-21 2x corpus (U-7 rebaseline) -- the numbers below are measured, and
+// two of the 1x conclusions do NOT survive the re-record; they are restated here rather than
+// quietly dropped:
+//   * WindowCreate: 125 orders, 14 with both margin bits, and they are no longer one shape class:
+//     eight distinct (style, w, h) shapes appear, including the About dialog (0x80080000,
+//     1072x928), the Registry Editor window (0x000F0000, 966x688) and the tray-flyout class
+//     (0x800B0000 / 0x800F0000).
+//   * THICKFRAME creates: 5, and 2 of them DO carry both bits -- the 1x "none margin-bearing"
+//     finding is a property of that session, not of the protocol. The margins now reach a
+//     resizable window on the CREATE as well as on updates.
+//   * WindowUpdate: 65 orders, 4 with both bits, and NOT one per scenario (s1/s4/s5a/s5b have one
+//     each, s2/s3 none), on two distinct create-time styles (0x000F0000 and 0x800F0000).
+// The probe now DOES log the four `resizeMargin*` values (ADR-0018 U-5 step 1), so the 2x samples
+// carry them; this census still counts BITS only, deliberately -- the value side belongs to
+// `ResizeMarginPayloadTests` and to whatever consumer ADR-0018 U-5 step 3 rules in.
 //
 // Layering (ReplayTests' own rule): the corpus pins are frozen-baseline feature pins
 // (`.enabled(if: ReplayTests.samplesDirIsFrozenBaseline)`); the census helper itself is pinned
@@ -146,7 +156,7 @@ struct ResizeMarginCorpusPinTests {
     // MARK: frozen-baseline pins (skip, not pass, under a SAMPLES_DIR override)
 
     @Test(
-        "frozen corpus: creates 138 / margin-bearing 7 (all WS_POPUP helpers 1009x4 or 0x0); THICKFRAME creates 6, none margin-bearing",
+        "frozen corpus: creates 125 / margin-bearing 14 across eight shape classes; THICKFRAME creates 5, two of them margin-bearing",
         .enabled(if: ReplayTests.samplesDirIsFrozenBaseline, ReplayTests.featurePinSkipReason)
     )
     func frozenCreates() throws {
@@ -154,26 +164,46 @@ struct ResizeMarginCorpusPinTests {
         for scenario in ReplayTests.Scenario.allCases {
             total += ResizeMarginCensus.of(try ReplayTests.replay(scenario).events)
         }
-        #expect(total.creates == 138)
-        #expect(total.createsWithBothBits == 7)
-        #expect(total.createBitShapes == [[0x8000_0000, 1009, 4], [0x8000_0000, 0, 0]])
-        #expect(total.thickFrameCreates == 6)
-        #expect(total.thickFrameCreatesWithBothBits == 0)
+        #expect(total.creates == 125)
+        #expect(total.createsWithBothBits == 14)
+        #expect(total.createBitShapes == [
+            [0x000F_0000, 966, 688],
+            [0x8000_0000, 0, 0],
+            [0x8000_0000, 1280, 720],
+            [0x8000_0000, 2530, 4],
+            [0x8000_0000, 2560, 1440],
+            [0x8008_0000, 1072, 928],
+            [0x800B_0000, 262, 71],
+            [0x800F_0000, 240, 60],
+        ])
+        #expect(total.thickFrameCreates == 5)
+        // NOT zero any more (it was on the 1x corpus): a resizable window's CREATE does carry
+        // the margins in this session. Pinned as the measured value, not widened away.
+        #expect(total.thickFrameCreatesWithBothBits == 2)
     }
 
+    /// Margin-bearing updates per scenario. The 1x corpus had exactly one in every scenario,
+    /// which the pin asserted as a uniform literal; the 2x corpus does not (s2/s3 have none),
+    /// so the same "exact per-scenario count" semantics is restated as a table instead of
+    /// being widened to a range.
+    static let expectedMarginUpdatesWithBothBits: [ReplayTests.Scenario: Int] = [
+        .s1: 1, .s2: 0, .s3: 0, .s4: 1, .s5a: 1, .s5b: 1,
+    ]
+
     @Test(
-        "frozen corpus: updates 64 / margin-bearing 6 -- one per scenario, every one on a THICKFRAME window (create style 0x000F0000)",
+        "frozen corpus: updates 65 / margin-bearing 4 -- per-scenario table, on create styles 0x000F0000 and 0x800F0000",
         .enabled(if: ReplayTests.samplesDirIsFrozenBaseline, ReplayTests.featurePinSkipReason)
     )
     func frozenUpdates() throws {
         var total = ResizeMarginCensus()
         for scenario in ReplayTests.Scenario.allCases {
             let c = ResizeMarginCensus.of(try ReplayTests.replay(scenario).events)
-            #expect(c.updatesWithBothBits == 1, "scenario \(scenario.rawValue)")
+            let expected = try #require(Self.expectedMarginUpdatesWithBothBits[scenario])
+            #expect(c.updatesWithBothBits == expected, "scenario \(scenario.rawValue)")
             total += c
         }
-        #expect(total.updates == 64)
-        #expect(total.updatesWithBothBits == 6)
-        #expect(total.updateBitWindowsCreateStyles == [0x000F_0000])
+        #expect(total.updates == 65)
+        #expect(total.updatesWithBothBits == 4)
+        #expect(total.updateBitWindowsCreateStyles == [0x000F_0000, 0x800F_0000])
     }
 }

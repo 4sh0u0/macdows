@@ -276,9 +276,23 @@ struct TitleAnchoredIdentityTests {
     /// multi-member class read as if it were the residual): the 4-member 136x39 tray-helper
     /// class, **11 eventCountChanged / 34 findings**; the 5-member 0x0 class, **3 / 52**; two
     /// singleton classes, **1 / 24** and **3 / 64**. The note quotes the range 1–11 / 24–64.
-    @Test("an untitled extra head window still cascades — the residual the note keeps naming")
+    ///
+    /// U-7 2x rebaseline (2026-09-21): this experiment deliberately keeps reading the
+    /// RETIRED 1x capture, by path, gated on it still being present. Everything pinned
+    /// below — the 145-line count, the four payload classes it clones (136x39, 0x0, 396x0),
+    /// the 1–11 / 24–64 endpoints — is a MEASUREMENT of that corpus, and the runtime
+    /// CASCADE-RISK note quotes those same endpoints verbatim. The 2x corpus has different
+    /// classes (262x71 instead of 136x39, 2530x4 instead of 396x0) and 144 lines in s3, so
+    /// re-pointing this at the new default would silently replace a measured claim with an
+    /// unmeasured one and leave the note's quoted range unbacked. Re-measuring the cascade
+    /// range on the 2x corpus and updating the note is a separate, reviewed change.
+    @Test(
+        "an untitled extra head window still cascades — the residual the note keeps naming (retired 1x corpus)",
+        .enabled(if: PhaseSamples.legacy1xAvailable,
+                 "the retired 1x capture directory is absent — the measured cascade residual cannot be re-checked")
+    )
     func untitledResidualCascades() throws {
-        let url = try #require(PhaseSamples.url(named: "s3-multiapp"))
+        let url = try #require(PhaseSamples.legacy1xURL(named: "s3-multiapp"))
         let contents = try String(contentsOf: url, encoding: .utf8)
         var lines = contents.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         while lines.last?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true { lines.removeLast() }
