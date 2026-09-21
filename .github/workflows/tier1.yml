@@ -332,6 +332,28 @@ jobs:
         # the script is red against the parent commit and green against this one by construction.
         run: ./Scripts/test-window-smoke-pins.sh
 
+      - name: K client-rect pins -- no product consumer, every lab mention registered
+        # The four RAIL client-rect fields (clientOffsetX/Y, windowClientDeltaX/Y -- K = delta-off)
+        # are CARRIED across five layers and CONSUMED by none: macContentRect still uses `off` alone
+        # as the client-area origin. The 2026-09-21 read-only map established that by grep plus one
+        # read and said so; this step is the first-hand form. A closed allow-list of the eleven carry
+        # sites, each with its purpose and its frozen comment-stripped occurrence counts, plus the
+        # negative pins on macContentRect's body and the whole rendering package.
+        #
+        # TWO claims, and the failure text says which one moved. (1) PRODUCT (App/, Packages/,
+        # Tools/): nothing outside the carry set names any of the four -- red here means a product
+        # path started naming a K field, so wire it deliberately or register the carrier. (2) LAB
+        # (Scripts/): every measurement-side file that names them is registered with its purpose --
+        # red here is NOT a counter-example to claim (1); a lab script naming the field set is
+        # declared by adding it to the allow-list.
+        #
+        # The repo's Swift pin on the same claim lives in App/MacdowsAppTests/ and needs Xcode, so
+        # it never runs here -- this is the twin that does, and it additionally reaches the
+        # ObjC++/C/PowerShell/lab carry sites the Swift bundle does not enumerate (by design: that
+        # bundle holds the exact call shapes instead). If a lane ever wires K, this step is SUPPOSED
+        # to go red and the lane declares the new consumer on the allow-list.
+        run: ./Scripts/test-k-consumer-pins.sh
+
       - name: Build-script prefix freshness suite
         # Scripts/build-ffmpeg.sh's idempotent skip is gated on a freshness verdict
         # (`--check-prefix`), not on the version stamp alone: a prefix built before a
