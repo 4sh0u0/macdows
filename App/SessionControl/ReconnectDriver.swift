@@ -1,5 +1,6 @@
 import Foundation
 import MacdowsCore
+import os
 
 /// Decides whether and when a dropped session reconnects, and performs the reconnect.
 ///
@@ -339,10 +340,19 @@ final class ReconnectDriver {
 
     // MARK: - State changes and the log line
 
+    /// The unified-log half of the line below. See `logLine`'s doc for why there are two halves.
+    private static let logger = Logger(subsystem: "dev.haru.macdows", category: "Reconnect")
+
     private func transition(to next: State) {
         state = next
         if let line = Self.logLine(for: next, failedAttempts: failedAttempts) {
             print(line)
+            // adr/0019 §2 lane D. The SAME string, on a second channel, and the `print` above is
+            // untouched -- see `logLine`'s doc comment. `privacy: .public` because the line is
+            // built from a fixed vocabulary of state names, an attempt index and a policy delay;
+            // without it the unified log would store `<private>` and the channel would be useless
+            // for exactly the run it exists to make readable.
+            Self.logger.info("\(line, privacy: .public)")
         }
         onStateChange?(next)
     }
@@ -357,8 +367,22 @@ final class ReconnectDriver {
     /// future live-host acceptance run will read, and the reason it is frozen now is that a
     /// judgement unit changed after the fact makes every earlier run unreadable.
     ///
-    /// `print`, not `os_log`: the harness that captures a run's output tees stdout to a file, and
-    /// unified-log entries do not land in it.
+    /// `print` AND the unified log, with the same string on both channels (adr/0019 §2 lane D).
+    /// They are complementary, not redundant, and neither one replaces the other:
+    ///
+    ///  - `print` is what the command-line harnesses read. `Scripts/run-window-smoke.command` tees
+    ///    stdout to a file, and `os_log` entries never land in it —
+    ///    `RemoteWindowRegistry.sessionTopologyFreezeCount`'s own doc records that finding.
+    ///  - the unified log is the only channel the GUI app has. `Macdows.app` is launched by Finder,
+    ///    by Xcode's Run button or by `open`, none of which gives its stdout anywhere a later
+    ///    reader can find, and the App is where a live-host reconnect run will actually happen.
+    ///    `log show --predicate 'subsystem == "dev.haru.macdows" AND category == "Reconnect"'`
+    ///    exports these lines, and what it exports is this same frozen text.
+    ///
+    /// The `print` argument is therefore byte-for-byte what it was before the second channel
+    /// existed, and `ReconnectLogChannelPinTests` is what keeps it that way: a judgement unit
+    /// changed after the fact makes every earlier run unreadable, and that applies to a line that
+    /// gains a prefix on its way to a new destination exactly as much as to one that is reworded.
     ///
     /// Returns `nil` for `.idle`, which is a starting value rather than a transition and therefore
     /// has no line — the frozen shape enumerates four state names and `idle` is deliberately not
