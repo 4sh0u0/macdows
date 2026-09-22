@@ -60,6 +60,13 @@ targets:
       # a separate framework target, since neither consumer needs anything the other
       # doesn't and a third Swift module boundary here would buy nothing).
       - path: RemoteWindowRendering
+      # adr/0019 §2 lane B: the session-lifecycle driver (reconnect back-off on top of
+      # MacdowsCore.ReconnectPolicy and CRSession's -restartForReconnectPreparing:). Its own
+      # directory, compiled into THIS target and MacdowsAppTests and deliberately NOT into
+      # window-smoke — see that target's sources: for why, and
+      # MacdowsAppTests/ReconnectSemanticsPinTests.swift for the pin that holds all three
+      # sides of that here rather than in a comment.
+      - path: SessionControl
       # Copy Files -> Frameworks: embed the three FreeRDP dylibs the CRBridge target
       # links against. install_name on these is already @rpath (verified against the lab
       # build), so LD_RUNPATH_SEARCH_PATHS = @executable_path/../Frameworks below is
@@ -401,6 +408,14 @@ targets:
     platform: macOS
     deploymentTarget: "14.0"
     sources:
+      # adr/0019 §2 lane B: SessionControl is deliberately absent, and this list is pinned
+      # for equality by MacdowsAppTests/ReconnectSemanticsPinTests.swift. This fixture is
+      # the only reconnect driver in the tree — it tears a session down and restarts it once
+      # per soak cycle, on its own schedule, and its clean / leftoverWindows / freezeCount
+      # assertions are written against exactly that sequence. Linking ReconnectDriver in here
+      # would put a second driver in the same binary, reacting to the very disconnect this
+      # one caused. Leaving the directory out makes that impossible at link time rather than
+      # by anyone's discipline.
       - path: ../Tools/window-smoke
       - path: RemoteWindowRendering
     settings:
@@ -463,6 +478,10 @@ targets:
     sources:
       - path: MacdowsAppTests
       - path: RemoteWindowRendering
+      # adr/0019 §2 lane B: same direct source-file sharing as the line above -- the driver is
+      # compiled INTO this bundle, so ReconnectDriverTests reaches its `internal` API with no
+      # @testable and no framework target.
+      - path: SessionControl
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.haru.macdows.dev.apptests
