@@ -490,6 +490,17 @@ typedef NS_ENUM(NSInteger, CRSessionState) {
                                                  * increments this (and WLog_WARNs) instead
                                                  * of silently swallowing a command when RAIL
                                                  * isn't connected yet. */
+    /* adr/0019 §2 lane B: cumulative for this instance, like the three counters above --
+     * -restartForReconnectPreparing: is its only writer, one per call. */
+    atomic_ullong _reconnectAttemptCount;
+    /* adr/0019 §2 lane B, the sentinel memory bit -- see -shutdownAndWait's header doc.
+     * Per CONNECTION, not per instance: -start clears it, -drainEventsWithHandler: sets it
+     * for any generation-matching DISCONNECTED it drains (whoever the drain's handler is),
+     * and step 4 of -shutdownAndWait seeds its own `sawDisconnected` from it so a sentinel
+     * some earlier drain already consumed still counts as observed. T_main only: every
+     * drain, every -start and every -shutdownAndWait runs on the thread that owns this
+     * session (CRSession.h's threading contract), so a plain BOOL is the whole story. */
+    BOOL _disconnectSentinelSeen;
     CRSessionState _state;
 }
 @property (nonatomic, copy) NSString *host;
@@ -2382,6 +2393,7 @@ static void crb_schedule_drain(void *ctx)
         atomic_init(&_staleEventsDiscardedCount, 0ULL);
         atomic_init(&_unknownEventCount, 0ULL);
         atomic_init(&_outboundDroppedNoRailCount, 0ULL);
+        atomic_init(&_reconnectAttemptCount, 0ULL);
 
         /* Persists across every reconnect this instance ever does -- adr/0005 §3/§4: the
          * generation counter this queue owns internally is the one and only thing a
@@ -2483,6 +2495,12 @@ static void crb_schedule_drain(void *ctx)
     /* adr/0011 §2: reset before every fresh attempt, same reasoning as -lastConnectError
      * above -- a caller must never see a prior connection generation's answer. */
     self.unicodeInputSupported = NO;
+    /* adr/0019 §2 lane B: both are per-CONNECTION, for the same reason as the two lines
+     * above, and this is the one place a new connection begins. Deliberately BELOW the
+     * not-idle gate: a -start that was ignored must not clear the state of the connection
+     * that is actually live. */
+    _teardownInitiated = NO;
+    _disconnectSentinelSeen = NO;
     _state = CRSessionStateConnecting;
 
     if (!crb_openssl_legacy_provider_available())
@@ -2633,6 +2651,11 @@ cleanup:
     if (_state == CRSessionStateIdle)
         return YES;
     _state = CRSessionStateDraining;
+    /* adr/0019 §2 lane B: from here until the next -start, a drained DISCONNECTED is this
+     * side's own doing. Set AFTER the idle early-return above -- an idle no-op tore nothing
+     * down, so claiming a teardown is in progress would leave the flag stuck YES with no
+     * -start on the way to clear it. */
+    _teardownInitiated = YES;
 
     /* Step 1: reject new outbound, signal T_rdp. */
     if (_outboundQueue)
@@ -2644,7 +2667,15 @@ cleanup:
      * DISCONNECTED with a bounded timeout -- pthread_join below is the real safety net,
      * this loop only exists to observe the sentinel and report a clean-vs-forced
      * shutdown, since W4a has no RemoteWindow registry to clean up yet. */
-    __block BOOL sawDisconnected = NO;
+    /* adr/0019 §2 lane B: seeded from the per-connection sentinel memory bit rather than
+     * from NO. On an UNEXPECTED disconnect the sentinel is posted while the owner's ordinary
+     * drain loop is still running, so that drain consumes it and this loop -- which can only
+     * see what it drains itself -- would burn its full 100 x 50 ms = 5 s budget on a
+     * connection that already ended cleanly, and then report clean=NO. The bit records that
+     * the sentinel did arrive on THIS connection (generation-matched, see
+     * -drainEventsWithHandler:), which is exactly what this loop is looking for; the
+     * clean-vs-forced meaning of the answer is unchanged. */
+    __block BOOL sawDisconnected = _disconnectSentinelSeen;
     for (int i = 0; i < 100 && !sawDisconnected; i++)
     {
         [self drainEventsWithHandler:^(CRDPEvent *event) {
@@ -2700,6 +2731,49 @@ cleanup:
     return sawDisconnected;
 }
 
+- (BOOL)restartForReconnectPreparing:(NS_NOESCAPE void (^)(void))prepare
+{
+    /* adr/0005 §4's reconnect, as one named step. The three parts below are the whole
+     * method on purpose: their ORDER is the thing this method exists to own. Until now the
+     * only reconnect driver in the tree was Tools/window-smoke, which spells the same three
+     * out by hand and whose own comment records that reversing the middle two is invisible
+     * to every offline test -- a pairing that can only be checked by reading call sites is
+     * one that will eventually be got wrong. Here shutdown-before-prepare-before-start is a
+     * property of the type, and a caller cannot express any other order.
+     *
+     * Everything a reconnect has to undo is undone by -shutdownAndWait (it walks all five
+     * steps, ending with the single crdpq_generation_bump this file contains) and everything
+     * a connection needs is rebuilt by -start; `prepare` is only the window between them, for
+     * the per-connection state that lives OUTSIDE this class and therefore cannot be re-taken
+     * by either of those two -- the caller's window registry and display-topology freeze. It
+     * runs synchronously, on this thread, with the session idle: exactly the pre-connect
+     * moment a freshly constructed registry would occupy. */
+    uint32_t generationBeforeShutdown = [self currentGeneration];
+    BOOL clean = [self shutdownAndWait];
+    /* One per reconnect performed, counted here rather than inside -shutdownAndWait so it counts
+     * RECONNECTS and not teardowns (-dealloc and applicationWillTerminate shut down without ever
+     * reconnecting).
+     *
+     * Gate r1 I-3: guarded by an ACTUAL generation change rather than counted unconditionally.
+     * -shutdownAndWait early-returns without bumping when the session is already idle, so an
+     * unconditional increment here would count a reconnect that tore nothing down -- and the
+     * header's "moves in lock-step with the generation counter" would be false on exactly that
+     * path. Comparing the counter across the call makes the claim true by construction instead of
+     * by the caller happening never to do that. The comparison is safe for the wrap case too: a
+     * bump changes the value, and `!=` is all this needs. */
+    if ([self currentGeneration] != generationBeforeShutdown)
+        atomic_fetch_add(&_reconnectAttemptCount, 1ULL);
+    if (prepare)
+        prepare();
+    [self start];
+    /* Both halves, per this method's header doc. -start is asynchronous past this point (T_rdp
+     * does the connect), so CRSessionStateConnected here means "the thread was spawned", not
+     * "the server answered" -- a caller waits for HandshakeFlags, or for -lastConnectError, to
+     * learn that. What YES rules out is the two synchronous failures: an unclean shutdown, and
+     * a -start that fell straight back to idle. */
+    return clean && _state == CRSessionStateConnected;
+}
+
 - (NSUInteger)drainEventsWithHandler:(void (^)(CRDPEvent *event))handler
 {
     if (!_controlQueue)
@@ -2726,9 +2800,13 @@ cleanup:
          * session-wide -staleEventsDiscardedCount. Read-only from this visitor's point of
          * view -- the table takes its own lock, and this runs on T_main. */
         crgfx_counters_t *gfxCounters;
+        /* adr/0019 §2 lane B: the session's sentinel memory bit, written through a pointer
+         * because this visitor is a capture-less lambda (it converts to a C function
+         * pointer) and so cannot reach `self` any other way. */
+        BOOL *disconnectSentinelSeen;
     } DrainCtx;
     DrainCtx dctx = {handler,  expectedGeneration, &delivered, &discarded, &unknown,
-                     _iconStore, _gfxFrameCounters};
+                     _iconStore, _gfxFrameCounters, &_disconnectSentinelSeen};
 
     crdpq_drain(
         _controlQueue,
@@ -2748,6 +2826,13 @@ cleanup:
                   crgfx_counters_note_stale(dctx->gfxCounters, ev->payload.frameReady.surfaceId);
               return;
           }
+          /* adr/0019 §2 lane B: remember that this connection's DISCONNECTED sentinel
+           * arrived, whoever ends up consuming it. Placed AFTER the generation gate (a
+           * previous connection's sentinel says nothing about this one) and BEFORE the
+           * handler runs, so the bit is already set if the handler itself decides to tear
+           * the session down in response. See -shutdownAndWait step 4 for the consumer. */
+          if (ev->type == CRDPQ_EVENT_DISCONNECTED)
+              *dctx->disconnectSentinelSeen = YES;
           CRDPEvent *event = CRDPEventFromCrdpEvent(ev, dctx->iconStore);
           if (!event)
           {
@@ -2775,6 +2860,11 @@ cleanup:
 - (uint64_t)staleEventsDiscardedCount
 {
     return atomic_load(&_staleEventsDiscardedCount);
+}
+
+- (uint64_t)reconnectAttemptCount
+{
+    return atomic_load(&_reconnectAttemptCount);
 }
 
 - (uint64_t)unknownEventCount

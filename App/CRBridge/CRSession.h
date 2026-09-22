@@ -426,7 +426,69 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// the generation counter (step 5). Idempotent — calling this when already idle is a
 /// harmless no-op. Returns YES iff the DISCONNECTED sentinel was actually observed before
 /// the join (a clean shutdown, not a timeout-forced one).
+///
+/// adr/0019 §2 lane B: "observed" means observed by ANY drain on this connection, not only
+/// by step 4's own loop. An unexpected disconnect posts the sentinel while the owner's
+/// ordinary drain is still running, so the owner's drain consumes it and step 4 would
+/// otherwise poll its full 100 x 50 ms budget and then report a timeout-forced shutdown for
+/// a connection that had in fact ended cleanly. The session therefore remembers, for the
+/// lifetime of one connection, that the sentinel arrived (`-start` clears that memory), and
+/// step 4 starts from it. The clean/forced meaning of the return value is unchanged — only
+/// where the evidence may come from.
 - (BOOL)shutdownAndWait;
+
+/// adr/0019 §2 lane B: one reconnect, with the order of its three parts fixed by this
+/// method's shape rather than by a caller's discipline — `-shutdownAndWait`, then `prepare`
+/// (if non-nil), then `-start`. `prepare` runs synchronously on the calling thread, between
+/// a completed shutdown and the next connect attempt: that is the one moment at which a
+/// caller may re-take anything frozen per connection (the reconnect re-take point
+/// `RemoteWindowRegistry.prepareForReconnect()` documents, and any display-topology re-take
+/// that must reach the server in the same connect). Nothing here times, retries or backs
+/// off: this is a single reconnect step, and the policy that decides whether and when to
+/// take it lives above the bridge (adr/0019 §2 lane A/B) — this class never reconnects on
+/// its own.
+///
+/// Returns YES iff BOTH halves succeeded: the shutdown was clean (`-shutdownAndWait`
+/// returned YES) AND the following `-start` left this session connected. NO therefore does
+/// not say which half failed; `-lastConnectError` (cleared by that `-start`) distinguishes a
+/// refused connect from a merely unclean shutdown.
+/// `NS_NOESCAPE` is load-bearing, not decoration: it is the compiler-checked half of "runs
+/// synchronously, on this thread, between the two halves". It also makes the Swift import
+/// non-escaping, which is what lets a `@MainActor` caller hand this block a closure that
+/// touches its own actor-isolated state (the whole point of the block) under Swift 6's
+/// concurrency rules.
+///
+/// `NS_SWIFT_NAME` only because the importer's default for this selector is
+/// `restart(forReconnectPreparing:)`, which reads as though "reconnect-preparing" were a kind of
+/// restart. The Objective-C selector is unchanged.
+- (BOOL)restartForReconnectPreparing:(nullable NS_NOESCAPE void (^)(void))prepare
+    NS_SWIFT_NAME(restartForReconnect(preparing:));
+
+/// YES from the moment `-shutdownAndWait` starts its work until the next `-start` clears it
+/// — i.e. "this session's teardown was asked for from this side".
+///
+/// adr/0019 §2 lane B: the one piece of intent a `DISCONNECTED` event cannot carry.
+/// `CRDPQ_EVENT_DISCONNECTED` has no payload and no reason (crdpq.h), and the same sentinel
+/// is posted for a server-side drop, a failed connect and a locally requested shutdown, so a
+/// reconnect driver that treats every drained `.disconnected` as unexpected would fight its
+/// own owner's `-shutdownAndWait` (including the one `-dealloc` runs). Read this first, and
+/// reconnect only when it is NO. Idle before the first `-start`: NO.
+@property (nonatomic, readonly) BOOL teardownInitiated;
+
+/// Cumulative count of reconnects this instance has actually performed — one per
+/// `-restartForReconnectPreparing:` call whose `-shutdownAndWait` really tore a connection
+/// down, whether or not the `-start` that follows goes on to connect (it counts attempts to
+/// reconnect, which is what a back-off policy's attempt index is about, not successes).
+/// Survives reconnects and is never reset: the same cumulative-for-this-instance lifetime
+/// contract as `-staleEventsDiscardedCount`.
+///
+/// It moves in lock-step with the generation counter by construction, and the construction is
+/// literal: `-restartForReconnectPreparing:` reads `-currentGeneration` either side of its
+/// shutdown and increments only if that value actually changed. The path this rules out is
+/// `-restartForReconnectPreparing:` on an ALREADY IDLE session, where `-shutdownAndWait`
+/// early-returns without bumping anything — that call reconnects nothing and is not counted
+/// (gate r1 I-3).
+@property (nonatomic, readonly) uint64_t reconnectAttemptCount;
 
 /// Drains the control lane once. adr/0005 §3: "the one comparison point is at the drain()
 /// entry point" — this method
