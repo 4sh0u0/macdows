@@ -504,7 +504,19 @@ final class RemoteWindowRegistry {
     /// `nil` therefore behaves exactly like "no usable display": every consumer skips and warns
     /// once, none of them invents a substitute (ADR §5.A.6). It is a wiring defect rather than a
     /// supported mode, and `sessionTopologyOrWarn()` says so by name in the log.
-    private let topologyProvider: (any DisplayTopologyProviding)?
+    ///
+    /// `var` rather than `let` for exactly one reason, adr/0019 §2 lane C (owner ruling R-3 = K):
+    /// `prepareForReconnect(refreezingTopologyWith:)` may swap the seam for the connection it is
+    /// about to prepare. That is not a relaxation of §5.A.4 but the only way to honour it for the
+    /// App's provider shape — the App hands over `StaticDisplayTopologyProvider(sessionSnapshot)`,
+    /// a value that by construction can never change, so re-freezing against the SAME static
+    /// provider would bump `sessionTopologyFreezeCount` while re-reading the previous session's
+    /// layout. THE ONLY ASSIGNMENT OUTSIDE `init` IS IN THAT METHOD, and it happens at a connect
+    /// moment (after the shutdown, before the next `-start`). Any other assignment would replace
+    /// the seam a LIVE session is doing geometry against, which §5.A.3 forbids outright;
+    /// `ReconnectTopologyOrderPinTests` counts the assignments in this file so that a third one
+    /// cannot be added without a test going red.
+    private var topologyProvider: (any DisplayTopologyProviding)?
 
     /// THE SESSION'S FROZEN TOPOLOGY SNAPSHOT — ADR-0015 §5 (U8, answer A), and the landing
     /// point of its §5.A.4 invariant: *within one session, the Y-flip anchor and the desktop
@@ -582,6 +594,13 @@ final class RemoteWindowRegistry {
     /// desktop size was negotiated and the freshly frozen topology no longer derives that same
     /// size, it says so — once per process, on the same one-shot discipline as every other
     /// diagnostic here. Recorded, not corrected — M1 is a measurement batch.
+    ///
+    /// adr/0019 §2 lane C narrowed "what the caller still owes" from a request into a parameter:
+    /// the reconnect call site is now `prepareForReconnect(refreezingTopologyWith:)`, whose
+    /// closure runs *before* this re-take and may hand back the provider it should read. The two
+    /// call sites are unchanged in number and in kind (`init`, and the reconnect entry point),
+    /// and this method is still invoked exactly once per call on either path — which is what
+    /// keeps `sessionTopologyFreezeCount == 1 + N` the assertion it has always been.
     private func refreshSessionTopology(reason: String) {
         sessionTopology = topologyProvider?.currentTopology
         sessionTopologyFreezeCount += 1
@@ -3226,10 +3245,79 @@ final class RemoteWindowRegistry {
     /// on this side at all. Called after `shutdownAndWait()` and before the next `start()`
     /// (`Tools/window-smoke/main.swift:1660` → `:1667` → `:1719`), which is exactly the
     /// pre-connect moment `init` occupies for a per-connection registry.
+    ///
+    /// adr/0019 §2 lane C: this spelling is the no-refresh branch of
+    /// `prepareForReconnect(refreezingTopologyWith:)` — "keep the provider you already have" —
+    /// and it is written as a delegation rather than as a second copy of the body so that the
+    /// ORDER below can only ever exist in one place.
     func prepareForReconnect() {
+        prepareForReconnect(refreezingTopologyWith: { nil })
+    }
+
+    /// The same between-connections reset, with the caller's **topology re-take as a parameter**.
+    ///
+    /// adr/0019 §2 lane C (owner ruling R-3 = K). The re-take has to happen before the teardown,
+    /// and until this overload existed that ordering was a *request*: `refreshSessionTopology`'s
+    /// own doc comment asked callers to "re-derive the desktop size in the same turn", and
+    /// `Tools/window-smoke`'s `finishCycle` spelled the two statements out by hand with a comment
+    /// recording that reversing them is invisible to every offline test (the registry's
+    /// freeze-count counts up either way). Passing the re-take in makes the order a property of
+    /// the CALL SHAPE: there is no spelling of this method in which `refreeze` runs after
+    /// `closeAllWindows()`.
+    ///
+    /// WHAT `refreeze` IS FOR, beyond running early. It returns the `DisplayTopologyProviding`
+    /// this connection should read, or `nil` for "keep the one you have". Both answers are real
+    /// call sites and they correspond to the two provider shapes in the tree:
+    ///
+    ///  * `nil` — the caller handed over a LIVE provider, so re-taking its `currentTopology` is
+    ///    already enough (`Tools/window-smoke/main.swift` hands the registry its own
+    ///    `DisplayTopologyProvider`). Also the "no refresh at all" branch: a caller that does not
+    ///    re-derive anything keeps the layout the last connection froze, which is adr/0015
+    ///    §5.A.4's degraded-but-stated behaviour, not a silent one.
+    ///  * a provider — the caller handed over a STATIC snapshot, which cannot change under it by
+    ///    construction (`StaticDisplayTopologyProvider`, what the App's connect path builds). For
+    ///    that shape a re-take against the existing seam is a no-op by design
+    ///    (`DisplayTopologyProvider.sessionSnapshot`'s own doc comment says so), so the only way
+    ///    a reconnect can pick up a new layout is to hand over a snapshot of it. That is
+    ///    `ReconnectTopologyRefresh.refreeze(session:topology:)`, which freezes the new snapshot
+    ///    and assigns the desktop size derived from THAT SAME read before returning it — so the
+    ///    anchor and the negotiated size still come from one `NSScreen` read, §5.A.4 exactly.
+    ///
+    /// - Parameter refreeze: runs FIRST, synchronously, in this call's own turn, with the window
+    ///   table still intact. Non-escaping: it must not be stored and run later, because "later"
+    ///   is after the teardown.
+    /// - Returns: whether `refreeze` supplied a provider and the seam was therefore replaced.
+    ///   Discardable — no caller has to branch on it; it exists so the replacement is an
+    ///   observable fact rather than an inference from a freeze count that rises either way.
+    ///
+    ///   IT IS NOT A SUCCESS SIGNAL, and gate r1 (m-1) asked for that to be said here rather than
+    ///   inferred. `true` means one thing only: `refreeze` returned non-nil, so the seam was
+    ///   swapped. It does not mean a usable layout was found — `ReconnectTopologyRefresh.refreeze`
+    ///   returns `StaticDisplayTopologyProvider(nil)` when there is no usable display, which is a
+    ///   provider, so this answers `true` on a headless reconnect too. It also does not mean the
+    ///   new layout DIFFERS from the old one. In practice the value is constant per call site (the
+    ///   App's hook always replaces, the fixture never does), so it reports which caller you are,
+    ///   not what this reconnect found: a status line driven off it would be lying in both
+    ///   directions.
+    @discardableResult
+    func prepareForReconnect(
+        refreezingTopologyWith refreeze: () -> (any DisplayTopologyProviding)?
+    ) -> Bool {
+        // ① THE RE-TAKE, BEFORE ANYTHING IS TORN DOWN. This line and the three below it are the
+        //    whole of adr/0019 §2 lane C: everything the caller owes §5.A.4 happens here, while
+        //    the window table, the generation and the old snapshot are all still in place.
+        let replaced: Bool
+        if let fresh = refreeze() {
+            topologyProvider = fresh
+            replaced = true
+        } else {
+            replaced = false
+        }
+        // ②③ Byte-for-byte the body this method has had since W4b, in its original order.
         closeAllWindows()
         currentGeneration = nil
         refreshSessionTopology(reason: "reconnect")
+        return replaced
     }
 
     private func closeAllWindows() {

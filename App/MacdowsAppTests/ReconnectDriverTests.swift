@@ -517,8 +517,12 @@ struct ReconnectDriverStepTests {
         #expect(freezesAtStart == 1)
 
         var freezesSeenByHook: Int?
+        // adr/0019 §2 lane C changed the hook's type from `() -> Void` to one that returns the
+        // provider the registry should read. `nil` is "keep the seam you have", which is what this
+        // case was already asserting against; the ordering claim below is unchanged.
         fixture.driver.topologyRefresh = { [registry = fixture.registry] in
             freezesSeenByHook = registry.sessionTopologyFreezeCount
+            return nil
         }
 
         fixture.disconnect()

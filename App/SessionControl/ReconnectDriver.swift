@@ -101,7 +101,20 @@ final class ReconnectDriver {
     /// since connect shows up as a whole-desktop offset" one, with its repair moved from "the next
     /// reconnect" to "the next reconnect after lane C lands". Registered as such, and the driver
     /// does not paper over it with a guess.
-    var topologyRefresh: (() -> Void)?
+    ///
+    /// adr/0019 §2 lane C changed the TYPE, and the change is the point. It was `() -> Void`, and
+    /// the driver called it as a statement of its own immediately above `prepareForReconnect()` —
+    /// so the order the comment there describes was, once again, the caller's discipline. It now
+    /// returns the provider the registry should read, which makes it an ARGUMENT to
+    /// `prepareForReconnect(refreezingTopologyWith:)` and the order a property of the call shape.
+    /// A hook that has nothing to swap in returns `nil`, which is also what an absent hook means,
+    /// so the two spellings of "keep the frozen topology" collapse into one branch of one method.
+    ///
+    /// Lane D installs it, not this class and not a default: the closure needs the App's resident
+    /// `DisplayTopologyProvider`, and a driver that held one would be a second `NSScreen` reader
+    /// in everything but name (adr/0015 §5.A.5 allows exactly one). The product body it will be
+    /// built from is `ReconnectTopologyRefresh.refreeze(session:topology:)`.
+    var topologyRefresh: (() -> (any DisplayTopologyProviding)?)?
 
     /// Lane D's hook: every state change, in order, on T_main. Called after `state` is updated, so
     /// a handler reading `state` sees the new value.
@@ -274,18 +287,26 @@ final class ReconnectDriver {
         transition(to: .reconnecting(attempt: attempt))
 
         let restarted = session.restartForReconnect {
-            // The order inside this block is `-restartForReconnectPreparing:`'s whole reason for
-            // existing, and it matches the fixture's hand-written one: re-take the display
-            // topology FIRST (lane C fills this in; nil today), then re-freeze the registry
-            // against it. Reversed, the registry freezes against the old layout and the server is
-            // then told about the new one — the divergence adr/0015 §5.A.4 forbids.
-            self.topologyRefresh?()
-            // adr/0012 §2: closes every window, drops the generation, re-freezes the topology, and
-            // resets the focus gate to `.unmonitored` — which can only reopen on a real
-            // MonitoredDesktop order from the new connection. No timeout fallback, and no replay
-            // of buffered input into the new connection: both are deliberate, and both are
-            // decisions this driver must not quietly reverse.
-            self.registry.prepareForReconnect()
+            // ONE call, not two statements in a load-bearing order (adr/0019 §2 lane C). The
+            // re-take of the display topology must happen before the registry tears its table
+            // down and re-freezes, or the registry freezes against the old layout while the server
+            // is told about the new one — the divergence adr/0015 §5.A.4 forbids. Lane B wrote
+            // that as `topologyRefresh?()` on the line above `prepareForReconnect()` plus a comment
+            // asking the next reader not to swap them; passing the hook in as the argument makes
+            // the order structural, and leaves nothing for a reader to preserve.
+            //
+            // `prepareForReconnect` itself is adr/0012 §2: it closes every window, drops the
+            // generation, re-freezes the topology, and resets the focus gate to `.unmonitored` —
+            // which can only reopen on a real MonitoredDesktop order from the new connection. No
+            // timeout fallback, and no replay of buffered input into the new connection: both are
+            // deliberate, and both are decisions this driver must not quietly reverse.
+            //
+            // `?? nil` flattens the doubly-optional `topologyRefresh?()`: no hook and a hook with
+            // nothing to swap in are the same instruction to the registry — keep the provider you
+            // have — and the registry has one branch for it, not two.
+            self.registry.prepareForReconnect(refreezingTopologyWith: {
+                self.topologyRefresh?() ?? nil
+            })
         }
 
         // `restarted == false` means either the shutdown was not clean or the `-start` fell
