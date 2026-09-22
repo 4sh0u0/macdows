@@ -6293,13 +6293,21 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // M1 L9 / adr/0015 §5.A.4, and the contract `RemoteWindowRegistry.swift:500-508` states
         // in the caller's direction: `prepareForReconnect()` re-freezes the registry's snapshot
         // from the LIVE provider, and this registry is reused across the whole soak. Re-deriving
-        // the desktop size here, immediately before it and in the same turn, is what keeps the
-        // next connection's Y-flip anchor and its negotiated desktop size from one `NSScreen`
-        // read. Reversing these two lines would freeze the registry against the OLD layout and
-        // then tell the server about the new one -- the exact divergence §5.A.4 forbids, and one
-        // that no offline test can catch because the registry's own freeze-count still counts up.
-        freezeAndApplyDesktopSize(to: session, reason: "cycle \(cycleIndex) reconnect")
-        registry.prepareForReconnect()
+        // the desktop size here, before the teardown and in the same turn, is what keeps the next
+        // connection's Y-flip anchor and its negotiated desktop size from one `NSScreen` read.
+        //
+        // adr/0019 §2 lane C (R-3 = K): this used to be two statements in this order, with a
+        // comment saying that reversing them would freeze the registry against the OLD layout and
+        // then tell the server about the new one -- the divergence §5.A.4 forbids, and one no
+        // offline test can catch because the freeze-count counts up either way. It is now ONE
+        // call: the re-take is the argument, so there is no spelling of this that runs it after
+        // the teardown. `nil` because this fixture handed the registry its own LIVE provider
+        // (unlike the App, which hands over a static snapshot), so the registry's own re-take
+        // already reads the value the line above just froze -- there is nothing to swap in.
+        registry.prepareForReconnect(refreezingTopologyWith: {
+            freezeAndApplyDesktopSize(to: session, reason: "cycle \(cycleIndex) reconnect")
+            return nil
+        })
         let leftover = registry.windowSnapshots().count
         cycleResults.append((rendered: rendered, closed: closed, clean: clean && leftover == 0,
                              seconds: seconds))
