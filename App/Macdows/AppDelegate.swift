@@ -23,6 +23,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	// bridge-smoke already satisfies independently.
 	private var session: CRSession?
 	private var registry: RemoteWindowRegistry?
+	/// adr/0019 §2 lane D: the reconnect driver for the session above, armed in `beginSession` and
+	/// dropped when this app stops having a session to reconnect. Per-connection, exactly like
+	/// `session` and `registry`, and deliberately NOT app-resident: it holds the very `CRSession`
+	/// it restarts, so a driver outliving that session would be armed against a connection nobody
+	/// owns any more.
+	private var reconnectDriver: ReconnectDriver?
 	private var drainTimer: Timer?
 	private var eventCount: Int = 0
 	/// True between the Connect press and the boundary gate's verdict. `session` is still nil
@@ -292,10 +298,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// is exactly the divergence §5.A.4 forbids. Without any provider the registry cannot learn
 		// about screens at all (its NSScreen read was removed in M1) and would decline to position
 		// any window, warning once -- loud, but still broken.
-		registry = RemoteWindowRegistry(
+		let newRegistry = RemoteWindowRegistry(
 			session: newSession,
 			topologyProvider: StaticDisplayTopologyProvider(displayTopology.sessionSnapshot)
 		)
+		registry = newRegistry
+		// adr/0019 §2 lane D: arm the reconnect driver for THIS connection. Built here rather than
+		// at launch because it is made out of the two objects the lines above just created, and
+		// armed before `newSession.start()` below, so no event can be posted before there is an
+		// armed driver to see it. Nothing else in this file constructs one.
+		let driver = ReconnectDriver(session: newSession, registry: newRegistry)
+		// adr/0015 §5.A.5 keeps every `NSScreen` read in this project inside `displayTopology`, so
+		// the driver is handed a CLOSURE over this delegate's resident provider and never a
+		// provider of its own. `ReconnectTopologyRefresh.refreeze` performs the connect-moment
+		// re-take and RETURNS the snapshot provider the registry must read for the connection about
+		// to begin; `prepareForReconnect(refreezingTopologyWith:)` installs it, which is what makes
+		// "re-take, then tear the table down" a property of that method's call shape rather than an
+		// order this closure would have to remember (adr/0019 §2 lane C).
+		//
+		// `[weak self]` is load-bearing: this delegate holds the driver, the driver holds this
+		// closure, and a strong `self` would close that cycle. `unowned newSession` is safe for the
+		// opposite reason -- the driver owns the session it restarts, so this closure cannot
+		// outlive it, and the session holds no reference back to the driver.
+		driver.topologyRefresh = { [weak self, unowned newSession] in
+			guard let self else { return nil }
+			return ReconnectTopologyRefresh.refreeze(session: newSession, topology: self.displayTopology)
+		}
+		driver.onStateChange = { [weak self] state in
+			self?.applyReconnectState(state)
+		}
+		driver.attach()
+		reconnectDriver = driver
 		eventCount = 0
 		statusLabel.stringValue = "Connecting..."
 		connectButton.isEnabled = false
@@ -343,6 +376,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			// display change would report its desktop size as "stale" and advise a reconnect for
 			// a session that does not exist.
 			displayTopology.endSession()
+			// adr/0019 §2 lane D, APPENDED to the five statements above and changing none of them.
+			// This branch returns BEFORE the drain below, so the `.disconnected` that accompanies a
+			// bridge refusal never reaches the driver on this path: without this line the driver
+			// would sit in `.reconnecting` for ever, still armed against a session whose failure
+			// the UI has already announced, and would bring it back up when its retry timer fired.
+			// Disarming it is the whole repair; the five statements above keep their wording and
+			// their order, and this branch stays the one place a connect ERROR re-enables the
+			// button.
+			reconnectDriver?.detach()
 			return
 		}
 		// Mirrors Tools/window-smoke/main.swift's own tick() exactly: every drained event
@@ -352,18 +394,119 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		let delivered = session.drainEvents { [weak self] event in
 			self?.eventCount += 1
 			self?.registry?.handle(event)
+			// adr/0019 §2 lane D: the driver reads the same stream, ALWAYS after the registry and
+			// never instead of it. `.disconnected` reaches the registry as `closeAllWindows()`,
+			// while the driver's reaction to the same event calls straight back into
+			// `applyReconnectState` on this turn -- so a driver that ran first would have this
+			// delegate announce "Reconnecting" with the window table still full and the live-window
+			// count still non-zero. `.handshakeFlags`, which the registry ignores, is the driver's
+			// only evidence that a connection actually works, which is why every event goes to both
+			// rather than being routed by kind.
+			self?.reconnectDriver?.handle(event)
 		}
+		// The drain above can end the session: a driver that gives up on this turn runs the same
+		// teardown `applicationWillTerminate` does, from inside the handler. `guard let session` at
+		// the top of this method holds a local strong reference and cannot see that, so re-read the
+		// property rather than overwrite the give-up line with a "Connected" one describing a
+		// session that no longer exists.
+		guard self.session != nil else { return }
 		if delivered > 0 || eventCount > 0 {
-			let windowCount = registry?.windowSnapshots().count ?? 0
 			// M1/W1: carry the screen-parameter note through this tick's overwrite. Without it,
 			// the one event this milestone adds would be legible for well under a second whenever
-			// a session is live -- which is precisely the state in which it means anything.
-			let displayNote = lastDisplayChangeNote.map { "\n\($0)" } ?? ""
-			statusLabel.stringValue = """
-				Connected — \(eventCount) event(s) so far (generation \(session.currentGeneration))
-				\(windowCount) remote window(s) live\(displayNote)
-				"""
+			// a session is live -- which is precisely the state in which it means anything. The
+			// note is now appended by `ShellReconnectPresenter` in every state, reconnects
+			// included, for the same reason.
+			//
+			// adr/0019 §2 lane D: ONE WRITER. This block used to hard-code the "Connected" wording,
+			// so a dropped session went on being announced as connected once a second for as long
+			// as the app ran -- `eventCount > 0` stays true after a drop, and this tick is what R-5
+			// means by "the status line stops at the last Connected". What the label says is now a
+			// function of the driver's state, and that function lives in one place.
+			//
+			// `?? .live` is the no-driver reading and is deliberately today's wording: a tick with
+			// no driver is the pre-lane-D shell, unchanged.
+			applyShell(for: reconnectDriver?.state ?? .live)
 		}
+	}
+
+	/// The driver's state changes, as this app's reaction to them. Called on T_main from
+	/// `ReconnectDriver`'s own transition, after its `state` has been updated.
+	private func applyReconnectState(_ state: ReconnectDriver.State) {
+		if case .reconnecting = state {
+			// The connect path's rule, applied to the other way a session begins: a staleness
+			// verdict belongs to the session it was computed against, and a reconnect has just
+			// re-frozen the topology against a fresh read. Cleared on `.reconnecting` rather than
+			// on `.live` so the note does not hang over the very attempt that is making it untrue.
+			lastDisplayChangeNote = nil
+		}
+		applyShell(for: state)
+		if case .gaveUp = state {
+			endSessionAfterGivingUp()
+		}
+	}
+
+	/// This app's half of "the driver has stopped trying": end the session for real, so that the
+	/// button `ShellReconnectPresenter` has just enabled can actually start a new one.
+	///
+	/// `session = nil` is the load-bearing statement. `connectTapped`'s first guard is
+	/// `session == nil`, and an automatic reconnect reuses the SAME `CRSession`, so a give-up that
+	/// re-enabled the button without dropping the session would produce a button that answers
+	/// "Already connecting/connected." to every press -- enabled and useless.
+	///
+	/// `shutdownAndWait()` runs from INSIDE the drain that delivered the `.disconnected`, so what
+	/// makes it safe here is not that it is cheap -- it is that step 4 of the five-step teardown
+	/// performs no drain of its own on this path. The bridge sets its per-connection
+	/// disconnect-sentinel bit BEFORE it calls the drain handler (adr/0019 §2 lane B, and
+	/// `ReconnectSemanticsPinTests` pins that order), step 4 seeds its loop from that bit, and a
+	/// seed of `true` means the loop body never runs: no 100 x 50 ms poll, and no NESTED
+	/// `crdpq_drain`.
+	///
+	/// A nested drain would not deadlock -- `crdpq_drain` releases its lock before it calls the
+	/// visitor -- and that is exactly what makes it dangerous rather than merely wasteful. It
+	/// would swap the double buffer a second time, handing the buffer the OUTER drain is still
+	/// iterating back to the producers with its element count zeroed: the next `crdpq_post` would
+	/// overwrite entries the outer loop has not reached yet, and a growth step would `realloc` the
+	/// outer loop's `drain_buf` out from under it. "No nested drain" is a memory-safety
+	/// precondition of calling this from a drain handler, not a performance note.
+	///
+	/// `pthread_join` inside step 5 is bounded for the same reason the sentinel is already set:
+	/// both paths that post DISCONNECTED do so as their last act before returning, and the bridge
+	/// hands work to the main queue with `dispatch_async`, never `dispatch_sync`, so T_rdp cannot
+	/// be waiting on the main thread that is waiting on it.
+	///
+	/// `endSession()` for the reason the connect-error branch states about itself: with no session
+	/// left, a later display change must not report a desktop size as stale for a session that
+	/// does not exist.
+	private func endSessionAfterGivingUp() {
+		drainTimer?.invalidate()
+		drainTimer = nil
+		reconnectDriver?.detach()
+		reconnectDriver = nil
+		session?.shutdownAndWait()
+		session = nil
+		registry = nil
+		displayTopology.endSession()
+	}
+
+	/// The Connect button and the status label, written together out of one decision.
+	///
+	/// The only place in this file that derives either of them from a reconnect state, which is
+	/// what keeps `ShellReconnectPresenter`'s offline tests worth anything: this app contributes
+	/// the binding and nothing else. The button's two literal `isEnabled = true` sites (the
+	/// boundary refusal and the connect-error branch) predate the driver and are left exactly as
+	/// they were -- neither of them is a reconnect state.
+	private func applyShell(for state: ReconnectDriver.State) {
+		let shell = ShellReconnectPresenter.shell(
+			for: state,
+			connected: .init(
+				events: eventCount,
+				generation: session?.currentGeneration ?? 0,
+				windows: registry?.windowSnapshots().count ?? 0
+			),
+			displayNote: lastDisplayChangeNote
+		)
+		statusLabel.stringValue = shell.statusLine
+		connectButton.isEnabled = shell.connectEnabled
 	}
 
 	func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -372,6 +515,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 	func applicationWillTerminate(_ notification: Notification) {
 		drainTimer?.invalidate()
+		// adr/0019 §2 lane D: before the shutdown, not after. `-shutdownAndWait` sets
+		// `teardownInitiated`, which is what stops the driver reacting to the DISCONNECTED this
+		// line is about to cause -- but that closes the EVENT edge only. A retry already scheduled
+		// on the clock is a second edge, and disarming the driver is what cancels it (and what the
+		// driver's own timer-edge guard reads before it restarts anything).
+		reconnectDriver?.detach()
 		session?.shutdownAndWait()
 		// The app's other session end. Paired with the shutdown above so the two ends of a
 		// session's lifetime read as one thing; the process is going away regardless.

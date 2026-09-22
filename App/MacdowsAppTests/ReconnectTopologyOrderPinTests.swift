@@ -265,30 +265,39 @@ struct ReconnectTopologyOrderPinTests {
             "freeze, then the desktop pair, then the advertised pair -- as one contiguous shape")
     }
 
-    /// GATE r1 m-5. `ReconnectTopologyRefresh` is in the same "exists, nobody calls it" state lane
-    /// A's `ReconnectPolicy` and lane B's `ReconnectDriver` shipped in, and lane B made that a
-    /// CHECKED fact rather than a `git diff` observation. Same here: the argument that "the App's
-    /// connect path is bit-identical after lane C" rests on this function having no product call
-    /// site at all, and a one-time diff cannot keep saying so.
+    /// GATE r1 m-5, as lane D left it. Lane C shipped `ReconnectTopologyRefresh` in the same
+    /// "exists, nobody calls it" state lane A's `ReconnectPolicy` and lane B's `ReconnectDriver`
+    /// shipped in, and made that a CHECKED fact rather than a `git diff` observation; the test's
+    /// own doc said lane D would change it in the commit that wired the hook up. This is that
+    /// change, and the claim is now the stronger one: the re-take has exactly ONE product call
+    /// site, and it is the closure `AppDelegate` hands the driver.
+    ///
+    /// Why one and not "at least one": the function FREEZES (adr/0015 §5.A.4 wants the desktop
+    /// size, the anchor and the advertised pair to come from a single `NSScreen` read), so a second
+    /// call site on one reconnect would be a second read -- the exact divergence lane C exists to
+    /// prevent -- and would bump the registry's freeze count with it.
     ///
     /// The needle keeps the space after `session:` deliberately: a real call reads
     /// `refreeze(session: something,` while the doc comments that name the function write the
     /// selector `refreeze(session:topology:)` with no space. Prose is therefore allowed and calls
     /// are not, which is exactly the distinction this pin needs to make.
-    ///
-    /// Lane D deletes this test in the same commit that wires the hook up; until then a product
-    /// call site is a lane violation, not an improvement.
-    @Test func theProductRefreezeHasNoProductCallSiteYet() throws {
+    @Test func theProductRefreezeHasExactlyOneProductCallSite() throws {
         let needle = "ReconnectTopologyRefresh.refreeze(session: "
+        let files = try productSwiftFiles()
         var checked = 0
-        for relative in try productSwiftFiles() {
-            #expect(occurrences(of: needle, in: try source(relative)) == 0, "call site in \(relative)")
-            checked += 1
+        var callSites: [String] = []
+        for relative in files {
+            let count = occurrences(of: needle, in: try source(relative))
+            if count > 0 { callSites.append("\(relative) x\(count)") }
+            checked += count
         }
+        #expect(callSites == ["App/Macdows/AppDelegate.swift x1"],
+                "the re-take's product call sites: \(callSites)")
+        #expect(checked == 1, "one freeze per reconnect")
         // A directory walk that found nothing would pass vacuously; the count is the guard. The
         // floor is deliberately loose -- it exists to catch an empty enumeration, not to pin a
         // file count that every future lane would have to update.
-        #expect(checked > 20, "product .swift files enumerated: \(checked)")
+        #expect(files.count > 20, "product .swift files enumerated: \(files.count)")
     }
 
     /// The product function is where the App's connect-path algorithm now also lives, so the two

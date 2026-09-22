@@ -439,28 +439,55 @@ struct ReconnectDriverLinkagePinTests {
         #expect(fixture == ["../Tools/window-smoke", "RemoteWindowRendering"], "window-smoke sources: \(fixture)")
     }
 
-    /// Pin ⑧, second half: the NOT-WIRED lock. Lane B ships the driver as "exists, nobody attaches
-    /// it" -- the same shape lane A's `ReconnectPolicy` shipped in. Wiring is lane D, because the
-    /// driver alone cannot repair the App's UI state: the Connect button is disabled the moment it
-    /// is pressed and re-enabled only on a connect ERROR, so a session that reconnects underneath
-    /// a status line nobody told about it leaves the user looking at a lie.
+    /// Pin ⑧, second half: the WIRING LOCK, which until lane D was a NOT-wired lock.
     ///
-    /// This pin is therefore a LANE MARKER, and lane D is expected to change it in the same commit
-    /// that wires the driver -- it is not a permanent prohibition, and it should not be read as
-    /// one. It is here so that "not wired" is a checked fact for as long as it is claimed.
-    @Test("nothing in the app entry point, the fixture or the scripts references ReconnectDriver")
-    func driverIsReferencedByNoCaller() throws {
+    /// Lane B shipped the driver as "exists, nobody attaches it" -- the same shape lane A's
+    /// `ReconnectPolicy` shipped in -- because the driver alone cannot repair the App's UI state: a
+    /// session that reconnects underneath a status line nobody told about it leaves the user
+    /// looking at a lie. Lane D built the missing half (`ShellReconnectPresenter` and the binding
+    /// in `AppDelegate`) and attached the driver, which is the change this pin's previous version
+    /// said out loud it was waiting for.
+    ///
+    /// The claim the pin makes NOW is the one that is still worth holding, and it is two claims:
+    ///
+    ///  - `Tools/**` and `Scripts/**` stay at ZERO. This is the half that never relaxes.
+    ///    `Tools/window-smoke` drives its own reconnects on its own schedule, and a second driver
+    ///    in that binary would react to the very `.disconnected` the fixture caused and make its
+    ///    `clean` / `leftoverWindows` / `freezeCount` numbers mean something else. The build graph
+    ///    (first half, above) makes the type absent there; this keeps a call from being written in
+    ///    the first place.
+    ///  - `App/Macdows` has exactly ONE construction site, in `AppDelegate.swift`. A driver is
+    ///    per-connection and restarts the session it holds, so two of them over one session would
+    ///    race each other's back-off curves.
+    ///
+    /// Counted on `ReconnectDriver(` rather than on the bare name deliberately: the bare name also
+    /// matches `ReconnectDriver.State` in a signature and the type in a stored property, so a pin
+    /// on it would be a pin on how many times lane D's prose happens to mention the class.
+    /// `AppDelegateReconnectWiringPinTests` is where the arming, the order and the disarmings are
+    /// held; this one is about WHO IS ALLOWED TO BUILD ONE.
+    @Test("exactly one driver is constructed, in the app entry point; the fixture and scripts build none")
+    func driverIsConstructedOnlyByTheAppEntryPoint() throws {
         // Gate r1 m-2: `Scripts` really is walked, not just named in the title -- the tree does
         // contain Swift there (`Scripts/lab/display_mode.swift`), and a pin whose title promises a
         // directory it never opens is the same defect as a pin that matches a name instead of a
         // call.
-        let files = try swiftFiles(under: "App/Macdows")
-            + swiftFiles(under: "Tools")
-            + swiftFiles(under: "Scripts")
-        #expect(files.contains("Scripts/lab/display_mode.swift"), "the Scripts walk found nothing")
-        for file in files {
+        let forbidden = try swiftFiles(under: "Tools") + swiftFiles(under: "Scripts")
+        #expect(forbidden.contains("Scripts/lab/display_mode.swift"), "the Scripts walk found nothing")
+        for file in forbidden {
             let text = try source(file)
             #expect(occurrences(of: "ReconnectDriver", in: text) == 0, "wired in \(file)")
         }
+
+        let app = try swiftFiles(under: "App/Macdows")
+        #expect(!app.isEmpty, "the App/Macdows walk found nothing")
+        var constructions = 0
+        for file in app {
+            let count = occurrences(of: "ReconnectDriver(", in: try source(file))
+            if file != "App/Macdows/AppDelegate.swift" {
+                #expect(count == 0, "a second construction site in \(file)")
+            }
+            constructions += count
+        }
+        #expect(constructions == 1, "one driver per app, built in AppDelegate.beginSession")
     }
 }
