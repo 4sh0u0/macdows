@@ -50,7 +50,7 @@ targets:
     # A single sources: list — a second `sources:` key later in this target would
     # silently replace this one under YAML mapping semantics, not merge with it, which
     # is exactly the bug that produced "no sources are being compiled" on the first
-    # attempt (the dylib copyFiles entries clobbered the actual Swift source path).
+    # attempt (historical: the dylib copyFiles entries clobbered the actual Swift source path).
     sources:
       - path: Macdows
         excludes:
@@ -67,80 +67,16 @@ targets:
       # MacdowsAppTests/ReconnectSemanticsPinTests.swift for the pin that holds all three
       # sides of that here rather than in a comment.
       - path: SessionControl
-      # Copy Files -> Frameworks: embed the three FreeRDP dylibs the CRBridge target
-      # links against. install_name on these is already @rpath (verified against the lab
-      # build), so LD_RUNPATH_SEARCH_PATHS = @executable_path/../Frameworks below is
-      # sufficient — no install_name_tool rewriting needed (adr/0006 §2).
-      #
-      # Each entry references only the SONAME symlink (`libfoo.3.dylib`), not the
-      # fully-versioned real file (`libfoo.3.30.0.dylib`): that symlink's name is the
-      # exact `@rpath/...` load command baked into every dependent, and it's a *single*
-      # hop to the real file, which Xcode's Copy Files phase (builtin-copy
-      # -resolve-src-symlinks) fully dereferences into real bytes at the symlink's own
-      # name — verified empirically. This also means project.yml never needs to change
-      # on a FreeRDP patch-version bump (3.30.0 -> 3.30.1 etc.), only on a SONAME bump.
-      # `optional: true` lets `xcodegen generate` succeed even before FreeRDP has ever
-      # been built (see Scripts/bootstrap.sh, which now runs the FreeRDP build then
-      # `xcodegen generate` in sequence so a clean checkout only needs one command).
-      - path: ../.build/freerdp/current/prefix/lib/libfreerdp3.3.dylib
-        optional: true
-        buildPhase:
-          copyFiles:
-            destination: frameworks
-            codeSignOnCopy: true
-      - path: ../.build/freerdp/current/prefix/lib/libfreerdp-client3.3.dylib
-        optional: true
-        buildPhase:
-          copyFiles:
-            destination: frameworks
-            codeSignOnCopy: true
-      - path: ../.build/freerdp/current/prefix/lib/libwinpr3.3.dylib
-        optional: true
-        buildPhase:
-          copyFiles:
-            destination: frameworks
-            codeSignOnCopy: true
-      # W8: the four FFmpeg dylibs libfreerdp3 links for H264/AVC decode (adr/0007; the
-      # fourth, libswscale, since the FreeRDP 3.31.1 pin -- h264_ffmpeg.c calls sws_* from
-      # 3.31.0 on).
-      # Same SONAME-symlink rule as the FreeRDP entries above — `libavcodec.63.dylib` is
-      # the literal `@rpath/...` load command baked into libfreerdp3, and it is one hop to
-      # the real `libavcodec.63.1.101.dylib`, which Xcode's Copy Files phase dereferences
-      # into real bytes under the symlink's own name. So these need editing on an FFmpeg
-      # *major* (SONAME) bump only, not on 9.0.1 -> 9.0.2.
-      #
-      # All four are mandatory, not a menu: libavcodec carries its own LC_LOAD_DYLIB on
-      # libswresample (FreeRDP itself calls no swr_* symbol) and libfreerdp3 links
-      # libswscale directly, so shipping a subset produces an app that fails to load.
-      # Scripts/gen-notices.sh asserts all four are present rather than trusting this list.
-      #
-      # Embedding rather than static-linking is also the LGPL-2.1 §6 obligation, not just a
-      # packaging preference — see LGPL_RELINK.md, which tells users how to swap exactly
-      # these four files for their own build.
-      - path: ../.build/deps/ffmpeg-prefix/lib/libavcodec.63.dylib
-        optional: true
-        buildPhase:
-          copyFiles:
-            destination: frameworks
-            codeSignOnCopy: true
-      - path: ../.build/deps/ffmpeg-prefix/lib/libavutil.61.dylib
-        optional: true
-        buildPhase:
-          copyFiles:
-            destination: frameworks
-            codeSignOnCopy: true
-      - path: ../.build/deps/ffmpeg-prefix/lib/libswresample.7.dylib
-        optional: true
-        buildPhase:
-          copyFiles:
-            destination: frameworks
-            codeSignOnCopy: true
-      - path: ../.build/deps/ffmpeg-prefix/lib/libswscale.10.dylib
-        optional: true
-        buildPhase:
-          copyFiles:
-            destination: frameworks
-            codeSignOnCopy: true
+      # adr/0006 §2/§3 fix (2026-09-23): the seven embedded FreeRDP/FFmpeg dylibs used to
+      # live here as `sources:` entries with `buildPhase.copyFiles.codeSignOnCopy: true`.
+      # XcodeGen 2.46.0 never lowers that per-TargetSource `codeSignOnCopy` flag into the
+      # generated `PBXCopyFilesBuildPhase`'s `ATTRIBUTES` (verified: `CodeSignOnCopy`
+      # appeared 0 times in the generated project.pbxproj, and the maintainer-overlay
+      # signed build's embedded dylibs stayed ad-hoc, which Hardened Runtime + a real Team
+      # ID rejects at dyld time with "different Team IDs" — the app died within 5s of
+      # launch). They now live below under `dependencies:` instead — see that key's own
+      # comment for why that path DOES get `CodeSignOnCopy` emitted (confirmed by
+      # generating a throwaway probe project and grepping the resulting .pbxproj).
       # W8 compliance last mile: the licence obligations have to travel with the *artifact*,
       # not just with this repository. Someone who receives only Macdows.app must still get
       # the notices, the verbatim licence texts, and — because FFmpeg is LGPL-2.1 and
@@ -239,6 +175,73 @@ targets:
           "$SRCROOT/../Scripts/build-freerdp.sh"
         basedOnDependencyAnalysis: false
     dependencies:
+      # Embed the three FreeRDP + four FFmpeg dylibs (formerly `sources:`
+      # copyFiles entries — see that key's own comment for the CodeSignOnCopy defect that
+      # moved them here). `framework:` accepts a raw `.dylib` path, not just a
+      # `.framework` bundle — confirmed against a throwaway probe project: XcodeGen 2.46.0
+      # emits `lastKnownFileType = "compiled.mach-o.dylib"` and a `PBXCopyFilesBuildPhase`
+      # with `dstSubfolderSpec = 10` (Frameworks), identical destination to the old
+      # `destination: frameworks`. `embed: true` + `codeSign: true` is what actually lowers
+      # into `ATTRIBUTES = (CodeSignOnCopy, ...)` this time (`codeSignOnCopy:` under
+      # `sources:` buildPhase.copyFiles never did — that was the bug). `link: false`
+      # keeps this purely a copy+resign step, same as before: without it, XcodeGen also
+      # adds each dylib to the target's "Frameworks" (Link Binary With Libraries) build
+      # phase, a second, redundant link edge alongside the existing explicit
+      # `OTHER_LDFLAGS: -lfreerdp3 -lfreerdp-client3 -lwinpr3` (which resolves against the
+      # *build-location* dylibs via LIBRARY_SEARCH_PATHS, not the embedded copies) — and
+      # for the four FFmpeg dylibs, which the App target never links directly at all (only
+      # libfreerdp3 does, transitively), `link: false` keeps that true.
+      #
+      # No `optional:` needed here, unlike the old `sources:` entries: XcodeGen's
+      # `dependencies:` framework/dylib paths are not existence-checked at `generate` time
+      # (confirmed against a throwaway probe project — `xcodegen generate` with a
+      # deliberately nonexistent dylib path succeeds), so a clean checkout can still run
+      # `xcodegen generate` before FreeRDP/FFmpeg have ever been built.
+      #
+      # Each entry still references only the SONAME symlink (`libfoo.3.dylib`), not the
+      # fully-versioned real file: that symlink's name is the exact `@rpath/...` load
+      # command baked into every dependent, and Xcode's Embed Frameworks copy action
+      # (builtin-copy -resolve-src-symlinks) fully dereferences it into real bytes at the
+      # symlink's own name — this is a property of the Embed Frameworks build phase itself,
+      # not of how project.yml declares it, so it is unchanged by this move. project.yml
+      # still never needs to change on a FreeRDP/FFmpeg patch-version bump, only a SONAME
+      # bump. All four FFmpeg dylibs are still mandatory, not a menu — see the historical
+      # W8 rationale in Scripts/gen-notices.sh, which independently asserts all four are
+      # present. Embedding rather than static-linking FFmpeg is also the LGPL-2.1 §6
+      # obligation (LGPL_RELINK.md), not just a packaging preference.
+      #
+      # install_name on all seven of these dylibs is already `@rpath/<SONAME>` (verified
+      # with `otool -D`), so the `LD_RUNPATH_SEARCH_PATHS: @executable_path/../Frameworks`
+      # set in this target's settings.base above is sufficient on its own -- no
+      # install_name_tool rewriting needed (adr/0006 §2).
+      - framework: ../.build/freerdp/current/prefix/lib/libfreerdp3.3.dylib
+        embed: true
+        codeSign: true
+        link: false
+      - framework: ../.build/freerdp/current/prefix/lib/libfreerdp-client3.3.dylib
+        embed: true
+        codeSign: true
+        link: false
+      - framework: ../.build/freerdp/current/prefix/lib/libwinpr3.3.dylib
+        embed: true
+        codeSign: true
+        link: false
+      - framework: ../.build/deps/ffmpeg-prefix/lib/libavcodec.63.dylib
+        embed: true
+        codeSign: true
+        link: false
+      - framework: ../.build/deps/ffmpeg-prefix/lib/libavutil.61.dylib
+        embed: true
+        codeSign: true
+        link: false
+      - framework: ../.build/deps/ffmpeg-prefix/lib/libswresample.7.dylib
+        embed: true
+        codeSign: true
+        link: false
+      - framework: ../.build/deps/ffmpeg-prefix/lib/libswscale.10.dylib
+        embed: true
+        codeSign: true
+        link: false
       - target: CRBridge
       - package: MacdowsCore
         product: MacdowsCore
@@ -370,7 +373,7 @@ targets:
           - $(SRCROOT)/../.build/freerdp/current/prefix/lib
           # W8 made libfreerdp3 reference @rpath/libav{codec,util}/libswresample/libswscale from the
           # self-built LGPL ffmpeg prefix. The App resolves those inside its own bundle
-          # (Copy Files + @executable_path/../Frameworks); these bare tools link the
+          # (Embed Frameworks with CodeSignOnCopy + @executable_path/../Frameworks); these bare tools link the
           # FreeRDP dylibs at their build location instead, so they need the ffmpeg
           # prefix on their rpath too -- without it the tool dies at dyld time
           # ("Library not loaded: @rpath/libavcodec..."), which is exactly how this
@@ -436,7 +439,7 @@ targets:
           - $(SRCROOT)/../.build/freerdp/current/prefix/lib
           # W8 made libfreerdp3 reference @rpath/libav{codec,util}/libswresample/libswscale from the
           # self-built LGPL ffmpeg prefix. The App resolves those inside its own bundle
-          # (Copy Files + @executable_path/../Frameworks); these bare tools link the
+          # (Embed Frameworks with CodeSignOnCopy + @executable_path/../Frameworks); these bare tools link the
           # FreeRDP dylibs at their build location instead, so they need the ffmpeg
           # prefix on their rpath too -- without it the tool dies at dyld time
           # ("Library not loaded: @rpath/libavcodec..."), which is exactly how this
