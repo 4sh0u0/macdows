@@ -22,6 +22,17 @@
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<!-- The reason string macOS shows in the local-network permission dialog. Added by
+	     adr/0019 §2 R-6 lane T1, which is the last change before the first unattended run:
+	     the ONE permission this app needs is Local Network (a grep of App/ and Packages/
+	     finds no Accessibility, Screen Recording or Input Monitoring API anywhere), the
+	     dialog appears on the first real connection, and until now App/project.yml's own
+	     comment claimed this plist "carries real usage-description keys" while it carried
+	     none -- so the dialog would have offered no reason at all. Deliberately generic:
+	     no host name, no address and no account appears here, because this file is
+	     tracked. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Macdows connects to a Windows PC on your local network over RDP.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright 2026 Haru Hazawa.</string>
 </dict>
