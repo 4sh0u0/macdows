@@ -216,9 +216,16 @@ struct AppDelegateAutolaunchPinTests {
     // MARK: - Pin 4: everything from connectTapped to the end of the file is untouched
 
     /// The fold of `AppDelegate.swift` from `@objc private func connectTapped() {` to the end of the
-    /// file, fingerprinted. At main `beaaee0` -- the merge base this lane branched from, before any
-    /// edit here -- that region folded to 22638 characters hashing to the constant below, and this
-    /// lane changed none of it.
+    /// file, fingerprinted. Frozen first at main `beaaee0` -- the merge base this lane branched from,
+    /// before any edit here -- where that region folded to 22638 characters, and this lane changed
+    /// none of it.
+    ///
+    /// RE-FROZEN by the session-end lane (branched from main `00d9994`, where the region was still
+    /// those 22638 characters): its three session ends now share `tearDownSession()`, which moved
+    /// the connect-error branch, the give-up teardown, `applicationWillTerminate` and the comments
+    /// that describe them. The region now folds to 26761 characters hashing to the constant below;
+    /// the +4123 is exactly that lane's net folded edit (5983 characters added, 1860 removed), and
+    /// everything before `connectTapped` is byte-identical to `00d9994`.
     ///
     /// Why a hash and not a quoted literal: the region is ~22 KB, which is not a thing to paste into
     /// a test, and an excerpt would pin only the excerpt. Why the fold WITH comments: the claim is
@@ -230,11 +237,11 @@ struct AppDelegateAutolaunchPinTests {
     /// expected to re-freeze this constant in the same commit that makes the edit, and the length
     /// below is here so that such a re-freeze can be sanity-checked (a length that MOVED by the size
     /// of the edit is a re-freeze; a length that moved by 22638 is a needle that stopped matching).
-    private static let foldedTailLength = 22638
+    private static let foldedTailLength = 26761
     private static let foldedTailSHA256 =
-        "6315858537ce205f9181c7f8187294a06220235c98290dee6d4b53f671740f64"
+        "24e75791b6a5b461cde367f728b0e4afb5e081b65809509a58d879ceed45e5ed"
 
-    @Test("connectTapped to end-of-file is byte-identical to the merge base")
+    @Test("connectTapped to end-of-file is byte-identical to its last deliberate freeze")
     func theRestOfTheFileIsUnchanged() throws {
         let raw = try autolaunchRawSource(Self.appDelegate)
         #expect(autolaunchOccurrences(of: Self.firstDeclarationAfterLaunch, in: raw) == 1)

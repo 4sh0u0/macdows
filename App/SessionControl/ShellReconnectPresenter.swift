@@ -102,21 +102,19 @@ enum ShellReconnectPresenter {
     ///
     /// So the claim this arm rests on is a REQUIREMENT on the App, registered here rather than
     /// asserted as a happy fact: **a stand-down `.idle` must not reach `AppDelegate`**. It holds
-    /// today at all three `detach()` sites, for three different reasons, and each reason is what a
-    /// future edit has to preserve:
+    /// because the App disarms the driver in exactly ONE place, `AppDelegate.tearDownSession()`,
+    /// and that place drops the driver (`reconnectDriver = nil`) right after detaching it; the
+    /// pending-retry block holds the driver weakly, so no callback can follow. All three of the
+    /// App's session ends go through it -- the connect-error branch, the give-up branch and
+    /// `applicationWillTerminate` -- and that single disarming site is what a future edit has to
+    /// preserve.
     ///
-    ///  1. the give-up teardown drops the driver (`reconnectDriver = nil`) right after detaching
-    ///     it, and the pending-retry block holds the driver weakly, so no callback can follow;
-    ///  2. `applicationWillTerminate` is the process leaving;
-    ///  3. the connect-error branch detaches but keeps the driver on the property, so it is the
-    ///     only site where a scheduled retry block could still find a live driver. Reaching the
-    ///     stand-down needs that driver to be in `.waiting`, which needs the `.disconnected` that
-    ///     scheduled it to have arrived with `lastConnectError` still nil -- and nothing can set
-    ///     that error afterwards, because both bridge paths set it BEFORE they post the sentinel
-    ///     and then return. Unreachable, but by an argument about another file.
-    ///
-    /// Registered, not repaired: the structural repair (nil the driver in the connect-error branch
-    /// too) would edit a branch this lane is only allowed to append to. Left for the owner.
+    /// Repaired, no longer merely registered: lane D left the connect-error branch detaching the
+    /// driver but keeping it on the property, which made it the only site where a scheduled retry
+    /// block could still have found a live driver -- unreachable then only by an argument about
+    /// another file (both bridge paths set `lastConnectError` BEFORE they post the sentinel, and
+    /// then return). The session-end lane routed that branch through the same teardown, which
+    /// drops the driver there too, so the argument is no longer needed.
     ///
     /// The stand-down reading is not lost by any of this: a stand-down only happens when the owner
     /// is already tearing the session down or has detached the driver, and in both of those the

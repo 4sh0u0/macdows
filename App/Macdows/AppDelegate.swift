@@ -406,22 +406,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		guard let session else { return }
 		if let error = session.lastConnectError {
 			statusLabel.stringValue = "Connect failed: \(error.localizedDescription)"
-			drainTimer?.invalidate()
-			drainTimer = nil
 			connectButton.isEnabled = true
-			// The session frozen at connect never came up, so drop it: otherwise every later
-			// display change would report its desktop size as "stale" and advise a reconnect for
-			// a session that does not exist.
-			displayTopology.endSession()
-			// adr/0019 §2 lane D, APPENDED to the five statements above and changing none of them.
-			// This branch returns BEFORE the drain below, so the `.disconnected` that accompanies a
-			// bridge refusal never reaches the driver on this path: without this line the driver
-			// would sit in `.reconnecting` for ever, still armed against a session whose failure
-			// the UI has already announced, and would bring it back up when its retry timer fired.
-			// Disarming it is the whole repair; the five statements above keep their wording and
-			// their order, and this branch stays the one place a connect ERROR re-enables the
-			// button.
-			reconnectDriver?.detach()
+			// The session-end lane (lane D impl-report §8 #1): this branch now ENDS the session
+			// instead of only announcing that it failed. It used to stop the timer, re-enable the
+			// button and drop the topology freeze but keep `session` -- and `connectTapped`'s first
+			// guard is `session == nil`, so the button it had just enabled answered "Already
+			// connecting/connected." to every press. `tearDownSession()` drops the session along
+			// with everything else a session owns, so the button really starts a new connection.
+			//
+			// UI first, teardown second: the order the give-up path has too. The failure line and
+			// the literal `true` are what lane D froze here that a human actually sees, and both are
+			// kept; this branch stays the one place a connect ERROR re-enables the button.
+			//
+			// Still BEFORE the drain below, so the `.disconnected` that accompanies a bridge refusal
+			// never reaches the driver on this path. The teardown disarms and drops the driver,
+			// which is what keeps it from sitting in `.reconnecting` for ever, armed against a
+			// session whose failure the UI has already announced. Why the shutdown the teardown now
+			// performs on this path is short: see the connect-error precondition on
+			// `tearDownSession()`.
+			tearDownSession()
 			return
 		}
 		// Mirrors Tools/window-smoke/main.swift's own tick() exactly: every drained event
@@ -441,11 +444,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			// rather than being routed by kind.
 			self?.reconnectDriver?.handle(event)
 		}
-		// The drain above can end the session: a driver that gives up on this turn runs the same
-		// teardown `applicationWillTerminate` does, from inside the handler. `guard let session` at
-		// the top of this method holds a local strong reference and cannot see that, so re-read the
-		// property rather than overwrite the give-up line with a "Connected" one describing a
-		// session that no longer exists.
+		// The drain above can end the session: a driver that gives up on this turn reaches
+		// `tearDownSession()` from inside the handler -- the one teardown every session end in this
+		// file goes through. `guard let session` at the top of this method holds a local strong
+		// reference and cannot see that, so re-read the property rather than overwrite the give-up
+		// line with a "Connected" one describing a session that no longer exists.
 		guard self.session != nil else { return }
 		if delivered > 0 || eventCount > 0 {
 			// M1/W1: carry the screen-parameter note through this tick's overwrite. Without it,
@@ -478,47 +481,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		}
 		applyShell(for: state)
 		if case .gaveUp = state {
-			endSessionAfterGivingUp()
+			// This app's half of "the driver has stopped trying": end the session for real, so the
+			// button `ShellReconnectPresenter` has just enabled can actually start a new one.
+			tearDownSession()
 		}
 	}
 
-	/// This app's half of "the driver has stopped trying": end the session for real, so that the
-	/// button `ShellReconnectPresenter` has just enabled can actually start a new one.
+	/// The one way a session ends in this app. Three callers, and only three: the connect-error
+	/// branch of `drainTick`, the `.gaveUp` branch of `applyReconnectState`, and
+	/// `applicationWillTerminate`. The status line and the button are NOT written here: each caller
+	/// says what happened in its own words before it calls this (or says nothing, on the way out of
+	/// the process).
 	///
-	/// `session = nil` is the load-bearing statement. `connectTapped`'s first guard is
-	/// `session == nil`, and an automatic reconnect reuses the SAME `CRSession`, so a give-up that
-	/// re-enabled the button without dropping the session would produce a button that answers
-	/// "Already connecting/connected." to every press -- enabled and useless.
+	/// WHY ONE FUNCTION (the session-end lane, repairing lane D impl-report §8 #1, #3, #5 and #7).
+	/// There used to be three hand-written teardowns, and each was missing a different step. The
+	/// connect-error branch kept `session`, so the button it re-enabled refused every press (#1);
+	/// termination dropped nothing (#7); none of the three cleared the push hook (#5); and a session
+	/// ending any other way would have left `drainTimer` rewriting the status line once a second for
+	/// the life of the process (#3). With every step spelled once, here, a session cannot be shut
+	/// down without its timer being stopped in the same breath, so #3 is closed by construction
+	/// rather than detected.
 	///
-	/// `shutdownAndWait()` runs from INSIDE the drain that delivered the `.disconnected`, so what
-	/// makes it safe here is not that it is cheap -- it is that step 4 of the five-step teardown
-	/// performs no drain of its own on this path. The bridge sets its per-connection
-	/// disconnect-sentinel bit BEFORE it calls the drain handler (adr/0019 §2 lane B, and
-	/// `ReconnectSemanticsPinTests` pins that order), step 4 seeds its loop from that bit, and a
+	/// THE ORDER, (a) to (f), and why each step is where it is:
+	///
+	/// (a) The timer first. It is the only thing that can call `drainTick` again on its own.
+	///
+	/// (b) Disarm the driver and drop it, BEFORE the shutdown. `-shutdownAndWait` sets
+	/// `teardownInitiated`, which stops the driver reacting to the DISCONNECTED the shutdown is about
+	/// to cause -- but that closes the EVENT edge only. A retry already scheduled on the clock is a
+	/// second edge, and disarming is what cancels it (and what the driver's own timer-edge guard
+	/// reads before it restarts anything). Dropping the driver as well means a retry block, which
+	/// holds it weakly, finds nothing even if it fires.
+	///
+	/// (c) Clear the push hook, BEFORE the shutdown, so a push the shutdown itself causes is a no-op
+	/// from the moment it is produced. The bridge reads the hook inside its main-queue block, when
+	/// the block runs (`AppDelegateSessionEndPinTests` pins that premise), so a push already queued
+	/// reads nil too. Cleared here rather than by the bridge because the reconnect path runs the very
+	/// same `-shutdownAndWait` and keeps using the hook after it. And cleared through `session?.`
+	/// BEFORE `session = nil`: after it, the same statement compiles and does nothing.
+	///
+	/// (d) Shut down, after both disconnections and before any reference is dropped.
+	///
+	/// (e) Drop `session` and `registry`. `session = nil` is the load-bearing statement:
+	/// `connectTapped`'s first guard is `session == nil`, and an automatic reconnect reuses the SAME
+	/// `CRSession`, so an ending that re-enabled the button without dropping the session would
+	/// produce a button that answers "Already connecting/connected." to every press -- enabled and
+	/// useless.
+	///
+	/// (f) The topology's session end, last. With no session left, a later display change must not
+	/// report a desktop size as stale, and advise a reconnect, for a session that does not exist. It
+	/// has no output, and nothing above depends on it.
+	///
+	/// PRECONDITIONS, caller by caller.
+	///
+	/// FROM THE GIVE-UP BRANCH this runs from INSIDE the drain that delivered the `.disconnected`, so
+	/// what makes (d) safe there is not that it is cheap -- it is that step 4 of the bridge's
+	/// five-step teardown performs no drain of its own on that path. The bridge sets its
+	/// per-connection disconnect-sentinel bit BEFORE it calls the drain handler (adr/0019 §2 lane B,
+	/// and `ReconnectSemanticsPinTests` pins that order), step 4 seeds its loop from that bit, and a
 	/// seed of `true` means the loop body never runs: no 100 x 50 ms poll, and no NESTED
 	/// `crdpq_drain`.
 	///
 	/// A nested drain would not deadlock -- `crdpq_drain` releases its lock before it calls the
-	/// visitor -- and that is exactly what makes it dangerous rather than merely wasteful. It
-	/// would swap the double buffer a second time, handing the buffer the OUTER drain is still
-	/// iterating back to the producers with its element count zeroed: the next `crdpq_post` would
-	/// overwrite entries the outer loop has not reached yet, and a growth step would `realloc` the
-	/// outer loop's `drain_buf` out from under it. "No nested drain" is a memory-safety
-	/// precondition of calling this from a drain handler, not a performance note.
+	/// visitor -- and that is exactly what makes it dangerous rather than merely wasteful. It would
+	/// swap the double buffer a second time, handing the buffer the OUTER drain is still iterating
+	/// back to the producers with its element count zeroed: the next `crdpq_post` would overwrite
+	/// entries the outer loop has not reached yet, and a growth step would `realloc` the outer
+	/// loop's `drain_buf` out from under it. "No nested drain" is a memory-safety precondition of
+	/// calling this from a drain handler, not a performance note.
 	///
-	/// `pthread_join` inside step 5 is bounded for the same reason the sentinel is already set:
-	/// both paths that post DISCONNECTED do so as their last act before returning, and the bridge
-	/// hands work to the main queue with `dispatch_async`, never `dispatch_sync`, so T_rdp cannot
-	/// be waiting on the main thread that is waiting on it.
+	/// `pthread_join` inside the bridge's step 5 is bounded for the same reason the sentinel is
+	/// already set: both paths that post DISCONNECTED do so as their last act before returning, and
+	/// the bridge hands work to the main queue with `dispatch_async`, never `dispatch_sync`, so T_rdp
+	/// cannot be waiting on the main thread that is waiting on it.
 	///
-	/// `endSession()` for the reason the connect-error branch states about itself: with no session
-	/// left, a later display change must not report a desktop size as stale for a session that
-	/// does not exist.
-	private func endSessionAfterGivingUp() {
+	/// The give-up branch may also be running inside the push hook's own block when (c) clears the
+	/// hook. That is safe for the same reason releasing the driver from inside its own callback is:
+	/// the bridge invokes the value its getter returned, which ARC keeps alive for the whole call.
+	///
+	/// FROM THE CONNECT-ERROR BRANCH this runs before that method's own drain, never inside one. A
+	/// `-start` that failed synchronously left the session idle, and `-shutdownAndWait` returns from
+	/// idle at once. A connect that failed on T_rdp set the error first and posted the sentinel as
+	/// its last act before returning, so step 4 drains for the sentinel itself -- a flat drain, not a
+	/// nested one -- and waits at most until T_rdp gets there; the join is of a thread on its way out.
+	///
+	/// FROM `applicationWillTerminate` nothing is inside a drain either, and a driver may have a
+	/// retry pending, which (b) cancels. The process is going away regardless; it ends its session in
+	/// this shape anyway so that "a session ends" has ONE shape in this file. The one difference that
+	/// makes there: the registry is released while its windows may still be open, so they are
+	/// deallocated without passing through the registry's own close path. Accepted on the
+	/// process-exit path (their notification observers capture weakly); a Disconnect control, when
+	/// one exists, has to have the registry close its windows before this runs.
+	private func tearDownSession() {
 		drainTimer?.invalidate()
 		drainTimer = nil
 		reconnectDriver?.detach()
 		reconnectDriver = nil
+		session?.onEventsAvailable = nil
 		session?.shutdownAndWait()
 		session = nil
 		registry = nil
@@ -530,8 +589,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// The only place in this file that derives either of them from a reconnect state, which is
 	/// what keeps `ShellReconnectPresenter`'s offline tests worth anything: this app contributes
 	/// the binding and nothing else. The button's two literal `isEnabled = true` sites (the
-	/// boundary refusal and the connect-error branch) predate the driver and are left exactly as
-	/// they were -- neither of them is a reconnect state.
+	/// boundary refusal and the connect-error branch) predate the driver and keep their literal --
+	/// neither of them is a reconnect state.
 	private func applyShell(for state: ReconnectDriver.State) {
 		let shell = ShellReconnectPresenter.shell(
 			for: state,
@@ -551,16 +610,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	}
 
 	func applicationWillTerminate(_ notification: Notification) {
-		drainTimer?.invalidate()
-		// adr/0019 §2 lane D: before the shutdown, not after. `-shutdownAndWait` sets
-		// `teardownInitiated`, which is what stops the driver reacting to the DISCONNECTED this
-		// line is about to cause -- but that closes the EVENT edge only. A retry already scheduled
-		// on the clock is a second edge, and disarming the driver is what cancels it (and what the
-		// driver's own timer-edge guard reads before it restarts anything).
-		reconnectDriver?.detach()
-		session?.shutdownAndWait()
-		// The app's other session end. Paired with the shutdown above so the two ends of a
-		// session's lifetime read as one thing; the process is going away regardless.
-		displayTopology.endSession()
+		// The session-end lane (lane D impl-report §8 #7): the app's last session end goes through
+		// the same teardown as every other, instead of a shorter one of its own that dropped
+		// nothing. It still disarms the driver before the shutdown (a retry already on the clock
+		// is an edge `teardownInitiated` does not close), and everything it drops, it drops after
+		// the shutdown. See the exit precondition on `tearDownSession()`.
+		tearDownSession()
 	}
 }

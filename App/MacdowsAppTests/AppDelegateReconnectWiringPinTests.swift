@@ -14,11 +14,17 @@ import Testing
 //  1. There is exactly ONE driver, armed once, before the connection it watches starts.
 //  2. The driver sees the event stream, always AFTER the registry (a driver that ran first would
 //     announce "Reconnecting" over a window table nobody had emptied yet).
-//  3. The driver is disarmed at every exit -- the connect-error branch, the give-up teardown and
+//  3. The driver is disarmed at every exit -- the connect-error branch, the give-up branch and
 //     app termination -- because a detached driver is the only kind that cannot bring a session
-//     its owner has closed back up from a retry timer that was already scheduled.
-//  4. The connect-error branch's five statements are BYTE-FOR-BYTE what they were. Lane D was
-//     allowed to append one call to it and nothing else.
+//     its owner has closed back up from a retry timer that was already scheduled. Since the
+//     session-end lane all three reach it through ONE function, `tearDownSession()`, whose body
+//     and single-spelling counts `AppDelegateSessionEndPinTests` holds; the three call sites are
+//     held here, beside the other claims about those three paths.
+//  4. The connect-error branch keeps its "Connect failed: ..." line and its literal `true`, and
+//     then ends the session through that same function. Lane D froze the branch's five statements
+//     byte-for-byte and appended one call; the session-end lane lifted that freeze to repair the
+//     button it left refusing every press (lane D impl-report §8 #1), keeping the two statements
+//     a human actually sees.
 //  5. The button is enabled by a literal `true` in exactly the two places that predate this lane.
 //     Everything a reconnect decides reaches it through the presenter's `connectEnabled`.
 //
@@ -92,12 +98,19 @@ struct AppDelegateReconnectWiringPinTests {
 
     // MARK: - D-5: one driver, armed once, disarmed at every exit
 
-    /// D-5a. The counts. One construction, one arming, three disarmings -- and the third is the
-    /// connect-error branch, which is the appended half of D-7 below.
+    /// D-5a. The counts. One construction, one arming, ONE disarming -- inside
+    /// `tearDownSession()`, which every exit calls. Lane D had three hand-written disarmings here
+    /// (connect-error branch, give-up teardown, termination); the session-end lane folded them into
+    /// the shared teardown, and the three exits are now held as call sites (D-7, the give-up pin and
+    /// the termination pin below).
+    ///
+    /// Counted over the UNSTRIPPED fold, as before: prose in `AppDelegate.swift` does not spell the
+    /// dotted call either, and keeping it that way is part of what this pin holds.
     ///
     /// MUST-RED for: a second `ReconnectDriver(...)` anywhere in the app entry point, an
-    /// `attach()` that is never paired, and a dropped `detach()` at any of the three exits.
-    @Test("one construction, one attach, three detaches")
+    /// `attach()` that is never paired, a dropped `detach()`, and an exit that disarms the driver by
+    /// hand beside the shared teardown.
+    @Test("one construction, one attach, one detach -- inside the shared teardown")
     func theDriverIsBuiltOnceAndDisarmedAtEveryExit() throws {
         let src = try source(Self.appDelegate)
         #expect(occurrences(of: "ReconnectDriver(", in: src) == 1,
@@ -105,8 +118,8 @@ struct AppDelegateReconnectWiringPinTests {
         #expect(occurrences(of: "ReconnectDriver(session: newSession, registry: newRegistry)", in: src) == 1,
                 "and it is built from the session and registry this connection just created")
         #expect(occurrences(of: ".attach()", in: src) == 1)
-        #expect(occurrences(of: ".detach()", in: src) == 3,
-                "connect-error branch, give-up teardown, applicationWillTerminate")
+        #expect(occurrences(of: ".detach()", in: src) == 1,
+                "tearDownSession(), called by the connect-error branch, the give-up branch and applicationWillTerminate")
     }
 
     /// D-5b. The ARMING ORDER. A driver attached after `-start` can miss the events of the
@@ -187,29 +200,36 @@ struct AppDelegateReconnectWiringPinTests {
         #expect(registry < driver, "registry first: see the comment at that line for why")
     }
 
-    // MARK: - D-7: the connect-error branch is untouched, and `true` stays in two places
+    // MARK: - D-7: the connect-error branch ends the session, and `true` stays in two places
 
-    /// D-7. The `lastConnectError` branch, verbatim.
+    /// D-7, re-frozen by the session-end lane. The `lastConnectError` branch ENDS the session.
     ///
-    /// Lane D's licence on this branch was to APPEND one call before its `return` and to change
-    /// nothing else. The needle is the whole branch with the prose stripped out, so any edit to any
-    /// of the five statements -- reordering them, re-wording the failure line, removing the
-    /// `endSession()` -- is red, and so is inserting anything between them.
+    /// Lane D froze this branch's five statements byte-for-byte and appended one `detach()`, and in
+    /// doing so froze a registered defect along with them (lane D impl-report §8 #1): the branch
+    /// re-enabled the button without dropping `session`, and `connectTapped`'s first guard is
+    /// `session == nil`, so the enabled button answered "Already connecting/connected." to every
+    /// press. The session-end lane lifted that freeze and kept exactly two statements from it, the
+    /// "Connect failed: ..." wording and the literal `true`. The rest -- stopping the timer, the
+    /// topology's `endSession()`, the appended disarming -- is now the shared teardown, which also
+    /// drops the session, the registry and the driver.
     ///
-    /// Why the appended call has to be there at all: this branch returns BEFORE the drain, so the
-    /// driver never sees the `.disconnected` a bridge refusal produces on this path and would stay
-    /// armed, in `.reconnecting`, over a session the label has already called failed.
-    @Test("the connect-error branch keeps its five statements, with detach() appended and nothing else")
-    func theConnectErrorBranchIsVerbatimPlusTheDetach() throws {
+    /// UI first, teardown second: the same order the give-up path has, where the presenter writes
+    /// the give-up line before the teardown runs. The needle starts at the method's own first
+    /// statement, so the branch cannot drift below the drain (it must return BEFORE the drain: the
+    /// driver never sees the `.disconnected` a bridge refusal produces on this path), and it runs to
+    /// the branch's `return }`, so nothing can be inserted between the call and the return.
+    ///
+    /// MUST-RED for: reverting to the hand-written statements, dropping or moving the literal
+    /// `true`, re-wording the failure line, and returning without the teardown.
+    @Test("the connect-error branch writes the failure, enables the button, and ends the session")
+    func theConnectErrorBranchEndsTheSession() throws {
         let stripped = try sourceWithoutComments(Self.appDelegate)
         #expect(occurrences(
-            of: "if let error = session.lastConnectError { "
+            of: "private func drainTick() { guard let session else { return } "
+                + "if let error = session.lastConnectError { "
                 + "statusLabel.stringValue = \"Connect failed: \\(error.localizedDescription)\" "
-                + "drainTimer?.invalidate() "
-                + "drainTimer = nil "
                 + "connectButton.isEnabled = true "
-                + "displayTopology.endSession() "
-                + "reconnectDriver?.detach() "
+                + "tearDownSession() "
                 + "return }",
             in: stripped) == 1)
     }
@@ -295,45 +315,50 @@ struct AppDelegateReconnectWiringPinTests {
         #expect(occurrences(of: "registry?.windowSnapshots().count", in: stripped) == 1)
     }
 
-    /// The give-up teardown, as one contiguous run.
+    /// The give-up branch ends the session through the shared teardown.
     ///
-    /// `session = nil` is the statement that matters and it is the only one in the file.
-    /// `connectTapped`'s first guard is `session == nil` and an automatic reconnect reuses the same
-    /// `CRSession`, so a give-up that re-enabled the button without dropping the session would
-    /// produce a button that answers "Already connecting/connected." to every press. The blueprint
-    /// registered that defect on the connect-error path as well (where it is pre-existing and left
-    /// alone for the owner); this pin is what keeps the new branch from copying it.
+    /// `session = nil` is the statement that matters and it is still the only one in the file --
+    /// now inside `tearDownSession()`, whose body `AppDelegateSessionEndPinTests` holds and which
+    /// this branch, the connect-error branch and termination all call. `connectTapped`'s first guard
+    /// is `session == nil` and an automatic reconnect reuses the same `CRSession`, so a give-up that
+    /// re-enabled the button without dropping the session would produce a button that answers
+    /// "Already connecting/connected." to every press. Lane D registered the same defect on the
+    /// connect-error path; the session-end lane repaired it there by routing that branch through
+    /// this same function, which is why the give-up teardown stopped being a function of its own.
     ///
-    /// MUST-RED for: dropping `session = nil`, reordering the teardown so the shutdown happens
-    /// after the session reference is gone, and leaving the driver attached.
+    /// MUST-RED for: the give-up branch no longer ending the session, a second `session = nil` (an
+    /// exit that ends a session by hand), and dropping it altogether.
     @Test("giving up really ends the session, so the button it enables can start a new one")
     func theGiveUpTeardownDropsTheSession() throws {
         let stripped = try sourceWithoutComments(Self.appDelegate)
-        #expect(occurrences(
-            of: "private func endSessionAfterGivingUp() { "
-                + "drainTimer?.invalidate() "
-                + "drainTimer = nil "
-                + "reconnectDriver?.detach() "
-                + "reconnectDriver = nil "
-                + "session?.shutdownAndWait() "
-                + "session = nil "
-                + "registry = nil "
-                + "displayTopology.endSession() }",
-            in: stripped) == 1)
+        #expect(occurrences(of: "if case .gaveUp = state { tearDownSession() }", in: stripped) == 1,
+                "reached from the driver's state change")
         #expect(occurrences(of: "session = nil", in: stripped) == 1,
                 "the one place this app stops having a session")
-        #expect(occurrences(of: "if case .gaveUp = state { endSessionAfterGivingUp() }", in: stripped) == 1,
-                "reached from the driver's state change and nowhere else")
     }
 
-    /// Termination disarms the driver BEFORE the shutdown it is about to cause.
+    /// Termination is the shared teardown, which disarms the driver BEFORE the shutdown it is about
+    /// to cause.
     ///
     /// `teardownInitiated` (which `-shutdownAndWait` sets) closes the event edge on its own, but a
-    /// retry already sitting on the clock is a second edge, and only disarming cancels that.
-    @Test("applicationWillTerminate detaches before it shuts the session down")
+    /// retry already sitting on the clock is a second edge, and only disarming cancels that. Until
+    /// the session-end lane this method carried a teardown of its own that dropped nothing (lane D
+    /// impl-report §8 #7); it is now one call, so this app has one shape for "a session ends".
+    ///
+    /// The order is read by index over the whole stripped file, which is sound because
+    /// `AppDelegateSessionEndPinTests` holds each of the two calls to a single spelling.
+    ///
+    /// MUST-RED for: termination keeping any hand-written step beside or instead of the call, and
+    /// the shared teardown shutting down before it disarms.
+    @Test("applicationWillTerminate is the shared teardown, which detaches before it shuts down")
     func terminationDisarmsTheDriverFirst() throws {
         let stripped = try sourceWithoutComments(Self.appDelegate)
-        #expect(occurrences(of: "reconnectDriver?.detach() session?.shutdownAndWait()", in: stripped) == 1)
+        #expect(occurrences(
+            of: "func applicationWillTerminate(_ notification: Notification) { tearDownSession() }",
+            in: stripped) == 1)
+        let detach = try index(of: "reconnectDriver?.detach()", in: stripped)
+        let shutdown = try index(of: "session?.shutdownAndWait()", in: stripped)
+        #expect(detach < shutdown, "disarm first: a scheduled retry is an edge teardownInitiated does not close")
     }
 
     /// The display-change note is cleared by the reconnect that makes it stale, in the one place
