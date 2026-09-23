@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -28,6 +29,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <freerdp/freerdp.h>
 #include <freerdp/constants.h>
@@ -79,6 +81,13 @@ typedef struct
 	uint32_t desktop_h;
 	uint32_t scale_desktop;
 	uint32_t scale_device;
+	/* R-6 lane G (adr/0019 §2 row G): --reconnect-leg <a>,<g>. leg1_seconds zero = knob absent =
+	 * one leg, which is today's lifecycle verbatim (main's leg loop runs once). Otherwise leg 1
+	 * runs leg1_seconds from its own ConnectSucceeded, then gap_seconds pass with no client
+	 * context alive, then leg 2 runs on a NEW context, same settings plan, for `duration`.
+	 * Validated in parse_args; refused together with --second-exec. */
+	uint32_t leg1_seconds;
+	uint32_t gap_seconds;
 	/* --print-plan: print the pre-connect settings sequence and exit before any context exists. */
 	bool print_plan;
 	char out_path[1024];
@@ -90,37 +99,30 @@ typedef struct
 	uint64_t count;
 } probeCodecCount;
 
+/* R-6 lane G (adr/0019 §2 row G): everything that outlives one leg's client context. With
+ * --reconnect-leg one run is two connections, each on its own freshly created context (the
+ * reconnect adr/0005 §4 defines: full teardown, then a new context, never the old one reused),
+ * yet one --out file, one monotonic clock and one summary. So the log lock, t0 and every counter
+ * the summary reads live here, once per process, and each leg's probeContext points at it.
+ * Without the knob there is exactly one leg, and this is simply where those fields moved to.
+ *
+ * Never copied by value: log_lock is a pthread_mutex_t, and using a copy of one is undefined
+ * (POSIX). It is initialised once, before leg 1's first event, and destroyed once, after the
+ * last leg. t0 is set once too, so t_ms stays monotonic across the gap between the legs. */
 typedef struct
 {
-	/* MUST be first member: freerdp_client_context_new()/casts rely on this layout. */
-	rdpClientContext common;
-
-	probeConfig cfg;
-
-	FILE* out;
 	pthread_mutex_t log_lock;
 	struct timespec t0;
-	uint64_t connect_ms;
-	bool second_exec_sent;
+	/* Raised by probe_leg_stop_signal from FreeRDP's SIGINT/SIGTERM cleanup chain; read by main
+	 * before leg 2 may start. That function says why the gap needs it. */
+	volatile sig_atomic_t stop_requested;
 
-	/* Wired once the "rail" SVC channel connects. */
-	RailClientContext* rail;
-	pcRailServerHandshake orig_ServerHandshake;
-	pcRailServerHandshakeEx orig_ServerHandshakeEx;
-
-	/* Wired once the RDPGFX DVC connects. */
-	pcRdpgfxMapSurfaceToWindow orig_MapSurfaceToWindow;
-	pcRdpgfxMapSurfaceToScaledWindow orig_MapSurfaceToScaledWindow;
-	pcRdpgfxResetGraphics orig_ResetGraphics;
-	pcRdpgfxCapsAdvertise orig_CapsAdvertise; /* the SENDER slot, not a notification */
-	pcRdpgfxCapsConfirm orig_CapsConfirm;
-	pcRdpgfxSurfaceCommand orig_SurfaceCommand; /* only wrapped when --decode is given */
 	uint64_t surface_command_count;
 	probeCodecCount* codec_counts;
 	size_t codec_counts_count;
 	size_t codec_counts_cap;
 
-	/* Bookkeeping for the final summary line. */
+	/* Bookkeeping for the final summary line, accumulated over every leg. */
 	uint32_t* created_ids;
 	size_t created_count;
 	size_t created_cap;
@@ -136,6 +138,41 @@ typedef struct
 	probeEventCount* event_counts;
 	size_t event_counts_count;
 	size_t event_counts_cap;
+} probeRun;
+
+typedef struct
+{
+	/* MUST be first member: freerdp_client_context_new()/casts rely on this layout. */
+	rdpClientContext common;
+
+	probeConfig cfg;
+	/* The run this leg belongs to (see probeRun). Set by main before the leg starts. */
+	probeRun* run;
+
+	/* Borrowed, set per leg: main owns the one --out file that every leg appends to. log_event
+	 * writes through this per-context name, not through run -- EmitterContractTests locates
+	 * log_event's two envelope templates by that exact spelling of the fprintf calls. */
+	FILE* out;
+	uint64_t connect_ms;
+	bool second_exec_sent;
+	/* Per leg: the seconds this leg lasts from its ConnectSucceeded (leg 1 of a --reconnect-leg
+	 * run: leg1_seconds; every other leg: --duration), and whether probe_main_loop ended on that
+	 * timer -- the one outcome after which leg 2 may start. */
+	int leg_seconds;
+	bool leg_timer_elapsed;
+
+	/* Wired once the "rail" SVC channel connects. */
+	RailClientContext* rail;
+	pcRailServerHandshake orig_ServerHandshake;
+	pcRailServerHandshakeEx orig_ServerHandshakeEx;
+
+	/* Wired once the RDPGFX DVC connects. */
+	pcRdpgfxMapSurfaceToWindow orig_MapSurfaceToWindow;
+	pcRdpgfxMapSurfaceToScaledWindow orig_MapSurfaceToScaledWindow;
+	pcRdpgfxResetGraphics orig_ResetGraphics;
+	pcRdpgfxCapsAdvertise orig_CapsAdvertise; /* the SENDER slot, not a notification */
+	pcRdpgfxCapsConfirm orig_CapsConfirm;
+	pcRdpgfxSurfaceCommand orig_SurfaceCommand; /* only wrapped when --decode is given */
 	/* ADR-0017 §4 row A2: raised by probe_on_channel_connected's --decode branch when the
 	 * RDPGFX decode path is not installed; probe_main_loop turns it into a DecodePathRefused
 	 * event and a non-zero result (the channel handler itself can only abort, not report). */
@@ -144,7 +181,10 @@ typedef struct
 
 /* Only the RDPGFX wrappers need this: gdi_graphics_pipeline_init() claims
  * RdpgfxClientContext::custom for its own rdpGdi* pointer, so we cannot smuggle our
- * context through there. This is a single-session CLI tool, so a global is fine. */
+ * context through there. This is a single-session CLI tool, so a global is fine. With
+ * --reconnect-leg (R-6 lane G) one process holds two contexts, but never at the same time:
+ * main points this at each leg's context before that leg starts and clears it once that
+ * context is freed, so no GFX callback can write into a freed leg's context. */
 static probeContext* g_probe = NULL;
 
 /* ------------------------------------------------------------------------------------ */
@@ -197,8 +237,8 @@ static uint64_t get_mono_ms(probeContext* p)
 {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
-	int64_t sec = (int64_t)ts.tv_sec - (int64_t)p->t0.tv_sec;
-	int64_t nsec = (int64_t)ts.tv_nsec - (int64_t)p->t0.tv_nsec;
+	int64_t sec = (int64_t)ts.tv_sec - (int64_t)p->run->t0.tv_sec;
+	int64_t nsec = (int64_t)ts.tv_nsec - (int64_t)p->run->t0.tv_nsec;
 	return (uint64_t)(sec * 1000 + nsec / 1000000);
 }
 
@@ -208,29 +248,29 @@ static void get_tid_hex(char* buf, size_t n)
 	snprintf(buf, n, "0x%lx", tid);
 }
 
-static void bump_event_count(probeContext* p, const char* ev)
+static void bump_event_count(probeRun* run, const char* ev)
 {
-	for (size_t i = 0; i < p->event_counts_count; i++)
+	for (size_t i = 0; i < run->event_counts_count; i++)
 	{
-		if (strcmp(p->event_counts[i].name, ev) == 0)
+		if (strcmp(run->event_counts[i].name, ev) == 0)
 		{
-			p->event_counts[i].count++;
+			run->event_counts[i].count++;
 			return;
 		}
 	}
-	if (p->event_counts_count == p->event_counts_cap)
+	if (run->event_counts_count == run->event_counts_cap)
 	{
-		size_t newcap = p->event_counts_cap ? p->event_counts_cap * 2 : 16;
-		probeEventCount* na = realloc(p->event_counts, newcap * sizeof(probeEventCount));
+		size_t newcap = run->event_counts_cap ? run->event_counts_cap * 2 : 16;
+		probeEventCount* na = realloc(run->event_counts, newcap * sizeof(probeEventCount));
 		if (!na)
 			return;
-		p->event_counts = na;
-		p->event_counts_cap = newcap;
+		run->event_counts = na;
+		run->event_counts_cap = newcap;
 	}
-	snprintf(p->event_counts[p->event_counts_count].name,
-	         sizeof(p->event_counts[p->event_counts_count].name), "%s", ev);
-	p->event_counts[p->event_counts_count].count = 1;
-	p->event_counts_count++;
+	snprintf(run->event_counts[run->event_counts_count].name,
+	         sizeof(run->event_counts[run->event_counts_count].name), "%s", ev);
+	run->event_counts[run->event_counts_count].count = 1;
+	run->event_counts_count++;
 }
 
 /* Logs one JSONL event. `fmt` (if non-NULL) is a printf format producing the extra JSON
@@ -254,8 +294,8 @@ static void log_event(probeContext* p, const char* ev, const char* fmt, ...)
 		va_end(ap);
 	}
 
-	pthread_mutex_lock(&p->log_lock);
-	bump_event_count(p, ev);
+	pthread_mutex_lock(&p->run->log_lock);
+	bump_event_count(p->run, ev);
 	if (p->out)
 	{
 		if (extra[0] != '\0')
@@ -266,7 +306,7 @@ static void log_event(probeContext* p, const char* ev, const char* fmt, ...)
 			        (unsigned long long)tms, tidbuf, ev);
 		fflush(p->out);
 	}
-	pthread_mutex_unlock(&p->log_lock);
+	pthread_mutex_unlock(&p->run->log_lock);
 }
 
 static void track_window_id(uint32_t** arr, size_t* count, size_t* cap, uint32_t id)
@@ -283,22 +323,22 @@ static void track_window_id(uint32_t** arr, size_t* count, size_t* cap, uint32_t
 	(*arr)[(*count)++] = id;
 }
 
-static void track_exec_result(probeContext* p, const char* program, uint32_t execResult,
-                               uint32_t rawResult)
+static void track_exec_result(probeRun* run, const char* program, uint32_t execResult,
+                              uint32_t rawResult)
 {
-	if (p->exec_results_count == p->exec_results_cap)
+	if (run->exec_results_count == run->exec_results_cap)
 	{
-		size_t newcap = p->exec_results_cap ? p->exec_results_cap * 2 : 8;
-		probeExecResult* na = realloc(p->exec_results, newcap * sizeof(probeExecResult));
+		size_t newcap = run->exec_results_cap ? run->exec_results_cap * 2 : 8;
+		probeExecResult* na = realloc(run->exec_results, newcap * sizeof(probeExecResult));
 		if (!na)
 			return;
-		p->exec_results = na;
-		p->exec_results_cap = newcap;
+		run->exec_results = na;
+		run->exec_results_cap = newcap;
 	}
-	p->exec_results[p->exec_results_count].program = strdup(program ? program : "");
-	p->exec_results[p->exec_results_count].execResult = execResult;
-	p->exec_results[p->exec_results_count].rawResult = rawResult;
-	p->exec_results_count++;
+	run->exec_results[run->exec_results_count].program = strdup(program ? program : "");
+	run->exec_results[run->exec_results_count].execResult = execResult;
+	run->exec_results[run->exec_results_count].rawResult = rawResult;
+	run->exec_results_count++;
 }
 
 /* Best-effort name for a WireToSurface1 codecId, from include/freerdp/channels/rdpgfx.h's
@@ -338,41 +378,41 @@ static const char* codec_id_name(uint32_t id)
 	}
 }
 
-static void bump_codec_count(probeContext* p, uint32_t codecId)
+static void bump_codec_count(probeRun* run, uint32_t codecId)
 {
-	for (size_t i = 0; i < p->codec_counts_count; i++)
+	for (size_t i = 0; i < run->codec_counts_count; i++)
 	{
-		if (p->codec_counts[i].codecId == codecId)
+		if (run->codec_counts[i].codecId == codecId)
 		{
-			p->codec_counts[i].count++;
+			run->codec_counts[i].count++;
 			return;
 		}
 	}
-	if (p->codec_counts_count == p->codec_counts_cap)
+	if (run->codec_counts_count == run->codec_counts_cap)
 	{
-		size_t newcap = p->codec_counts_cap ? p->codec_counts_cap * 2 : 8;
-		probeCodecCount* na = realloc(p->codec_counts, newcap * sizeof(probeCodecCount));
+		size_t newcap = run->codec_counts_cap ? run->codec_counts_cap * 2 : 8;
+		probeCodecCount* na = realloc(run->codec_counts, newcap * sizeof(probeCodecCount));
 		if (!na)
 			return;
-		p->codec_counts = na;
-		p->codec_counts_cap = newcap;
+		run->codec_counts = na;
+		run->codec_counts_cap = newcap;
 	}
-	p->codec_counts[p->codec_counts_count].codecId = codecId;
-	p->codec_counts[p->codec_counts_count].count = 1;
-	p->codec_counts_count++;
+	run->codec_counts[run->codec_counts_count].codecId = codecId;
+	run->codec_counts[run->codec_counts_count].count = 1;
+	run->codec_counts_count++;
 }
 
 /* Renders {"<codecId>":<count>,...} into buf for the periodic CodecStats JSONL line. */
-static void build_codec_counts_json(probeContext* p, char* buf, size_t bufsz)
+static void build_codec_counts_json(const probeRun* run, char* buf, size_t bufsz)
 {
 	size_t o = 0;
 	int n = snprintf(buf + o, bufsz - o, "{");
 	if (n > 0)
 		o += (size_t)n;
-	for (size_t i = 0; i < p->codec_counts_count && o < bufsz; i++)
+	for (size_t i = 0; i < run->codec_counts_count && o < bufsz; i++)
 	{
-		n = snprintf(buf + o, bufsz - o, "%s\"%u\":%llu", i ? "," : "", p->codec_counts[i].codecId,
-		             (unsigned long long)p->codec_counts[i].count);
+		n = snprintf(buf + o, bufsz - o, "%s\"%u\":%llu", i ? "," : "", run->codec_counts[i].codecId,
+		             (unsigned long long)run->codec_counts[i].count);
 		if (n > 0)
 			o += (size_t)n;
 	}
@@ -410,6 +450,12 @@ static void usage(const char* prog)
 	       "  --scale <d>[,<v>]        Advertise DesktopScaleFactor d (100..500) and DeviceScaleFactor v "
 	       "(100|140|180, default 100) in TS_UD_CS_CORE. Without it neither setting is touched, as "
 	       "before.\n"
+	       "  --reconnect-leg <a>,<g>  Two legs in one run: leg 1 for a seconds (1..3600) from its "
+	       "ConnectSucceeded, a clean disconnect (no logoff), g seconds (0..3600) with no client context "
+	       "alive, then leg 2 on a NEW client context, same settings plan, for --duration seconds. Both "
+	       "values required. One --out file holds both legs (leg 2 starts at the second PreConnect); "
+	       "--print-plan adds one 'reconnect-leg ...' line after the set lines. Not with --second-exec. "
+	       "Without it: one connection, as before.\n"
 	       "  --print-plan             Print the pre-connect settings sequence this configuration would "
 	       "apply -- one 'set <FreeRDP_Key> = <value>' line each, in order -- and exit 0 without "
 	       "connecting. --host/--user are still required; --app, --out and the password ($WIN_PASS) "
@@ -471,6 +517,32 @@ static bool parse_scale_knob(const char* text, uint32_t* desktop, uint32_t* devi
 		return false;
 	*desktop = (uint32_t)d;
 	*device = (uint32_t)v;
+	return true;
+}
+
+/* R-6 lane G: strict "<a>,<g>", the parse_scale_knob discipline with both halves required -- a
+ * in 1..3600 (leg 1's seconds; zero would be no leg at all), g in 0..3600 (the gap; zero is a
+ * legitimate back-to-back reconnect). No default gap: the value belongs to the run's
+ * pre-registration, not to this tool. A missing half, a trailing comma, a third field, a sign,
+ * whitespace and hex are all refused; leading zeros normalise ("030,00" is 30,0, and the plan
+ * prints the normalised values). */
+static bool parse_reconnect_leg_knob(const char* text, uint32_t* leg1, uint32_t* gap)
+{
+	char* end = NULL;
+	unsigned long a = 0;
+	unsigned long g = 0;
+	if (!text || !isdigit((unsigned char)text[0]))
+		return false;
+	a = strtoul(text, &end, 10);
+	if (*end != ',' || !isdigit((unsigned char)end[1]))
+		return false;
+	g = strtoul(end + 1, &end, 10);
+	if (*end != '\0')
+		return false;
+	if (a < 1 || a > 3600 || g > 3600)
+		return false;
+	*leg1 = (uint32_t)a;
+	*gap = (uint32_t)g;
 	return true;
 }
 
@@ -580,6 +652,17 @@ static bool parse_args(int argc, char** argv, probeConfig* cfg)
 				return false;
 			}
 		}
+		else if (strcmp(a, "--reconnect-leg") == 0)
+		{
+			if (++i >= argc)
+				goto missing;
+			if (!parse_reconnect_leg_knob(argv[i], &cfg->leg1_seconds, &cfg->gap_seconds))
+			{
+				fprintf(stderr, "Invalid value for --reconnect-leg: '%s' (want <a>,<g>, both required: a 1..3600 seconds of leg 1, g 0..3600 seconds of gap)\n", argv[i]);
+				usage(argv[0]);
+				return false;
+			}
+		}
 		else if (strcmp(a, "--print-plan") == 0)
 		{
 			cfg->print_plan = true;
@@ -596,6 +679,18 @@ static bool parse_args(int argc, char** argv, probeConfig* cfg)
 			usage(argv[0]);
 			return false;
 		}
+	}
+
+	/* R-6 lane G: --reconnect-leg and --second-exec are refused together, on the plan path and
+	 * the connect path alike (this check precedes both). Each leg's fresh context starts with
+	 * second_exec_sent false, so leg 2 would send the second ClientExecute again and mix a new
+	 * launch into the very window list a two-leg run exists to read (what the server re-sends).
+	 * Not a v1 combination. */
+	if (cfg->leg1_seconds > 0 && cfg->second_exec[0] != '\0')
+	{
+		fprintf(stderr, "--reconnect-leg and --second-exec cannot be combined (leg 2 would send the second ClientExecute again)\n");
+		usage(argv[0]);
+		return false;
 	}
 
 	if (cfg->print_plan)
@@ -740,7 +835,8 @@ static BOOL probe_window_common(rdpContext* context, const WINDOW_ORDER_INFO* or
 	          windowState->windowClientDeltaY);
 
 	if (isNew)
-		track_window_id(&p->created_ids, &p->created_count, &p->created_cap, orderInfo->windowId);
+		track_window_id(&p->run->created_ids, &p->run->created_count, &p->run->created_cap,
+		                orderInfo->windowId);
 
 	return TRUE;
 }
@@ -749,7 +845,8 @@ static BOOL probe_window_delete(rdpContext* context, const WINDOW_ORDER_INFO* or
 {
 	probeContext* p = (probeContext*)context;
 	log_event(p, "WindowDelete", "\"windowId\":%u", orderInfo->windowId);
-	track_window_id(&p->deleted_ids, &p->deleted_count, &p->deleted_cap, orderInfo->windowId);
+	track_window_id(&p->run->deleted_ids, &p->run->deleted_count, &p->run->deleted_cap,
+	                orderInfo->windowId);
 	return TRUE;
 }
 
@@ -874,7 +971,7 @@ static UINT probe_rail_server_execute_result(RailClientContext* context,
 	log_event(p, "ServerExecuteResult",
 	          "\"flags\":%u,\"execResult\":%u,\"rawResult\":%u,\"exeOrFile\":\"%s\"",
 	          execResult->flags, execResult->execResult, execResult->rawResult, exeEsc);
-	track_exec_result(p, exeEsc, execResult->execResult, execResult->rawResult);
+	track_exec_result(p->run, exeEsc, execResult->execResult, execResult->rawResult);
 	return CHANNEL_RC_OK;
 }
 
@@ -999,13 +1096,13 @@ static UINT probe_gfx_surface_command(RdpgfxClientContext* context,
                                        const RDPGFX_SURFACE_COMMAND* cmd)
 {
 	probeContext* p = g_probe;
-	bump_codec_count(p, cmd->codecId);
-	p->surface_command_count++;
+	bump_codec_count(p->run, cmd->codecId);
+	p->run->surface_command_count++;
 
-	if (p->surface_command_count % 50 == 0)
+	if (p->run->surface_command_count % 50 == 0)
 	{
 		char countsJson[2048];
-		build_codec_counts_json(p, countsJson, sizeof(countsJson));
+		build_codec_counts_json(p->run, countsJson, sizeof(countsJson));
 		log_event(p, "CodecStats", "\"counts\":%s", countsJson);
 	}
 
@@ -1554,8 +1651,10 @@ static UINT probe_run_second_exec(probeContext* p)
 }
 
 /* Mirrors client/Sample/tf_freerdp.c's tf_client_thread_proc(), plus a bounded wait so we
- * can poll for the --second-exec delay and --duration deadline from this same thread
- * without spinning up a timer thread. */
+ * can poll for the --second-exec delay and this leg's deadline (p->leg_seconds: --duration,
+ * or leg 1's seconds under --reconnect-leg) from this same thread without spinning up a
+ * timer thread. The deadline travels in the context rather than as a parameter so that this
+ * signature stays the anchor GfxDecodePathInvariantTests reads the function by. */
 static DWORD probe_main_loop(freerdp* instance, probeContext* p)
 {
 	DWORD result = 0;
@@ -1609,10 +1708,11 @@ static DWORD probe_main_loop(freerdp* instance, probeContext* p)
 			p->second_exec_sent = true;
 		}
 
-		if (sinceConnect >= (uint64_t)p->cfg.duration * 1000)
+		if (sinceConnect >= (uint64_t)p->leg_seconds * 1000)
 		{
 			log_event(p, "DurationElapsed", "\"sinceConnectMs\":%llu",
 			          (unsigned long long)sinceConnect);
+			p->leg_timer_elapsed = true;
 			break;
 		}
 	}
@@ -1631,47 +1731,62 @@ disconnect:
 	return result;
 }
 
+/* R-6 lane G: a stop request during a --reconnect-leg run. FreeRDP's term handler (SIGINT,
+ * SIGTERM, ...) does not end the process: it runs the registered cleanup handlers -- the connect
+ * path registers one per live connection, which aborts it -- and returns. Between the legs there
+ * is no connection and so no abort handler; without this one an operator's Ctrl-C in the gap
+ * would only cut the sleep short, and leg 2 would dial anyway. main registers it once for a
+ * two-leg run (before leg 1 connects, so it sits first in upstream's handler table) and removes
+ * it after the last leg; it only raises a sig_atomic_t flag, which is async-signal-safe, and
+ * main reads that flag during the gap and before leg 2. */
+static void probe_leg_stop_signal(int signum, const char* signame, void* context)
+{
+	(void)signum;
+	(void)signame;
+	((probeRun*)context)->stop_requested = 1;
+}
+
 /* ------------------------------------------------------------------------------------ */
 /* Summary                                                                               */
 /* ------------------------------------------------------------------------------------ */
 
-static void print_summary(probeContext* p)
+static void print_summary(const probeRun* run, const probeConfig* cfg)
 {
 	printf("{");
-	printf("\"hidef\":%s,", p->cfg.no_hidef ? "false" : "true");
+	printf("\"hidef\":%s,", cfg->no_hidef ? "false" : "true");
 
 	printf("\"eventCounts\":{");
-	for (size_t i = 0; i < p->event_counts_count; i++)
-		printf("%s\"%s\":%llu", i ? "," : "", p->event_counts[i].name,
-		       (unsigned long long)p->event_counts[i].count);
+	for (size_t i = 0; i < run->event_counts_count; i++)
+		printf("%s\"%s\":%llu", i ? "," : "", run->event_counts[i].name,
+		       (unsigned long long)run->event_counts[i].count);
 	printf("},");
 
 	printf("\"windowsCreated\":[");
-	for (size_t i = 0; i < p->created_count; i++)
-		printf("%s%u", i ? "," : "", p->created_ids[i]);
+	for (size_t i = 0; i < run->created_count; i++)
+		printf("%s%u", i ? "," : "", run->created_ids[i]);
 	printf("],");
 
 	printf("\"windowsDeleted\":[");
-	for (size_t i = 0; i < p->deleted_count; i++)
-		printf("%s%u", i ? "," : "", p->deleted_ids[i]);
+	for (size_t i = 0; i < run->deleted_count; i++)
+		printf("%s%u", i ? "," : "", run->deleted_ids[i]);
 	printf("],");
 
 	printf("\"execResults\":[");
-	for (size_t i = 0; i < p->exec_results_count; i++)
+	for (size_t i = 0; i < run->exec_results_count; i++)
 	{
 		printf("%s{\"program\":\"%s\",\"execResult\":%u,\"rawResult\":%u}", i ? "," : "",
-		       p->exec_results[i].program ? p->exec_results[i].program : "",
-		       p->exec_results[i].execResult, p->exec_results[i].rawResult);
+		       run->exec_results[i].program ? run->exec_results[i].program : "",
+		       run->exec_results[i].execResult, run->exec_results[i].rawResult);
 	}
 	printf("],");
 
-	printf("\"decode\":%s,", p->cfg.decode ? "true" : "false");
+	printf("\"decode\":%s,", cfg->decode ? "true" : "false");
 	printf("\"codecCounts\":[");
-	for (size_t i = 0; i < p->codec_counts_count; i++)
+	for (size_t i = 0; i < run->codec_counts_count; i++)
 	{
 		printf("%s{\"codecId\":%u,\"name\":\"%s\",\"count\":%llu}", i ? "," : "",
-		       p->codec_counts[i].codecId, codec_id_name(p->codec_counts[i].codecId),
-		       (unsigned long long)p->codec_counts[i].count);
+		       run->codec_counts[i].codecId, codec_id_name(run->codec_counts[i].codecId),
+		       (unsigned long long)run->codec_counts[i].count);
 	}
 	printf("]");
 
@@ -1777,7 +1892,20 @@ int main(int argc, char** argv)
 	 * -- the guard is main's first act and stays so -- and before freerdp_client_context_new, so
 	 * no FreeRDP context, file or socket is ever created on this path. */
 	if (cfg.print_plan)
-		return probe_settings_plan(&cfg, probe_plan_print, stdout) ? 0 : 1;
+	{
+		if (!probe_settings_plan(&cfg, probe_plan_print, stdout))
+			return 1;
+		/* R-6 lane G: a --reconnect-leg run prints exactly one more line, after every set line
+		 * and not starting with "set ", so any reader that counts setting lines is unaffected.
+		 * There is no second set block: each leg's PreConnect applies this very plan to its own
+		 * fresh context, so the lines above are the truth for both legs. Without the knob
+		 * nothing is added -- the output is byte-identical to before. */
+		if (cfg.leg1_seconds > 0 &&
+		    fprintf(stdout, "reconnect-leg leg1-seconds=%u gap-seconds=%u leg2-seconds=%d context=new settings=same\n",
+		            (unsigned)cfg.leg1_seconds, (unsigned)cfg.gap_seconds, cfg.duration) <= 0)
+			return 1;
+		return 0;
+	}
 
 	RDP_CLIENT_ENTRY_POINTS entryPoints = { 0 };
 	entryPoints.Size = sizeof(RDP_CLIENT_ENTRY_POINTS_V1);
@@ -1790,66 +1918,133 @@ int main(int argc, char** argv)
 	entryPoints.ClientStart = probe_client_start;
 	entryPoints.ClientStop = probe_client_stop;
 
-	rdpContext* context = freerdp_client_context_new(&entryPoints);
-	if (!context)
-	{
-		fprintf(stderr, "freerdp_client_context_new failed\n");
-		return 1;
-	}
-
-	probeContext* p = (probeContext*)context;
-	g_probe = p;
-	p->cfg = cfg;
-	pthread_mutex_init(&p->log_lock, NULL);
-	clock_gettime(CLOCK_MONOTONIC, &p->t0);
-
-	p->out = fopen(p->cfg.out_path, "w");
-	if (!p->out)
-	{
-		fprintf(stderr, "failed to open --out file '%s': %s\n", p->cfg.out_path,
-		        strerror(errno));
-		freerdp_client_context_free(context);
-		return 1;
-	}
-
-	rdpSettings* settings = context->settings;
-	if (!freerdp_settings_set_string(settings, FreeRDP_ServerHostname, p->cfg.host) ||
-	    !freerdp_settings_set_string(settings, FreeRDP_Username, p->cfg.user) ||
-	    !freerdp_settings_set_string(settings, FreeRDP_Password, p->cfg.pass))
-	{
-		fprintf(stderr, "failed to apply host/user/pass settings\n");
-		fclose(p->out);
-		freerdp_client_context_free(context);
-		return 1;
-	}
-
+	/* R-6 lane G (adr/0019 §2 row G): the leg loop. Without --reconnect-leg it runs once, and
+	 * every call in it happens in the order it always has -- context, cfg, lock, t0, --out,
+	 * credentials, start, main loop to --duration, stop -- with one move: the context is now
+	 * freed before the summary is printed instead of after it, which nothing can observe (see
+	 * the note at the free). With the knob a second
+	 * pass runs the SAME text on a NEW client context -- the reconnect adr/0005 §4 defines (full
+	 * teardown, then a fresh context; the product creates one per -start as well), never the
+	 * old context reused. So nothing a server wrote into leg 1's settings (an auto-reconnect
+	 * cookie, a server-chosen desktop size) can reach leg 2, and --print-plan stays the truth
+	 * for both legs. Each call exists once in this file and sits here, in main below the
+	 * handshake guard, not in a helper above main: Scripts/test-lab-boundary.sh pins that the
+	 * first context creation in the file comes after the guard, and
+	 * Scripts/test-rail-probe-plan.sh pins the one-copy shapes.
+	 *
+	 * Leg 2 starts only after a leg 1 that ended on its own timer (it wrote DurationElapsed)
+	 * with a clean result and no stop request. Every other ending -- ConnectFailed, a failed
+	 * wait or event check, DecodePathRefused, a signal -- ends the run with today's exit-code
+	 * meaning. The gap passes with no client context alive. Both legs append to one --out file
+	 * on one clock; a leg starts at its PreConnect line, so the second PreConnect is the leg
+	 * boundary, and the summary counts both legs together (eventCounts.PreConnect == 2).
+	 *
+	 * `run` is static so that its address, which the stop handler holds, outlives main's frame
+	 * on every exit path, including the early returns below. */
+	static probeRun run;
+	FILE* out = NULL;
+	const int legs = (cfg.leg1_seconds > 0) ? 2 : 1;
 	int rc = 0;
-	if (freerdp_client_start(context) != 0)
+	for (int leg = 1; leg <= legs; leg++)
 	{
-		fprintf(stderr, "freerdp_client_start failed\n");
-		rc = 1;
-	}
-	else
-	{
-		DWORD res = probe_main_loop(context->instance, p);
-		rc = (int)res;
-		if (freerdp_client_stop(context) != 0)
+		rdpContext* context = freerdp_client_context_new(&entryPoints);
+		if (!context)
+		{
+			fprintf(stderr, "freerdp_client_context_new failed\n");
+			return 1;
+		}
+
+		probeContext* p = (probeContext*)context;
+		g_probe = p;
+		p->cfg = cfg;
+		p->run = &run;
+		if (leg == 1)
+		{
+			/* Once per run, never per leg (see probeRun). */
+			pthread_mutex_init(&run.log_lock, NULL);
+			clock_gettime(CLOCK_MONOTONIC, &run.t0);
+
+			if (legs > 1 && !freerdp_add_signal_cleanup_handler(&run, probe_leg_stop_signal))
+			{
+				fprintf(stderr, "failed to register the --reconnect-leg stop handler\n");
+				freerdp_client_context_free(context);
+				return 1;
+			}
+
+			out = fopen(cfg.out_path, "w");
+			if (!out)
+			{
+				fprintf(stderr, "failed to open --out file '%s': %s\n", cfg.out_path,
+				        strerror(errno));
+				freerdp_client_context_free(context);
+				return 1;
+			}
+		}
+		p->out = out;
+		p->leg_seconds = (leg < legs) ? (int)cfg.leg1_seconds : cfg.duration;
+
+		rdpSettings* settings = context->settings;
+		if (!freerdp_settings_set_string(settings, FreeRDP_ServerHostname, p->cfg.host) ||
+		    !freerdp_settings_set_string(settings, FreeRDP_Username, p->cfg.user) ||
+		    !freerdp_settings_set_string(settings, FreeRDP_Password, p->cfg.pass))
+		{
+			fprintf(stderr, "failed to apply host/user/pass settings\n");
+			fclose(out);
+			freerdp_client_context_free(context);
+			return 1;
+		}
+
+		if (freerdp_client_start(context) != 0)
+		{
+			fprintf(stderr, "freerdp_client_start failed\n");
 			rc = 1;
+		}
+		else
+		{
+			DWORD res = probe_main_loop(context->instance, p);
+			rc = (int)res;
+			if (freerdp_client_stop(context) != 0)
+				rc = 1;
+		}
+		const bool timer_elapsed = p->leg_timer_elapsed;
+
+		/* Nothing of ours runs inside the free: the disconnect at the end of probe_main_loop
+		 * already ran PostDisconnect (channel events unsubscribed) and closed the channels, so
+		 * no event can be logged from here on, and the summary below reads only run. */
+		freerdp_client_context_free(context);
+		g_probe = NULL;
+
+		if (leg < legs)
+		{
+			if (timer_elapsed && rc == 0)
+			{
+				/* One-second steps, so a stop request is honoured within a second even if the
+				 * signal was delivered to a thread other than this one. */
+				for (uint32_t s = 0; s < cfg.gap_seconds && !run.stop_requested; s++)
+					(void)sleep(1);
+			}
+			if (!timer_elapsed || rc != 0 || run.stop_requested)
+			{
+				fprintf(stderr, "rail-probe: leg 2 not started -- leg 1 did not end on its own "
+				                "timer with a clean result, or a stop signal arrived\n");
+				break;
+			}
+		}
 	}
+	if (legs > 1)
+		(void)freerdp_del_signal_cleanup_handler(&run, probe_leg_stop_signal);
 
-	print_summary(p);
+	print_summary(&run, &cfg);
 
-	if (p->out)
-		fclose(p->out);
-	pthread_mutex_destroy(&p->log_lock);
-	free(p->created_ids);
-	free(p->deleted_ids);
-	for (size_t i = 0; i < p->exec_results_count; i++)
-		free(p->exec_results[i].program);
-	free(p->exec_results);
-	free(p->event_counts);
-	free(p->codec_counts);
-
-	freerdp_client_context_free(context);
+	if (out)
+		fclose(out);
+	pthread_mutex_destroy(&run.log_lock);
+	free(run.created_ids);
+	free(run.deleted_ids);
+	for (size_t i = 0; i < run.exec_results_count; i++)
+		free(run.exec_results[i].program);
+	free(run.exec_results);
+	free(run.event_counts);
+	free(run.codec_counts);
 	return rc;
 }

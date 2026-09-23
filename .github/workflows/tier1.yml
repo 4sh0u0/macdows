@@ -332,6 +332,35 @@ jobs:
         # the script is red against the parent commit and green against this one by construction.
         run: ./Scripts/test-window-smoke-pins.sh
 
+      - name: rail-probe plan source pins
+        # Scripts/test-rail-probe-plan.sh pins Tools/rail-probe's pre-connect settings plan and, since
+        # R-6 lane G (adr/0019 §2 row G, --reconnect-leg), the shape of its leg loop. Its SOURCE PINS
+        # S1-S6 are pure grep/awk and run here: one freerdp_settings_set_ implementation (S1), the
+        # plan's two consumers (S2), one copy of the connection lifecycle, in order (S3), no
+        # same-context reconnect entry point (S4), the frozen JSONL event-name set -- this runner's
+        # mirror of MacdowsCore's EmitterContractTests, which only Tier 2 runs (S5) -- and one
+        # leg-line print point, after the plan's (S6). Its BINARY cases need a built rail-probe and a
+        # FreeRDP prefix, which this compile-free runner does not have: the suite reports them as a
+        # NOTE (not_run=1), never as a pass, and they run on maintainer machines and in lane gates.
+        # So the step demands each of the six source pins by name instead of trusting the exit code
+        # alone -- a pin that silently stopped printing would otherwise leave a green step behind.
+        run: |
+          set -euo pipefail
+          SUITE_LOG="${RUNNER_TEMP:-/tmp}/rail-probe-plan.log"
+          ./Scripts/test-rail-probe-plan.sh | tee "$SUITE_LOG"
+
+          # grep -c into variables, not grep -q in a pipeline (see the boundary suite step above).
+          BAD=0
+          for n in 1 2 3 4 5 6; do
+            [ "$(grep -c "^PASS  S$n " "$SUITE_LOG" || true)" -eq 1 ] || BAD=1
+          done
+          PINS="$(grep -cE '^PASS  S[1-6] ' "$SUITE_LOG" || true)"
+          FAILS="$(grep -c '^FAIL' "$SUITE_LOG" || true)"
+          if [ "$BAD" -ne 0 ] || [ "$PINS" -ne 6 ] || [ "$FAILS" -ne 0 ]; then
+            echo "::error::rail-probe plan suite: expected S1-S6 to PASS exactly once each (six lines) and no FAIL; got ${PINS} source-pin PASS lines and ${FAILS} FAIL lines -- see the log above."
+            exit 1
+          fi
+
       - name: K client-rect pins -- no product consumer, every lab mention registered
         # The four RAIL client-rect fields (clientOffsetX/Y, windowClientDeltaX/Y -- K = delta-off)
         # are CARRIED across five layers and CONSUMED by none: macContentRect still uses `off` alone
