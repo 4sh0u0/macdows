@@ -134,6 +134,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			self.lastDisplayChangeNote = note
 			self.statusLabel.stringValue = note
 		}
+
+		// adr/0019 §2 R-6 tool lane T1: the two unattended-launch knobs, both default OFF. With
+		// neither variable exported -- which is every launch by Finder, by Xcode's Run button or
+		// by `open` -- `plan` is `ShellAutolaunch.off`, both `if`s are not taken, and this app
+		// finishes launching byte-for-byte as it did before this lane. See `ShellAutolaunch` for
+		// why reading these two names is not the thing `connectTapped` refuses to do (that refusal
+		// is about where a HOST comes from; neither knob names a host, an account or a credential).
+		//
+		// Read once, into one value, because the pin next door holds `ShellAutolaunch.plan(` to
+		// exactly one occurrence in this file: two call sites could disagree about the same launch.
+		let autolaunch = ShellAutolaunch.plan(environment: ProcessInfo.processInfo.environment)
+		if autolaunch.autoconnect {
+			// `connectTapped()` itself, never a copy of any step inside it: the host.env read, the
+			// live-host boundary gate and the button/`isCheckingBoundary` interlock all have to run
+			// exactly as they do for a human press, and the only way to guarantee that is to make
+			// the press. `@objc private` is callable from inside this file, so no visibility changes.
+			connectTapped()
+		}
+		if let quitAfter = autolaunch.quitAfterInterval {
+			// `NSApp.terminate`, not `exit()` and not a SIGTERM from outside: terminate is the one
+			// route that runs `applicationWillTerminate` below, and that method's detach ->
+			// shutdownAndWait -> endSession sequence is part of what an unattended run has to
+			// exercise. It doubles as the safety net -- a batch that dies leaves behind no app
+			// still holding a live session.
+			//
+			// One-shot and deliberately unstored: there is nothing to cancel it for. The ceiling
+			// applies to the process, not to a session, and an app that has already been asked to
+			// stop by this timer is going away whatever a later session does.
+			//
+			// assumeIsolated for the same reason drainTimer's block does it (see below): the timer
+			// is scheduled on, and fires on, the main run loop.
+			_ = Timer.scheduledTimer(withTimeInterval: quitAfter, repeats: false) { _ in
+				MainActor.assumeIsolated {
+					NSApp.terminate(nil)
+				}
+			}
+		}
 	}
 
 	@objc private func connectTapped() {
