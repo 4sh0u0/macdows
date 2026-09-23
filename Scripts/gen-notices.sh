@@ -119,7 +119,7 @@ done
 if [ "$FFMPEG_LINKED" -gt 0 ]; then
 	DETECTED+=("FFmpeg")
 	[ "$FFMPEG_LINKED" -eq "${#FFMPEG_COMPONENTS[@]}" ] \
-		|| die "only $FFMPEG_LINKED of ${#FFMPEG_COMPONENTS[@]} FFmpeg components (${FFMPEG_COMPONENTS[*]}) appear in the bundle's load commands — a partial FFmpeg embed cannot load at runtime and cannot satisfy the LGPL §6 obligation to ship replaceable libraries; check App/project.yml's Copy Files entries"
+		|| die "only $FFMPEG_LINKED of ${#FFMPEG_COMPONENTS[@]} FFmpeg components (${FFMPEG_COMPONENTS[*]}) appear in the bundle's load commands — a partial FFmpeg embed cannot load at runtime and cannot satisfy the LGPL §6 obligation to ship replaceable libraries; check App/project.yml's dependencies: Embed Frameworks entries (framework: + embed: true + codeSign: true)"
 	# Load commands say what is *referenced*; this says what is actually *present*. An app
 	# that resolved its @rpath entries against a build-tree dylib outside the bundle would
 	# pass the former and fail the latter.
@@ -226,11 +226,14 @@ VERSIONS_CHECKED="$FREERDP_TAG, $LOCKED_OPENSSL_VERSION"
 # artifact in hand rather than the repo's intent.
 #
 # Note on CRDP_WITH_FFMPEG=0: that toggle changes how *FreeRDP* is configured (no H264
-# decode, no ffmpeg link), but App/project.yml's Copy Files entries are unconditional
-# `optional: true` paths, so if an ffmpeg prefix happens to exist on the machine its dylibs
-# are still embedded and this branch still runs. That is deliberate — a dylib physically
-# present in a shipped bundle carries its licence obligations whether or not anything links
-# it, so the gate follows what is in the bundle, not what the build flag intended.
+# decode, no ffmpeg link), but the seven dylibs are declared as App/project.yml's
+# `dependencies:` entries (adr/0006 §3.1), which carry no `optional:` key — the
+# `dependencies:` framework/dylib path is never existence-checked at `generate` time, so
+# a missing file only fails later, at Embed Frameworks build time — so if an ffmpeg
+# prefix happens to exist on the machine its dylibs are still embedded and this branch
+# still runs. That is deliberate — a dylib physically present in a shipped bundle carries
+# its licence obligations whether or not anything links it, so the gate follows what is
+# in the bundle, not what the build flag intended.
 if printf '%s\n' "${DETECTED[@]}" | grep -cx "FFmpeg" >/dev/null; then
 	grep -qF "$LOCKED_FFMPEG_VERSION" "$NOTICES_FILE" \
 		|| die "THIRD_PARTY_NOTICES.md does not mention FFmpeg version $LOCKED_FFMPEG_VERSION (deps/freerdp.lock .ffmpeg.version) — the notices file is stale, update its FFmpeg section"
