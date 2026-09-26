@@ -3323,15 +3323,14 @@ final class RemoteWindowRegistry {
         return replaced
     }
 
-    /// The App's own session-end window teardown (adr/0020 §2 lane R, D-1 = A). Once lane S
-    /// wires an actual call site, the caller will be `AppDelegate.tearDownSession()`, after
-    /// `session?.shutdownAndWait()` returns and before `session = nil`. Unlike
+    /// The App's own session-end window teardown (adr/0020 §2 lane R, D-1 = A). The caller is
+    /// `AppDelegate.tearDownSession()` (adr/0020 §2 lane S)'s seventh step, between
+    /// `session?.shutdownAndWait()` returning and `session = nil`. Unlike
     /// `prepareForReconnect()`, this is not a rebuild seam: it only closes windows and resets
     /// THIS registry's own per-connection state (via `closeAllWindows()`) and does nothing to
     /// prepare for a next connection -- no topology re-take hook, no `currentGeneration = nil`,
-    /// no `refreshSessionTopology`. Once that caller exists, the registry will be discarded
-    /// right after this call returns (`registry = nil`), so those three steps would have no
-    /// consumer (adr/0020 §1 D-1).
+    /// no `refreshSessionTopology`. The registry is discarded right after this call returns
+    /// (`registry = nil`), so those three steps have no consumer (adr/0020 §1 D-1).
     func closeWindowsForSessionEnd() {
         closeAllWindows()
     }

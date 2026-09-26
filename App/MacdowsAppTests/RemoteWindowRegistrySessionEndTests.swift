@@ -10,10 +10,10 @@ import Testing
 // explicit `prepareForReconnect()` driver). This lane adds a FOURTH caller for a session that is
 // simply ENDING, with no next connection to prepare for: `closeWindowsForSessionEnd()`, an
 // `internal` method whose body is exactly the one call `closeAllWindows()` -- the shape R-2
-// below pins, not a new one this lane invents. Lane S (a later, separate lane) wires the
-// actual call site inside `AppDelegate.tearDownSession()`; this file only proves the entry
-// itself and pins its source shape, since `AppDelegate.swift` does not compile into this test
-// bundle at all (adr/0020 §0(f)).
+// below pins, not a new one this lane invents. Lane S (adr/0020 §2 lane S) wires the actual
+// call site inside `AppDelegate.tearDownSession()`'s seventh step; this file only proves the
+// entry itself and pins its source shape, since `AppDelegate.swift` does not compile into this
+// test bundle at all (adr/0020 §0(f)).
 //
 // WHAT R-1 / R-1c DISCRIMINATE, and why both are needed. The registry has always had exactly one
 // way to make a RAIL window disappear from the screen and from `windowSnapshots()` together:
