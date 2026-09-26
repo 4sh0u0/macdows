@@ -3,7 +3,9 @@ name: Tier 2
 # Tier 2 per adr/0006 §6: macOS arm64, the full vendored-dependency chain (OpenSSL ->
 # LGPL-only FFmpeg -> FreeRDP) plus the app build and every test suite that does NOT need a
 # live Windows host. Tier 1 (ubuntu, every push) stays compile-free and keeps the security
-# gates; this is the only lane with a toolchain.
+# gates; this is the only lane with a toolchain. Tools/rail-probe's 31 binary cases (see
+# Scripts/test-rail-probe-plan.sh's own header) also run here, since they need that toolchain --
+# and, per that header, open no socket even here.
 #
 # Cost note, because it is the reason this lane did not exist until now: adr/0006 §6 sized it
 # against a PRIVATE repo's 10x macOS billing (~300 macOS minutes/month on Pro) and the owner
@@ -195,6 +197,73 @@ jobs:
         # 4m13s cold, measured; 20 leaves room for a slower runner without hiding a hang.
         timeout-minutes: 20
         run: ./Scripts/bootstrap.sh
+
+      - name: Build rail-probe against the FreeRDP prefix
+        # docs STATUS (the R-6 lane G entry's deferred item) / adr/0019 R-6 lane G: Tier 1's
+        # "rail-probe plan source pins" step (tier1.yml) only ever exercises the six SOURCE pins
+        # (S1-S6); the 31 BINARY cases need a built rail-probe and report as `NOTE` (not_run=1)
+        # there, which the compile-free ubuntu runner accepts as green -- so CI never actually
+        # executed them. This lane has the toolchain and the FreeRDP prefix Bootstrap just produced,
+        # so it builds the binary here and the next step demands the binary cases all PASS.
+        #
+        # Not `Scripts/probe.sh`, on purpose: probe.sh first requires a host.env credentials file
+        # (Scripts/probe.sh:50-56), then the lab-boundary gate (:77, `crdp_assert_lab_boundary` in
+        # Scripts/lib.sh), and only once the gate passes does it export the
+        # `MACDOWS_BOUNDARY_GATED=1` handshake (:101). A CI runner has neither the credentials file
+        # nor the boundary file, so it would `die` before ever reaching its own `cmake` lines
+        # (Scripts/probe.sh:128-129). This step is those same two `cmake` lines, called directly,
+        # against the prefix Bootstrap just built.
+        #
+        # FREERDP_PREFIX is `$PWD/.build/freerdp/current/prefix`, an ABSOLUTE path, not a bare
+        # `.build/freerdp/current/prefix`: Tools/rail-probe/CMakeLists.txt derives the FFmpeg lib
+        # dir for the rpath by walking three levels up from this prefix LEXICALLY (`../../..`,
+        # collapsed as text, not resolved through symlinks) to find the shared build root -- a
+        # relative path would collapse against `Tools/rail-probe` (`CMAKE_CURRENT_SOURCE_DIR`)
+        # instead, configure would print a "does not look like this repo's build root" STATUS line,
+        # and the build would then fail outright (`freerdp/config.h` not found) -- not silent, but
+        # not the outcome this step wants either (see that file's own comment on why REALPATH is
+        # deliberately not used either).
+        #
+        # `-B` kept at the suite's default path: the suite's own `BIN` default (and its `-nt`
+        # freshness check against `rail-probe.c`) is `Tools/rail-probe/build/rail-probe`, so leaving
+        # `-B` at that default path is what makes the next step's binary cases run instead of
+        # reporting `NOTE`.
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cmake -S Tools/rail-probe -B Tools/rail-probe/build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFREERDP_PREFIX="$PWD/.build/freerdp/current/prefix"
+          cmake --build Tools/rail-probe/build -j"$(sysctl -n hw.ncpu)"
+
+      - name: rail-probe plan suite (source pins + binary cases)
+        # Scripts/test-rail-probe-plan.sh's own header explains the split: SOURCE PINS (S1-S6) run
+        # everywhere, BINARY CASES need the binary the previous step just built. With it present
+        # and fresh, every case that Tier 1 could only report as `NOTE` now actually runs -- this
+        # step is what makes that real, so it demands the full count rather than trusting the exit
+        # code alone (mirrors the "rail-probe plan source pins" step's own reasoning in
+        # tier1.yml).
+        #
+        # 37 is hard-coded deliberately: 6 source pins (S1-S6) + 31 binary cases. A binary case
+        # that silently stopped running (or a source pin that fired twice) would still leave the
+        # step green if it only checked "no FAIL, no NOTE" -- the fixed count is what turns a
+        # missing case into a red step instead of a quietly smaller green one.
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          SUITE_LOG="${RUNNER_TEMP:-/tmp}/rail-probe-plan.log"
+          ./Scripts/test-rail-probe-plan.sh | tee "$SUITE_LOG"
+
+          BAD=0
+          for n in 1 2 3 4 5 6; do
+            [ "$(grep -c "^PASS  S$n " "$SUITE_LOG" || true)" -eq 1 ] || BAD=1
+          done
+          PASSES="$(grep -c '^PASS ' "$SUITE_LOG" || true)"
+          NOTES="$(grep -c '^NOTE' "$SUITE_LOG" || true)"
+          FAILS="$(grep -c '^FAIL' "$SUITE_LOG" || true)"
+          LAST_LINE="$(tail -n1 "$SUITE_LOG")"
+          if [ "$BAD" -ne 0 ] || [ "$PASSES" -ne 37 ] || [ "$NOTES" -ne 0 ] || [ "$FAILS" -ne 0 ] || [ "$LAST_LINE" != "failures=0 not_run=0" ]; then
+            echo "::error::rail-probe plan suite: expected S1-S6 to PASS exactly once each, 37 total PASS lines (6 source pins + 31 binary cases), no NOTE, no FAIL, and a final 'failures=0 not_run=0' line; got ${PASSES} PASS / ${NOTES} NOTE / ${FAILS} FAIL lines and last line '${LAST_LINE}' -- see the log above."
+            exit 1
+          fi
 
       - name: Build the app
         # Through a scheme, never a bare package scheme -- App/project.yml's `schemes:` block

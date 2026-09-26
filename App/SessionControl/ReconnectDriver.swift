@@ -352,7 +352,16 @@ final class ReconnectDriver {
             // built from a fixed vocabulary of state names, an attempt index and a policy delay;
             // without it the unified log would store `<private>` and the channel would be useless
             // for exactly the run it exists to make readable.
-            Self.logger.info("\(line, privacy: .public)")
+            //
+            // `.notice`, not `.info`: os.Logger's `.info` level stays only in the unified log's
+            // in-memory buffer and is cleared once that buffer fills, on the order of minutes on
+            // the lab Mac, so a `log show` export run minutes after the batch comes back empty.
+            // That is exactly what happened on 2026-09-24: the form-1 dry-run batch and the
+            // acceptance batch (two runs each) produced four `app-oslog-<sub>.txt` exports, and all
+            // four came back as bare headers for this reason. `.notice` is the lowest level the
+            // unified log persists to disk by default. `print(line)` above and the stdout channel
+            // it feeds are unaffected by this.
+            Self.logger.notice("\(line, privacy: .public)")
         }
         onStateChange?(next)
     }

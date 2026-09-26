@@ -341,7 +341,8 @@ jobs:
         # mirror of MacdowsCore's EmitterContractTests, which only Tier 2 runs (S5) -- and one
         # leg-line print point, after the plan's (S6). Its BINARY cases need a built rail-probe and a
         # FreeRDP prefix, which this compile-free runner does not have: the suite reports them as a
-        # NOTE (not_run=1), never as a pass, and they run on maintainer machines and in lane gates.
+        # NOTE (not_run=1), never as a pass, and they run on maintainer machines and in Tier 2,
+        # which builds the binary.
         # So the step demands each of the six source pins by name instead of trusting the exit code
         # alone -- a pin that silently stopped printing would otherwise leave a green step behind.
         run: |

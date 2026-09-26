@@ -78,15 +78,16 @@ struct ReconnectLogChannelPinTests {
     /// The two channels, adjacent, both given `line` and nothing else.
     ///
     /// MUST-RED for: a `print` that gains a prefix, a logger call that interpolates anything other
-    /// than the whole line, a logger call that replaces the `print` instead of joining it, and a
-    /// second `print` anywhere in the driver.
+    /// than the whole line, a logger call that replaces the `print` instead of joining it, a
+    /// second `print` anywhere in the driver, and a logger call at a level the unified log does
+    /// not persist.
     @Test("stdout keeps the line verbatim, and the unified log gets the same string")
     func bothChannelsCarryTheSameUnmodifiedLine() throws {
         let stripped = try sourceWithoutComments(Self.driverPath)
         #expect(occurrences(
             of: "if let line = Self.logLine(for: next, failedAttempts: failedAttempts) { "
                 + "print(line) "
-                + "Self.logger.info(\"\\(line, privacy: .public)\") }",
+                + "Self.logger.notice(\"\\(line, privacy: .public)\") }",
             in: stripped) == 1,
             "one guard, two channels, one string -- in that order and with nothing between them")
         #expect(occurrences(of: "print(", in: stripped) == 1,
@@ -110,5 +111,21 @@ struct ReconnectLogChannelPinTests {
         #expect(occurrences(of: "Logger(subsystem: \"dev.haru.macdows\", category: \"Reconnect\")",
                             in: stripped) == 1,
                 "the predicate a `log show` export will filter on")
+    }
+
+    /// `os.Logger`'s `.info` level stays only in the unified log's in-memory buffer, cleared once
+    /// that buffer fills (on the order of minutes on the lab Mac), so a post-hoc `log show` run
+    /// minutes later exports empty. That is exactly what happened to the 2026-09-24 form-1 batch:
+    /// the dry-run and acceptance runs (two each) produced four `app-oslog-<sub>.txt` exports that
+    /// came back as bare headers, because the mirror this file pins was still `.info`. `.notice` is
+    /// the lowest level the unified log persists by default, which is why the driver call, and this
+    /// pin, moved there -- `print(line)` and the `[reconnect]` line family are untouched either
+    /// way.
+    @Test("the mirror is at a persisted level: notice, not info")
+    func theMirrorIsAtAPersistedLevel() throws {
+        let stripped = try sourceWithoutComments(Self.driverPath)
+        #expect(occurrences(of: "logger.notice(", in: stripped) == 1)
+        #expect(occurrences(of: "logger.info(", in: stripped) == 0)
+        #expect(occurrences(of: "logger.debug(", in: stripped) == 0)
     }
 }
