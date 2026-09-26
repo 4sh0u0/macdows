@@ -370,10 +370,10 @@ final class TrayStatusController {
     }
 
     /// Session-scoped teardown -- called from `RemoteWindowRegistry.closeAllWindows()` (all
-    /// three of its callers: the generation-rollover branch in `handle(_:)`, the
-    /// `.disconnected` case, and the explicit `prepareForReconnect()` driver), matching how
-    /// that method already tears down every
-    /// other per-connection resource it owns. Clears the LIVE model/items only -- see
+    /// four of its callers: the generation-rollover branch in `handle(_:)`, the
+    /// `.disconnected` case, the explicit `prepareForReconnect()` driver, and the session-end
+    /// entry, `closeWindowsForSessionEnd()`), matching how that method already tears down
+    /// every other per-connection resource it owns. Clears the LIVE model/items only -- see
     /// `statusItems`'s own doc comment for why none of this type's counters (including
     /// adr/0014's `clicksForwarded`/`notifyEventsSent`) are reset here.
     func removeAll() {
