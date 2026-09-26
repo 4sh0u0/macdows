@@ -1648,13 +1648,11 @@ final class RemoteWindow {
     // observer token. close(via:) above is this class's own documented single point of
     // teardown ("call exactly once, from RemoteWindowRegistry only") and already removes
     // the observer. Every path that ends a session while windows are still tracked routes
-    // through it via `closeAllWindows()` -- including, for whatever caller a later lane
-    // gives it (adr/0020 §2 lane S), the session-end entry,
-    // `RemoteWindowRegistry.closeWindowsForSessionEnd()` (adr/0020 §2 lane R). The one path
-    // that still does not route through either is process termination releasing the
-    // registry directly. adr/0020 D-3 = X1 is the RULING that this exit path will also
-    // close windows, not a note that a gap has merely been logged for later -- once a later
-    // lane implements it, this sentence is true without qualification.
+    // through it via `closeAllWindows()` -- including, via the session-end entry
+    // `RemoteWindowRegistry.closeWindowsForSessionEnd()` (adr/0020 §2 lane R), the App's own
+    // teardown `AppDelegate.tearDownSession()` (adr/0020 §2 lane S), for every one of that
+    // method's callers -- including the exit path (adr/0020 D-3 = X1). No path releases the
+    // registry without first routing through one of the two.
 }
 
 // MARK: - The mask pipeline's one crossing into CoreGraphics (M1/L8, ADR-0015 §9's L8 row)
