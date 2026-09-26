@@ -208,47 +208,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			return
 		}
 
-		// MacdowsCore.EnvFile, not the inline loop this method used to carry. That loop keyed
-		// each line on everything left of the first `=`, so the ordinary line
-		// `export WIN_HOST=x` was filed under the key "export WIN_HOST" and was invisible to
-		// the lookup right below it -- and it stripped no quotes, so `WIN_HOST="x"` dialled a
-		// host whose name included the quote characters. Both defects were duplicated verbatim
-		// in Tools/window-smoke, and both disagreed with the rules
-		// Scripts/run-window-smoke.command applies to the same file; EnvFile's own doc comment
-		// records how that disagreement was measured fail-open. One parser now, in the package
-		// whose tests run in every replay-gate pass (the app-side bundle, MacdowsAppTests,
-		// arrived later -- D7, 2026-09-02 -- and does not change where a parser belongs).
-		//
-		// MacdowsPaths.hostEnvPath() rather than a local `NSHomeDirectory()` concatenation, for
-		// the same reason: LabBoundary locates its own boundary file through $HOME, so the two
-		// halves of the gate a few lines below -- the host, and the segments it is judged
-		// against -- used to be able to come out of two different homes when HOME is redirected.
-		// One resolver now decides both (see MacdowsPaths for the reconciled order and why).
-		// In the default environment the path is byte-identical to the one this line built
-		// before, so nothing about a normal launch changes.
-		//
-		// This method deliberately does NOT take the WIN_HOST/WIN_USER/WIN_PASS environment
-		// variables into account, unlike the two command-line harnesses (which get them from
-		// Scripts/run-window-smoke.command, the whole point of the precedence there). This is a
-		// GUI app: it is launched by Finder, by Xcode's Run button or by `open`, none of which
-		// is a place a maintainer sets a variable on purpose, and honouring one would add a way
-		// to change which host a button press dials that is invisible in the window the human
-		// is looking at. host.env is the app's single source, the status label says so, and
-		// EnvFile.value(forKey:in:environment:) is deliberately not called here.
-		let values: [String: String]
-		do {
-			values = try EnvFile.parse(path: MacdowsPaths.hostEnvPath())
-		} catch {
-			statusLabel.stringValue = "Could not read ~/.config/macdows/host.env"
-			return
-		}
-		guard let host = values["WIN_HOST"], let user = values["WIN_USER"], let pass = values["WIN_PASS"],
-			!host.isEmpty, !user.isEmpty, !pass.isEmpty
-		else {
-			statusLabel.stringValue = "host.env missing WIN_HOST/WIN_USER/WIN_PASS"
-			return
-		}
-
 		// Live-host testing boundary gate (owner rule, 2026-08-31), the in-process mirror of
 		// Scripts/lib.sh's crdp_assert_lab_boundary. Pressing Connect used to build a CRSession
 		// straight from host.env with nothing between the button and the socket -- the shell
@@ -281,23 +240,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// main actor under every language mode and feature set. The enclosing `Task {}` inherits
 		// MainActor isolation, so everything after the await is back on the main actor and may
 		// touch AppKit directly.
+		//
+		// adr/0020 D-8 (#6): the host.env read and its three-key check run in that same detached
+		// task, ahead of the gate, instead of on the main actor before it. The file is local and
+		// small, but a HOME on a network mount can stall a read, and a stalled read on the main
+		// actor is the beachball the paragraph above rules out. The price is that the two host.env
+		// failures now arrive after the button has been disabled, so each of them -- like the
+		// gate's refusal -- has to hand the button back: `isCheckingBoundary` is reset once, before
+		// the verdict is read, whatever it is, and every failure arm re-enables Connect with a
+		// literal `true`. Without that, one bad host.env would lock Connect for the life of the
+		// process. The two failure lines are unchanged; the "Checking" line now also covers the
+		// read, which is part of the same check.
 		isCheckingBoundary = true
 		connectButton.isEnabled = false
 		statusLabel.stringValue = "Checking the live-host boundary..."
 		Task { [weak self] in
-			let verdict = await Task.detached(priority: .userInitiated) {
-				LabBoundary.check(host: host)
+			let preflight = await Task.detached(priority: .userInitiated) { () -> ConnectPreflight in
+				// MacdowsCore.EnvFile, not the inline loop this method used to carry. That loop keyed
+				// each line on everything left of the first `=`, so the ordinary line
+				// `export WIN_HOST=x` was filed under the key "export WIN_HOST" and was invisible to
+				// the lookup right below it -- and it stripped no quotes, so `WIN_HOST="x"` dialled a
+				// host whose name included the quote characters. Both defects were duplicated verbatim
+				// in Tools/window-smoke, and both disagreed with the rules
+				// Scripts/run-window-smoke.command applies to the same file; EnvFile's own doc comment
+				// records how that disagreement was measured fail-open. One parser now, in the package
+				// whose tests run in every replay-gate pass (the app-side bundle, MacdowsAppTests,
+				// arrived later -- D7, 2026-09-02 -- and does not change where a parser belongs).
+				//
+				// MacdowsPaths.hostEnvPath() rather than a local `NSHomeDirectory()` concatenation, for
+				// the same reason: LabBoundary locates its own boundary file through $HOME, so the two
+				// halves of the gate a few lines below -- the host, and the segments it is judged
+				// against -- used to be able to come out of two different homes when HOME is redirected.
+				// One resolver now decides both (see MacdowsPaths for the reconciled order and why).
+				// In the default environment the path is byte-identical to the one this line built
+				// before, so nothing about a normal launch changes.
+				//
+				// This method deliberately does NOT take the WIN_HOST/WIN_USER/WIN_PASS environment
+				// variables into account, unlike the two command-line harnesses (which get them from
+				// Scripts/run-window-smoke.command, the whole point of the precedence there). This is a
+				// GUI app: it is launched by Finder, by Xcode's Run button or by `open`, none of which
+				// is a place a maintainer sets a variable on purpose, and honouring one would add a way
+				// to change which host a button press dials that is invisible in the window the human
+				// is looking at. host.env is the app's single source, the status label says so, and
+				// EnvFile.value(forKey:in:environment:) is deliberately not called here.
+				let values: [String: String]
+				do {
+					values = try EnvFile.parse(path: MacdowsPaths.hostEnvPath())
+				} catch {
+					return .unreadable
+				}
+				guard let host = values["WIN_HOST"], let user = values["WIN_USER"], let pass = values["WIN_PASS"],
+					!host.isEmpty, !user.isEmpty, !pass.isEmpty
+				else {
+					return .missingKeys
+				}
+				return .checked(host: host, user: user, password: pass, verdict: LabBoundary.check(host: host))
 			}.value
 			guard let self else { return }
 			self.isCheckingBoundary = false
-			switch verdict {
-			case .allowed:
+			switch preflight {
+			case .unreadable:
+				self.statusLabel.stringValue = "Could not read ~/.config/macdows/host.env"
+				self.connectButton.isEnabled = true
+			case .missingKeys:
+				self.statusLabel.stringValue = "host.env missing WIN_HOST/WIN_USER/WIN_PASS"
+				self.connectButton.isEnabled = true
+			case .checked(let host, let user, let pass, .allowed):
 				self.beginSession(host: host, user: user, password: pass)
-			case .refused(let refusal):
+			case .checked(let host, _, _, .refused(let refusal)):
 				self.statusLabel.stringValue = LabBoundary.refusalLine(host: host, refusal: refusal)
 				self.connectButton.isEnabled = true
 			}
 		}
+	}
+
+	/// adr/0020 D-8 (#6): everything the off-main half of a Connect press can come back with --
+	/// host.env unreadable, host.env without all three keys, or the three values together with
+	/// the live-host gate's verdict on the host. One value, so the main-actor half reads the
+	/// whole outcome in one `switch` and cannot act on credentials without the verdict that goes
+	/// with them.
+	private enum ConnectPreflight: Sendable {
+		case unreadable
+		case missingKeys
+		case checked(host: String, user: String, password: String, verdict: LabBoundary.Verdict)
 	}
 
 	/// Everything `connectTapped` used to do inline once the credentials were in hand. Split out
@@ -673,9 +698,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	///
 	/// The only place in this file that derives either of them from a reconnect state, which is
 	/// what keeps `ShellReconnectPresenter`'s offline tests worth anything: this app contributes
-	/// the binding and nothing else. The button's three literal `isEnabled = true` sites -- the
-	/// boundary refusal and the connect-error branch, which predate the driver, and the End-session
-	/// action (adr/0020 D-5) -- keep their literal: none of them is a reconnect state.
+	/// the binding and nothing else. The button's five literal `isEnabled = true` sites -- the
+	/// boundary refusal and the connect-error branch, which predate the driver, the End-session
+	/// action (adr/0020 D-5) and the two host.env failures that moved behind the button's disable
+	/// (adr/0020 D-8) -- keep their literal: none of them is a reconnect state.
 	private func applyShell(for state: ReconnectDriver.State) {
 		let shell = ShellReconnectPresenter.shell(
 			for: state,

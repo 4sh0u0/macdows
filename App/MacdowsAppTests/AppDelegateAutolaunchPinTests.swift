@@ -26,6 +26,11 @@ import Testing
 //     append statements to the end of `applicationDidFinishLaunching` and nothing else, and the
 //     fingerprint below is what says so without quoting 22 KB of source.
 //
+// adr/0020 lane S added a fifth claim here, because it changed what the real button press does
+// before it dials (D-8, #6): the host.env read now runs off the main actor, and every way that
+// read or the gate can fail hands the button back. Autoconnect presses that same button, so this
+// file is where its interlock is held.
+//
 // REGISTERED GAP, stated rather than papered over: these pins check that the wiring is WRITTEN, not
 // that it RUNS. No offline test in this repository can launch this app, set an environment variable
 // for it, or watch its Timer fire. Closing the gap means splitting `AppDelegate` into a target this
@@ -229,12 +234,18 @@ struct AppDelegateAutolaunchPinTests {
     ///
     /// RE-FROZEN by adr/0020 lane S (branched from main `8a51cf6`, where the region was still those
     /// 26761 characters): the End-session action and the teardown's seventh step, the `.reconnecting`
-    /// branch's event-count reset, and the comments that describe them. The region now folds to
-    /// 31244 characters hashing to the constant below; the +4483 is exactly that lane's net folded
-    /// edit (4916 characters added, 433 removed, counted token by token over the two folds). Lane
-    /// S's other hunks -- the button's stored property, `session`'s `didSet` and the button's
-    /// construction -- sit before `connectTapped` and are held by `AppDelegateSessionEndPinTests`
-    /// instead.
+    /// branch's event-count reset, and the comments that describe them. That commit left the region
+    /// folding to 31244 characters; the +4483 was exactly its net folded edit (4916 characters
+    /// added, 433 removed, counted token by token over the two folds). Lane S's other hunks -- the
+    /// button's stored property, `session`'s `didSet` and the button's construction -- sit before
+    /// `connectTapped` and are held by `AppDelegateSessionEndPinTests` instead.
+    ///
+    /// RE-FROZEN again by lane S's separable D-8 commit (#6): the host.env read moved into the
+    /// detached task with its comment, the verdict gained two failure arms, and the result type
+    /// `ConnectPreflight` was declared after `connectTapped`. The region now folds to 33035
+    /// characters hashing to the constant below; the +1791 is exactly that commit's net folded edit
+    /// (4342 characters added, 2551 removed -- the moved comment counts on both sides). Reverting
+    /// that commit alone restores 31244.
     ///
     /// Why a hash and not a quoted literal: the region is ~22 KB, which is not a thing to paste into
     /// a test, and an excerpt would pin only the excerpt. Why the fold WITH comments: the claim is
@@ -246,9 +257,9 @@ struct AppDelegateAutolaunchPinTests {
     /// expected to re-freeze this constant in the same commit that makes the edit, and the length
     /// below is here so that such a re-freeze can be sanity-checked (a length that MOVED by the size
     /// of the edit is a re-freeze; a length that moved by 22638 is a needle that stopped matching).
-    private static let foldedTailLength = 31244
+    private static let foldedTailLength = 33035
     private static let foldedTailSHA256 =
-        "164554caebe37c4e1a6327e8c32eb0c0012adaf59748c0df1e008cce955748dc"
+        "149fdc7753f53217320e2269515f910d0873b0be8d6d89330ba78fd8e21bbbf3"
 
     @Test("connectTapped to end-of-file is byte-identical to its last deliberate freeze")
     func theRestOfTheFileIsUnchanged() throws {
@@ -258,6 +269,64 @@ struct AppDelegateAutolaunchPinTests {
         let folded = autolaunchFolded(String(raw[start...]))
         #expect(folded.count == Self.foldedTailLength)
         #expect(autolaunchSHA256(folded) == Self.foldedTailSHA256)
+    }
+
+    // MARK: - adr/0020 S-8: the press reads host.env off the main actor and never locks itself
+
+    /// adr/0020 S-8 (D-8, #6). The host.env read and its three-key check live INSIDE the
+    /// `Task.detached` closure, with the gate: `EnvFile.parse(` sits between `Task.detached(` and
+    /// the closure's `}.value`, and there is exactly one of each. Parsing on the main actor again
+    /// would put a possibly-stalled file read back on the press that must feel instant.
+    ///
+    /// The other half is the interlock. Both host.env failures now happen after the button has
+    /// been disabled, so the verdict is read as ONE contiguous run: `isCheckingBoundary` reset once,
+    /// before the `switch`, for every outcome; each of the three failure arms (unreadable, keys
+    /// missing, refused) writes its line and re-enables Connect with a literal `true`; only the
+    /// allowed arm starts a session. A failure arm without its `true` would leave Connect disabled
+    /// with nothing left to enable it -- a button locked for the life of the process -- and the
+    /// autoconnect knob presses this very button.
+    ///
+    /// MUST-RED for: the parse moved back in front of the Task (onto the main actor), a failure arm
+    /// that forgets to re-enable Connect, the reset moved into some arms only, and a verdict arm
+    /// that starts a session without the gate's `.allowed`.
+    @Test("the Connect press reads host.env off the main actor, and every failure hands the button back")
+    func theHostEnvReadIsOffMainAndEveryFailureReEnablesConnect() throws {
+        let code = try Self.code()
+        #expect(autolaunchOccurrences(of: "EnvFile.parse(", in: code) == 1)
+        #expect(autolaunchOccurrences(of: "Task.detached(", in: code) == 1)
+        #expect(autolaunchOccurrences(of: "}.value", in: code) == 1)
+        let detached = try autolaunchIndex(of: "Task.detached(", in: code)
+        let parse = try autolaunchIndex(of: "EnvFile.parse(", in: code)
+        let value = try autolaunchIndex(of: "}.value", in: code)
+        #expect(detached < parse, "the read is inside the detached closure, not in front of it")
+        #expect(parse < value, "the read is inside the detached closure, not after it")
+
+        #expect(autolaunchOccurrences(
+            of: "let preflight = await Task.detached(priority: .userInitiated) { () -> ConnectPreflight in "
+                + "let values: [String: String] "
+                + "do { values = try EnvFile.parse(path: MacdowsPaths.hostEnvPath()) } catch { return .unreadable } "
+                + "guard let host = values[\"WIN_HOST\"], let user = values[\"WIN_USER\"], let pass = values[\"WIN_PASS\"], "
+                + "!host.isEmpty, !user.isEmpty, !pass.isEmpty else { return .missingKeys } "
+                + "return .checked(host: host, user: user, password: pass, verdict: LabBoundary.check(host: host)) "
+                + "}.value",
+            in: code) == 1)
+        #expect(autolaunchOccurrences(
+            of: "}.value guard let self else { return } self.isCheckingBoundary = false switch preflight { "
+                + "case .unreadable: "
+                + "self.statusLabel.stringValue = \"Could not read ~/.config/macdows/host.env\" "
+                + "self.connectButton.isEnabled = true "
+                + "case .missingKeys: "
+                + "self.statusLabel.stringValue = \"host.env missing WIN_HOST/WIN_USER/WIN_PASS\" "
+                + "self.connectButton.isEnabled = true "
+                + "case .checked(let host, let user, let pass, .allowed): "
+                + "self.beginSession(host: host, user: user, password: pass) "
+                + "case .checked(let host, _, _, .refused(let refusal)): "
+                + "self.statusLabel.stringValue = LabBoundary.refusalLine(host: host, refusal: refusal) "
+                + "self.connectButton.isEnabled = true "
+                + "} }",
+            in: code) == 1)
+        #expect(autolaunchOccurrences(of: "isCheckingBoundary = false", in: code) == 2,
+                "the stored property's initial value, and the one reset in front of the verdict")
     }
 
     // MARK: - The knob names the orchestrator greps for

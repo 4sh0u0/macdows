@@ -28,8 +28,9 @@ import Testing
 //     button it left refusing every press (lane D impl-report §8 #1), keeping the two statements
 //     a human actually sees.
 //  5. The button is enabled by a literal `true` only where no reconnect state is involved: the two
-//     places that predate this lane, and the End-session action adr/0020 lane S added. Everything
-//     a reconnect decides reaches it through the presenter's `connectEnabled`.
+//     places that predate this lane, and the three adr/0020 lane S added (the End-session action,
+//     and the two host.env failures D-8 moved behind the button's disable). Everything a reconnect
+//     decides reaches it through the presenter's `connectEnabled`.
 //
 // REGISTERED GAP, stated rather than papered over: these pins check that the wiring is WRITTEN, not
 // that it RUNS. No offline test in this repository can press that button. Closing the gap means
@@ -238,22 +239,23 @@ struct AppDelegateReconnectWiringPinTests {
     }
 
     /// D-7b. The literal `true` stays in the two places that predate this lane -- the boundary
-    /// refusal and the connect-error branch -- plus the one adr/0020 lane S added (D-5 = Q1): the
-    /// End-session action, which enables Connect by a literal for the same reason those two do,
-    /// because ending a session on purpose is not a reconnect state. Every enable a reconnect
-    /// decides goes through the presenter, so any further literal would be a second opinion about
-    /// when the button is usable. Re-frozen by lane S in the same commit: 2 -> 3 literal trues,
-    /// 5 -> 6 writes.
+    /// refusal and the connect-error branch -- plus the three adr/0020 lane S added, none of which is
+    /// a reconnect state either: the End-session action (D-5 = Q1), and the two host.env failures
+    /// (unreadable, keys missing) that D-8 moved off the main actor and therefore behind the
+    /// button's disable, where each has to hand the button back. Every enable a reconnect decides
+    /// goes through the presenter, so any further literal would be a second opinion about when the
+    /// button is usable. Re-frozen by lane S: 2 -> 3 literal trues and 5 -> 6 writes in its main
+    /// commit, 3 -> 5 and 6 -> 8 in its separable D-8 commit.
     ///
     /// Read from the comment-stripped text so that a `true` written in prose cannot be counted.
-    @Test("connectButton.isEnabled = true survives in exactly three places, none of them a reconnect state")
-    func theButtonIsEnabledByALiteralInThreePlacesOnly() throws {
+    @Test("connectButton.isEnabled = true survives in exactly five places, none of them a reconnect state")
+    func theButtonIsEnabledByALiteralInFivePlacesOnly() throws {
         let stripped = try sourceWithoutComments(Self.appDelegate)
-        #expect(occurrences(of: "connectButton.isEnabled = true", in: stripped) == 3)
+        #expect(occurrences(of: "connectButton.isEnabled = true", in: stripped) == 5)
         #expect(occurrences(of: "connectButton.isEnabled = shell.connectEnabled", in: stripped) == 1,
                 "the reconnect-aware enable, in one place")
-        #expect(occurrences(of: "connectButton.isEnabled =", in: stripped) == 6,
-                "three literal trues, two literal falses (the Connect press, the session start), one presenter")
+        #expect(occurrences(of: "connectButton.isEnabled =", in: stripped) == 8,
+                "five literal trues, two literal falses (the Connect press, the session start), one presenter")
     }
 
     // MARK: - the status line has one writer, and the give-up teardown is complete
