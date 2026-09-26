@@ -43,7 +43,9 @@
 #     `PASS  S<n>` lines and no FAIL.
 #   * BINARY CASES run when Tools/rail-probe/build/rail-probe exists and is newer than its source;
 #     they need cmake and a FreeRDP prefix, which Tier 1 does not have (a missing binary is a NOTE,
-#     never a silent pass; Tier 1 accepts that NOTE and still requires the six source pins). No case
+#     never a silent pass; Tier 1 accepts that NOTE and still requires the six source pins). Tier 2
+#     (.github/workflows/tier2.yml, step "rail-probe plan suite (source pins + binary cases)") does
+#     build the binary and requires all 31 to PASS with `not_run=0`. No case
 #     here can open a socket: --print-plan exits before any FreeRDP context exists, and the one
 #     connect-path case that gets past parse_args' missing-argument check (X2) names an --out file
 #     inside a directory that does not exist, so even with the refusal it tests regressed it would
