@@ -3235,8 +3235,11 @@ final class RemoteWindowRegistry {
     /// so neither of `handle()`'s two cleanup triggers (generation change, `.disconnected`)
     /// can ever fire from a post-shutdown drain (2026-08-22 review BLOCKER: the soak's
     /// "forced drain" delivered zero events and the previous cycle's windows survived
-    /// into the next). The real app never needs this: it only shuts down at
-    /// `applicationWillTerminate`.
+    /// into the next). This is about the no-arg spelling specifically: the real app never
+    /// calls it. It drives the other overload, `prepareForReconnect(refreezingTopologyWith:)`,
+    /// from `ReconnectDriver.swift:308-310` on every live reconnect -- a different teardown
+    /// timing from `closeWindowsForSessionEnd()` (adr/0020 §2 lane R), which runs when a
+    /// session ends with no next connection to prepare for.
     ///
     /// M1/W1 (ADR-0015 §5, U8): this is also **the reconnect re-take point** for a reused
     /// registry — the one moment ADR §5 means by "重连就是新会话、新快照". It belongs here rather
@@ -3320,6 +3323,19 @@ final class RemoteWindowRegistry {
         return replaced
     }
 
+    /// The App's own session-end window teardown (adr/0020 §2 lane R, D-1 = A). Once lane S
+    /// wires an actual call site, the caller will be `AppDelegate.tearDownSession()`, after
+    /// `session?.shutdownAndWait()` returns and before `session = nil`. Unlike
+    /// `prepareForReconnect()`, this is not a rebuild seam: it only closes windows and resets
+    /// THIS registry's own per-connection state (via `closeAllWindows()`) and does nothing to
+    /// prepare for a next connection -- no topology re-take hook, no `currentGeneration = nil`,
+    /// no `refreshSessionTopology`. Once that caller exists, the registry will be discarded
+    /// right after this call returns (`registry = nil`), so those three steps would have no
+    /// consumer (adr/0020 §1 D-1).
+    func closeWindowsForSessionEnd() {
+        closeAllWindows()
+    }
+
     private func closeAllWindows() {
         for (_, window) in windows {
             window.close(via: session)
@@ -3339,17 +3355,19 @@ final class RemoteWindowRegistry {
         warnedUnresolvedOwner.removeAll()
         // Phase 2 W6 (docs/plans/phase2.md §4 W6 acceptance: "delete 清零"): every live
         // NSStatusItem this session created is session-scoped, same as every RemoteWindow
-        // above -- torn down unconditionally on all three of this method's callers (the
-        // generation-rollover branch in `handle(_:)`, the `.disconnected` case, and the
-        // explicit prepareForReconnect() driver). createsSeen/updatesSeen/deletesSeen are
+        // above -- torn down unconditionally on all four of this method's callers (the
+        // generation-rollover branch in `handle(_:)`, the `.disconnected` case, the explicit
+        // `prepareForReconnect()` driver, and the session-end entry,
+        // `closeWindowsForSessionEnd()`). createsSeen/updatesSeen/deletesSeen are
         // NOT reset by this (see TrayStatusController.statusItems' own doc comment).
         trayStatusController.removeAll()
         desktopState = ServerDesktopState()
         // adr/0012 §2 reconnect discipline: reset to `.unmonitored` -- the gate can only
         // reopen on a subsequent *real* MonitoredDesktop order, never by any timeout.
-        // Covers all three of this method's callers: the generation-rollover branch in
-        // `handle(_:)`, the `.disconnected` case, and the explicit `prepareForReconnect()`
-        // driver, since every one routes through here. Effects intentionally discarded, matching `heldModifierKeys`'
+        // Covers all four of this method's callers: the generation-rollover branch in
+        // `handle(_:)`, the `.disconnected` case, the explicit `prepareForReconnect()` driver,
+        // and the session-end entry, `closeWindowsForSessionEnd()`, since every one routes
+        // through here. Effects intentionally discarded, matching `heldModifierKeys`'
         // own reset right below -- the connection this buffered/keyed state described is
         // already gone, so there is nothing left to send any of it to.
         _ = focusAuthority.generationReset()

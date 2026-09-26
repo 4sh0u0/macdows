@@ -341,10 +341,12 @@ final class RemoteWindow {
     private let firstFrameTimeout: TimeInterval
 
     /// W4c review H1: token for the `NSWindow.didResignKeyNotification` observer below,
-    /// removed in `close(via:)`/`deinit` — a block-based `NotificationCenter` observer
-    /// keeps firing (and keeps this instance alive, via the closure's captures) until
-    /// explicitly removed; it does not get torn down automatically just because the
-    /// underlying `NSWindow` closes.
+    /// removed in `close(via:)` — there is no `deinit` in this class to also do it. A
+    /// block-based `NotificationCenter` observer keeps firing until explicitly removed; it
+    /// does not get torn down automatically just because the underlying `NSWindow` closes.
+    /// (Gate r1 m-8's correction: the closure itself captures `[weak contentView]`, not
+    /// `self` -- see its registration below -- so it is not what keeps a `RemoteWindow`
+    /// instance alive either.)
     private var didResignKeyObserver: NSObjectProtocol?
 
     /// Phase 2 W3 (docs/plans/phase2.md §2 W3, adr/0012's optimistic-prediction principle
@@ -1591,8 +1593,10 @@ final class RemoteWindow {
     }
 
     /// Closes the window and recycles whatever surface it was last displaying (if any).
-    /// Call exactly once, from `RemoteWindowRegistry` only, on `WindowDelete` or a
-    /// generation rollover — not idempotent against a second call.
+    /// Call exactly once, from `RemoteWindowRegistry` only: on `WindowDelete`, or via
+    /// `closeAllWindows()` (a generation rollover, `.disconnected`, `prepareForReconnect()`,
+    /// or the session-end entry, `closeWindowsForSessionEnd()`) -- not idempotent against a
+    /// second call.
     func close(via session: CRSession) {
         // Phase 2 W0③: nothing left to time out once this window is closing -- covers
         // WindowDelete, closeAllWindows, and prepareForReconnect alike, since all three
@@ -1643,8 +1647,14 @@ final class RemoteWindow {
     // read a MainActor-isolated, non-Sendable stored property like an NSObjectProtocol
     // observer token. close(via:) above is this class's own documented single point of
     // teardown ("call exactly once, from RemoteWindowRegistry only") and already removes
-    // the observer; nothing in this codebase deallocates a RemoteWindow without going
-    // through it first.
+    // the observer. Every path that ends a session while windows are still tracked routes
+    // through it via `closeAllWindows()` -- including, for whatever caller a later lane
+    // gives it (adr/0020 §2 lane S), the session-end entry,
+    // `RemoteWindowRegistry.closeWindowsForSessionEnd()` (adr/0020 §2 lane R). The one path
+    // that still does not route through either is process termination releasing the
+    // registry directly. adr/0020 D-3 = X1 is the RULING that this exit path will also
+    // close windows, not a note that a gap has merely been logged for later -- once a later
+    // lane implements it, this sentence is true without qualification.
 }
 
 // MARK: - The mask pipeline's one crossing into CoreGraphics (M1/L8, ADR-0015 §9's L8 row)
