@@ -18,20 +18,29 @@ import Testing
 // `App/project.yml` keeps `Macdows` out of this bundle, so `AppDelegate` is reachable only as
 // source text.
 //
+// adr/0020 lane S (the shell's Disconnect control) re-froze S1-S3 in the same commit that changed
+// what they hold -- a seventh step, the registry's session-end window close, and a fourth caller,
+// the End-session button -- and added the button's own pins (adr/0020 S-3', S-4, S-5, S-6) here.
+//
 // What these pins are FOR:
 //
 //  S0. The comment stripper did not eat the code. Every other pin here reads the stripped text.
-//  S1. `tearDownSession()`'s body is exactly its six steps, in the one order that is safe.
+//  S1. `tearDownSession()`'s body is exactly its seven steps, in the one order that is safe.
 //  S2. Every step is spelled ONCE in the whole file, so no path can end a session by hand any
 //      more. That is what closes #3 structurally rather than by detection: with a single
 //      `invalidate()` and a single `shutdownAndWait(`, a session cannot be shut down without its
 //      timer being stopped in the same breath.
-//  S3. The function is declared once and called from exactly three places. WHICH three is held
+//  S3. The function is declared once and called from exactly four places. WHICH four is held
 //      next door (`AppDelegateReconnectWiringPinTests`: the connect-error branch, the give-up
-//      branch, termination), beside the other claims about those three paths.
+//      branch, termination) and below (the End-session action), beside the other claims about
+//      those paths.
 //  S4. The bridge reads the push hook when its main-queue block RUNS, not when the block is
 //      scheduled -- the premise without which clearing the hook on the main actor would not stop
 //      a push that is already queued.
+//  adr/0020 S-3', S-4, S-5, S-6. The End-session button: its action is UI first and teardown
+//      second; it is enabled by one statement, in `session`'s `didSet`; there is one action and one
+//      binding, named clear of the substrings the other pins count; and nothing about it adds a
+//      menu, a stdout line or a reconnect route.
 //
 // REGISTERED GAP, stated rather than papered over: these pins check that the teardown is WRITTEN,
 // not that it RUNS. Whether the re-enabled button really starts a new connection cannot be observed
@@ -79,6 +88,28 @@ private func sessionEndIndex(of needle: String, in haystack: String) throws -> S
     return found.lowerBound
 }
 
+/// Every `.swift` file under `relative`, recursively, as repo-relative paths. This file's own copy
+/// of the walk `ReconnectSemanticsPinTests` and `RemoteWindowRegistrySessionEndTests` each keep
+/// (copying it is the established precedent here, not a shortcut).
+private func sessionEndSwiftFiles(under relative: String) throws -> [String] {
+    let root = sessionEndRepoRoot().appendingPathComponent(relative)
+    guard let walker = FileManager.default.enumerator(atPath: root.path) else { return [] }
+    var out: [String] = []
+    for case let entry as String in walker where entry.hasSuffix(".swift") {
+        out.append("\(relative)/\(entry)")
+    }
+    return out.sorted()
+}
+
+/// The first capture group of every match of `pattern` in `haystack`, in order.
+private func sessionEndCaptures(of pattern: String, in haystack: String) throws -> [String] {
+    let regex = try NSRegularExpression(pattern: pattern)
+    let whole = NSRange(haystack.startIndex..., in: haystack)
+    return regex.matches(in: haystack, range: whole).compactMap { match in
+        Range(match.range(at: 1), in: haystack).map { String(haystack[$0]) }
+    }
+}
+
 @Suite("session-end lane — AppDelegate ends every session through one teardown, pinned as source")
 struct AppDelegateSessionEndPinTests {
 
@@ -107,8 +138,9 @@ struct AppDelegateSessionEndPinTests {
 
     // MARK: - S1: the body, in order
 
-    /// S1. The whole body as one contiguous run, so the ORDER is the claim and nothing can be
-    /// inserted between the steps. Why each step sits where it does:
+    /// S1 (re-frozen by adr/0020 lane S, D-2 = P1: six steps -> seven). The whole body as one
+    /// contiguous run, so the ORDER is the claim and nothing can be inserted between the steps. Why
+    /// each step sits where it does:
     ///
     ///  1. The timer first. It is the only thing that can call `drainTick` again on its own, and
     ///     this is now its only stopping point (#3).
@@ -122,14 +154,20 @@ struct AppDelegateSessionEndPinTests {
     ///     into a silent no-op -- still compiling, still spelled once, and wrong.
     ///  4. The shutdown after both disconnections and before any reference is dropped: it needs
     ///     the session it shuts down.
-    ///  5. The references dropped after the shutdown. `session = nil` is the statement that lets
+    ///  5. The RAIL windows closed through the registry's session-end entry, AFTER the shutdown --
+    ///     adr/0005 §4 closes an NSWindow only once both FreeRDP threads are gone, which is what
+    ///     `-shutdownAndWait` returning means -- and BEFORE the references are dropped: each window
+    ///     hands its surface back through the session the registry still holds, and a registry
+    ///     dropped with its windows ordered in leaves them on screen with no owner.
+    ///  6. The references dropped after the shutdown. `session = nil` is the statement that lets
     ///     `connectTapped`'s first guard pass again (#1).
-    ///  6. The topology's `endSession()` last: it has no output and nothing after it depends on it.
+    ///  7. The topology's `endSession()` last: it has no output and nothing after it depends on it.
     ///
-    /// MUST-RED for: any reordering, any inserted statement, any dropped step, and the clear moved
-    /// behind the nil-ing.
-    @Test("tearDownSession's body is its six steps, in the one safe order")
-    func theTeardownBodyIsTheSixStepsInOrder() throws {
+    /// MUST-RED for: any reordering, any inserted statement, any dropped step, the clear moved
+    /// behind the nil-ing, and the window close moved in front of the shutdown (adr/0005 §4) or
+    /// behind the session's nil-ing.
+    @Test("tearDownSession's body is its seven steps, in the one safe order")
+    func theTeardownBodyIsTheSevenStepsInOrder() throws {
         let code = try Self.code()
         #expect(sessionEndOccurrences(
             of: "private func tearDownSession() { "
@@ -139,29 +177,38 @@ struct AppDelegateSessionEndPinTests {
                 + "reconnectDriver = nil "
                 + "session?.onEventsAvailable = nil "
                 + "session?.shutdownAndWait() "
+                + "registry?.closeWindowsForSessionEnd() "
                 + "session = nil "
                 + "registry = nil "
                 + "displayTopology.endSession() }",
             in: code) == 1)
 
-        // The hook's two neighbours, stated separately so a failure names the edge that broke.
+        // The hook's two neighbours and the window close's, stated separately so a failure names
+        // the edge that broke: shutdown < window close < `session = nil` < `registry = nil`.
         let driverDropped = try sessionEndIndex(of: "reconnectDriver = nil", in: code)
         let hookCleared = try sessionEndIndex(of: "session?.onEventsAvailable = nil", in: code)
         let shutdown = try sessionEndIndex(of: "session?.shutdownAndWait()", in: code)
+        let windowsClosed = try sessionEndIndex(of: "registry?.closeWindowsForSessionEnd()", in: code)
         let sessionDropped = try sessionEndIndex(of: "session = nil", in: code)
+        let registryDropped = try sessionEndIndex(of: "registry = nil", in: code)
         #expect(driverDropped < hookCleared)
         #expect(hookCleared < shutdown, "cleared before the shutdown it would otherwise be pushed by")
-        #expect(shutdown < sessionDropped, "a cleared session reference cannot be shut down")
+        #expect(shutdown < windowsClosed, "adr/0005 §4: windows close only once both FreeRDP threads are gone")
+        #expect(windowsClosed < sessionDropped, "each window hands its surface back through the session")
+        #expect(sessionDropped < registryDropped, "the registry, which still holds the session, goes last")
     }
 
     // MARK: - S2: every step spelled once
 
-    /// S2. Nine single-point counts over the comment-stripped file. Each of these used to appear at
-    /// two or three hand-written exits (or, for the hook, at none); one spelling each is what makes
-    /// "a session ended without X" unwritable rather than merely absent today.
+    /// S2. Ten single-point counts over the comment-stripped file. The first nine each used to
+    /// appear at two or three hand-written exits (or, for the hook, at none); one spelling each is
+    /// what makes "a session ended without X" unwritable rather than merely absent today. The tenth
+    /// is adr/0020 S-2': the registry's session-end entry, called once, inside the teardown -- zero
+    /// before lane S.
     ///
     /// MUST-RED for: a second `invalidate()` anywhere (the shape of #3), a second shutdown call
-    /// site, an exit that keeps a private copy of any step, and a lost hook clear.
+    /// site, an exit that keeps a private copy of any step, a lost hook clear, and a window close
+    /// that is dropped or called a second time outside the teardown.
     @Test("each teardown step is spelled exactly once in the whole file")
     func eachTeardownStepHasOneSpelling() throws {
         let code = try Self.code()
@@ -175,28 +222,155 @@ struct AppDelegateSessionEndPinTests {
             ("session = nil", "#1: the one place this app stops having a session"),
             ("registry = nil", "the registry, dropped once"),
             ("onEventsAvailable = nil", "#5: the push hook, cleared once"),
+            ("closeWindowsForSessionEnd(", "adr/0020 S-2': the session-end window close, called once"),
         ]
         for step in steps {
             #expect(sessionEndOccurrences(of: step.needle, in: code) == 1, "\(step.needle) -- \(step.why)")
         }
     }
 
-    // MARK: - S3: declared once, called three times
+    // MARK: - S3: declared once, called four times
 
-    /// S3. One declaration plus the three callers the wiring pins name: the connect-error branch
-    /// (`theConnectErrorBranchEndsTheSession`), the give-up branch
-    /// (`theGiveUpTeardownDropsTheSession`) and termination (`terminationDisarmsTheDriverFirst`).
-    /// Counted with and without the closing parenthesis so an overload that takes an argument
-    /// cannot slip in beside the parameterless one.
+    /// S3 (re-frozen by adr/0020 lane S: three callers -> four). One declaration plus the four
+    /// callers the needles name: the connect-error branch (`theConnectErrorBranchEndsTheSession`),
+    /// the give-up branch (`theGiveUpTeardownDropsTheSession`), termination
+    /// (`terminationDisarmsTheDriverFirst`) and the End-session action
+    /// (`theEndSessionActionIsUIFirstThenTeardown`, below). Counted with and without the closing
+    /// parenthesis so an overload that takes an argument cannot slip in beside the parameterless
+    /// one.
     ///
-    /// MUST-RED for: a fourth caller nobody pinned, a caller dropped, and a second declaration.
-    @Test("tearDownSession is declared once and called from exactly three places")
-    func theTeardownHasOneDeclarationAndThreeCallers() throws {
+    /// MUST-RED for: a fifth caller nobody pinned, a caller dropped, and a second declaration.
+    @Test("tearDownSession is declared once and called from exactly four places")
+    func theTeardownHasOneDeclarationAndFourCallers() throws {
         let code = try Self.code()
         #expect(sessionEndOccurrences(of: "func tearDownSession(", in: code) == 1)
-        #expect(sessionEndOccurrences(of: "tearDownSession()", in: code) == 4,
-                "one declaration + connect-error branch + give-up branch + applicationWillTerminate")
-        #expect(sessionEndOccurrences(of: "tearDownSession(", in: code) == 4)
+        #expect(sessionEndOccurrences(of: "tearDownSession()", in: code) == 5,
+                "one declaration + connect-error branch + give-up branch + endSessionTapped + applicationWillTerminate")
+        #expect(sessionEndOccurrences(of: "tearDownSession(", in: code) == 5)
+    }
+
+    /// adr/0020 S-3'. The End-session action, as one contiguous run over its whole body (D-5 = Q1):
+    /// a `session != nil` guard, the action's own status line, Connect enabled by a literal `true`,
+    /// and only then the teardown -- the connect-error branch's order, UI first. The status line is
+    /// part of the needle so that a re-worded line is a deliberate re-freeze; it carries no `//`
+    /// (the stripper would cut it), no `adr/0019` (S0) and no `Connected —` (the wiring pins keep
+    /// that wording in the presenter).
+    ///
+    /// The needle already admits nothing else into the body; the three route checks after it say
+    /// the part of adr/0020 S-6 that is about THIS body in words a failure can name: no
+    /// `connectTapped(` (a one-press reconnect), no `performClose` (an SC_CLOSE), no
+    /// `prepareForReconnect` (the registry's reconnect seam).
+    ///
+    /// MUST-RED for: dropping the guard, tearing down before the UI is written, a second statement
+    /// of any kind inside the action (a reconnect route, a stdout line, a note clear), and the
+    /// action no longer ending the session.
+    @Test("the End-session action writes its line, enables Connect, and only then ends the session")
+    func theEndSessionActionIsUIFirstThenTeardown() throws {
+        let code = try Self.code()
+        #expect(sessionEndOccurrences(
+            of: "@objc private func endSessionTapped() { "
+                + "guard session != nil else { return } "
+                + "statusLabel.stringValue = \"Session ended. Press Connect to start a new one.\" "
+                + "connectButton.isEnabled = true "
+                + "tearDownSession() }",
+            in: code) == 1)
+
+        let start = try sessionEndIndex(of: "@objc private func endSessionTapped() {", in: code)
+        let end = try #require(code[start...].range(of: "tearDownSession() }"), "the action's end").upperBound
+        let body = code[start..<end]
+        for route in ["connectTapped(", "performClose", "prepareForReconnect"] {
+            #expect(!body.contains(route), "the End-session action calls \(route)")
+        }
+    }
+
+    // MARK: - adr/0020 S-4: one enablement write, in session's didSet
+
+    /// adr/0020 S-4 (D-4 = K1). The End-session button is usable exactly while `session` is
+    /// non-nil, and ONE statement decides that: `session`'s own `didSet`, which covers both of the
+    /// property's assignments (`beginSession`'s and the teardown's). The bare predicate
+    /// `session != nil` is deliberately not counted -- the drain tick's re-read guard and the
+    /// action's own guard spell it too -- the WRITE is.
+    ///
+    /// `applyShell` is not a legal home for it: three of the four session ends never call it after
+    /// their teardown, and the give-up one calls it BEFORE its teardown, while `session` is still
+    /// set. Moving the write there also breaks the wiring pins' whole-body needle on `applyShell`.
+    ///
+    /// NSButton starts out enabled, so the construction writes the initial value, once, as a
+    /// literal `false`; spelled as the same predicate it would make the write count two. The last
+    /// count is exhaustive: every `.isEnabled =` in the file is either Connect's or one of these
+    /// two, so a third writer anywhere -- whatever its name -- is red.
+    ///
+    /// MUST-RED for: the write moved into `applyShell` (or anywhere out of the `didSet`), a second
+    /// enablement write, a missing or non-literal initial value.
+    @Test("the End-session button is enabled by one statement, in session's didSet, and starts disabled")
+    func theEndSessionButtonHasOneEnablementWrite() throws {
+        let code = try Self.code()
+        #expect(sessionEndOccurrences(of: "isEnabled = session != nil", in: code) == 1)
+        #expect(sessionEndOccurrences(
+            of: "private var session: CRSession? { didSet { endSessionButton.isEnabled = session != nil } }",
+            in: code) == 1)
+        #expect(sessionEndOccurrences(of: "endButton.isEnabled = false endSessionButton = endButton", in: code) == 1,
+                "the initial value, a literal false, set once where the button is built")
+        let everyWrite = sessionEndOccurrences(of: ".isEnabled =", in: code)
+        let connectWrites = sessionEndOccurrences(of: "connectButton.isEnabled =", in: code)
+        #expect(everyWrite - connectWrites == 2, "the construction's literal and the didSet, and nothing else")
+    }
+
+    // MARK: - adr/0020 S-5: one action, one binding, names clear of the counted substrings
+
+    /// adr/0020 S-5. Exactly one End-session action method and exactly one `#selector(...)` binding
+    /// it, and names that stay clear of the substrings other pins count: `connectTapped` (the
+    /// autolaunch pins count `connectTapped()`), `connectButton` (the wiring pins count
+    /// `connectButton.isEnabled =`) and `tearDownSession` (S3). The names are read out of the
+    /// source rather than restated, so a rename that re-freezes the expected list still has to pass
+    /// the substring check.
+    ///
+    /// MUST-RED for: a second action or binding, a renamed action or button (the name lists), and
+    /// a name that would inflate another pin's count (the substring check).
+    @Test("one End-session action, bound by one selector, named clear of the pinned substrings")
+    func theEndSessionActionIsOneMethodWithOneBinding() throws {
+        let code = try Self.code()
+        let selectors = try sessionEndCaptures(of: "#selector\\((\\w+)\\)", in: code)
+        let actions = try sessionEndCaptures(of: "@objc private func (\\w+)\\(\\)", in: code)
+        let buttons = try sessionEndCaptures(of: "private var (\\w+): NSButton!", in: code)
+        #expect(selectors.sorted() == ["connectTapped", "endSessionTapped"])
+        #expect(actions.sorted() == ["connectTapped", "endSessionTapped"])
+        #expect(buttons.sorted() == ["connectButton", "endSessionButton"])
+        #expect(sessionEndOccurrences(of: "@objc", in: code) == 2, "the file's only two action methods")
+        for name in (selectors + actions + buttons) where name != "connectTapped" && name != "connectButton" {
+            for counted in ["connectTapped", "connectButton", "tearDownSession"] {
+                #expect(!name.contains(counted), "\(name) contains \(counted)")
+            }
+        }
+    }
+
+    // MARK: - adr/0020 S-6: no menu, no stdout, no reconnect route
+
+    /// adr/0020 S-6, a guard: green before lane S and after it, red on three mutant classes. No
+    /// `mainMenu` anywhere in `App/Macdows` (a menu item for Disconnect would bring key equivalents
+    /// that take Cmd+W and friends before a RAIL window's `keyDown` sees them); no `print(` there
+    /// (the product's Disconnect path adds no stdout line, D-10, and the App's only reachable
+    /// stdout writer stays the reconnect driver's); and no `performClose` or `prepareForReconnect`
+    /// anywhere in `AppDelegate` (an SC_CLOSE, the registry's reconnect seam). The same three
+    /// routes, plus `connectTapped(`, are checked inside the action's own body by S-3' above,
+    /// which can only be green once the action exists.
+    ///
+    /// A knob lane that prints an anchor line from `App/Macdows` collides with this pin and has to
+    /// change it in the same commit.
+    @Test("no mainMenu and no print( in App/Macdows, and no SC_CLOSE or reconnect seam in AppDelegate")
+    func theEndSessionPathAddsNoMenuNoStdoutAndNoReconnect() throws {
+        let files = try sessionEndSwiftFiles(under: "App/Macdows")
+        #expect(files.contains(Self.appDelegate) && files.contains("App/Macdows/main.swift"),
+                "the walk found \(files) -- this pin would pass vacuously")
+        for file in files {
+            let code = sessionEndCodeOnly(try sessionEndRawSource(file))
+            #expect(sessionEndOccurrences(of: "mainMenu", in: code) == 0, "\(file)")
+            #expect(sessionEndOccurrences(of: "print(", in: code) == 0, "\(file)")
+        }
+
+        let code = try Self.code()
+        #expect(sessionEndOccurrences(of: "performClose", in: code) == 0)
+        #expect(sessionEndOccurrences(of: "prepareForReconnect", in: code) == 0)
     }
 
     // MARK: - S4: the premise on the bridge side

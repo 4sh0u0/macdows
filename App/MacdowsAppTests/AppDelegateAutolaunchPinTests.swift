@@ -227,6 +227,15 @@ struct AppDelegateAutolaunchPinTests {
     /// the +4123 is exactly that lane's net folded edit (5983 characters added, 1860 removed), and
     /// everything before `connectTapped` is byte-identical to `00d9994`.
     ///
+    /// RE-FROZEN by adr/0020 lane S (branched from main `8a51cf6`, where the region was still those
+    /// 26761 characters): the End-session action and the teardown's seventh step, the `.reconnecting`
+    /// branch's event-count reset, and the comments that describe them. The region now folds to
+    /// 31244 characters hashing to the constant below; the +4483 is exactly that lane's net folded
+    /// edit (4916 characters added, 433 removed, counted token by token over the two folds). Lane
+    /// S's other hunks -- the button's stored property, `session`'s `didSet` and the button's
+    /// construction -- sit before `connectTapped` and are held by `AppDelegateSessionEndPinTests`
+    /// instead.
+    ///
     /// Why a hash and not a quoted literal: the region is ~22 KB, which is not a thing to paste into
     /// a test, and an excerpt would pin only the excerpt. Why the fold WITH comments: the claim is
     /// "byte-identical", and a fold is stable under re-wrapping and re-indentation (the two edits
@@ -237,9 +246,9 @@ struct AppDelegateAutolaunchPinTests {
     /// expected to re-freeze this constant in the same commit that makes the edit, and the length
     /// below is here so that such a re-freeze can be sanity-checked (a length that MOVED by the size
     /// of the edit is a re-freeze; a length that moved by 22638 is a needle that stopped matching).
-    private static let foldedTailLength = 26761
+    private static let foldedTailLength = 31244
     private static let foldedTailSHA256 =
-        "24e75791b6a5b461cde367f728b0e4afb5e081b65809509a58d879ceed45e5ed"
+        "164554caebe37c4e1a6327e8c32eb0c0012adaf59748c0df1e008cce955748dc"
 
     @Test("connectTapped to end-of-file is byte-identical to its last deliberate freeze")
     func theRestOfTheFileIsUnchanged() throws {
