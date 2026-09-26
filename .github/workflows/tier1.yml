@@ -362,6 +362,41 @@ jobs:
             exit 1
           fi
 
+      - name: window-count-sampler source pins
+        # Scripts/test-window-count-sampler.sh pins Tools/window-count-sampler/main.swift (ADR-0020
+        # lane V blueprint §2.1 / O-6): the external, title-free window counter lane V's D-A prereg
+        # uses for DA-1 (its l25 field is printed, but status items are structurally absent from the
+        # on-screen table, so DA-2 has no surface through it). Its SOURCE PINS are pure grep and run
+        # here, each a default-deny grammar over the file: W1 the red line (the exact window-related
+        # identifier set, a window dictionary and the window table only in their pinned shapes, one
+        # output function and no other sink, serialiser, spawn or process-name API, two imports),
+        # W2 the line grammar (whole format strings, every line printed through one of nine pinned
+        # calls), W3 one CGWindowListCopyWindowInfo call, on-screen only, and W5 the sampling
+        # semantics verbatim (the main loop's order, the owner-PID filter, the layer buckets, the
+        # sorted wins list, found, flush, the self-check decision, the signal handling). Its BINARY
+        # cases (W4*) need a built executable named by WCS_BIN, which this compile-free runner does
+        # not have: the suite reports them as one NOTE (not_run=1), never as a pass, and they run on
+        # a maintainer machine that builds the tool outside the repository tree.
+        # So the step demands each of the four source pins by name instead of trusting the exit
+        # code alone -- a pin that silently stopped printing would otherwise leave a green step
+        # behind.
+        run: |
+          set -euo pipefail
+          SUITE_LOG="${RUNNER_TEMP:-/tmp}/window-count-sampler.log"
+          ./Scripts/test-window-count-sampler.sh | tee "$SUITE_LOG"
+
+          # grep -c into variables, not grep -q in a pipeline (see the boundary suite step above).
+          BAD=0
+          for n in 1 2 3 5; do
+            [ "$(grep -c "^PASS  W$n " "$SUITE_LOG" || true)" -eq 1 ] || BAD=1
+          done
+          PINS="$(grep -cE '^PASS  W[1235] ' "$SUITE_LOG" || true)"
+          FAILS="$(grep -c '^FAIL' "$SUITE_LOG" || true)"
+          if [ "$BAD" -ne 0 ] || [ "$PINS" -ne 4 ] || [ "$FAILS" -ne 0 ]; then
+            echo "::error::window-count-sampler suite: expected W1, W2, W3 and W5 to PASS exactly once each (four lines) and no FAIL; got ${PINS} source-pin PASS lines and ${FAILS} FAIL lines -- see the log above."
+            exit 1
+          fi
+
       - name: K client-rect pins -- no product consumer, every lab mention registered
         # The four RAIL client-rect fields (clientOffsetX/Y, windowClientDeltaX/Y -- K = delta-off)
         # are CARRIED across five layers and CONSUMED by none: macContentRect still uses `off` alone
