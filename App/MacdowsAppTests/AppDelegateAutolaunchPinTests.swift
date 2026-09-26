@@ -8,7 +8,7 @@ import Testing
 // the same instrument `AppDelegateReconnectWiringPinTests`, `ReconnectSemanticsPinTests` and
 // `ProductScaleDefaultPinTests` already use on this same file and for this same reason.
 //
-// What these four pins are FOR. `ShellAutolaunch` decides what the two knobs mean and is covered by
+// What these pins are FOR. `ShellAutolaunch` decides what the four knobs mean and is covered by
 // ordinary tests next door; the claims here are the ones no value can carry:
 //
 //  1. The knobs are read ONCE, and inside `applicationDidFinishLaunching`. One reading per launch,
@@ -31,12 +31,29 @@ import Testing
 // read or the gate can fail hands the button back. Autoconnect presses that same button, so this
 // file is where its interlock is held.
 //
+// adr/0020 lane K added a fifth and sixth: the Disconnect delay knob presses the real
+// `endSessionTapped()`, exactly once, from a Timer nested inside the launch method (Pin 5); and
+// the reconnect delay knob presses the real `connectTapped()` a second time, from a Timer nested
+// inside THAT one (Pin 6, reusing Pin 2's invocation-count shape). Both are real button presses
+// for the same reason Pin 2 already is one: `endSessionTapped`'s own guard, its status line, its
+// literal `connectButton.isEnabled = true` and its one `tearDownSession()` all have to run for an
+// unattended Disconnect exactly as they do for a human one, and copying any step out of it would
+// skip one of those.
+//
+// adr/0020 lane K's gate r1 fold-in added a seventh: an anchor line, printed by
+// `ShellAutolaunch.notePress(_:)`, immediately before each of Pin 5's and Pin 6's presses (Pin 7,
+// gate r1 I-1) -- neither press otherwise writes anything that says it happened.
+//
 // REGISTERED GAP, stated rather than papered over: these pins check that the wiring is WRITTEN, not
 // that it RUNS. No offline test in this repository can launch this app, set an environment variable
 // for it, or watch its Timer fire. Closing the gap means splitting `AppDelegate` into a target this
 // bundle can compile, which is a different lane; the run-time evidence for this lane is the
 // orchestrator's own `app-stdout-<sub>.log` (a launch with the knobs off produces no `[reconnect]`
-// line and no self-termination; a launch with them on produces both).
+// line, no `[autolaunch]` line and no self-termination; a launch with T1's own knob on produces the
+// first and the last). adr/0020 lane K's own two knobs are evidenced the same way, by the
+// `[autolaunch] press=disconnect` / `[autolaunch] press=connect` anchor lines `notePress(_:)`
+// writes immediately before each real press -- the one place in this lane's run-time evidence that
+// says a press actually happened, not merely that the code to make it compiled (gate r1 I-1).
 
 private func repoRoot() -> URL {
     URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -154,28 +171,46 @@ struct AppDelegateAutolaunchPinTests {
     /// lane's frozen face. They were already the line above this lane's only hunk. A later lane that
     /// legitimately edits the end of `applicationDidFinishLaunching` re-freezes this needle in the
     /// same commit, exactly as it would the tail fingerprint below.
-    @Test("the three statements are the tail of applicationDidFinishLaunching, not a stray helper")
+    /// RE-FROZEN by adr/0020 lane K: the needle now spans the two new nested Timers as well, so
+    /// the same mutant gate-r1 I1 rules out for T1 (moving a knob's statements into an unrelated
+    /// helper declared in the same gap) rules out for the Disconnect/reconnect pair too.
+    ///
+    /// RE-FROZEN AGAIN by lane K's gate r1 fold-in (I-1): each real press now has
+    /// `ShellAutolaunch.notePress(_:)` immediately in front of it, inside the same
+    /// `MainActor.assumeIsolated` block -- this is also what Pin 7's adjacency tests below rely on,
+    /// stated here as one contiguous needle instead of two.
+    @Test("the four statements are the tail of applicationDidFinishLaunching, not a stray helper")
     func theKnobsAreTheTailOfTheLaunchMethod() throws {
         let code = try Self.code()
-        #expect(
-            code.contains(
-                "self.lastDisplayChangeNote = note self.statusLabel.stringValue = note } "
-                    + "let autolaunch = ShellAutolaunch.plan(environment: ProcessInfo.processInfo.environment) "
-                    + "if autolaunch.autoconnect { connectTapped() } "
-                    + "if let quitAfter = autolaunch.quitAfterInterval {"))
+        // Built as a `let`, not inline inside `#expect`: a single expression this long, chained
+        // entirely with `+`, made the type checker time out (gate r1's original, T1-sized needle
+        // was already close to that ceiling; this lane's longer one crossed it).
+        let needle: String =
+            "self.lastDisplayChangeNote = note self.statusLabel.stringValue = note } "
+            + "let autolaunch = ShellAutolaunch.plan(environment: ProcessInfo.processInfo.environment) "
+            + "if autolaunch.autoconnect { connectTapped() } "
+            + "if let disconnectAfter = autolaunch.disconnectAfterInterval { "
+            + "_ = Timer.scheduledTimer(withTimeInterval: disconnectAfter, repeats: false) { _ in "
+            + "MainActor.assumeIsolated { ShellAutolaunch.notePress(.disconnect) self.endSessionTapped() "
+            + "if let reconnectAfter = autolaunch.reconnectAfterInterval { "
+            + "_ = Timer.scheduledTimer(withTimeInterval: reconnectAfter, repeats: false) { _ in "
+            + "MainActor.assumeIsolated { ShellAutolaunch.notePress(.connect) self.connectTapped() } } } } } } "
+            + "if let quitAfter = autolaunch.quitAfterInterval {"
+        #expect(code.contains(needle))
     }
 
     // MARK: - Pin 2: autoconnect presses the real button
 
-    /// Two occurrences of `connectTapped()` in the whole file: the declaration, and exactly one
-    /// no-argument invocation. `#selector(connectTapped)` carries no parentheses of its own and so
-    /// is not counted by this needle -- the target-action binding is a separate claim, pinned by its
-    /// own line below.
-    @Test("there is exactly one no-argument connectTapped() invocation")
-    func exactlyOneConnectTappedInvocation() throws {
+    /// THREE occurrences of `connectTapped()` in the whole file since adr/0020 lane K: the
+    /// declaration, the autoconnect branch's bare invocation, and the reconnect knob's
+    /// `self.connectTapped()` (the substring match does not care about the `self.` prefix).
+    /// `#selector(connectTapped)` carries no parentheses of its own and so is not counted by this
+    /// needle -- the target-action binding is a separate claim, pinned by its own line below.
+    @Test("there are exactly two no-argument connectTapped() invocations (autoconnect, reconnect)")
+    func exactlyTwoConnectTappedInvocations() throws {
         let code = try Self.code()
         #expect(autolaunchOccurrences(of: "func connectTapped()", in: code) == 1)
-        #expect(autolaunchOccurrences(of: "connectTapped()", in: code) == 2)
+        #expect(autolaunchOccurrences(of: "connectTapped()", in: code) == 3)
         #expect(autolaunchOccurrences(of: "#selector(connectTapped)", in: code) == 1)
     }
 
@@ -186,6 +221,61 @@ struct AppDelegateAutolaunchPinTests {
         let invocation = try autolaunchIndex(of: "if autolaunch.autoconnect { connectTapped() }", in: code)
         let nextDeclaration = try autolaunchIndex(of: Self.firstDeclarationAfterLaunch, in: code)
         #expect(invocation < nextDeclaration)
+    }
+
+    // MARK: - Pin 5 (adr/0020 lane K): the Disconnect knob presses the real endSessionTapped()
+
+    /// Same shape as Pin 2, for `endSessionTapped()`: two occurrences in the whole file -- the
+    /// declaration, and exactly one no-argument invocation, added by this lane. Before this lane
+    /// the only other mention is `#selector(endSessionTapped)`, which (like
+    /// `#selector(connectTapped)` above) carries no parentheses and so is not counted here.
+    @Test("there is exactly one no-argument endSessionTapped() invocation, from the disconnect knob")
+    func exactlyOneEndSessionTappedInvocation() throws {
+        let code = try Self.code()
+        #expect(autolaunchOccurrences(of: "func endSessionTapped()", in: code) == 1)
+        #expect(autolaunchOccurrences(of: "endSessionTapped()", in: code) == 2)
+        #expect(autolaunchOccurrences(of: "#selector(endSessionTapped)", in: code) == 1)
+    }
+
+    /// MUST-RED for the "presses the wrong thing" mutant: a knob that calls `self.tearDownSession()`
+    /// directly instead would still fail THIS test, but not through a count -- `code.contains(
+    /// "self.endSessionTapped()")` below would simply be false. The count assertion that catches
+    /// the same mutant a different way (`endSessionTapped()`'s bare-invocation count stopping at 1,
+    /// declaration only) lives next door, in `exactlyOneEndSessionTappedInvocation`.
+    @Test("the invocation is self.endSessionTapped(), inside applicationDidFinishLaunching")
+    func theInvocationIsTheDisconnectAfterBranch() throws {
+        let code = try Self.code()
+        #expect(code.contains("self.endSessionTapped()"))
+        let invocation = try autolaunchIndex(of: "self.endSessionTapped()", in: code)
+        let nextDeclaration = try autolaunchIndex(of: Self.firstDeclarationAfterLaunch, in: code)
+        #expect(invocation < nextDeclaration)
+    }
+
+    // MARK: - Pin 6 (adr/0020 lane K): the reconnect knob presses the real connectTapped(), after Disconnect
+
+    /// The second `connectTapped()` invocation Pin 2 above now counts, isolated by its `self.`
+    /// prefix (the autoconnect branch's own invocation is bare, with no receiver).
+    @Test("the second invocation is self.connectTapped(), inside applicationDidFinishLaunching")
+    func theSecondInvocationIsTheReconnectAfterBranch() throws {
+        let code = try Self.code()
+        #expect(code.contains("self.connectTapped()"))
+        let invocation = try autolaunchIndex(of: "self.connectTapped()", in: code)
+        let nextDeclaration = try autolaunchIndex(of: Self.firstDeclarationAfterLaunch, in: code)
+        #expect(invocation < nextDeclaration)
+    }
+
+    /// ORDER, not just presence: the brief for this lane is "press Disconnect, THEN press Connect
+    /// again" -- the two presses swapped would leave every count and containment check above
+    /// green while reversing the one thing this knob pair is for. `self.connectTapped()`'s only
+    /// occurrence is inside the `if let reconnectAfter` block nested inside the `if let
+    /// disconnectAfter` block, so its index in the source can only be later than
+    /// `self.endSessionTapped()`'s while the nesting is the right way round.
+    @Test("the Disconnect press comes before the reconnect press in source order")
+    func theDisconnectPressComesBeforeTheReconnectPress() throws {
+        let code = try Self.code()
+        let disconnect = try autolaunchIndex(of: "self.endSessionTapped()", in: code)
+        let reconnect = try autolaunchIndex(of: "self.connectTapped()", in: code)
+        #expect(disconnect < reconnect)
     }
 
     // MARK: - Pin 3: the quit ceiling goes through NSApp.terminate, once
@@ -339,17 +429,81 @@ struct AppDelegateAutolaunchPinTests {
                 "the stored property's initial value, and the one reset in front of the verdict")
     }
 
+    // MARK: - Pin 7 (adr/0020 lane K, gate r1 I-1): the press anchor, before each real press
+
+    /// `ShellAutolaunch.notePress(` appears exactly twice in the whole file, once per real press
+    /// this lane adds, and nowhere else -- there is no third occasion in this file for an anchor
+    /// line.
+    @Test("ShellAutolaunch.notePress is called exactly twice, once per press this lane adds")
+    func exactlyTwoNotePressInvocations() throws {
+        let code = try Self.code()
+        #expect(autolaunchOccurrences(of: "ShellAutolaunch.notePress(", in: code) == 2)
+        #expect(autolaunchOccurrences(of: "ShellAutolaunch.notePress(.disconnect)", in: code) == 1)
+        #expect(autolaunchOccurrences(of: "ShellAutolaunch.notePress(.connect)", in: code) == 1)
+    }
+
+    /// MUST-RED for "the anchor is printed after the press, not before": the anchor line's only
+    /// reason to exist is to let an orchestrator locate the instant of a press it cannot otherwise
+    /// see (gate r1 I-1) -- a line written after the fact locates only the instant AppDelegate got
+    /// back around to writing it, not the press.
+    @Test("the disconnect anchor comes immediately before self.endSessionTapped()")
+    func disconnectAnchorPrecedesTheDisconnectPress() throws {
+        let code = try Self.code()
+        #expect(code.contains("ShellAutolaunch.notePress(.disconnect) self.endSessionTapped()"))
+    }
+
+    /// Same must-red, for the reconnect press.
+    @Test("the reconnect anchor comes immediately before self.connectTapped()")
+    func reconnectAnchorPrecedesTheReconnectPress() throws {
+        let code = try Self.code()
+        #expect(code.contains("ShellAutolaunch.notePress(.connect) self.connectTapped()"))
+    }
+
+    // MARK: - adr/0020 lane K, gate r1 I-4 (folded in): ShellAutolaunch.swift's own zero-output guard
+
+    private static func shellAutolaunchCode() throws -> String {
+        try autolaunchCodeOnly(autolaunchRawSource(shellAutolaunch))
+    }
+
+    /// I-4 (gate r1 mutant M2a): `plan(environment:)` runs on EVERY launch, knobs off included, so
+    /// a stray `print` inside it (or inside either `*Interval` conversion, both declared even
+    /// earlier, inside `Plan`) would put a line on stdout on every launch with nothing in
+    /// `App/Macdows/` -- where `noOtherExitRoute`'s S-6 guard lives -- able to catch it. This
+    /// file's only sanctioned output is `notePress(_:)`'s own `print(line)`, declared BEFORE
+    /// `plan(environment:)` in source, so ONE occurrence of `print(` in the whole file, strictly
+    /// between `notePress`'s declaration and `plan`'s, both proves it is there and rules out a
+    /// second one anywhere else in the file.
+    @Test("ShellAutolaunch.swift prints exactly once, from notePress(_:), and nowhere else")
+    func shellAutolaunchPrintsOnlyFromNotePress() throws {
+        let code = try Self.shellAutolaunchCode()
+        #expect(autolaunchOccurrences(of: "print(", in: code) == 1)
+        let notePress = try autolaunchIndex(of: "static func notePress(", in: code)
+        let printSite = try autolaunchIndex(of: "print(", in: code)
+        let plan = try autolaunchIndex(of: "static func plan(environment:", in: code)
+        #expect(notePress < printSite, "the one print( must be inside notePress(_:)")
+        #expect(printSite < plan, "the one print( must be before plan(environment:), not inside it")
+    }
+
     // MARK: - The knob names the orchestrator greps for
 
     /// `form1-batch.sh`'s third pre-check refuses to start a batch unless `ShellAutolaunch.swift`
     /// mentions `MACDOWS_AUTOCONNECT` -- the same "does this checkout support the knob at all"
     /// shape `soak-batch.sh` uses for `WINDOW_SMOKE_CYCLES`. That check reads a literal out of this
     /// file, so the literal has to stay spelled out here rather than being assembled at run time.
-    @Test("both knob names appear literally in ShellAutolaunch.swift")
+    ///
+    /// EXTENDED by gate r1 I-3 (folded in): the same orchestrator that greps for
+    /// `MACDOWS_AUTOCONNECT` before starting a batch has to grep for lane K's own two knob names
+    /// the same way, since a silently renamed key makes the D-A sub-run degrade to shape 1 (connect,
+    /// then exit at the ceiling) with nothing in-process to say so (no anchor line is ever printed
+    /// for a knob whose name does not match). Gate r1's mutant M3c proved the old, two-name version
+    /// of this test let exactly that renaming through.
+    @Test("all four knob names appear literally in ShellAutolaunch.swift")
     func knobNamesAreGreppable() throws {
         let raw = try autolaunchRawSource(Self.shellAutolaunch)
         #expect(raw.contains("\"MACDOWS_AUTOCONNECT\""))
         #expect(raw.contains("\"MACDOWS_QUIT_AFTER_SECONDS\""))
+        #expect(raw.contains("\"MACDOWS_DISCONNECT_AFTER_SECONDS\""))
+        #expect(raw.contains("\"MACDOWS_RECONNECT_AFTER_SECONDS\""))
     }
 
     /// The app's ONE permission, declared. `App/project.yml`'s own comment about the test bundle's

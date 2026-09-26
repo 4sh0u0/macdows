@@ -159,12 +159,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			self.statusLabel.stringValue = note
 		}
 
-		// adr/0019 §2 R-6 tool lane T1: the two unattended-launch knobs, both default OFF. With
-		// neither variable exported -- which is every launch by Finder, by Xcode's Run button or
-		// by `open` -- `plan` is `ShellAutolaunch.off`, both `if`s are not taken, and this app
-		// finishes launching byte-for-byte as it did before this lane. See `ShellAutolaunch` for
-		// why reading these two names is not the thing `connectTapped` refuses to do (that refusal
-		// is about where a HOST comes from; neither knob names a host, an account or a credential).
+		// adr/0019 §2 R-6 tool lane T1, extended by adr/0020 lane K: four unattended-launch knobs,
+		// all default OFF. With none of the four variables exported -- which is every launch by
+		// Finder, by Xcode's Run button or by `open` -- `plan` is `ShellAutolaunch.off`, none of
+		// the `if`s below are taken, and this app finishes launching byte-for-byte as it did
+		// before either lane. See `ShellAutolaunch` for why reading these names is not the thing
+		// `connectTapped` refuses to do (that refusal is about where a HOST comes from; none of
+		// the four knobs names a host, an account or a credential).
 		//
 		// Read once, into one value, because the pin next door holds `ShellAutolaunch.plan(` to
 		// exactly one occurrence in this file: two call sites could disagree about the same launch.
@@ -175,6 +176,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			// exactly as they do for a human press, and the only way to guarantee that is to make
 			// the press. `@objc private` is callable from inside this file, so no visibility changes.
 			connectTapped()
+		}
+		if let disconnectAfter = autolaunch.disconnectAfterInterval {
+			// adr/0020 lane K (D-10 = V1): the same real button a human's mouse would press, by
+			// the same route as `connectTapped()` above -- one Timer, scheduled once, calling the
+			// `@objc` action method itself, never a step copied out of it. `ShellAutolaunch.plan`
+			// (gate r1 I-2, folded in) never returns a `disconnectAfterInterval` unless
+			// `autoconnect` is also on, so this block cannot be entered by an environment that only
+			// sets this one knob, and this press cannot land on a session a human started by hand
+			// instead of this knob's own autoconnect press.
+			//
+			// If the autoconnect attempt above has already failed (`drainTick`'s connect-error
+			// branch already tore its session down) or never got as far as `beginSession` at all,
+			// `endSessionTapped()`'s own `guard session != nil` makes THIS press a silent no-op
+			// (gate r1 m-2) -- and the reconnect press below then starts what is really a RETRY of
+			// that same failed attempt, not a second connection to one still up.
+			_ = Timer.scheduledTimer(withTimeInterval: disconnectAfter, repeats: false) { _ in
+				MainActor.assumeIsolated {
+					ShellAutolaunch.notePress(.disconnect)
+					self.endSessionTapped()
+					if let reconnectAfter = autolaunch.reconnectAfterInterval {
+						// "Another t2 seconds" -- relative to the moment `self.endSessionTapped()`
+						// just above RETURNED, not to launch and not to when it was CALLED (gate
+						// r1 m-1): that call blocks (in `.live`, through `tearDownSession()`'s
+						// `shutdownAndWait()`), so this Timer is scheduled, and starts counting,
+						// only once that block is over. Nested here rather than a second
+						// top-level `if let` for the same reason as above: `ShellAutolaunch.plan`
+						// (gate r1 I-2) already reads `MACDOWS_RECONNECT_AFTER_SECONDS` as `nil`
+						// whenever `MACDOWS_DISCONNECT_AFTER_SECONDS` did not itself parse to a
+						// value, since there is then no Disconnect press for it to be "after".
+						_ = Timer.scheduledTimer(withTimeInterval: reconnectAfter, repeats: false) { _ in
+							MainActor.assumeIsolated {
+								ShellAutolaunch.notePress(.connect)
+								self.connectTapped()
+							}
+						}
+					}
+				}
+			}
 		}
 		if let quitAfter = autolaunch.quitAfterInterval {
 			// `NSApp.terminate`, not `exit()` and not a SIGTERM from outside: terminate is the one
