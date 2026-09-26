@@ -35,7 +35,8 @@ enum ShellReconnectPresenter {
     /// session's event count beside the previous session's generation is a call site worth not
     /// having.
     struct ConnectedSummary: Equatable {
-        /// Events drained since `beginSession` reset the counter.
+        /// Events drained since the App last reset the counter: in `beginSession`, and again on
+        /// every `.reconnecting` (adr/0020 D-7), so it counts the connection `generation` names.
         let events: Int
         /// `CRSession.currentGeneration` -- the control queue's connection generation.
         let generation: UInt32
@@ -82,8 +83,10 @@ enum ShellReconnectPresenter {
     /// instance it is called on), and `AppDelegate.connectTapped`'s first guard is
     /// `session == nil`. So a button enabled while a retry is pending or in flight would answer
     /// "Already connecting/connected." to every press -- a button that lies is worse than one that
-    /// is visibly unavailable. Giving up is the one state in which the App drops the session, which
-    /// is what lets the next press start a real connection.
+    /// is visibly unavailable. Giving up is the one reconnect state in which the App drops the
+    /// session, which is what lets the next press start a real connection. The user's End-session
+    /// press drops it too (adr/0020 D-5), but that is not a reconnect state and never reaches this
+    /// function: that action enables Connect with a literal of its own.
     ///
     /// `.idle` is FALSE, and that is the one place this differs from the lane blueprint's sketch.
     /// `.idle` is not only the stand-down state (`ReconnectDriver.performReconnect`'s abandoned
@@ -104,10 +107,10 @@ enum ShellReconnectPresenter {
     /// asserted as a happy fact: **a stand-down `.idle` must not reach `AppDelegate`**. It holds
     /// because the App disarms the driver in exactly ONE place, `AppDelegate.tearDownSession()`,
     /// and that place drops the driver (`reconnectDriver = nil`) right after detaching it; the
-    /// pending-retry block holds the driver weakly, so no callback can follow. All three of the
-    /// App's session ends go through it -- the connect-error branch, the give-up branch and
-    /// `applicationWillTerminate` -- and that single disarming site is what a future edit has to
-    /// preserve.
+    /// pending-retry block holds the driver weakly, so no callback can follow. All four of the
+    /// App's session ends go through it -- the connect-error branch, the give-up branch, the
+    /// End-session action (adr/0020) and `applicationWillTerminate` -- and that single disarming
+    /// site is what a future edit has to preserve.
     ///
     /// Repaired, no longer merely registered: lane D left the connect-error branch detaching the
     /// driver but keeping it on the property, which made it the only site where a scheduled retry

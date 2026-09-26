@@ -14,19 +14,23 @@ import Testing
 //  1. There is exactly ONE driver, armed once, before the connection it watches starts.
 //  2. The driver sees the event stream, always AFTER the registry (a driver that ran first would
 //     announce "Reconnecting" over a window table nobody had emptied yet).
-//  3. The driver is disarmed at every exit -- the connect-error branch, the give-up branch and
-//     app termination -- because a detached driver is the only kind that cannot bring a session
-//     its owner has closed back up from a retry timer that was already scheduled. Since the
-//     session-end lane all three reach it through ONE function, `tearDownSession()`, whose body
-//     and single-spelling counts `AppDelegateSessionEndPinTests` holds; the three call sites are
-//     held here, beside the other claims about those three paths.
+//  3. The driver is disarmed at every exit -- the connect-error branch, the give-up branch, app
+//     termination and (since adr/0020 lane S) the End-session button -- because a detached driver
+//     is the only kind that cannot bring a session its owner has closed back up from a retry timer
+//     that was already scheduled. Since the session-end lane every exit reaches it through ONE
+//     function, `tearDownSession()`, whose body and single-spelling counts
+//     `AppDelegateSessionEndPinTests` holds; three of the call sites are held here, beside the
+//     other claims about those three paths, and the End-session action's next door, beside that
+//     button's own pins.
 //  4. The connect-error branch keeps its "Connect failed: ..." line and its literal `true`, and
 //     then ends the session through that same function. Lane D froze the branch's five statements
 //     byte-for-byte and appended one call; the session-end lane lifted that freeze to repair the
 //     button it left refusing every press (lane D impl-report §8 #1), keeping the two statements
 //     a human actually sees.
-//  5. The button is enabled by a literal `true` in exactly the two places that predate this lane.
-//     Everything a reconnect decides reaches it through the presenter's `connectEnabled`.
+//  5. The button is enabled by a literal `true` only where no reconnect state is involved: the two
+//     places that predate this lane, and the three adr/0020 lane S added (the End-session action,
+//     and the two host.env failures D-8 moved behind the button's disable). Everything a reconnect
+//     decides reaches it through the presenter's `connectEnabled`.
 //
 // REGISTERED GAP, stated rather than papered over: these pins check that the wiring is WRITTEN, not
 // that it RUNS. No offline test in this repository can press that button. Closing the gap means
@@ -119,7 +123,7 @@ struct AppDelegateReconnectWiringPinTests {
                 "and it is built from the session and registry this connection just created")
         #expect(occurrences(of: ".attach()", in: src) == 1)
         #expect(occurrences(of: ".detach()", in: src) == 1,
-                "tearDownSession(), called by the connect-error branch, the give-up branch and applicationWillTerminate")
+                "tearDownSession(), called by the connect-error branch, the give-up branch, endSessionTapped and applicationWillTerminate")
     }
 
     /// D-5b. The ARMING ORDER. A driver attached after `-start` can miss the events of the
@@ -234,19 +238,24 @@ struct AppDelegateReconnectWiringPinTests {
             in: stripped) == 1)
     }
 
-    /// D-7b. The literal `true` stays in the two places that predate this lane: the boundary
-    /// refusal and the connect-error branch. Every enable a reconnect decides goes through the
-    /// presenter, so a third literal would be a second opinion about when the button is usable.
+    /// D-7b. The literal `true` stays in the two places that predate this lane -- the boundary
+    /// refusal and the connect-error branch -- plus the three adr/0020 lane S added, none of which is
+    /// a reconnect state either: the End-session action (D-5 = Q1), and the two host.env failures
+    /// (unreadable, keys missing) that D-8 moved off the main actor and therefore behind the
+    /// button's disable, where each has to hand the button back. Every enable a reconnect decides
+    /// goes through the presenter, so any further literal would be a second opinion about when the
+    /// button is usable. Re-frozen by lane S: 2 -> 3 literal trues and 5 -> 6 writes in its main
+    /// commit, 3 -> 5 and 6 -> 8 in its separable D-8 commit.
     ///
     /// Read from the comment-stripped text so that a `true` written in prose cannot be counted.
-    @Test("connectButton.isEnabled = true survives in exactly the two pre-lane-D places")
-    func theButtonIsEnabledByALiteralInTwoPlacesOnly() throws {
+    @Test("connectButton.isEnabled = true survives in exactly five places, none of them a reconnect state")
+    func theButtonIsEnabledByALiteralInFivePlacesOnly() throws {
         let stripped = try sourceWithoutComments(Self.appDelegate)
-        #expect(occurrences(of: "connectButton.isEnabled = true", in: stripped) == 2)
+        #expect(occurrences(of: "connectButton.isEnabled = true", in: stripped) == 5)
         #expect(occurrences(of: "connectButton.isEnabled = shell.connectEnabled", in: stripped) == 1,
                 "the reconnect-aware enable, in one place")
-        #expect(occurrences(of: "connectButton.isEnabled =", in: stripped) == 5,
-                "two literal trues, two literal falses (the Connect press, the session start), one presenter")
+        #expect(occurrences(of: "connectButton.isEnabled =", in: stripped) == 8,
+                "five literal trues, two literal falses (the Connect press, the session start), one presenter")
     }
 
     // MARK: - the status line has one writer, and the give-up teardown is complete
@@ -363,12 +372,21 @@ struct AppDelegateReconnectWiringPinTests {
 
     /// The display-change note is cleared by the reconnect that makes it stale, in the one place
     /// that knows a re-freeze just happened -- the same rule the connect path states for itself.
-    @Test("a reconnect clears the display-change note, on .reconnecting")
+    ///
+    /// adr/0020 S-7 (D-7, #4), re-frozen by lane S: the same branch restarts the event count, so
+    /// the status line's event count and its `generation` -- which steps inside the same
+    /// synchronous turn, when the driver's restart shuts the old connection down -- describe one
+    /// connection. `beginSession`'s reset is the other `eventCount = 0`.
+    ///
+    /// MUST-RED for: the reset dropped from the branch, moved out of it, or spelled a third time.
+    @Test("a reconnect clears the display-change note and restarts the event count, on .reconnecting")
     func theDisplayNoteIsClearedByTheReconnect() throws {
         let stripped = try sourceWithoutComments(Self.appDelegate)
         #expect(occurrences(
-            of: "if case .reconnecting = state { lastDisplayChangeNote = nil }", in: stripped) == 1)
+            of: "if case .reconnecting = state { lastDisplayChangeNote = nil eventCount = 0 }", in: stripped) == 1)
         #expect(occurrences(of: "lastDisplayChangeNote = nil", in: stripped) == 2,
                 "the connect path's own clear, and the reconnect's")
+        #expect(occurrences(of: "eventCount = 0", in: stripped) == 2,
+                "beginSession's reset, and the reconnect's (adr/0020 D-7)")
     }
 }

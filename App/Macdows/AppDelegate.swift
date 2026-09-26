@@ -13,6 +13,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	private var window: NSWindow!
 	private var statusLabel: NSTextField!
 	private var connectButton: NSButton!
+	/// adr/0020 D-4 (K1): the scaffold's second button, which ends the current session. A button of
+	/// its own beside Connect rather than one Connect that toggles: a double-click on a toggling
+	/// button lands its second click on the opposite action. Named so that nothing in it spells
+	/// `connectButton`, `connectTapped` or the teardown's name -- the pins on this file count those
+	/// as substrings.
+	private var endSessionButton: NSButton!
 
 	// Not started automatically: the app bundle has its own, separate TCC identity from
 	// a Terminal.app-relayed CLI process (Tools/bridge-smoke, W4a's actual verification
@@ -21,7 +27,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	// can manually kick off + observe a real connection later (e.g. the morning after an
 	// overnight W4a run), without blocking W4a's own acceptance criteria, which
 	// bridge-smoke already satisfies independently.
-	private var session: CRSession?
+	private var session: CRSession? {
+		// adr/0020 D-4 (K1): the End-session button is usable exactly while there is a session to
+		// end, and this is the ONE statement that says so. A `didSet` covers both of this
+		// property's assignments -- `beginSession`'s and the teardown's -- without adding a line to
+		// either. `applyShell` is deliberately not the place: three of the four session ends never
+		// call it after their teardown, and the give-up one calls it BEFORE its teardown, while this
+		// property is still set. Every assignment happens after `applicationDidFinishLaunching` has
+		// built the button.
+		didSet { endSessionButton.isEnabled = session != nil }
+	}
 	private var registry: RemoteWindowRegistry?
 	/// adr/0019 §2 lane D: the reconnect driver for the session above, armed in `beginSession` and
 	/// dropped when this app stops having a session to reconnect. Per-connection, exactly like
@@ -81,7 +96,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		button.translatesAutoresizingMaskIntoConstraints = false
 		connectButton = button
 
-		let stack = NSStackView(views: [label, status, button])
+		// adr/0020 D-4 (K1): NSButton starts out enabled, so the End-session button's initial state
+		// is written here, as a literal -- there is no session at launch. After this line its only
+		// writer is `session`'s `didSet`; spelling the initial value as that same predicate would
+		// make it two.
+		let endButton = NSButton(title: "Disconnect", target: self, action: #selector(endSessionTapped))
+		endButton.translatesAutoresizingMaskIntoConstraints = false
+		endButton.isEnabled = false
+		endSessionButton = endButton
+
+		let stack = NSStackView(views: [label, status, button, endButton])
 		stack.orientation = .vertical
 		stack.spacing = 16
 		stack.alignment = .centerX
@@ -155,9 +179,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		if let quitAfter = autolaunch.quitAfterInterval {
 			// `NSApp.terminate`, not `exit()` and not a SIGTERM from outside: terminate is the one
 			// route that runs `applicationWillTerminate` below, and that method's detach ->
-			// shutdownAndWait -> endSession sequence is part of what an unattended run has to
-			// exercise. It doubles as the safety net -- a batch that dies leaves behind no app
-			// still holding a live session.
+			// shutdownAndWait -> close windows -> endSession sequence is part of what an
+			// unattended run has to exercise. It doubles as the safety net -- a batch that dies
+			// leaves behind no app still holding a live session, and none of its RAIL windows
+			// still on screen (adr/0020 D-3, X1).
 			//
 			// One-shot and deliberately unstored: there is nothing to cancel it for. The ceiling
 			// applies to the process, not to a session, and an app that has already been asked to
@@ -181,47 +206,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// happens before this method returns cannot be raced).
 		guard session == nil, !isCheckingBoundary else {
 			statusLabel.stringValue = "Already connecting/connected."
-			return
-		}
-
-		// MacdowsCore.EnvFile, not the inline loop this method used to carry. That loop keyed
-		// each line on everything left of the first `=`, so the ordinary line
-		// `export WIN_HOST=x` was filed under the key "export WIN_HOST" and was invisible to
-		// the lookup right below it -- and it stripped no quotes, so `WIN_HOST="x"` dialled a
-		// host whose name included the quote characters. Both defects were duplicated verbatim
-		// in Tools/window-smoke, and both disagreed with the rules
-		// Scripts/run-window-smoke.command applies to the same file; EnvFile's own doc comment
-		// records how that disagreement was measured fail-open. One parser now, in the package
-		// whose tests run in every replay-gate pass (the app-side bundle, MacdowsAppTests,
-		// arrived later -- D7, 2026-09-02 -- and does not change where a parser belongs).
-		//
-		// MacdowsPaths.hostEnvPath() rather than a local `NSHomeDirectory()` concatenation, for
-		// the same reason: LabBoundary locates its own boundary file through $HOME, so the two
-		// halves of the gate a few lines below -- the host, and the segments it is judged
-		// against -- used to be able to come out of two different homes when HOME is redirected.
-		// One resolver now decides both (see MacdowsPaths for the reconciled order and why).
-		// In the default environment the path is byte-identical to the one this line built
-		// before, so nothing about a normal launch changes.
-		//
-		// This method deliberately does NOT take the WIN_HOST/WIN_USER/WIN_PASS environment
-		// variables into account, unlike the two command-line harnesses (which get them from
-		// Scripts/run-window-smoke.command, the whole point of the precedence there). This is a
-		// GUI app: it is launched by Finder, by Xcode's Run button or by `open`, none of which
-		// is a place a maintainer sets a variable on purpose, and honouring one would add a way
-		// to change which host a button press dials that is invisible in the window the human
-		// is looking at. host.env is the app's single source, the status label says so, and
-		// EnvFile.value(forKey:in:environment:) is deliberately not called here.
-		let values: [String: String]
-		do {
-			values = try EnvFile.parse(path: MacdowsPaths.hostEnvPath())
-		} catch {
-			statusLabel.stringValue = "Could not read ~/.config/macdows/host.env"
-			return
-		}
-		guard let host = values["WIN_HOST"], let user = values["WIN_USER"], let pass = values["WIN_PASS"],
-			!host.isEmpty, !user.isEmpty, !pass.isEmpty
-		else {
-			statusLabel.stringValue = "host.env missing WIN_HOST/WIN_USER/WIN_PASS"
 			return
 		}
 
@@ -257,23 +241,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// main actor under every language mode and feature set. The enclosing `Task {}` inherits
 		// MainActor isolation, so everything after the await is back on the main actor and may
 		// touch AppKit directly.
+		//
+		// adr/0020 D-8 (#6): the host.env read and its three-key check run in that same detached
+		// task, ahead of the gate, instead of on the main actor before it. The file is local and
+		// small, but a HOME on a network mount can stall a read, and a stalled read on the main
+		// actor is the beachball the paragraph above rules out. The price is that the two host.env
+		// failures now arrive after the button has been disabled, so each of them -- like the
+		// gate's refusal -- has to hand the button back: `isCheckingBoundary` is reset once, before
+		// the verdict is read, whatever it is, and every failure arm re-enables Connect with a
+		// literal `true`. Without that, one bad host.env would lock Connect for the life of the
+		// process. The two failure lines are unchanged; the "Checking" line now also covers the
+		// read, which is part of the same check.
 		isCheckingBoundary = true
 		connectButton.isEnabled = false
 		statusLabel.stringValue = "Checking the live-host boundary..."
 		Task { [weak self] in
-			let verdict = await Task.detached(priority: .userInitiated) {
-				LabBoundary.check(host: host)
+			let preflight = await Task.detached(priority: .userInitiated) { () -> ConnectPreflight in
+				// MacdowsCore.EnvFile, not the inline loop this method used to carry. That loop keyed
+				// each line on everything left of the first `=`, so the ordinary line
+				// `export WIN_HOST=x` was filed under the key "export WIN_HOST" and was invisible to
+				// the lookup right below it -- and it stripped no quotes, so `WIN_HOST="x"` dialled a
+				// host whose name included the quote characters. Both defects were duplicated verbatim
+				// in Tools/window-smoke, and both disagreed with the rules
+				// Scripts/run-window-smoke.command applies to the same file; EnvFile's own doc comment
+				// records how that disagreement was measured fail-open. One parser now, in the package
+				// whose tests run in every replay-gate pass (the app-side bundle, MacdowsAppTests,
+				// arrived later -- D7, 2026-09-02 -- and does not change where a parser belongs).
+				//
+				// MacdowsPaths.hostEnvPath() rather than a local `NSHomeDirectory()` concatenation, for
+				// the same reason: LabBoundary locates its own boundary file through $HOME, so the two
+				// halves of the gate a few lines below -- the host, and the segments it is judged
+				// against -- used to be able to come out of two different homes when HOME is redirected.
+				// One resolver now decides both (see MacdowsPaths for the reconciled order and why).
+				// In the default environment the path is byte-identical to the one this line built
+				// before, so nothing about a normal launch changes.
+				//
+				// This method deliberately does NOT take the WIN_HOST/WIN_USER/WIN_PASS environment
+				// variables into account, unlike the two command-line harnesses (which get them from
+				// Scripts/run-window-smoke.command, the whole point of the precedence there). This is a
+				// GUI app: it is launched by Finder, by Xcode's Run button or by `open`, none of which
+				// is a place a maintainer sets a variable on purpose, and honouring one would add a way
+				// to change which host a button press dials that is invisible in the window the human
+				// is looking at. host.env is the app's single source, the status label says so, and
+				// EnvFile.value(forKey:in:environment:) is deliberately not called here.
+				let values: [String: String]
+				do {
+					values = try EnvFile.parse(path: MacdowsPaths.hostEnvPath())
+				} catch {
+					return .unreadable
+				}
+				guard let host = values["WIN_HOST"], let user = values["WIN_USER"], let pass = values["WIN_PASS"],
+					!host.isEmpty, !user.isEmpty, !pass.isEmpty
+				else {
+					return .missingKeys
+				}
+				return .checked(host: host, user: user, password: pass, verdict: LabBoundary.check(host: host))
 			}.value
 			guard let self else { return }
 			self.isCheckingBoundary = false
-			switch verdict {
-			case .allowed:
+			switch preflight {
+			case .unreadable:
+				self.statusLabel.stringValue = "Could not read ~/.config/macdows/host.env"
+				self.connectButton.isEnabled = true
+			case .missingKeys:
+				self.statusLabel.stringValue = "host.env missing WIN_HOST/WIN_USER/WIN_PASS"
+				self.connectButton.isEnabled = true
+			case .checked(let host, let user, let pass, .allowed):
 				self.beginSession(host: host, user: user, password: pass)
-			case .refused(let refusal):
+			case .checked(let host, _, _, .refused(let refusal)):
 				self.statusLabel.stringValue = LabBoundary.refusalLine(host: host, refusal: refusal)
 				self.connectButton.isEnabled = true
 			}
 		}
+	}
+
+	/// adr/0020 D-8 (#6): everything the off-main half of a Connect press can come back with --
+	/// host.env unreadable, host.env without all three keys, or the three values together with
+	/// the live-host gate's verdict on the host. One value, so the main-actor half reads the
+	/// whole outcome in one `switch` and cannot act on credentials without the verdict that goes
+	/// with them.
+	private enum ConnectPreflight: Sendable {
+		case unreadable
+		case missingKeys
+		case checked(host: String, user: String, password: String, verdict: LabBoundary.Verdict)
 	}
 
 	/// Everything `connectTapped` used to do inline once the credentials were in hand. Split out
@@ -478,6 +528,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			// re-frozen the topology against a fresh read. Cleared on `.reconnecting` rather than
 			// on `.live` so the note does not hang over the very attempt that is making it untrue.
 			lastDisplayChangeNote = nil
+			// adr/0020 D-7 (#4): the event count starts again with the connection it counts. The
+			// status line puts it beside `generation`, which the bridge steps when it shuts the old
+			// connection down, and the driver announces this state and then restarts the session in
+			// one synchronous turn -- so resetting here keeps both numbers about one connection.
+			// Accepted cost, owner-ruled with D-7: until the new connection's first event, the drain
+			// tick's `eventCount > 0` gate is shut, so a display-change note written straight into
+			// the label in that interval stays there alone. The `.reconnecting` line itself does not
+			// depend on the tick: `applyShell` below writes it on this very call.
+			eventCount = 0
 		}
 		applyShell(for: state)
 		if case .gaveUp = state {
@@ -487,11 +546,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		}
 	}
 
-	/// The one way a session ends in this app. Three callers, and only three: the connect-error
-	/// branch of `drainTick`, the `.gaveUp` branch of `applyReconnectState`, and
-	/// `applicationWillTerminate`. The status line and the button are NOT written here: each caller
-	/// says what happened in its own words before it calls this (or says nothing, on the way out of
-	/// the process).
+	/// The End-session button's action (adr/0020 D-5 = Q1): the user ending the session on
+	/// purpose, and the teardown's fourth caller.
+	///
+	/// The connect-error branch's shape, UI first and teardown second: this method's own status
+	/// line, then Connect enabled by a literal `true`, then the teardown. Neither goes through
+	/// `ShellReconnectPresenter`, because ending a session on purpose is not a reconnect state --
+	/// the reason `applyShell` gives for the other literal `true`s. This button is not written here
+	/// at all: the teardown's `session = nil` disables it through `session`'s `didSet`.
+	///
+	/// Pressable in every state that has a session (adr/0020 D-6): before the handshake, where it
+	/// amounts to cancelling the connect, and in `.live`, `.waiting` and `.reconnecting`. The
+	/// teardown disarms and drops the driver before it shuts anything down, which closes both of
+	/// the driver's edges in all four, so the driver gains no API for this. In `.live` the teardown
+	/// blocks this thread until the bridge has joined T_rdp -- the same class of wait as the quit
+	/// ceiling's exit -- and the label a human sees is the one written below, once that wait is
+	/// over. Not deferred to a later turn to paint first: a deferral is a window in which a push
+	/// could re-enter a session this press has already decided to end.
+	///
+	/// It writes nothing to stdout and nothing to the unified log (adr/0020 D-10): an unattended run
+	/// that needs a press anchor is to get one from the knob that presses this button (adr/0020
+	/// lane K), not from the button itself.
+	@objc private func endSessionTapped() {
+		guard session != nil else { return }
+		statusLabel.stringValue = "Session ended. Press Connect to start a new one."
+		connectButton.isEnabled = true
+		tearDownSession()
+	}
+
+	/// The one way a session ends in this app. Four callers, and only four: the connect-error
+	/// branch of `drainTick`, the `.gaveUp` branch of `applyReconnectState`, the End-session
+	/// button's `endSessionTapped` (adr/0020), and `applicationWillTerminate`. The status line and
+	/// the button are NOT written here: each caller says what happened in its own words before it
+	/// calls this (or says nothing, on the way out of the process).
 	///
 	/// WHY ONE FUNCTION (the session-end lane, repairing lane D impl-report §8 #1, #3, #5 and #7).
 	/// There used to be three hand-written teardowns, and each was missing a different step. The
@@ -502,7 +589,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// down without its timer being stopped in the same breath, so #3 is closed by construction
 	/// rather than detected.
 	///
-	/// THE ORDER, (a) to (f), and why each step is where it is:
+	/// THE ORDER, (a) to (g), and why each step is where it is:
 	///
 	/// (a) The timer first. It is the only thing that can call `drainTick` again on its own.
 	///
@@ -522,13 +609,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	///
 	/// (d) Shut down, after both disconnections and before any reference is dropped.
 	///
-	/// (e) Drop `session` and `registry`. `session = nil` is the load-bearing statement:
+	/// (e) Close the RAIL windows, through the registry's session-end entry (adr/0020 D-2 = P1):
+	/// AFTER the shutdown and BEFORE either reference is dropped. After, because `-shutdownAndWait`
+	/// returns only once both FreeRDP threads are gone -- adr/0005 §4 closes an NSWindow only then --
+	/// and because by then the bridge has destroyed its outbound queue, so nothing this step sets
+	/// off (a modifier release from a window giving up key status as it closes included) can reach
+	/// the wire, and has cleared its surface pool, so a surface a closing window hands back is
+	/// released rather than reused. Before, because each window hands its surface back through the
+	/// session the registry still holds, and because a registry dropped with its windows still
+	/// ordered in would leave them on screen with no owner: a window with `isReleasedWhenClosed =
+	/// false` survives losing its last App-side reference. Every caller runs it. On the give-up and
+	/// connect-error paths the window table is already empty when this runs (adr/0020 §0(b)), so
+	/// there it closes nothing and only resets the registry's own tray and input state -- "argued
+	/// empty" becomes "closed by construction". The End-session button and the exit path are where
+	/// it closes windows that are still open.
+	///
+	/// (f) Drop `session` and `registry`. `session = nil` is the load-bearing statement:
 	/// `connectTapped`'s first guard is `session == nil`, and an automatic reconnect reuses the SAME
 	/// `CRSession`, so an ending that re-enabled the button without dropping the session would
 	/// produce a button that answers "Already connecting/connected." to every press -- enabled and
 	/// useless.
 	///
-	/// (f) The topology's session end, last. With no session left, a later display change must not
+	/// (g) The topology's session end, last. With no session left, a later display change must not
 	/// report a desktop size as stale, and advise a reconnect, for a session that does not exist. It
 	/// has no output, and nothing above depends on it.
 	///
@@ -565,13 +667,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// its last act before returning, so step 4 drains for the sentinel itself -- a flat drain, not a
 	/// nested one -- and waits at most until T_rdp gets there; the join is of a thread on its way out.
 	///
+	/// FROM `endSessionTapped` nothing is inside a drain: it is an AppKit target-action on the main
+	/// thread, and every other way into this file's session code -- the push hook's block, the
+	/// backstop timer, the driver's retry clock -- runs on that same thread, one at a time. A driver
+	/// may have a retry pending, which (b) cancels. In `.live` the shutdown's step 4 waits for the
+	/// sentinel the abort produces and step 5 joins T_rdp without a timeout, so the main thread is
+	/// blocked for that long, as it is on the quit ceiling's exit.
+	///
 	/// FROM `applicationWillTerminate` nothing is inside a drain either, and a driver may have a
 	/// retry pending, which (b) cancels. The process is going away regardless; it ends its session in
-	/// this shape anyway so that "a session ends" has ONE shape in this file. The one difference that
-	/// makes there: the registry is released while its windows may still be open, so they are
-	/// deallocated without passing through the registry's own close path. Accepted on the
-	/// process-exit path (their notification observers capture weakly); a Disconnect control, when
-	/// one exists, has to have the registry close its windows before this runs.
+	/// this shape anyway so that "a session ends" has ONE shape in this file -- and since adr/0020
+	/// D-3 (X1) that shape includes (e): windows still open at exit are closed inside this function,
+	/// after the shutdown and before the references are dropped, like every other caller's.
+	/// On the common exit path (a quit ceiling or an explicit `NSApp.terminate`) closing the last
+	/// windows here never makes AppKit ask `applicationShouldTerminateAfterLastWindowClosed` at
+	/// all -- that ask never fires during termination on that path. On the other shape, where
+	/// closing the last RAIL window outside this function is itself what starts termination, the
+	/// ask happens exactly once, as the trigger, before this function ever runs; closing the
+	/// remaining (already-hidden) window from inside here does not provoke a second ask. Either
+	/// way this step does not re-enter `terminate:` (adr/0020 D-3's offline exit probe, run for
+	/// lane S, and gate r1's G6 arm, which drove termination from that very check).
 	private func tearDownSession() {
 		drainTimer?.invalidate()
 		drainTimer = nil
@@ -579,6 +694,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		reconnectDriver = nil
 		session?.onEventsAvailable = nil
 		session?.shutdownAndWait()
+		registry?.closeWindowsForSessionEnd()
 		session = nil
 		registry = nil
 		displayTopology.endSession()
@@ -588,9 +704,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	///
 	/// The only place in this file that derives either of them from a reconnect state, which is
 	/// what keeps `ShellReconnectPresenter`'s offline tests worth anything: this app contributes
-	/// the binding and nothing else. The button's two literal `isEnabled = true` sites (the
-	/// boundary refusal and the connect-error branch) predate the driver and keep their literal --
-	/// neither of them is a reconnect state.
+	/// the binding and nothing else. The button's five literal `isEnabled = true` sites -- the
+	/// boundary refusal and the connect-error branch, which predate the driver, the End-session
+	/// action (adr/0020 D-5) and the two host.env failures that moved behind the button's disable
+	/// (adr/0020 D-8) -- keep their literal: none of them is a reconnect state.
 	private func applyShell(for state: ReconnectDriver.State) {
 		let shell = ShellReconnectPresenter.shell(
 			for: state,
