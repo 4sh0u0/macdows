@@ -179,9 +179,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		if let quitAfter = autolaunch.quitAfterInterval {
 			// `NSApp.terminate`, not `exit()` and not a SIGTERM from outside: terminate is the one
 			// route that runs `applicationWillTerminate` below, and that method's detach ->
-			// shutdownAndWait -> endSession sequence is part of what an unattended run has to
-			// exercise. It doubles as the safety net -- a batch that dies leaves behind no app
-			// still holding a live session.
+			// shutdownAndWait -> close windows -> endSession sequence is part of what an
+			// unattended run has to exercise. It doubles as the safety net -- a batch that dies
+			// leaves behind no app still holding a live session, and none of its RAIL windows
+			// still on screen (adr/0020 D-3, X1).
 			//
 			// One-shot and deliberately unstored: there is nothing to cancel it for. The ceiling
 			// applies to the process, not to a session, and an app that has already been asked to
@@ -678,9 +679,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// this shape anyway so that "a session ends" has ONE shape in this file -- and since adr/0020
 	/// D-3 (X1) that shape includes (e): windows still open at exit are closed inside this function,
 	/// after the shutdown and before the references are dropped, like every other caller's.
-	/// Closing the last windows there does not make AppKit ask
-	/// `applicationShouldTerminateAfterLastWindowClosed` again or re-enter `terminate:` (adr/0020
-	/// D-3's offline exit probe, run for lane S).
+	/// On the common exit path (a quit ceiling or an explicit `NSApp.terminate`) closing the last
+	/// windows here never makes AppKit ask `applicationShouldTerminateAfterLastWindowClosed` at
+	/// all -- that ask never fires during termination on that path. On the other shape, where
+	/// closing the last RAIL window outside this function is itself what starts termination, the
+	/// ask happens exactly once, as the trigger, before this function ever runs; closing the
+	/// remaining (already-hidden) window from inside here does not provoke a second ask. Either
+	/// way this step does not re-enter `terminate:` (adr/0020 D-3's offline exit probe, run for
+	/// lane S, and gate r1's G6 arm, which drove termination from that very check).
 	private func tearDownSession() {
 		drainTimer?.invalidate()
 		drainTimer = nil

@@ -235,17 +235,27 @@ struct AppDelegateAutolaunchPinTests {
     /// RE-FROZEN by adr/0020 lane S (branched from main `8a51cf6`, where the region was still those
     /// 26761 characters): the End-session action and the teardown's seventh step, the `.reconnecting`
     /// branch's event-count reset, and the comments that describe them. That commit left the region
-    /// folding to 31244 characters; the +4483 was exactly its net folded edit (4916 characters
-    /// added, 433 removed, counted token by token over the two folds). Lane S's other hunks -- the
+    /// folding to 31244 characters, a net folded edit of +4483. Lane S's other hunks -- the
     /// button's stored property, `session`'s `didSet` and the button's construction -- sit before
     /// `connectTapped` and are held by `AppDelegateSessionEndPinTests` instead.
     ///
     /// RE-FROZEN again by lane S's separable D-8 commit (#6): the host.env read moved into the
     /// detached task with its comment, the verdict gained two failure arms, and the result type
-    /// `ConnectPreflight` was declared after `connectTapped`. The region now folds to 33035
-    /// characters hashing to the constant below; the +1791 is exactly that commit's net folded edit
-    /// (4342 characters added, 2551 removed -- the moved comment counts on both sides). Reverting
-    /// that commit alone restores 31244.
+    /// `ConnectPreflight` was declared after `connectTapped`. The region folded to 33035
+    /// characters, a net folded edit of +1791. Reverting that commit alone restores 31244.
+    ///
+    /// RE-FROZEN again by lane S's gate r1 fold-in (m-3): `tearDownSession`'s exit-ordering comment
+    /// was reworded to match gate r1's G6 exit-probe arm (the "last window" ask fires once, as
+    /// termination's own trigger, not a second time from this function's own close) -- after
+    /// `connectTapped`, so it is inside this region. (The fold-in's other comment fix, m-2, sits
+    /// inside `applicationDidFinishLaunching`'s quit-ceiling block, before `connectTapped`, so it
+    /// does not touch this region at all.) The region now folds to 33563 characters hashing to the
+    /// constant below, a net folded edit of +528.
+    ///
+    /// The "net folded edit" above is the folded-length delta for each re-freeze, which is what the
+    /// length chain below already checks; it is not a token-by-token added/removed count -- those
+    /// depend on the diff algorithm and separator convention used to produce them, so this pin does
+    /// not restate them.
     ///
     /// Why a hash and not a quoted literal: the region is ~22 KB, which is not a thing to paste into
     /// a test, and an excerpt would pin only the excerpt. Why the fold WITH comments: the claim is
@@ -257,9 +267,9 @@ struct AppDelegateAutolaunchPinTests {
     /// expected to re-freeze this constant in the same commit that makes the edit, and the length
     /// below is here so that such a re-freeze can be sanity-checked (a length that MOVED by the size
     /// of the edit is a re-freeze; a length that moved by 22638 is a needle that stopped matching).
-    private static let foldedTailLength = 33035
+    private static let foldedTailLength = 33563
     private static let foldedTailSHA256 =
-        "149fdc7753f53217320e2269515f910d0873b0be8d6d89330ba78fd8e21bbbf3"
+        "74764581c43f583422efb5fed8b319aa2da31a3a998abf5a0c92550f70300956"
 
     @Test("connectTapped to end-of-file is byte-identical to its last deliberate freeze")
     func theRestOfTheFileIsUnchanged() throws {

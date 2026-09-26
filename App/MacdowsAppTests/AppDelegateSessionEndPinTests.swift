@@ -300,17 +300,40 @@ struct AppDelegateSessionEndPinTests {
     /// count is exhaustive: every `.isEnabled =` in the file is either Connect's or one of these
     /// two, so a third writer anywhere -- whatever its name -- is red.
     ///
+    /// The construction needle is widened to the whole run from the button's `NSButton(...)` call
+    /// through the `NSStackView(views:)` line that lays out the shell, ending on the literal array
+    /// `[label, status, button, endButton]`. A button that is built, wired and disabled but never
+    /// added to the stack still satisfies every other pin here -- it is a dead control the pins
+    /// could not otherwise see (gate r1 I-1, mutant G9: dropping `endButton` from the array still
+    /// built and passed all 234 tests). Folding the whole run into one needle means any statement
+    /// inserted between construction and the stack line, and any change to the array's own
+    /// membership, is red. The separate whole-file count on `endSessionButton` (declaration,
+    /// `didSet`, construction assignment -- exactly 3) closes the gap the substring check in S-5
+    /// leaves open: a fourth use anywhere else, such as an `isHidden` or `removeFromSuperview`
+    /// write, is red too.
+    ///
     /// MUST-RED for: the write moved into `applyShell` (or anywhere out of the `didSet`), a second
-    /// enablement write, a missing or non-literal initial value.
-    @Test("the End-session button is enabled by one statement, in session's didSet, and starts disabled")
+    /// enablement write, a missing or non-literal initial value, the button dropped from the
+    /// stack's view array (G9), or any additional use of `endSessionButton` elsewhere in the file.
+    @Test("the End-session button is enabled by one statement, in session's didSet, starts disabled, and is in the stack")
     func theEndSessionButtonHasOneEnablementWrite() throws {
         let code = try Self.code()
         #expect(sessionEndOccurrences(of: "isEnabled = session != nil", in: code) == 1)
         #expect(sessionEndOccurrences(
             of: "private var session: CRSession? { didSet { endSessionButton.isEnabled = session != nil } }",
             in: code) == 1)
-        #expect(sessionEndOccurrences(of: "endButton.isEnabled = false endSessionButton = endButton", in: code) == 1,
-                "the initial value, a literal false, set once where the button is built")
+        #expect(sessionEndOccurrences(
+            of: """
+                let endButton = NSButton(title: "Disconnect", target: self, action: #selector(endSessionTapped)) \
+                endButton.translatesAutoresizingMaskIntoConstraints = false \
+                endButton.isEnabled = false \
+                endSessionButton = endButton \
+                let stack = NSStackView(views: [label, status, button, endButton])
+                """,
+            in: code) == 1,
+                "the construction run through the stack line, with endButton inside the views array")
+        #expect(sessionEndOccurrences(of: "endSessionButton", in: code) == 3,
+                "declaration, didSet, and the construction assignment -- nothing else touches the button")
         let everyWrite = sessionEndOccurrences(of: ".isEnabled =", in: code)
         let connectWrites = sessionEndOccurrences(of: "connectButton.isEnabled =", in: code)
         #expect(everyWrite - connectWrites == 2, "the construction's literal and the didSet, and nothing else")
