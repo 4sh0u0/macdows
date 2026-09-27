@@ -84,7 +84,10 @@ struct ShellAutolaunchTests {
     /// and not a silently different answer.
     @Test(
         "anything that is not a positive whole number yields no ceiling",
-        arguments: ["", "abc", "10s", "1e3", "10.5", ".5", "-1", "-0", "0", "00", " 10", "10 ", "1_0", "0x10", "٩", "9999999999999999999999"]
+        arguments: [
+            "", "abc", "10s", "1e3", "1e1", "10.5", "10.0", ".5", "-1", "-0", "+10", "0", "00", " 10", "10 ", "1_0",
+            "0x10", "٩", "１０", "9999999999999999999999",
+        ]
     )
     func quitAfterRefusesEverythingElse(value: String) {
         let plan = ShellAutolaunch.plan(environment: [ShellAutolaunch.quitAfterKey: value])
@@ -99,6 +102,25 @@ struct ShellAutolaunchTests {
         #expect(ShellAutolaunch.quitAfter(nil) == nil)
         #expect(ShellAutolaunch.quitAfter("nonsense") == nil)
         #expect(ShellAutolaunch.quitAfter("7") == .seconds(7))
+    }
+
+    /// Leading zeros normalise exactly as `Int(_:)` already normalises them -- "010" is ten
+    /// seconds, never an octal literal and never refused for the leading zero itself. The same
+    /// normalisation rail-probe's `parse_decimal_field` documents for its own knobs.
+    @Test("a leading zero normalises like Int(_:), not a refusal")
+    func quitAfterNormalisesLeadingZeros() {
+        #expect(ShellAutolaunch.quitAfter("010") == .seconds(10))
+    }
+
+    /// gate r1 m-5: the boundary a hand-rolled replacement for `Int(_:)` could get wrong silently
+    /// -- there is no ceiling below `Int.max` (unlike rail-probe's 3600), so `Int.max` itself must
+    /// still be accepted, and a value one digit past it must be refused rather than wrapping
+    /// around to a small, plausible-looking number.
+    @Test("Int.max is accepted; one digit past it is refused, not wrapped")
+    func quitAfterIntMaxBoundary() {
+        #expect(ShellAutolaunch.quitAfter(String(Int.max)) == .seconds(Int.max))
+        #expect(ShellAutolaunch.quitAfter(String(Int.max) + "0") == nil)
+        #expect(ShellAutolaunch.quitAfter(String(repeating: "9", count: 20)) == nil)
     }
 
     // MARK: - adr/0020 lane K: MACDOWS_DISCONNECT_AFTER_SECONDS
@@ -128,7 +150,10 @@ struct ShellAutolaunchTests {
     /// because I-2's own gate would already have refused it.
     @Test(
         "anything that is not a positive whole number never schedules a Disconnect press, even with autoconnect on",
-        arguments: ["", "abc", "10s", "1e3", "10.5", ".5", "-1", "-0", "0", "00", " 10", "10 ", "1_0", "0x10", "٩", "9999999999999999999999"]
+        arguments: [
+            "", "abc", "10s", "1e3", "1e1", "10.5", "10.0", ".5", "-1", "-0", "+10", "0", "00", " 10", "10 ", "1_0",
+            "0x10", "٩", "１０", "9999999999999999999999",
+        ]
     )
     func disconnectAfterRefusesEverythingElse(value: String) {
         let plan = ShellAutolaunch.plan(environment: [
@@ -165,7 +190,10 @@ struct ShellAutolaunchTests {
     /// holding autoconnect on and `disconnectAfter` valid throughout.
     @Test(
         "anything that is not a positive whole number never schedules a reconnect press, even with autoconnect and a valid Disconnect delay",
-        arguments: ["", "abc", "10s", "1e3", "10.5", ".5", "-1", "-0", "0", "00", " 10", "10 ", "1_0", "0x10", "٩", "9999999999999999999999"]
+        arguments: [
+            "", "abc", "10s", "1e3", "1e1", "10.5", "10.0", ".5", "-1", "-0", "+10", "0", "00", " 10", "10 ", "1_0",
+            "0x10", "٩", "１０", "9999999999999999999999",
+        ]
     )
     func reconnectAfterRefusesEverythingElse(value: String) {
         let plan = ShellAutolaunch.plan(environment: [

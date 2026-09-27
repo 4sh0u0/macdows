@@ -463,9 +463,9 @@ struct ReconnectDriverReactionTests {
         #expect(fixture.session.restartCount == 0)
     }
 
-    /// Not wired means not armed, at runtime as well as at link time. Construction alone must not
-    /// make a driver that reacts to anything -- that is what lets lane B merge the class into the
-    /// app target without changing a single thing the app does.
+    /// Unattached means inert: construction alone must not make a driver that reacts to anything --
+    /// the state between `ReconnectDriver(` and `attach()` in `AppDelegate`'s `beginSession`, and
+    /// again after `detach()`.
     @Test("an unattached driver ignores everything")
     func unattachedDriverIsInert() throws {
         let fixture = try Fixture.make(attached: false)
