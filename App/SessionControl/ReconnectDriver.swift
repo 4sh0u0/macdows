@@ -32,15 +32,20 @@ import os
 ///     is deliberately NOT "`-restartForReconnectPreparing:` returned YES": that only means the
 ///     RDP thread was spawned, which is true of every attempt that will go on to fail.
 ///
-/// ## Not wired
+/// ## Wiring
 ///
-/// Nothing constructs this class. Lane B ships it as "exists, nobody attaches it", the same shape
-/// lane A's `ReconnectPolicy` shipped in, and `ReconnectSemanticsPinTests` holds that as a checked
-/// fact. Wiring is lane D's, for a reason worth stating: a session that silently reconnects under
-/// a UI that was never told is worse than one that stays down — the App's Connect button is
-/// disabled the moment it is pressed and re-enabled only on a connect error, so the driver alone
-/// would leave a working session behind a dead button and a status line that lies. `onStateChange`
-/// is the seam D consumes; `topologyRefresh` is the seam lane C fills.
+/// `AppDelegate`'s connect path constructs one driver per connection -- inside the method that
+/// begins a session, alongside the `CRSession` and `RemoteWindowRegistry` it depends on -- arms it
+/// with `attach()` before that session starts, and disarms it at every exit (a connect error, a
+/// give-up, app termination, the End-session button). `ReconnectSemanticsPinTests` holds "exactly
+/// one driver is constructed, in the app entry point; the fixture and scripts build none" and
+/// `AppDelegateReconnectWiringPinTests` holds the arming, ordering and disarmings, both as source
+/// pins: this test bundle's target does not include `Macdows`, so `AppDelegate` cannot be driven
+/// here directly. `onStateChange` is the seam
+/// `AppDelegate` consumes to keep the Connect button and status label truthful about a reconnect in
+/// progress (`ShellReconnectPresenter` decides what they say); `topologyRefresh` is the seam
+/// `AppDelegate` fills with a closure over its own resident `DisplayTopologyProvider`, per adr/0019
+/// §2 lane C.
 @MainActor
 final class ReconnectDriver {
 

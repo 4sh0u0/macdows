@@ -10,9 +10,9 @@ import os
 // from a file, and the only channel that carries the frozen `[reconnect]` line family is the App's
 // own stdout (`ReconnectDriver.logLine`'s doc records why the status label cannot be read at all).
 // An orchestrator therefore has to be able to start `Macdows.app`, have it connect, and have it
-// exit again, with nobody at the keyboard. Today nothing in this app can do either: the only path
-// to a connection is a button press, and the only path to `applicationWillTerminate` is a human
-// quitting the app.
+// exit again, with nobody at the keyboard. Before T1, nothing in this app could do either: the
+// only path to a connection was a button press, and the only path to `applicationWillTerminate`
+// was a human quitting the app.
 //
 // ## Why this is NOT the precedent `AppDelegate.connectTapped` refuses
 //
@@ -210,6 +210,8 @@ enum ShellAutolaunch {
     ///
     /// `MACDOWS_QUIT_AFTER_SECONDS`, `MACDOWS_DISCONNECT_AFTER_SECONDS` and
     /// `MACDOWS_RECONNECT_AFTER_SECONDS` each take a whole number of seconds, strictly positive.
+    /// Digits only: a sign, whitespace, a decimal point or any non-ASCII digit is refused --
+    /// `Tools/rail-probe`'s `parse_decimal_field` is the same grammar, for the same knob shape.
     /// Anything else -- an empty value, a word, a float, a negative number, `0`, or a number too
     /// large for `Int` -- yields `nil`, which is the "do nothing" answer, and never a trap or a
     /// crash. `0` is refused with the rest deliberately: a zero-second delay fires before the
@@ -245,9 +247,16 @@ enum ShellAutolaunch {
     /// The "whole positive number of seconds, else nothing" parse shared by
     /// `MACDOWS_QUIT_AFTER_SECONDS`, `MACDOWS_DISCONNECT_AFTER_SECONDS` and
     /// `MACDOWS_RECONNECT_AFTER_SECONDS`, split out so its refusals can be tested by value once
-    /// rather than three times.
+    /// rather than three times. Digits only: a sign, whitespace, a decimal point or any
+    /// non-ASCII digit is refused, even one `Int(_:)` alone would otherwise have accepted (a
+    /// leading `+`) -- the same grammar `Tools/rail-probe`'s `parse_decimal_field` uses for its
+    /// own seconds knobs. Leading zeros normalise the way `Int(_:)` already normalises them
+    /// ("010" is 10).
     static func quitAfter(_ raw: String?) -> Duration? {
-        guard let raw, let seconds = Int(raw), seconds > 0 else { return nil }
+        guard let raw, !raw.isEmpty, raw.utf8.allSatisfy({ (0x30...0x39).contains($0) }) else {
+            return nil
+        }
+        guard let seconds = Int(raw), seconds > 0 else { return nil }
         return .seconds(seconds)
     }
 
