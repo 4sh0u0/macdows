@@ -25,6 +25,15 @@
 # JSONL event-name set; one leg-line print point, after the plan's). P6-P8, I8-I16 and X1-X2 hold
 # its plan line, its grammar and its refusal next to --second-exec.
 #
+# The seconds knobs (--duration, --second-delay) were bare atoi() until the lane that added
+# parse_seconds_knob: "abc" ran as 0, "-5" as -5, "+10" and "25abc" as 10 and 25, all with exit 0.
+# They now go through parse_decimal_field, the one field grammar each --reconnect-leg half uses
+# too (ASCII digits, leading zeros normalise, --duration 1..3600, --second-delay 0..3600).
+# I17-I29, P9-P16, M3 and M4 hold that grammar, the accepted values and the unchanged
+# missing-value path; I8-I16, I30-I31 and P6-P8 hold it for --reconnect-leg (I30-I31, gate r1 I-1:
+# the gap half's own sign and whitespace), and S7 holds the structure behind "one grammar" -- each
+# of those parsers calls parse_decimal_field and none re-implements it.
+#
 # Gate r1 B-1/B-2 fold: the checks above did not catch two ways to make "a second leg" mean "the
 # same leg, reused" -- reusing leg 1's client context for leg 2 (B-1), and copying cross-leg state
 # (the mutex, the run clock, the g_probe pointer, the only-after-a-clean-timer gate into leg 2) by
@@ -35,17 +44,18 @@
 # g_probe at its OWN context, and that leg 2 only starts when leg 1's own timer ended it cleanly.
 #
 # Two kinds of case, same split as Scripts/test-lab-boundary.sh's rail-probe section:
-#   * SOURCE PINS (S1-S6) run always and hold the structural claims -- ONE implementation
+#   * SOURCE PINS (S1-S7) run always and hold the structural claims -- ONE implementation
 #     (probe_settings_plan) feeds both the connect path and --print-plan, so a settings write that
 #     bypasses it is visible as a changed count of freerdp_settings_set_ call sites; and a second
-#     leg is the same lifecycle text run twice, never a second path. Tier 1 runs this suite
-#     (.github/workflows/tier1.yml, step "rail-probe plan source pins") and requires exactly six
+#     leg is the same lifecycle text run twice, never a second path; and every numeric knob in
+#     S7's scope parses through the one field grammar. Tier 1 runs this suite
+#     (.github/workflows/tier1.yml, step "rail-probe plan source pins") and requires exactly seven
 #     `PASS  S<n>` lines and no FAIL.
 #   * BINARY CASES run when Tools/rail-probe/build/rail-probe exists and is newer than its source;
 #     they need cmake and a FreeRDP prefix, which Tier 1 does not have (a missing binary is a NOTE,
-#     never a silent pass; Tier 1 accepts that NOTE and still requires the six source pins). Tier 2
+#     never a silent pass; Tier 1 accepts that NOTE and still requires the seven source pins). Tier 2
 #     (.github/workflows/tier2.yml, step "rail-probe plan suite (source pins + binary cases)") does
-#     build the binary and requires all 31 to PASS with `not_run=0`. No case
+#     build the binary and requires all 56 to PASS with `not_run=0`. No case
 #     here can open a socket: --print-plan exits before any FreeRDP context exists, and the one
 #     connect-path case that gets past parse_args' missing-argument check (X2) names an --out file
 #     inside a directory that does not exist, so even with the refusal it tests regressed it would
@@ -279,6 +289,78 @@ OK=0
 [ "$S6_LEG" -lt "$S6_CTX" ] || OK=1
 check "$OK" "S6 one leg-line print point" "printed once, after the plan's print call, before any context exists" "$TEST_DIR/s6.txt"
 
+# S7 (seconds-knob lane, gate r1 I-1). One field grammar: --reconnect-leg (each half), --duration
+# and --second-delay all parse through parse_decimal_field, and none of their parsers carries a
+# copy of it -- an equivalent hand-written copy passes every binary case, so only the source can
+# tell. Call shapes, not names: parse_seconds_knob's doc comment itself says "bare atoi()", so a
+# name count would be red on a correct tree. Function bodies are cut from the folded source,
+# signature to the first "return true; }" (each knob parser ends that way), which keeps the doc
+# comment of the NEXT function out of them. Needles go through ENVIRON, not -v, so the '\0' in a
+# needle reaches awk verbatim instead of as an escape.
+#   grammar:leg / grammar:sec  parse_reconnect_leg_knob calls it twice (',' then '\0' terminator),
+#                              parse_seconds_knob once ('\0'); grammar:total -- definition + those
+#                              three, so no other function calls it (desktop/scale keep their own
+#                              registered copies, below).
+#   grammar:own                neither of those two bodies calls strtoul/strtol/atoi/isdigit itself.
+#   convert                    strtoul( calls: 1 in parse_decimal_field + 2 each in
+#                              parse_desktop_knob/parse_scale_knob (their private copies, registered
+#                              for a later lane) = 5 in the file, none anywhere else; no atoi( call
+#                              and no other converter (strtol/strtoll/strtoull/atol/atoll/sscanf).
+#   sites / assign             each seconds knob is one refusal-guarded parse_seconds_knob call with
+#                              its own field and range, and the defaults are the only other writes.
+fold_body() {
+	START="$1" awk -F '\n' '{ i = index($0, ENVIRON["START"]); if (i == 0) exit; s = substr($0, i); e = "return true; }"; j = index(s, e); if (j == 0) exit; printf "%s", substr(s, 1, j + length(e) - 1) }' "$FOLDED" >"$2"
+}
+file_cnt() {
+	NEEDLE="$1" awk -F '\n' '{ n = ENVIRON["NEEDLE"]; s = $0; while ((i = index(s, n)) > 0) { c++; s = substr(s, i + length(n)) } } END { print c + 0 }' "$2"
+}
+call_cnt() {
+	{ grep -oE "(^|[^A-Za-z0-9_])($1)[[:space:]]*[(][^)]" "$2" || true; } | wc -l | tr -d ' '
+}
+S7_OK=0
+S7_WHY=""
+fold_body 'static bool parse_decimal_field(' "$TEST_DIR/s7-field.txt"
+fold_body 'static bool parse_reconnect_leg_knob(' "$TEST_DIR/s7-leg.txt"
+fold_body 'static bool parse_seconds_knob(' "$TEST_DIR/s7-sec.txt"
+fold_body 'static bool parse_desktop_knob(' "$TEST_DIR/s7-desktop.txt"
+fold_body 'static bool parse_scale_knob(' "$TEST_DIR/s7-scale.txt"
+S7_LEG_N="$(file_cnt 'parse_decimal_field(' "$TEST_DIR/s7-leg.txt")"
+S7_LEG_A="$(file_cnt "parse_decimal_field(text, ',', " "$TEST_DIR/s7-leg.txt")"
+S7_LEG_G="$(file_cnt "parse_decimal_field(comma + 1, '\\0', " "$TEST_DIR/s7-leg.txt")"
+{ [ "$S7_LEG_N" -eq 2 ] && [ "$S7_LEG_A" -eq 1 ] && [ "$S7_LEG_G" -eq 1 ]; } || { S7_OK=1; S7_WHY="$S7_WHY grammar:leg"; }
+S7_SEC_N="$(file_cnt 'parse_decimal_field(' "$TEST_DIR/s7-sec.txt")"
+S7_SEC_S="$(file_cnt "parse_decimal_field(s, '\\0', " "$TEST_DIR/s7-sec.txt")"
+{ [ "$S7_SEC_N" -eq 1 ] && [ "$S7_SEC_S" -eq 1 ]; } || { S7_OK=1; S7_WHY="$S7_WHY grammar:sec"; }
+S7_TOTAL="$(file_cnt 'parse_decimal_field(' "$FOLDED")"
+[ "$S7_TOTAL" -eq 4 ] || { S7_OK=1; S7_WHY="$S7_WHY grammar:total"; }
+S7_OWN="$(cat "$TEST_DIR/s7-leg.txt" "$TEST_DIR/s7-sec.txt" >"$TEST_DIR/s7-own.txt"; call_cnt 'strtoul|strtol|atoi|isdigit' "$TEST_DIR/s7-own.txt")"
+[ "$S7_OWN" -eq 0 ] || { S7_OK=1; S7_WHY="$S7_WHY grammar:own"; }
+S7_STRTOUL_FILE="$(call_cnt 'strtoul' "$FOLDED")"
+S7_STRTOUL_FIELD="$(call_cnt 'strtoul' "$TEST_DIR/s7-field.txt")"
+S7_STRTOUL_COPIES="$(( $(call_cnt 'strtoul' "$TEST_DIR/s7-desktop.txt") + $(call_cnt 'strtoul' "$TEST_DIR/s7-scale.txt") ))"
+S7_ATOI="$(call_cnt 'atoi' "$FOLDED")"
+S7_OTHER="$(call_cnt 'strtol|strtoll|strtoull|atol|atoll|sscanf' "$FOLDED")"
+{ [ "$S7_STRTOUL_FILE" -eq 5 ] && [ "$S7_STRTOUL_FIELD" -eq 1 ] && [ "$S7_STRTOUL_COPIES" -eq 4 ] && [ "$S7_ATOI" -eq 0 ] && [ "$S7_OTHER" -eq 0 ]; } || { S7_OK=1; S7_WHY="$S7_WHY convert"; }
+S7_SD_SITE="$(file_cnt 'if (!parse_seconds_knob(argv[i], 0, 3600, &cfg->second_delay)) {' "$FOLDED")"
+S7_DUR_SITE="$(file_cnt 'if (!parse_seconds_knob(argv[i], 1, 3600, &cfg->duration)) {' "$FOLDED")"
+S7_SEC_TOTAL="$(file_cnt 'parse_seconds_knob(' "$FOLDED")"
+{ [ "$S7_SD_SITE" -eq 1 ] && [ "$S7_DUR_SITE" -eq 1 ] && [ "$S7_SEC_TOTAL" -eq 3 ]; } || { S7_OK=1; S7_WHY="$S7_WHY sites"; }
+S7_SD_ASSIGN="$(file_cnt 'cfg->second_delay =' "$FOLDED")"
+S7_DUR_ASSIGN="$(file_cnt 'cfg->duration =' "$FOLDED")"
+{ [ "$S7_SD_ASSIGN" -eq 1 ] && [ "$S7_DUR_ASSIGN" -eq 1 ]; } || { S7_OK=1; S7_WHY="$S7_WHY assign"; }
+{
+	printf 'grammar:leg parse_decimal_field( in parse_reconnect_leg_knob: %s (expected 2: ",", then "\\0" terminator: %s / %s)\n' "$S7_LEG_N" "$S7_LEG_A" "$S7_LEG_G"
+	printf 'grammar:sec parse_decimal_field( in parse_seconds_knob: %s (expected 1, "\\0" terminator: %s)\n' "$S7_SEC_N" "$S7_SEC_S"
+	printf 'grammar:total parse_decimal_field( in the file: %s (expected 4 = definition + 3 calls)\n' "$S7_TOTAL"
+	printf 'grammar:own strtoul/strtol/atoi/isdigit calls in those two bodies: %s (expected 0)\n' "$S7_OWN"
+	printf 'convert strtoul( calls: file %s (expected 5), parse_decimal_field %s (expected 1), desktop+scale copies %s (expected 4); atoi( calls %s, other converters %s (expected 0 each)\n' "$S7_STRTOUL_FILE" "$S7_STRTOUL_FIELD" "$S7_STRTOUL_COPIES" "$S7_ATOI" "$S7_OTHER"
+	printf 'sites guarded seconds-knob calls: second-delay %s, duration %s (expected 1 each); parse_seconds_knob( total %s (expected 3)\n' "$S7_SD_SITE" "$S7_DUR_SITE" "$S7_SEC_TOTAL"
+	printf 'assign cfg->second_delay = %s, cfg->duration = %s (expected 1 each: the defaults)\n' "$S7_SD_ASSIGN" "$S7_DUR_ASSIGN"
+} >"$TEST_DIR/s7.txt"
+S7_NAME="S7 one field grammar"
+[ -z "$S7_WHY" ] || S7_NAME="S7${S7_WHY}"
+check "$S7_OK" "$S7_NAME" "leg halves, --duration, --second-delay parse through parse_decimal_field only; no own copy, no atoi" "$TEST_DIR/s7.txt"
+
 echo "== binary cases =="
 if [ ! -x "$BIN" ]; then
 	printf 'NOTE  %-40s no built binary at Tools/rail-probe/build/rail-probe (set RAILPROBE_BIN to override)\n' "binary cases"
@@ -504,10 +586,13 @@ PLAN
 	# I8..I16: the leg knob's grammar is as strict as --scale's, with both halves required (a 1..3600,
 	# g 0..3600): out of range, a missing half, a trailing comma, a third field, a sign and hex are
 	# each refused -- exit 2, the grammar refusal naming the option on stderr, usage on stdout, and
-	# no plan line of either kind on stdout.
-	for bad in "--reconnect-leg 0,5" "--reconnect-leg 3601,5" "--reconnect-leg 20,3601" "--reconnect-leg 20" "--reconnect-leg 20," "--reconnect-leg ,5" "--reconnect-leg 20,5,1" "--reconnect-leg +20,5" "--reconnect-leg 20,0x5"; do
-		# shellcheck disable=SC2086
-		run_probe --print-plan --app "$APP" --out "$NEVER" $bad
+	# no plan line of either kind on stdout. I30/I31 (gate r1 I-1): the gap half's own sign and
+	# leading whitespace -- I15 only signs the first half, so a gap half parsed outside
+	# parse_decimal_field could take "+5" and stay green. Each value is passed as one argument, so
+	# the one with a space survives as itself.
+	for val in "0,5" "3601,5" "20,3601" "20" "20," ",5" "20,5,1" "+20,5" "20,0x5" "20,+5" "20, 5"; do
+		bad="--reconnect-leg $val"
+		run_probe --print-plan --app "$APP" --out "$NEVER" --reconnect-leg "$val"
 		OK=0
 		[ "$RC" -eq 2 ] || OK=1
 		[ "$(grep -c '^set ' "$TEST_DIR/stdout.txt" || true)" -eq 0 ] || OK=1
@@ -555,6 +640,98 @@ PLAN
 		head -3 "$TEST_DIR/stderr.txt"
 	} >"$TEST_DIR/x2.txt"
 	check "$OK" "leg + --second-exec refused (connect)" "exit 2 on the connect path (all args present), refusal on stderr, nothing created" "$TEST_DIR/x2.txt"
+
+	# ---- seconds knobs: --duration and --second-delay (parse_seconds_knob) ----
+
+	# I17..I29: out-of-grammar values are refused, the way --desktop/--scale/--reconnect-leg refuse
+	# theirs: exit 2, stderr is exactly ONE line and that line is the full refusal naming the option
+	# and quoting the value, usage on stdout, and no plan line of either kind on stdout (parse_args
+	# returned before the plan was reached). Each entry is "<option>|<value>", so the empty value
+	# and one with a leading space survive as themselves. ' 25' pins that leading whitespace (which
+	# atoi and strtoul both skip) is refused; 4294967321 is 2^32 + 25, which a 32-bit wrap would
+	# turn into 25.
+	for bad in "--duration|abc" "--duration|-5" "--duration|+10" "--duration|0" "--duration|3601" "--duration|25abc" "--duration|" "--duration| 25" "--duration|4294967321" "--second-delay|abc" "--second-delay|-1" "--second-delay|+8" "--second-delay|3601"; do
+		opt="${bad%%|*}"
+		val="${bad#*|}"
+		want='0..3600'
+		[ "$opt" != "--duration" ] || want='1..3600'
+		run_probe --print-plan --app "$APP" --out "$NEVER" "$opt" "$val"
+		OK=0
+		[ "$RC" -eq 2 ] || OK=1
+		[ "$(grep -c '' "$TEST_DIR/stderr.txt" || true)" -eq 1 ] || OK=1
+		grep -qxF -- "Invalid value for $opt: '$val' (want whole seconds $want)" "$TEST_DIR/stderr.txt" || OK=1
+		grep -q 'Usage:' "$TEST_DIR/stdout.txt" || OK=1
+		[ "$(grep -c -e '^set ' -e '^reconnect-leg ' "$TEST_DIR/stdout.txt" || true)" -eq 0 ] || OK=1
+		{
+			printf 'rc=%s\n--- stdout (plan lines only) ---\n' "$RC"
+			grep -e '^set ' -e '^reconnect-leg ' "$TEST_DIR/stdout.txt" || true
+			printf -- '--- stderr ---\n'
+			head -3 "$TEST_DIR/stderr.txt"
+		} >"$TEST_DIR/bad.txt"
+		check "$OK" "refuses $opt '$val'" "exit 2, one stderr line: the refusal quoting the value; usage on stdout; no plan line" "$TEST_DIR/bad.txt"
+	done
+
+	# P9..P12: --duration 1, 25, 3600 and 010 are accepted. The plan's one field that carries
+	# --duration is the leg line's leg2-seconds, so each case adds --reconnect-leg 20,5 and the
+	# output must be the eight settings plus that line carrying the normalised value; exit 0,
+	# nothing on stderr. Each entry is "<value>|<printed>": 010 prints 10, the leading zero
+	# normalising as in P7's 030,00. (25 is also the default, so that case pins acceptance only.)
+	for good in "1|1" "25|25" "3600|3600" "010|10"; do
+		val="${good%%|*}"
+		printed="${good#*|}"
+		{ cat "$EXPECTED_BASE"; printf 'reconnect-leg leg1-seconds=20 gap-seconds=5 leg2-seconds=%s context=new settings=same\n' "$printed"; } >"$TEST_DIR/expected-dur.txt"
+		run_probe --print-plan --app "$APP" --out "$NEVER" --reconnect-leg 20,5 --duration "$val"
+		OK=0
+		diff -u "$TEST_DIR/expected-dur.txt" "$TEST_DIR/stdout.txt" >"$TEST_DIR/good.diff" || OK=1
+		[ "$RC" -eq 0 ] || OK=1
+		[ ! -s "$TEST_DIR/stderr.txt" ] || OK=1
+		{ printf 'rc=%s\n' "$RC"; head -3 "$TEST_DIR/stderr.txt"; cat "$TEST_DIR/good.diff"; } >"$TEST_DIR/good.txt"
+		check "$OK" "accepts --duration $val" "exit 0, stderr empty; the leg line carries leg2-seconds=$printed" "$TEST_DIR/good.txt"
+	done
+
+	# P13..P16: --second-delay 0, 8, 3600 and 08 are accepted. No plan line carries --second-delay
+	# (the plan lists pre-connect settings; only the main loop reads the delay), so what is
+	# pinnable is exit 0, nothing on stderr, and a plan byte-identical to P1's.
+	for good in 0 8 3600 08; do
+		run_probe --print-plan --app "$APP" --out "$NEVER" --second-delay "$good"
+		OK=0
+		diff -u "$EXPECTED_BASE" "$TEST_DIR/stdout.txt" >"$TEST_DIR/good.diff" || OK=1
+		[ "$RC" -eq 0 ] || OK=1
+		[ ! -s "$TEST_DIR/stderr.txt" ] || OK=1
+		{ printf 'rc=%s\n' "$RC"; head -3 "$TEST_DIR/stderr.txt"; cat "$TEST_DIR/good.diff"; } >"$TEST_DIR/good.txt"
+		check "$OK" "accepts --second-delay $good" "exit 0, stderr empty; plan byte-identical to P1's" "$TEST_DIR/good.txt"
+	done
+
+	# M3: --duration as the last argument, with no value, still takes parse_args' missing-value path
+	# (exit 2, stderr exactly "Missing value for --duration", usage on stdout, no plan line), not
+	# the grammar refusal.
+	run_probe --print-plan --app "$APP" --out "$NEVER" --duration
+	OK=0
+	[ "$RC" -eq 2 ] || OK=1
+	[ "$(grep -c '' "$TEST_DIR/stderr.txt" || true)" -eq 1 ] || OK=1
+	grep -qxF -- 'Missing value for --duration' "$TEST_DIR/stderr.txt" || OK=1
+	grep -q 'Usage:' "$TEST_DIR/stdout.txt" || OK=1
+	[ "$(grep -c -e '^set ' -e '^reconnect-leg ' "$TEST_DIR/stdout.txt" || true)" -eq 0 ] || OK=1
+	{
+		printf 'rc=%s\n--- stderr ---\n' "$RC"
+		head -3 "$TEST_DIR/stderr.txt"
+	} >"$TEST_DIR/m3.txt"
+	check "$OK" "missing value for --duration" "exit 2, stderr exactly 'Missing value for --duration', usage on stdout, no plan line" "$TEST_DIR/m3.txt"
+
+	# M4 (gate r1 m-2): the same for --second-delay, whose `goto missing` M3 does not reach -- without
+	# it the parser would read argv[argc] (NULL) and refuse "(null)" as a grammar error instead.
+	run_probe --print-plan --app "$APP" --out "$NEVER" --second-delay
+	OK=0
+	[ "$RC" -eq 2 ] || OK=1
+	[ "$(grep -c '' "$TEST_DIR/stderr.txt" || true)" -eq 1 ] || OK=1
+	grep -qxF -- 'Missing value for --second-delay' "$TEST_DIR/stderr.txt" || OK=1
+	grep -q 'Usage:' "$TEST_DIR/stdout.txt" || OK=1
+	[ "$(grep -c -e '^set ' -e '^reconnect-leg ' "$TEST_DIR/stdout.txt" || true)" -eq 0 ] || OK=1
+	{
+		printf 'rc=%s\n--- stderr ---\n' "$RC"
+		head -3 "$TEST_DIR/stderr.txt"
+	} >"$TEST_DIR/m4.txt"
+	check "$OK" "missing value for --second-delay" "exit 2, stderr exactly 'Missing value for --second-delay', usage on stdout, no plan line" "$TEST_DIR/m4.txt"
 fi
 
 echo "== summary =="
