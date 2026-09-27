@@ -2,8 +2,8 @@
 # lab relay -- one-shot RemoteApp run against the owner's own test host (authorized e2e
 # lab; same posture as W7's acceptance relay). Reads NO credentials itself beyond
 # sourcing the owner's untracked host.env. Launched via Terminal.app (local-network TCC
-# holder); `open -a Terminal` does not pass environment variables through, so ALL
-# parameters come from job.env.
+# holder); `open -a Terminal` does not pass environment variables through, so ALL job
+# parameters come from job.env (the client pin is not a job parameter -- see CLIENT PIN).
 #
 # THIS FILE IS TRACKED (Scripts/lab, since 2026-09-01) and therefore world-readable: it
 # must never gain a host address, account name or credential. Everything host-specific is
@@ -16,6 +16,43 @@
 # own lab segments. Fail-closed -- a refusal writes BOUNDARY-REFUSED plus a non-zero DONE
 # line to relay.log and no connection is attempted. The window still self-closes; the
 # verdict lives in the log, which is what callers poll.
+#
+# CLIENT PIN (2026-09-28): on 2026-09-24 Homebrew silently upgraded xfreerdp to FreeRDP 3.32.0,
+# whose drive redirection regressed (upstream FreeRDP issue #13495: drive_file_read passes the
+# wrong object to GetFileSize, so every redirected file reads as size 0). Host-side jobs that
+# read their payload from \\tsclient\lab then ran on empty input and still ended DONE exit=0,
+# and nothing in relay.log said which client had dialled. So the client is now pinnable and
+# fingerprinted. After job.env has been validated, the binary that dials is resolved as:
+#   1. .build/lab-runtime/relay-client.env (untracked; one line MACDOWS_XFREERDP='<abs path>').
+#      When the file is PRESENT -- a dangling symlink, a directory or an unreadable file counts as
+#      present -- it is authoritative: it must be a readable regular file, it is read like job.env
+#      (executed once in a subshell, only that one key comes back out, a trailing CR is stripped),
+#      and a missing, empty, multi-line, relative or non-executable value refuses the run -- it
+#      never falls through to 2 or 3. To unpin, delete the file.
+#   2. MACDOWS_XFREERDP from the environment, when non-empty (same validation). `open -a Terminal`
+#      does not pass the caller's environment through, so this level reaches a launched relay
+#      only via what the Terminal login shell itself exports (shell start-up files, `launchctl
+#      setenv`) -- or when the relay is run by hand from a shell.
+#   3. xfreerdp from PATH (the behaviour before this pin); nothing found refuses the run.
+# The resolved client must then answer `--version` with exit status 0: a pin whose libraries no
+# longer load (dyld failure, abort) or whose interpreter is gone is refused here instead of
+# dialling and ending DONE exit=0 with nothing done on the host. The probe runs with stdin and
+# stderr on /dev/null, and it has no timeout: a client that hangs on --version stalls the relay
+# before its DONE line, and the caller's own WAIT_* timeout is the backstop. A refusal writes
+# CLIENT-INVALID plus DONE exit=69 (EX_UNAVAILABLE) and dials nothing. The pin is deliberately
+# NOT a job.env key: it describes the machine the relay runs on, not the job -- every job of a
+# batch must dial through the same binary, and jobs/*.env are tracked while the pin is a
+# machine-local path that may sit under the home directory. Every dialling run logs
+#   [relay] client=<x.y.z|unknown> sha8=<first 8 hex of the binary's SHA-256|unknown> source=<file|env|path>
+# before its program= line (source= names the level that chose the client: file = 1, env = 2,
+# path = 3). The version is the first x.y.z
+# after "version " on the first --version line, skipping a leading [argv0] (FreeRDP's
+# print_version_ex form puts the binary's path, whose directory may itself carry a version,
+# there); `unknown` when there is none. sha8 fingerprints the executable only: the drive code
+# lives in libfreerdp-client, loaded through @rpath, which the version token reflects (that
+# library prints it) and sha8 does not. Neither this line nor anything else the relay writes
+# carries the pin path, and the client is started as `exec -a xfreerdp`, so its argv[0] -- which
+# FreeRDP echoes into relay.log in its usage and error banners -- is `xfreerdp`, as before the pin.
 #
 # job.env keys:
 #   PROGRAM   Windows path of the RemoteApp program to run
@@ -59,6 +96,87 @@ relay_extra_tokens_ok() { # <XFREERDP_EXTRA value>
     return 0
 }
 
+# Resolves the client that will dial (CLIENT PIN in the header) and fingerprints it. On success
+# sets XFREERDP_BIN (an absolute path), XFREERDP_SOURCE (file|env|path), CLIENT_VERSION and
+# CLIENT_SHA8 and returns 0; on refusal sets CLIENT_REASON (a fixed text -- never the path) and
+# returns 1 having run nothing but, at most, the client's own --version probe.
+relay_resolve_client() {
+    local pin='' pin_source='' client_end='' client_keys cr ver_out ver_rc ver_line
+    cr=$(printf '\r')
+    XFREERDP_BIN=''; XFREERDP_SOURCE=''; CLIENT_VERSION=''; CLIENT_SHA8=''; CLIENT_REASON=''
+    # `-L` too: a dangling symlink is not `-e`, and it must refuse rather than fall through.
+    if [ -e "$RUNTIME/relay-client.env" ] || [ -L "$RUNTIME/relay-client.env" ]; then
+        if [ ! -f "$RUNTIME/relay-client.env" ] || [ ! -r "$RUNTIME/relay-client.env" ]; then
+            CLIENT_REASON="relay-client.env is not a readable regular file"
+            return 1
+        fi
+        # Same isolation as job.env: executed once in a subshell, one key plus a sentinel come
+        # back out, so the file cannot redefine the gate, a function or any other variable of
+        # this shell. MACDOWS_XFREERDP is unset first, so a file that sets nothing refuses the run
+        # instead of silently handing over the environment's value.
+        # shellcheck source=/dev/null
+        client_keys="$( unset MACDOWS_XFREERDP; . "$RUNTIME/relay-client.env" >/dev/null 2>&1; printf '%s\n%s\n' "${MACDOWS_XFREERDP:-}" 'END-OF-CLIENT-KEYS' )"
+        { IFS= read -r pin; IFS= read -r client_end; } <<EOF_CLIENT_KEYS
+$client_keys
+EOF_CLIENT_KEYS
+        pin="${pin%"$cr"}"; client_end="${client_end%"$cr"}"
+        if [ "$client_end" != "END-OF-CLIENT-KEYS" ]; then
+            CLIENT_REASON="relay-client.env does not yield one single-line MACDOWS_XFREERDP (multi-line value or early exit)"
+            return 1
+        elif [ -z "$pin" ]; then
+            CLIENT_REASON="relay-client.env exists but sets no MACDOWS_XFREERDP"
+            return 1
+        fi
+        pin_source='file'
+    else
+        pin="${MACDOWS_XFREERDP:-}"
+        pin_source='env'
+    fi
+    if [ -n "$pin" ]; then
+        XFREERDP_BIN="$pin"
+        XFREERDP_SOURCE="$pin_source"
+    else
+        XFREERDP_BIN="$(command -v xfreerdp 2>/dev/null)"
+        XFREERDP_SOURCE='path'
+    fi
+    # Absolute, a regular file (a directory is -x too) and executable. `command -v` answers a bare
+    # name for a function or alias, which the absolute-path test turns away as well.
+    case "$XFREERDP_BIN" in
+        /*) ;;
+        *) XFREERDP_BIN='' ;;
+    esac
+    if [ -z "$XFREERDP_BIN" ] || [ ! -f "$XFREERDP_BIN" ] || [ ! -x "$XFREERDP_BIN" ]; then
+        if [ "$XFREERDP_SOURCE" != "path" ]; then
+            CLIENT_REASON="MACDOWS_XFREERDP is not an executable absolute path"
+        else
+            CLIENT_REASON="no executable xfreerdp on PATH"
+        fi
+        return 1
+    fi
+    # The probe must exit 0 (CLIENT PIN in the header). Its stderr goes to /dev/null so a loader or
+    # interpreter error naming the binary's path never reaches relay.log; its stdin is /dev/null
+    # so it can never consume or wait on the relay's own stdin.
+    ver_out="$("$XFREERDP_BIN" --version 2>/dev/null </dev/null)"; ver_rc=$?
+    if [ "$ver_rc" -ne 0 ]; then
+        CLIENT_REASON="client version probe failed"
+        return 1
+    fi
+    # First line only; drop everything up to "version " and a leading "[argv0] ", then take the
+    # first x.y.z -- the trailing (<revision>) may repeat it, hence the final head.
+    ver_line="$(printf '%s\n' "$ver_out" | head -n 1)"
+    case "$ver_line" in *'version '*) ver_line="${ver_line#*version }" ;; esac
+    case "$ver_line" in '['*) ver_line="${ver_line#*] }" ;; esac
+    CLIENT_VERSION="$(printf '%s\n' "$ver_line" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"
+    [ -n "$CLIENT_VERSION" ] || CLIENT_VERSION=unknown
+    # Read through the path as resolved: shasum follows a symlink (Homebrew's bin/ entry), so the
+    # digest is that of the real binary, the same as hashing its `readlink -f` target. stderr is
+    # redirected BEFORE the input, so an unreadable (execute-only) binary's redirection error --
+    # which names the path -- goes to /dev/null too; the shape check then records `unknown`.
+    CLIENT_SHA8="$(shasum -a 256 2>/dev/null <"$XFREERDP_BIN" | cut -c1-8)"
+    printf '%s' "$CLIENT_SHA8" | grep -qE '^[0-9a-f]{8}$' || CLIENT_SHA8=unknown
+    return 0
+}
+
 {
     # shellcheck source=/dev/null
     source "$HOME/.config/macdows/host.env"
@@ -81,12 +199,15 @@ relay_extra_tokens_ok() { # <XFREERDP_EXTRA value>
     # non-numeric TIMEOUT made the poll loop's `-lt` fail so the connection was torn down at
     # once yet reported DONE exit=0 (r4 I1). The contract is "every run writes DONE" -- the
     # job.env refusals keep it, each with a named reason and a sysexits code the caller can
-    # tell apart (66 EX_NOINPUT / 65 EX_DATAERR; 78 EX_CONFIG stays the boundary's).
+    # tell apart (66 EX_NOINPUT / 65 EX_DATAERR; 78 EX_CONFIG stays the boundary's; 69
+    # EX_UNAVAILABLE is the client pin's CLIENT-INVALID, see CLIENT PIN in the header).
     if ! crdp_assert_lab_boundary "${WIN_HOST:-}"; then
         echo "[relay] BOUNDARY-REFUSED -- target is not a permitted lab host; no connection attempted"
         RELAY_RC=78
     elif [ ! -r "$RUNTIME/job.env" ]; then
-        echo "[relay] JOB-ENV-MISSING -- $RUNTIME/job.env is not readable; no connection attempted"
+        # The repo-relative spelling: $RUNTIME is an absolute path that may sit under the home
+        # directory, and nothing the relay logs names one.
+        echo "[relay] JOB-ENV-MISSING -- .build/lab-runtime/job.env is not readable; no connection attempted"
         RELAY_RC=66
     else
         # One subshell, four lines out plus a sentinel (the keys are single-line by contract;
@@ -117,7 +238,11 @@ EOF_JOB_KEYS
         elif ! relay_extra_tokens_ok "$XFREERDP_EXTRA"; then
             echo "[relay] JOB-ENV-INVALID -- job.env XFREERDP_EXTRA carries a switch outside the allowlist (/scale:<100|140|180>, /scale-desktop:<100-500>, /scale-device:<100|140|180>, /dynamic-resolution); no connection attempted"
             RELAY_RC=65
+        elif ! relay_resolve_client; then
+            echo "[relay] CLIENT-INVALID -- ${CLIENT_REASON}; no connection attempted"
+            RELAY_RC=69
         else
+            echo "[relay] client=${CLIENT_VERSION} sha8=${CLIENT_SHA8} source=${XFREERDP_SOURCE}"
             APP_SPEC="/app:program:${PROGRAM}"
             if [ -n "${CMDARGS:-}" ]; then
                 APP_SPEC="${APP_SPEC},cmd:${CMDARGS}"
@@ -133,8 +258,11 @@ EOF_JOB_KEYS
             # shellcheck disable=SC2086
             set -- $XFREERDP_EXTRA
             set +f
-            xfreerdp "/v:${WIN_HOST}" "/u:${WIN_USER}" "/p:${WIN_PASS}" /cert:ignore \
-                "$@" "$APP_SPEC" "/drive:lab,${SHARE}" /gfx:AVC420 &
+            # `exec -a xfreerdp` keeps argv[0] what it was before the pin (CLIENT PIN in the header)
+            # instead of the pin's absolute path. The subshell execs the client, so $! is the
+            # client's own pid and the TIMEOUT kill below still reaches it.
+            ( exec -a xfreerdp "$XFREERDP_BIN" "/v:${WIN_HOST}" "/u:${WIN_USER}" "/p:${WIN_PASS}" /cert:ignore \
+                "$@" "$APP_SPEC" "/drive:lab,${SHARE}" /gfx:AVC420 ) &
             XPID=$!
             SECS=0
             while kill -0 "$XPID" 2>/dev/null && [ "$SECS" -lt "$TIMEOUT" ]; do
