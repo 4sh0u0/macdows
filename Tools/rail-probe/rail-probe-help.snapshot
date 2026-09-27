@@ -7,8 +7,8 @@ Usage: rail-probe --host <host> --user <user> --app <exe-path> --out <file.jsonl
                            process listing (ps/argv is world-readable).
   --app <exe-path>         RemoteApp program to launch, e.g. 'C:\\Windows\\System32\\winver.exe'
   --second-exec <exe-path> Launch a second RemoteApp after --second-delay seconds
-  --second-delay <secs>    Delay before launching --second-exec (default: 8)
-  --duration <secs>        Total session duration before clean disconnect (default: 25)
+  --second-delay <secs>    Delay before launching --second-exec (whole seconds, 0..3600; default: 8)
+  --duration <secs>        Total session duration before clean disconnect (whole seconds, 1..3600; default: 25)
   --no-hidef               Disable HiDefRemoteApp (FreeRDP_HiDefRemoteApp=FALSE)
   --decode                 Keep FreeRDP_DeactivateClientDecoding=FALSE (full GFX decode path) and log per-codecId SurfaceCommand stats (CodecStats event every 50 frames, codecCounts in the summary). Without this flag, decoding stays disabled as before.
   --desktop <w>x<h>        Declare a remote desktop size (FreeRDP_DesktopWidth/Height, each 1..65535). Without it FreeRDP's own default is left untouched, as before.

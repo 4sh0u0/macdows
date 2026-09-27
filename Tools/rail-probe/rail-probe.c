@@ -69,6 +69,8 @@ typedef struct
 	char pass[256];
 	char app[520];
 	char second_exec[520];
+	/* --second-delay / --duration, whole seconds. Validated in parse_args (parse_seconds_knob):
+	 * 0..3600 and 1..3600; defaults 8 and 25. */
 	int second_delay;
 	int duration;
 	bool no_hidef;
@@ -437,9 +439,10 @@ static void usage(const char* prog)
 	       "  --app <exe-path>         RemoteApp program to launch, e.g. 'C:\\\\Windows\\\\"
 	       "System32\\\\winver.exe'\n"
 	       "  --second-exec <exe-path> Launch a second RemoteApp after --second-delay seconds\n"
-	       "  --second-delay <secs>    Delay before launching --second-exec (default: 8)\n"
-	       "  --duration <secs>        Total session duration before clean disconnect "
-	       "(default: 25)\n"
+	       "  --second-delay <secs>    Delay before launching --second-exec (whole seconds, "
+	       "0..3600; default: 8)\n"
+	       "  --duration <secs>        Total session duration before clean disconnect (whole "
+	       "seconds, 1..3600; default: 25)\n"
 	       "  --no-hidef               Disable HiDefRemoteApp (FreeRDP_HiDefRemoteApp=FALSE)\n"
 	       "  --decode                 Keep FreeRDP_DeactivateClientDecoding=FALSE (full GFX "
 	       "decode path) and log per-codecId SurfaceCommand stats (CodecStats event every 50 "
@@ -520,29 +523,59 @@ static bool parse_scale_knob(const char* text, uint32_t* desktop, uint32_t* devi
 	return true;
 }
 
-/* R-6 lane G: strict "<a>,<g>", the parse_scale_knob discipline with both halves required -- a
- * in 1..3600 (leg 1's seconds; zero would be no leg at all), g in 0..3600 (the gap; zero is a
+/* One whole-number field of a knob -- the one grammar --reconnect-leg (each half), --duration and
+ * --second-delay share: a run of ASCII decimal digits starting at `text`, ended by `term` (the
+ * separator that must follow it, or '\0' for a knob's last field), whose value lies in min..max.
+ * Leading zeros normalise ("030" is 30, "08" is 8, never octal). A sign, whitespace, any other
+ * character and an empty field are refused by the digit-first rule and the terminator check, and
+ * an overlong run saturates strtoul at ULONG_MAX, above every max. On success *next (when given)
+ * points at the terminator. */
+static bool parse_decimal_field(const char* text, char term, unsigned long min, unsigned long max,
+                                unsigned long* out, const char** next)
+{
+	char* end = NULL;
+	unsigned long v = 0;
+	if (!text || !isdigit((unsigned char)text[0]))
+		return false;
+	v = strtoul(text, &end, 10);
+	if (*end != term || v < min || v > max)
+		return false;
+	*out = v;
+	if (next)
+		*next = end;
+	return true;
+}
+
+/* R-6 lane G: strict "<a>,<g>", both halves required and each one parse_decimal_field -- a in
+ * 1..3600 (leg 1's seconds; zero would be no leg at all), g in 0..3600 (the gap; zero is a
  * legitimate back-to-back reconnect). No default gap: the value belongs to the run's
  * pre-registration, not to this tool. A missing half, a trailing comma, a third field, a sign,
  * whitespace and hex are all refused; leading zeros normalise ("030,00" is 30,0, and the plan
  * prints the normalised values). */
 static bool parse_reconnect_leg_knob(const char* text, uint32_t* leg1, uint32_t* gap)
 {
-	char* end = NULL;
+	const char* comma = NULL;
 	unsigned long a = 0;
 	unsigned long g = 0;
-	if (!text || !isdigit((unsigned char)text[0]))
+	if (!parse_decimal_field(text, ',', 1, 3600, &a, &comma))
 		return false;
-	a = strtoul(text, &end, 10);
-	if (*end != ',' || !isdigit((unsigned char)end[1]))
-		return false;
-	g = strtoul(end + 1, &end, 10);
-	if (*end != '\0')
-		return false;
-	if (a < 1 || a > 3600 || g > 3600)
+	if (!parse_decimal_field(comma + 1, '\0', 0, 3600, &g, NULL))
 		return false;
 	*leg1 = (uint32_t)a;
 	*gap = (uint32_t)g;
+	return true;
+}
+
+/* --duration (1..3600) and --second-delay (0..3600): one parse_decimal_field over the whole
+ * string, so it has the grammar and the 3600 ceiling of a --reconnect-leg half. Replaces the
+ * bare atoi() that took "abc" as 0, "-5" as -5 and "25abc" as 25 without a word. Callers pass
+ * 0 <= min <= max. */
+static bool parse_seconds_knob(const char* s, int min, int max, int* out)
+{
+	unsigned long v = 0;
+	if (!parse_decimal_field(s, '\0', (unsigned long)min, (unsigned long)max, &v, NULL))
+		return false;
+	*out = (int)v;
 	return true;
 }
 
@@ -614,13 +647,23 @@ static bool parse_args(int argc, char** argv, probeConfig* cfg)
 		{
 			if (++i >= argc)
 				goto missing;
-			cfg->second_delay = atoi(argv[i]);
+			if (!parse_seconds_knob(argv[i], 0, 3600, &cfg->second_delay))
+			{
+				fprintf(stderr, "Invalid value for --second-delay: '%s' (want whole seconds 0..3600)\n", argv[i]);
+				usage(argv[0]);
+				return false;
+			}
 		}
 		else if (strcmp(a, "--duration") == 0)
 		{
 			if (++i >= argc)
 				goto missing;
-			cfg->duration = atoi(argv[i]);
+			if (!parse_seconds_knob(argv[i], 1, 3600, &cfg->duration))
+			{
+				fprintf(stderr, "Invalid value for --duration: '%s' (want whole seconds 1..3600)\n", argv[i]);
+				usage(argv[0]);
+				return false;
+			}
 		}
 		else if (strcmp(a, "--no-hidef") == 0)
 		{
