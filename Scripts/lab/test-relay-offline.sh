@@ -12,7 +12,11 @@
 #   1. `xfreerdp`, `osascript` and `nc` are PATH-shimmed, and the suite ASSERTS before the first
 #      case that the shim is what PATH resolves each of them to. The xfreerdp shim records its
 #      argv and either exits at once or `exec`s a sleep (so the relay's TIMEOUT kill has a real
-#      process to kill and killing it leaves no orphan). It opens no socket.
+#      process to kill and killing it leaves no orphan). It opens no socket. The client-pin cases
+#      (13*) pin copies of the same shim that live under the sandbox's pins/ directory, never on
+#      PATH; every copy answers `--version` with its own fixed line (or fails it on purpose). Case
+#      13l also compiles a tiny C stub with `cc`, when one is available, because a #! script never
+#      sees its own argv[0]; it records its argv and exits, and opens nothing either.
 #   2. HOME is redirected into the sandbox. Its host.env carries an RFC 5737 documentation
 #      address and placeholder account strings (never a real host, never a real credential).
 #   3. relay.command is copied into a sandbox tree at the same depth as the real one, so its
@@ -25,7 +29,7 @@
 #      parses an IP literal directly; no DNS is ever consulted for one).
 #
 # Each case starts with `begin`, which resets the per-case trace and the sandbox log, so no
-# case depends on what the previous one left behind. Two mutation proofs (M1, M2) copy the
+# case depends on what the previous one left behind. The mutation proofs (M1-M8) copy the
 # relay with one guard disabled and require the case that claims to pin it to FAIL against
 # the mutant. A pin that would also pass against the broken code pins nothing.
 #
@@ -112,15 +116,45 @@ snapshot_tracked > "$TRACKED_PRISTINE" || exit 1
 
 # -- PATH shims ------------------------------------------------------------------------------
 
-cat > "$SB/bin/xfreerdp" <<'SHIM_XFREERDP' || exit 1
-#!/usr/bin/env bash
-# OFFLINE TEST SHIM: records argv and either exits at once or `exec`s a sleep so the relay's
-# TIMEOUT kill has a real process to kill. `exec` matters: it makes THIS pid the sleeping
-# process, so the pid the relay kills (and the pid this suite reads from the trace) is the
-# sleep itself -- no orphaned child outlives the case. Opens nothing.
+# One shim body, several copies: the PATH shim and the pinned stubs under $SB/pins (never on PATH)
+# differ only in how they answer `--version`, so each copy also has its own SHA-256 -- which is
+# what lets the client-line cases (13*) tell them apart.
+write_xfreerdp_shim() { # <path> <--version answer line> [probe mode: ok|exit127|abort|noisy]
+	{
+		printf '#!/usr/bin/env bash\n'
+		printf 'LABTEST_SHIM_VERSION_LINE=%q\n' "$2"
+		printf 'LABTEST_SHIM_PROBE_MODE=%q\n' "${3:-ok}"
+		cat <<'SHIM_XFREERDP'
+# OFFLINE TEST SHIM. `--version` follows LABTEST_SHIM_PROBE_MODE:
+#   ok       answer the line above, exit 0; the probe is recorded as a `version` trace line,
+#            never as a dial
+#   exit127  exit 127 without answering or recording (a client that cannot start)
+#   abort    die of SIGABRT without answering or recording (the shape of a dyld load failure)
+#   noisy    like ok, but also write $0 to stderr, record any stdin line it can read as
+#            `version stdin=<line>`, and answer in FreeRDP's print_version_ex form
+#            `This is FreeRDP version [<$0>] <line above>`
+# Any other call records its own path ($0) and its argv and either exits at once or `exec`s a
+# sleep so the relay's TIMEOUT kill has a real process to kill. `exec` matters: it makes THIS pid
+# the sleeping process, so the pid the relay kills (and the pid this suite reads from the trace)
+# is the sleep itself -- no orphaned child outlives the case. Opens nothing.
 set -u
+if [ "${1:-}" = "--version" ]; then
+	case "$LABTEST_SHIM_PROBE_MODE" in
+	exit127) exit 127 ;;
+	abort) kill -ABRT "$$"; exit 1 ;;
+	esac
+	printf 'version argv0=%s\n' "$0" >> "$LABTEST_TRACE"
+	if [ "$LABTEST_SHIM_PROBE_MODE" = noisy ]; then
+		printf '%s\n' "$0" >&2
+		if IFS= read -r -t 1 l; then printf 'version stdin=%s\n' "$l" >> "$LABTEST_TRACE"; fi
+		printf 'This is FreeRDP version [%s] %s\n' "$0" "$LABTEST_SHIM_VERSION_LINE"
+	else
+		printf '%s\n' "$LABTEST_SHIM_VERSION_LINE"
+	fi
+	exit 0
+fi
 {
-	printf 'xfreerdp pid=%s' "$$"
+	printf 'xfreerdp pid=%s argv0=%s' "$$" "$0"
 	for a in "$@"; do printf ' [%s]' "$a"; done
 	printf '\n'
 } >> "$LABTEST_TRACE"
@@ -131,6 +165,97 @@ exit1) exit 1 ;;
 *) exit 0 ;;
 esac
 SHIM_XFREERDP
+	} > "$1" && chmod +x "$1"
+}
+write_xfreerdp_shim "$SB/bin/xfreerdp" 'This is FreeRDP version 9.9.9 (n/a)' || exit 1
+# Pinned stubs for the client-pin cases: three that answer a version (or none), one that is not
+# executable and a directory (which `-x` alone would accept).
+PINS="$SB/pins"
+PIN_A="$PINS/a/xfreerdp"
+PIN_B="$PINS/b/xfreerdp"
+PIN_NOVERSION="$PINS/noversion/xfreerdp"
+PIN_NOEXEC="$PINS/noexec/xfreerdp"
+PIN_DIR="$PINS/dir-pin"
+mkdir -p "$PINS/a" "$PINS/b" "$PINS/noversion" "$PINS/noexec" "$PIN_DIR" || exit 1
+write_xfreerdp_shim "$PIN_A" 'This is FreeRDP version 8.8.8 (n/a)' || exit 1
+write_xfreerdp_shim "$PIN_B" 'This is FreeRDP version 7.7.7 (n/a)' || exit 1
+# Two lines: the version token is taken from the FIRST line only, so the x.y.z on the second must
+# not be picked up (13f).
+write_xfreerdp_shim "$PIN_NOVERSION" "$(printf '%s\n%s' 'This is FreeRDP version n/a (no release tag)' 'Build configuration: 1.2.3')" || exit 1
+write_xfreerdp_shim "$PIN_NOEXEC" 'This is FreeRDP version 6.6.6 (n/a)' || exit 1
+chmod -x "$PIN_NOEXEC" || exit 1
+# Clients that fail the --version probe (13k): exit 127, SIGABRT, and an interpreter that is gone.
+PIN_V127="$PINS/v127/xfreerdp"
+PIN_ABORT="$PINS/abort/xfreerdp"
+PIN_BADINTERP="$PINS/badinterp/xfreerdp"
+mkdir -p "$PINS/v127" "$PINS/abort" "$PINS/badinterp" || exit 1
+write_xfreerdp_shim "$PIN_V127" 'This is FreeRDP version 5.0.1 (n/a)' exit127 || exit 1
+write_xfreerdp_shim "$PIN_ABORT" 'This is FreeRDP version 5.0.2 (n/a)' abort || exit 1
+printf '#!/nonexistent/labtest-interpreter\n' > "$PIN_BADINTERP" || exit 1
+chmod +x "$PIN_BADINTERP" || exit 1
+# A noisy client (13n) in a directory whose name carries a version of its own, as the pinned build's
+# does: its print_version_ex answer puts that path before the real version, which repeats in the
+# revision field.
+PIN_NOISY="$PINS/xfreerdp-1.1.1/xfreerdp"
+mkdir -p "$PINS/xfreerdp-1.1.1" || exit 1
+write_xfreerdp_shim "$PIN_NOISY" '4.4.4 (4.4.4)' noisy || exit 1
+# A `shasum` that answers no digest (13n), put on PATH only for the run that needs it.
+mkdir -p "$SB/badsha" || exit 1
+cat > "$SB/badsha/shasum" <<'SHIM_BADSHA' || exit 1
+#!/usr/bin/env bash
+# OFFLINE TEST SHIM: a digest tool that answers something that is not a digest.
+printf '%s\n' 'not-a-digest  -'
+SHIM_BADSHA
+chmod +x "$SB/badsha/shasum" || exit 1
+# Stdin the relay is given in 13n: a probe that inherited it would read this line.
+printf 'LABTEST-STDIN-SENTINEL\n' > "$SB/stdin-data.txt" || exit 1
+# A compiled client for 13l (a #! script never sees its own argv[0]), built only when a working
+# `cc` exists; without one 13l runs its source-shape half alone and says so. One copy doubles as
+# the PATH form (via RELAY_PATH_OVERRIDE), one is execute-only (mode 0111) for the sha8 fallback.
+CSTUB_DIR="$SB/cstub"
+CSTUB_BIN="$CSTUB_DIR/bin/xfreerdp"
+CSTUB_EXEC_ONLY="$CSTUB_DIR/exec-only/xfreerdp"
+CSTUB_OK=0
+mkdir -p "$CSTUB_DIR/bin" "$CSTUB_DIR/exec-only" || exit 1
+cat > "$CSTUB_DIR/xfreerdp-stub.c" <<'CSTUB_SRC' || exit 1
+/* OFFLINE TEST STUB: answers --version; any other call echoes argv[0] on stderr the way FreeRDP's
+ * usage and error banners do, records its argv (argv[0] included) and exits. Opens nothing. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv)
+{
+	const char *trace = getenv("LABTEST_TRACE");
+	const char *ledger = getenv("LABTEST_PID_LEDGER");
+	FILE *t;
+	int i;
+	if (argc > 1 && strcmp(argv[1], "--version") == 0) {
+		if (trace && (t = fopen(trace, "a")) != NULL) {
+			fprintf(t, "version argv0=%s\n", argv[0]);
+			fclose(t);
+		}
+		printf("This is FreeRDP version 5.5.5 (n/a)\n");
+		return 0;
+	}
+	fprintf(stderr, "%s - offline stub banner\n", argv[0]);
+	if (trace && (t = fopen(trace, "a")) != NULL) {
+		fprintf(t, "xfreerdp pid=%d argv0=%s", (int)getpid(), argv[0]);
+		for (i = 1; i < argc; i++)
+			fprintf(t, " [%s]", argv[i]);
+		fprintf(t, "\n");
+		fclose(t);
+	}
+	if (ledger && (t = fopen(ledger, "a")) != NULL) {
+		fprintf(t, "%d\n", (int)getpid());
+		fclose(t);
+	}
+	return 0;
+}
+CSTUB_SRC
+if command -v cc >/dev/null 2>&1 && cc -o "$CSTUB_BIN" "$CSTUB_DIR/xfreerdp-stub.c" >/dev/null 2>&1; then
+	cp "$CSTUB_BIN" "$CSTUB_EXEC_ONLY" && chmod 0111 "$CSTUB_EXEC_ONLY" && CSTUB_OK=1
+fi
 
 for tool in osascript nc; do
 	cat > "$SB/bin/$tool" <<SHIM_REFUSE || exit 1
@@ -141,7 +266,7 @@ exit 97
 SHIM_REFUSE
 done
 chmod +x "$SB"/bin/* || exit 1
-for shim in "$SB"/bin/*; do
+for shim in "$SB"/bin/* "$PINS"/*/xfreerdp; do
 	if ! bash -n "$shim"; then printf 'shim does not parse: %s\n' "$shim"; exit 1; fi
 done
 # The load-bearing safety assertion: with the sandbox PATH in force, each shimmed name MUST
@@ -172,10 +297,27 @@ fi
 
 # -- Helpers ---------------------------------------------------------------------------------
 
-begin() { # <case label>
-	CASE="$1"
+# The client pin's two run-environment inputs besides relay-client.env: RELAY_ENV_PIN is passed as
+# MACDOWS_XFREERDP (empty = unset, as the relay reads it) and RELAY_PATH_OVERRIDE, when non-empty,
+# replaces the sandbox PATH. Both (and RELAY_STDIN) are cleared by `begin` and by `reset_run`.
+RELAY_ENV_PIN=''
+RELAY_PATH_OVERRIDE=''
+# The relay's stdin: /dev/null unless a case names a file (13n).
+RELAY_STDIN=''
+# Clears everything one relay run leaves or reads, except job.env (a case with several runs keeps
+# its job and changes only the client inputs between them). `-r`: 13m makes relay-client.env a
+# directory; on a symlink `rm -rf` removes the link, never its target.
+reset_run() {
 	: > "$LABTEST_TRACE"
 	: > "$LOG"
+	rm -rf "$SBRUNTIME/relay-client.env"
+	RELAY_ENV_PIN=''
+	RELAY_PATH_OVERRIDE=''
+	RELAY_STDIN=''
+}
+begin() { # <case label>
+	CASE="$1"
+	reset_run
 	rm -f "$SBRUNTIME/job.env"
 }
 assert_has() { # <file> <fixed string>
@@ -199,6 +341,9 @@ assert_argv_has() { # <argv line> <element>
 last_line() { tail -n 1 "$LOG" 2>/dev/null; }
 done_lines() { grep -c '^DONE exit=' "$LOG" 2>/dev/null || true; }
 xfreerdp_calls() { grep -c '^xfreerdp pid=' "$LABTEST_TRACE" 2>/dev/null || true; }
+# Every line any xfreerdp shim or stub wrote this case -- dials AND --version probes. A refused
+# run must leave none: the client is resolved and probed only once everything else has passed.
+trace_lines() { grep -c '' "$LABTEST_TRACE" 2>/dev/null || true; }
 xfreerdp_argv() { grep '^xfreerdp pid=' "$LABTEST_TRACE" | head -n 1; }
 # Every pid the shim recorded this case; with `exec sleep` that IS the sleeping process.
 kill_recorded_shims() {
@@ -215,24 +360,65 @@ write_job() { # <PROGRAM> [CMDARGS] [TIMEOUT]
 	} > "$SBRUNTIME/job.env"
 }
 
+write_client_env() { # <MACDOWS_XFREERDP value>
+	printf 'MACDOWS_XFREERDP=%q\n' "$1" > "$SBRUNTIME/relay-client.env"
+}
+sha8_of() { shasum -a 256 < "$1" | cut -c1-8; }
+
+# Verdict of a DIALLING run for the client pin, as reasons (empty = every pin holds): exactly one
+# `[relay] client=` line, equal to `client=<version> sha8=<SHA-256 prefix of binary> source=<source>`
+# and placed before the program= line; exactly one dial, made by <binary> (its $0 in the trace);
+# DONE exit=0. 13a/13b and the M5/M6 mutation proofs share it, so "the mutant turns 13a red" means
+# literally this function returning reasons for the mutant.
+client_run_reasons() { # <version-token> <source> <binary>
+	local r='' n line cl pl want
+	want="[relay] client=$1 sha8=$(sha8_of "$3") source=$2"
+	n="$(grep -c '^\[relay\] client=' "$LOG" 2>/dev/null || true)"
+	[ "$n" = "1" ] || r="$r client-lines=$n;"
+	line="$(grep '^\[relay\] client=' "$LOG" 2>/dev/null | head -n 1)"
+	[ "$line" = "$want" ] || r="$r client-line=[$line]-expected-[$want];"
+	cl="$(grep -n '^\[relay\] client=' "$LOG" 2>/dev/null | head -n 1 | cut -d: -f1)"
+	pl="$(grep -n '^\[relay\] program=' "$LOG" 2>/dev/null | head -n 1 | cut -d: -f1)"
+	if [ -z "$cl" ] || [ -z "$pl" ] || [ "$cl" -ge "$pl" ]; then r="$r client-line-not-before-program-line;"; fi
+	[ "$(xfreerdp_calls)" = "1" ] || r="$r xfreerdp-calls=$(xfreerdp_calls);"
+	[[ "$(xfreerdp_argv)" == "xfreerdp pid="*" argv0=$3 ["* ]] || r="$r dial-not-from-the-expected-binary;"
+	[ "$(last_line)" = "DONE exit=0" ] || r="$r last-line=[$(last_line)];"
+	printf '%s' "$r"
+}
+
+# Verdict of a run the client pin must REFUSE, as reasons prefixed with <label>: the CLIENT-INVALID
+# line with <reason text>, DONE exit=69, nothing run at all (the trace is empty -- no dial and no
+# --version probe of any shim or stub) and no sandbox path in relay.log.
+client_refused_reasons() { # <label> <reason text>
+	local r=''
+	grep -qF "[relay] CLIENT-INVALID -- $2; no connection attempted" "$LOG" || r="$r $1:no-CLIENT-INVALID-line;"
+	[ "$(last_line)" = "DONE exit=69" ] || r="$r $1:last-line=[$(last_line)];"
+	[ ! -s "$LABTEST_TRACE" ] || r="$r $1:trace=[$(tr '\n' '|' < "$LABTEST_TRACE")];"
+	if grep -qF "$SB/" "$LOG"; then r="$r $1:sandbox-path-in-log;"; fi
+	printf '%s' "$r"
+}
+
 # Runs the relay (or a mutant copy) with the sandbox environment. Everything the relay reads
 # comes from HOME/PATH/job.env; TERM_PROGRAM is cleared so the Terminal self-close branch is
 # not taken. <boundary-file> empty = MACDOWS_LAB_BOUNDARY_FILE is passed EMPTY, which lib.sh's
 # `${MACDOWS_LAB_BOUNDARY_FILE:-…}` treats exactly like unset: the relay resolves the DEFAULT
 # path under the sandbox HOME, as it does live. (Passed as a plain variable, not an array --
 # `"${arr[@]}"` on an empty array is an unbound-variable error under bash 3.2 + `set -u`, the
-# /bin/bash this suite must also run under.)
+# /bin/bash this suite must also run under.) MACDOWS_XFREERDP is passed the same way, from
+# RELAY_ENV_PIN, and is EMPTY -- which the relay reads as unset -- unless a 13* case sets it. The
+# relay's stdin is /dev/null (or RELAY_STDIN), never the suite's own.
 run_relay() { # <relay-path> <boundary-file|""> [xfreerdp-mode]
 	env -i \
 		HOME="$SBHOME" \
-		PATH="$SB/bin:$PATH" \
+		PATH="${RELAY_PATH_OVERRIDE:-$SB/bin:$PATH}" \
 		TERM_PROGRAM= \
 		LABTEST_TRACE="$LABTEST_TRACE" \
 		LABTEST_REFUSED_TRACE="$LABTEST_REFUSED_TRACE" \
 		LABTEST_PID_LEDGER="$LABTEST_PID_LEDGER" \
 		LABTEST_XFREERDP_MODE="${3:-exit0}" \
 		MACDOWS_LAB_BOUNDARY_FILE="$2" \
-		bash "$1" >/dev/null 2>&1
+		MACDOWS_XFREERDP="$RELAY_ENV_PIN" \
+		bash "$1" >/dev/null 2>&1 < "${RELAY_STDIN:-/dev/null}"
 }
 
 # Runs the relay with a watchdog: kills it if it has not exited within <budget> seconds.
@@ -244,14 +430,15 @@ run_relay_bounded() { # <relay-path> <boundary-file|""> <xfreerdp-mode> <budget>
 	start=$(date +%s)
 	env -i \
 		HOME="$SBHOME" \
-		PATH="$SB/bin:$PATH" \
+		PATH="${RELAY_PATH_OVERRIDE:-$SB/bin:$PATH}" \
 		TERM_PROGRAM= \
 		LABTEST_TRACE="$LABTEST_TRACE" \
 		LABTEST_REFUSED_TRACE="$LABTEST_REFUSED_TRACE" \
 		LABTEST_PID_LEDGER="$LABTEST_PID_LEDGER" \
 		LABTEST_XFREERDP_MODE="$3" \
 		MACDOWS_LAB_BOUNDARY_FILE="$2" \
-		bash "$1" >/dev/null 2>&1 &
+		MACDOWS_XFREERDP="$RELAY_ENV_PIN" \
+		bash "$1" >/dev/null 2>&1 < "${RELAY_STDIN:-/dev/null}" &
 	pid=$!
 	while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$4" ]; do
 		sleep 1
@@ -283,7 +470,7 @@ begin '1 boundary refused'
 write_job 'C:\Windows\System32\notepad.exe'
 run_relay "$SBLAB/relay.command" "$DENY_FILE"
 if assert_has "$LOG" 'BOUNDARY-REFUSED' && assert_eq "$(last_line)" 'DONE exit=78' 'last log line' \
-	&& assert_eq "$(xfreerdp_calls)" '0' 'xfreerdp invocations' && assert_lacks "$LOG" 'LABTEST-PLACEHOLDER-SECRET-3f9a'; then
+	&& assert_eq "$(trace_lines)" '0' 'xfreerdp runs (dials and --version probes)' && assert_lacks "$LOG" 'LABTEST-PLACEHOLDER-SECRET-3f9a'; then
 	pass "$CASE: BOUNDARY-REFUSED logged, DONE exit=78, xfreerdp never invoked, no credential in the log"
 fi
 
@@ -295,7 +482,7 @@ write_job 'C:\Windows\System32\notepad.exe'
 run_relay "$SBLAB/relay.command" ""
 mv "$ALLOW_FILE.away" "$ALLOW_FILE" || exit 1
 if assert_has "$LOG" 'BOUNDARY-REFUSED' && assert_eq "$(last_line)" 'DONE exit=78' 'last log line' \
-	&& assert_eq "$(xfreerdp_calls)" '0' 'xfreerdp invocations'; then
+	&& assert_eq "$(trace_lines)" '0' 'xfreerdp runs (dials and --version probes)'; then
 	pass "$CASE: fail-closed refusal through the default boundary path, xfreerdp never invoked"
 fi
 
@@ -412,9 +599,9 @@ fi
 #    its own timeout.
 begin '9 job.env missing'
 run_relay "$SBLAB/relay.command" "" exit0
-if assert_has "$LOG" 'JOB-ENV-MISSING' && assert_eq "$(last_line)" 'DONE exit=66' 'last log line' \
-	&& assert_eq "$(xfreerdp_calls)" '0' 'xfreerdp invocations'; then
-	pass "$CASE: JOB-ENV-MISSING logged, DONE exit=66, xfreerdp never invoked"
+if assert_has "$LOG" 'JOB-ENV-MISSING' && assert_eq "$(last_line)" 'DONE exit=66' 'last log line' && assert_lacks "$LOG" "$SB/" \
+	&& assert_eq "$(trace_lines)" '0' 'xfreerdp runs (dials and --version probes)'; then
+	pass "$CASE: JOB-ENV-MISSING logged (repo-relative, no absolute path), DONE exit=66, xfreerdp never invoked"
 fi
 
 # 10. job.env present but without PROGRAM: same contract, its own reason and code (65 EX_DATAERR).
@@ -422,7 +609,7 @@ begin '10 job.env without PROGRAM'
 printf 'TIMEOUT=5\n' > "$SBRUNTIME/job.env"
 run_relay "$SBLAB/relay.command" "" exit0
 if assert_has "$LOG" 'JOB-ENV-INVALID' && assert_eq "$(last_line)" 'DONE exit=65' 'last log line' \
-	&& assert_eq "$(xfreerdp_calls)" '0' 'xfreerdp invocations'; then
+	&& assert_eq "$(trace_lines)" '0' 'xfreerdp runs (dials and --version probes)'; then
 	pass "$CASE: JOB-ENV-INVALID logged, DONE exit=65, xfreerdp never invoked"
 fi
 
@@ -434,7 +621,7 @@ begin '10b job.env cannot redefine the gate'
 printf 'crdp_assert_lab_boundary() { return 0; }\nPROGRAM=%q\n' 'C:\Windows\System32\notepad.exe' > "$SBRUNTIME/job.env"
 run_relay "$SBLAB/relay.command" "$DENY_FILE" exit0
 if assert_has "$LOG" 'BOUNDARY-REFUSED' && assert_eq "$(last_line)" 'DONE exit=78' 'last log line' \
-	&& assert_eq "$(xfreerdp_calls)" '0' 'xfreerdp invocations'; then
+	&& assert_eq "$(trace_lines)" '0' 'xfreerdp runs (dials and --version probes)'; then
 	pass "$CASE: a job.env redefining crdp_assert_lab_boundary is still refused (job.env is sourced after the gate)"
 fi
 
@@ -445,7 +632,7 @@ begin '10d job.env TIMEOUT not a positive integer'
 write_job 'C:\Windows\System32\notepad.exe' '' 'abc'
 run_relay "$SBLAB/relay.command" "" exit0
 if assert_has "$LOG" 'JOB-ENV-INVALID' && assert_has "$LOG" 'TIMEOUT is not a positive integer' \
-	&& assert_eq "$(last_line)" 'DONE exit=65' 'last log line' && assert_eq "$(xfreerdp_calls)" '0' 'xfreerdp invocations'; then
+	&& assert_eq "$(last_line)" 'DONE exit=65' 'last log line' && assert_eq "$(trace_lines)" '0' 'xfreerdp runs (dials and --version probes)'; then
 	pass "$CASE: JOB-ENV-INVALID (TIMEOUT) logged, DONE exit=65, xfreerdp never invoked"
 fi
 
@@ -475,7 +662,7 @@ begin '10f multi-line job.env value'
 printf 'PROGRAM=%q\nCMDARGS=$'"'"'a\\nb'"'"'\nTIMEOUT=5\n' 'C:\Windows\System32\notepad.exe' > "$SBRUNTIME/job.env"
 run_relay "$SBLAB/relay.command" "" exit0
 if assert_has "$LOG" 'spans more than one line' && assert_eq "$(last_line)" 'DONE exit=65' 'last log line' \
-	&& assert_eq "$(xfreerdp_calls)" '0' 'xfreerdp invocations'; then
+	&& assert_eq "$(trace_lines)" '0' 'xfreerdp runs (dials and --version probes)'; then
 	pass "$CASE: a multi-line CMDARGS is refused as JOB-ENV-INVALID (65), xfreerdp never invoked"
 fi
 
@@ -496,23 +683,6 @@ if assert_eq "$(xfreerdp_calls)" '1' 'xfreerdp invocations' \
 	&& assert_argv_has "$argv" "/drive:lab,$SBRUNTIME/share" && assert_lacks "$LABTEST_TRACE" '198.51.100.7' \
 	&& assert_lacks "$LABTEST_TRACE" '/etc]' && assert_argv_has "$argv" '/app:program:C:\Windows\System32\notepad.exe'; then
 	pass "$CASE: WIN_HOST/WIN_USER/WIN_PASS/SHARE overrides in job.env never reach the argv (subshell read, four keys only)"
-fi
-
-# 11. Across EVERY case above the refuse shims were never reached: the Terminal self-close
-#     branch was not taken and no socket helper was invoked (run-long trace, never reset).
-begin '11 refuse shims never reached'
-if [ ! -s "$LABTEST_REFUSED_TRACE" ]; then
-	pass "$CASE: osascript/nc shims recorded no call across the whole run (TERM_PROGRAM cleared; no socket helper invoked)"
-else
-	fail "$CASE: $(sort "$LABTEST_REFUSED_TRACE" | uniq -c | tr '\n' ';')"
-fi
-
-# 12. Tracked-tree census: every run above wrote only under .build/lab-runtime.
-begin '12 tracked tree census'
-if diff -q "$TRACKED_PRISTINE" <(snapshot_tracked) >/dev/null; then
-	pass "$CASE: no case wrote into the tracked lab directory"
-else
-	fail "$CASE: tracked tree changed"; diff "$TRACKED_PRISTINE" <(snapshot_tracked) | sed 's/^/        /'
 fi
 
 # ------------------------------------------------------------------------------------------
@@ -538,7 +708,7 @@ fi
 begin '12b XFREERDP_EXTRA cannot redirect the connection'
 printf 'PROGRAM=%q\nXFREERDP_EXTRA=%q\nTIMEOUT=5\n' 'C:\Windows\System32\notepad.exe' '/scale:180 /v:198.51.100.7' > "$SBRUNTIME/job.env"
 run_relay "$SBLAB/relay.command" "" exit0
-if assert_eq "$(xfreerdp_calls)" "0" "xfreerdp invocations" && assert_has "$LOG" 'JOB-ENV-INVALID' \
+if assert_eq "$(trace_lines)" "0" "xfreerdp runs (dials and --version probes)" && assert_has "$LOG" 'JOB-ENV-INVALID' \
 	&& assert_eq "$(last_line)" "DONE exit=65" "last line" && assert_lacks "$LABTEST_TRACE" '198.51.100.7'; then
 	pass "$CASE: a /v: token in XFREERDP_EXTRA is refused as JOB-ENV-INVALID (65); xfreerdp never runs"
 fi
@@ -546,7 +716,7 @@ fi
 begin '12c XFREERDP_EXTRA value outside the allowlist'
 printf 'PROGRAM=%q\nXFREERDP_EXTRA=%q\nTIMEOUT=5\n' 'C:\Windows\System32\notepad.exe' '/scale:150' > "$SBRUNTIME/job.env"
 run_relay "$SBLAB/relay.command" "" exit0
-if assert_eq "$(xfreerdp_calls)" "0" "xfreerdp invocations" && assert_has "$LOG" 'JOB-ENV-INVALID' \
+if assert_eq "$(trace_lines)" "0" "xfreerdp runs (dials and --version probes)" && assert_has "$LOG" 'JOB-ENV-INVALID' \
 	&& assert_eq "$(last_line)" "DONE exit=65" "last line"; then
 	pass "$CASE: /scale:150 (not one of 100|140|180) is refused as JOB-ENV-INVALID (65)"
 fi
@@ -569,6 +739,339 @@ argv="$(xfreerdp_argv)"
 if assert_eq "$(xfreerdp_calls)" "1" "xfreerdp invocations" && assert_argv_has "$argv" '/scale:140' && assert_lacks "$LABTEST_TRACE" "$(printf '\r')" \
 	&& assert_eq "$(last_line)" "DONE exit=0" "last line"; then
 	pass "$CASE: a trailing CR on XFREERDP_EXTRA is stripped; /scale:140 accepted; no CR reaches the argv"
+fi
+
+# 13. CLIENT PIN (2026-09-28). Homebrew's FreeRDP 3.32.0 read every redirected file as empty
+#     (upstream issue #13495) while the relay kept dialling whatever xfreerdp PATH found and logged
+#     nothing about it. The relay now resolves relay-client.env > environment MACDOWS_XFREERDP >
+#     PATH, refuses a bad pin as CLIENT-INVALID (69) before running anything, and logs
+#     `[relay] client=<version> sha8=<8 hex> source=<file|env|path>` before its program= line;
+#     source= names the level that chose the client (relay-client.env / environment / PATH).
+begin '13a client line (PATH)'
+write_job 'C:\Windows\System32\notepad.exe'
+run_relay "$SBLAB/relay.command" "" exit0
+reasons="$(client_run_reasons 9.9.9 path "$SB/bin/xfreerdp")"
+if [ -z "$reasons" ]; then
+	pass "$CASE: exactly one [relay] client=9.9.9 sha8=<the PATH shim's SHA-256 prefix> source=path line, before program=; the PATH shim dials"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
+begin '13b client pin via relay-client.env'
+write_client_env "$PIN_A"
+write_job 'C:\Windows\System32\notepad.exe'
+run_relay "$SBLAB/relay.command" "" exit0
+reasons="$(client_run_reasons 8.8.8 file "$PIN_A")"
+if [ -z "$reasons" ]; then
+	pass "$CASE: relay-client.env's stub dials (its \$0 in the trace) and is named client=8.8.8 sha8=<its own SHA-256 prefix> source=file"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"; note "trace: $(cat "$LABTEST_TRACE")"
+fi
+
+# 13c. A pin that is not an executable absolute path refuses the run and runs NOTHING -- not the
+#      pin, not a --version probe, and no fall-back to PATH: a non-executable file; a bare name,
+#      with the relay started from a directory that holds an executable stub of that name (so only
+#      the absolute-path rule can refuse it -- `-f`/`-x` pass, and bash would run the PATH shim); a
+#      directory (which `-x` alone accepts); a value spanning two lines (whose first line is a valid
+#      pin). One verdict over the four runs.
+begin '13c pin not an executable absolute path'
+write_job 'C:\Windows\System32\notepad.exe'
+reasons=''
+write_client_env "$PIN_NOEXEC"
+run_relay "$SBLAB/relay.command" "" exit0
+reasons="$reasons$(client_refused_reasons non-executable 'MACDOWS_XFREERDP is not an executable absolute path')"
+reset_run; write_client_env 'xfreerdp'
+(cd "$PINS/a" && run_relay "$SBLAB/relay.command" "" exit0)
+reasons="$reasons$(client_refused_reasons bare-name 'MACDOWS_XFREERDP is not an executable absolute path')"
+reset_run; write_client_env "$PIN_DIR"
+run_relay "$SBLAB/relay.command" "" exit0
+reasons="$reasons$(client_refused_reasons directory 'MACDOWS_XFREERDP is not an executable absolute path')"
+reset_run; write_client_env "$(printf '%s\n%s' "$PIN_A" "$PIN_A")"
+run_relay "$SBLAB/relay.command" "" exit0
+reasons="$reasons$(client_refused_reasons two-lines 'relay-client.env does not yield one single-line MACDOWS_XFREERDP (multi-line value or early exit)')"
+if [ -z "$reasons" ]; then
+	pass "$CASE: non-executable file, bare name, directory and two-line value each give CLIENT-INVALID + DONE exit=69 with nothing run and no path logged"
+else
+	fail "$CASE:$reasons"
+fi
+
+# 13d. relay-client.env gets the job.env isolation (the shape of 10b + 10c): a file that also
+#      redefines the gate and overrides the host, account, password, share and every job key must
+#      (i) leave a denied host refused and (ii) on an allowed host change nothing but the client --
+#      the argv, the program, the timeout and the extra switches still come from host.env/job.env.
+begin '13d relay-client.env cannot redefine the gate or other keys'
+write_job 'C:\Windows\System32\notepad.exe'
+write_intruder_client_env() {
+	{
+		printf 'crdp_assert_lab_boundary() { return 0; }\nrelay_extra_tokens_ok() { return 0; }\n'
+		printf 'MACDOWS_XFREERDP=%q\n' "$PIN_A"
+		printf 'WIN_HOST=198.51.100.7\nWIN_USER=intruder\nWIN_PASS=stolen\nSHARE=/etc\n'
+		printf 'PROGRAM=%q\nTIMEOUT=1\nXFREERDP_EXTRA=%q\n' 'C:\intruder.exe' '/v:198.51.100.7'
+	} > "$SBRUNTIME/relay-client.env"
+}
+reasons=''
+write_intruder_client_env
+run_relay "$SBLAB/relay.command" "$DENY_FILE" exit0
+grep -qF 'BOUNDARY-REFUSED' "$LOG" || reasons="$reasons deny:no-BOUNDARY-REFUSED;"
+[ "$(last_line)" = "DONE exit=78" ] || reasons="$reasons deny:last-line=[$(last_line)];"
+[ ! -s "$LABTEST_TRACE" ] || reasons="$reasons deny:trace-not-empty;"
+reset_run; write_intruder_client_env
+run_relay "$SBLAB/relay.command" "" exit0
+argv="$(xfreerdp_argv)"
+reasons="$reasons$(client_run_reasons 8.8.8 file "$PIN_A")"
+for want in '/v:192.0.2.10' '/u:labtest-placeholder' "/drive:lab,$SBRUNTIME/share" '/app:program:C:\Windows\System32\notepad.exe'; do
+	[[ "$argv" == *"[$want]"* ]] || reasons="$reasons allow:argv-lacks-[$want];"
+done
+for unwanted in '198.51.100.7' 'intruder' '/etc]' 'stolen'; do
+	if grep -qF -- "$unwanted" "$LABTEST_TRACE"; then reasons="$reasons allow:trace-has-[$unwanted];"; fi
+done
+grep -qF '[relay] program=C:\Windows\System32\notepad.exe timeout=25s extra=<none>' "$LOG" || reasons="$reasons allow:program-line-changed;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: a denied host stays refused; on an allowed host only the pin is taken -- host, account, share, program, timeout and extra switches in relay-client.env never reach the argv or the log"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"; note "argv: $argv"
+fi
+
+# 13e. A CRLF relay-client.env (the shape of 10e): the trailing CR is stripped, the pin is taken and
+#      no CR reaches the argv, the trace or relay.log.
+begin '13e CRLF relay-client.env'
+write_job 'C:\Windows\System32\notepad.exe'
+printf 'MACDOWS_XFREERDP=%q\r\n' "$PIN_A" > "$SBRUNTIME/relay-client.env"
+run_relay "$SBLAB/relay.command" "" exit0
+reasons="$(client_run_reasons 8.8.8 file "$PIN_A")"
+if grep -q "$(printf '\r')" "$LABTEST_TRACE"; then reasons="$reasons bare-CR-in-trace;"; fi
+if grep -q "$(printf '\r')" "$LOG"; then reasons="$reasons bare-CR-in-log;"; fi
+if [ -z "$reasons" ]; then
+	pass "$CASE: the trailing CR is stripped; the pinned stub dials and is named source=file; no CR reaches the trace or the log"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
+# 13f. A client whose FIRST --version line carries no x.y.z is named `unknown` (the x.y.z on its
+#      second line is not taken) -- and still dials: the line is a record, not a gate.
+begin '13f version token unknown'
+write_job 'C:\Windows\System32\notepad.exe'
+write_client_env "$PIN_NOVERSION"
+run_relay "$SBLAB/relay.command" "" exit0
+reasons="$(client_run_reasons unknown file "$PIN_NOVERSION")"
+if [ -z "$reasons" ]; then
+	pass "$CASE: no x.y.z on the first --version line gives client=unknown (the second line's is ignored) with the stub's sha8; the run still dials and ends DONE exit=0"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
+# 13g. The client line never carries a path (a pin may sit under the home directory): in both the
+#      pinned and the PATH form the one client= line contains no `/`, and no sandbox path at all
+#      reaches relay.log.
+begin '13g client line carries no path'
+write_job 'C:\Windows\System32\notepad.exe'
+reasons=''
+for form in pinned path; do
+	reset_run
+	if [ "$form" = pinned ]; then write_client_env "$PIN_A"; fi
+	run_relay "$SBLAB/relay.command" "" exit0
+	n="$(grep -c '^\[relay\] client=' "$LOG" || true)"
+	[ "$n" = "1" ] || reasons="$reasons $form:client-lines=$n;"
+	if grep '^\[relay\] client=' "$LOG" | grep -qF '/'; then reasons="$reasons $form:slash-in-client-line;"; fi
+	if grep -qF "$SB/" "$LOG"; then reasons="$reasons $form:sandbox-path-in-log;"; fi
+done
+if [ -z "$reasons" ]; then
+	pass "$CASE: pinned and PATH form each log one client= line without a '/', and no sandbox path reaches relay.log"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
+# 13h. Level 2 of the priority: with no relay-client.env, a non-empty MACDOWS_XFREERDP in the
+#      environment pins the client (source=env); an invalid one refuses without falling back to PATH.
+begin '13h environment MACDOWS_XFREERDP pin'
+write_job 'C:\Windows\System32\notepad.exe'
+RELAY_ENV_PIN="$PIN_A"
+run_relay "$SBLAB/relay.command" "" exit0
+reasons="$(client_run_reasons 8.8.8 env "$PIN_A")"
+reset_run; RELAY_ENV_PIN="$PIN_NOEXEC"
+run_relay "$SBLAB/relay.command" "" exit0
+reasons="$reasons$(client_refused_reasons env-non-executable 'MACDOWS_XFREERDP is not an executable absolute path')"
+if [ -z "$reasons" ]; then
+	pass "$CASE: an environment pin dials its stub as source=env; a non-executable one gives CLIENT-INVALID (69) and PATH is never consulted"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
+# 13i. Level 1 beats level 2, and a PRESENT relay-client.env is authoritative: with both a file pin
+#      and an environment pin the file's stub dials; an empty file refuses the run even though the
+#      environment carries a valid pin (to unpin, the file is deleted, not emptied).
+begin '13i relay-client.env wins over the environment'
+write_job 'C:\Windows\System32\notepad.exe'
+write_client_env "$PIN_A"; RELAY_ENV_PIN="$PIN_B"
+run_relay "$SBLAB/relay.command" "" exit0
+reasons="$(client_run_reasons 8.8.8 file "$PIN_A")"
+reset_run; : > "$SBRUNTIME/relay-client.env"; RELAY_ENV_PIN="$PIN_B"
+run_relay "$SBLAB/relay.command" "" exit0
+reasons="$reasons$(client_refused_reasons empty-file 'relay-client.env exists but sets no MACDOWS_XFREERDP')"
+if [ -z "$reasons" ]; then
+	pass "$CASE: the file pin (8.8.8, source=file) dials over the environment pin (7.7.7); an empty relay-client.env refuses (69) instead of handing over the environment's pin"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
+# 13j. Level 3 with nothing to find: no pin and no xfreerdp anywhere on PATH refuses as CLIENT-INVALID
+#      (69) -- before the pin, bash's "command not found" still ended DONE exit=0. The reduced PATH is
+#      the suite's own PATH minus the shim directory, minus every directory holding anything named
+#      xfreerdp, minus relative entries; the case runs only after a fresh bash under that PATH has
+#      been shown to resolve no xfreerdp, so no real client can be reached.
+begin '13j no xfreerdp on PATH'
+write_job 'C:\Windows\System32\notepad.exe'
+nox_path=''
+set -f
+old_ifs="$IFS"; IFS=:
+for d in $PATH; do
+	case "$d" in /*) ;; *) continue ;; esac
+	[ "$d" = "$SB/bin" ] && continue
+	[ -e "$d/xfreerdp" ] && continue
+	nox_path="${nox_path:+$nox_path:}$d"
+done
+IFS="$old_ifs"
+set +f
+leak="$(env -i PATH="$nox_path" "$BASH" -c 'command -v xfreerdp' 2>/dev/null || true)"
+if [ -n "$leak" ] || [ -z "$nox_path" ]; then
+	fail "$CASE: not run -- the reduced PATH still resolves an xfreerdp or is empty"
+else
+	RELAY_PATH_OVERRIDE="$nox_path"
+	run_relay "$SBLAB/relay.command" "" exit0
+	reasons="$(client_refused_reasons no-path-client 'no executable xfreerdp on PATH')"
+	if [ -z "$reasons" ]; then
+		pass "$CASE: with nothing on PATH the relay refuses as CLIENT-INVALID (69) and dials nothing"
+	else
+		fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+	fi
+fi
+
+# 13k. A client that cannot answer --version is refused, never dialled (gate r1 I-1): a pin whose
+#      libraries stopped loading after a Homebrew upgrade dies in dyld (SIGABRT), an interpreter
+#      that is gone fails the exec, a missing loader exits 127. Before the probe's status counted,
+#      each of these was logged client=unknown and dialled, ending DONE exit=0 with nothing done on
+#      the host. Each must give CLIENT-INVALID + DONE exit=69, no dial and no path in relay.log.
+begin '13k client that fails its --version probe'
+write_job 'C:\Windows\System32\notepad.exe'
+reasons=''
+for spec in "exit127:$PIN_V127" "sigabrt:$PIN_ABORT" "bad-interpreter:$PIN_BADINTERP"; do
+	reset_run; write_client_env "${spec#*:}"
+	run_relay "$SBLAB/relay.command" "" exit0
+	reasons="$reasons$(client_refused_reasons "${spec%%:*}" 'client version probe failed')"
+done
+if [ -z "$reasons" ]; then
+	pass "$CASE: --version exiting 127, dying of SIGABRT or hitting a missing interpreter each give CLIENT-INVALID (probe failed) + DONE exit=69, with no dial and no path logged"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
+# 13l. The client's argv[0] is `xfreerdp`, never the pin path (gate r1 I-2): FreeRDP echoes argv[0]
+#      into relay.log in its usage and error banners, and the pin may sit under the home directory.
+#      A #! script never sees its argv[0], so the behavioural half uses the compiled stub and runs
+#      only when `cc` built it; the source-shape half always runs. The verdict lives in
+#      argv0_reasons so M8 can reuse it.
+# Shape half: exactly one statement runs the client with /v:, and it is the `exec -a xfreerdp` form.
+# Behavioural half: the pinned and the PATH form each dial with argv[0] exactly `xfreerdp`, the
+# stub's argv[0] banner reaches relay.log (so the no-path check is not vacuous) and no sandbox path
+# does; an execute-only client (unreadable, so no digest) is logged sha8=unknown and still dials.
+argv0_reasons() { # <relay-path>
+	local r='' n_all n_exec form want
+	# shellcheck disable=SC2016  # the single quotes are deliberate: the literal source text
+	n_all="$(grep -cF '"$XFREERDP_BIN" "/v:${WIN_HOST}"' "$1" || true)"
+	# shellcheck disable=SC2016  # as above
+	n_exec="$(grep -cF '( exec -a xfreerdp "$XFREERDP_BIN" "/v:${WIN_HOST}"' "$1" || true)"
+	if [ "$n_all" != "1" ] || [ "$n_exec" != "1" ]; then r="$r shape:dial-statements=$n_all,exec-a-form=$n_exec;"; fi
+	if [ "$CSTUB_OK" -ne 1 ]; then printf '%s' "$r"; return 0; fi
+	for form in pinned path exec-only; do
+		reset_run
+		case "$form" in
+		pinned) write_client_env "$CSTUB_BIN"; want="client=5.5.5 sha8=$(sha8_of "$CSTUB_BIN") source=file" ;;
+		path) RELAY_PATH_OVERRIDE="$CSTUB_DIR/bin:$SB/bin:$PATH"; want="client=5.5.5 sha8=$(sha8_of "$CSTUB_BIN") source=path" ;;
+		exec-only)
+			if [ -r "$CSTUB_EXEC_ONLY" ]; then continue; fi
+			write_client_env "$CSTUB_EXEC_ONLY"; want='client=5.5.5 sha8=unknown source=file' ;;
+		esac
+		run_relay "$1" "" exit0
+		[ "$(grep '^\[relay\] client=' "$LOG" | head -n 1)" = "[relay] $want" ] || r="$r $form:client-line-not-[$want];"
+		[ "$(xfreerdp_calls)" = "1" ] || r="$r $form:xfreerdp-calls=$(xfreerdp_calls);"
+		[[ "$(xfreerdp_argv)" == "xfreerdp pid="*" argv0=xfreerdp ["* ]] || r="$r $form:argv0-is-not-xfreerdp;"
+		grep -qF 'xfreerdp - offline stub banner' "$LOG" || r="$r $form:no-banner-in-log;"
+		if grep -qF "$SB/" "$LOG"; then r="$r $form:sandbox-path-in-log;"; fi
+		[ "$(last_line)" = "DONE exit=0" ] || r="$r $form:last-line=[$(last_line)];"
+	done
+	printf '%s' "$r"
+}
+begin '13l dial argv[0] is xfreerdp, never the pin path'
+write_job 'C:\Windows\System32\notepad.exe'
+reasons="$(argv0_reasons "$SBLAB/relay.command")"
+if [ "$CSTUB_OK" -ne 1 ]; then
+	note "no working cc: the compiled-stub half did not run, the source-shape half did"
+elif [ -r "$CSTUB_EXEC_ONLY" ]; then
+	note "a mode-0111 file is still readable here (root?): the execute-only form did not run"
+fi
+if [ -z "$reasons" ] && [ "$CSTUB_OK" -ne 1 ]; then
+	pass "$CASE: the one dial statement is the exec -a xfreerdp form (source-shape half only: no working cc)"
+elif [ -z "$reasons" ]; then
+	pass "$CASE: the one dial statement is the exec -a xfreerdp form; the compiled stub sees argv[0]=xfreerdp in pinned and PATH form, its argv[0] banner carries no path into relay.log, and an unreadable client logs sha8=unknown"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
+# 13m. A PRESENT relay-client.env that is not a readable regular file refuses -- a dangling
+#      symlink (which `-e` alone calls absent), a directory, an unreadable file -- and so does one
+#      that exits before its value can be read. The environment carries a valid pin all along, so a
+#      fall-through to level 2 (or 3) would dial and show up in the trace.
+begin '13m relay-client.env that is not a readable regular file'
+write_job 'C:\Windows\System32\notepad.exe'
+reasons=''
+for form in dangling-symlink directory unreadable exits-early; do
+	reset_run; RELAY_ENV_PIN="$PIN_B"
+	case "$form" in
+	dangling-symlink) ln -s "$SB/no-such-relay-client.env" "$SBRUNTIME/relay-client.env" ;;
+	directory) mkdir "$SBRUNTIME/relay-client.env" ;;
+	unreadable)
+		write_client_env "$PIN_A"; chmod 000 "$SBRUNTIME/relay-client.env"
+		if [ -r "$SBRUNTIME/relay-client.env" ]; then
+			note "a mode-000 file is still readable here (root?): the unreadable form did not run"
+			continue
+		fi ;;
+	exits-early) printf 'MACDOWS_XFREERDP=%q\nexit 0\n' "$PIN_A" > "$SBRUNTIME/relay-client.env" ;;
+	esac
+	run_relay "$SBLAB/relay.command" "" exit0
+	if [ "$form" = exits-early ]; then
+		reasons="$reasons$(client_refused_reasons "$form" 'relay-client.env does not yield one single-line MACDOWS_XFREERDP (multi-line value or early exit)')"
+	else
+		reasons="$reasons$(client_refused_reasons "$form" 'relay-client.env is not a readable regular file')"
+	fi
+done
+reset_run
+if [ -z "$reasons" ]; then
+	pass "$CASE: a dangling symlink, a directory, an unreadable file and a file that exits early each refuse (69) with nothing run -- never a fall-through to the environment pin"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
+# 13n. Probe hygiene. (i) A noisy client -- it writes its path to stderr, reads whatever stdin it
+#      is given, and answers in FreeRDP's print_version_ex form `version [<its path>] 4.4.4 (4.4.4)`
+#      from a directory named xfreerdp-1.1.1 -- is logged client=4.4.4: not the path's 1.1.1, one
+#      token although the revision repeats it, no path in relay.log, and it never saw the stdin
+#      the relay was given. (ii) A digest tool that answers no digest gives sha8=unknown.
+begin '13n version probe hygiene'
+write_job 'C:\Windows\System32\notepad.exe'
+write_client_env "$PIN_NOISY"; RELAY_STDIN="$SB/stdin-data.txt"
+run_relay "$SBLAB/relay.command" "" exit0
+reasons="$(client_run_reasons 4.4.4 file "$PIN_NOISY")"
+if grep -qF 'version stdin=' "$LABTEST_TRACE"; then reasons="$reasons noisy:probe-read-the-relay-stdin;"; fi
+if grep -qF "$SB/" "$LOG"; then reasons="$reasons noisy:sandbox-path-in-log;"; fi
+grep -qF 'version argv0=' "$LABTEST_TRACE" || reasons="$reasons noisy:probe-did-not-run;"
+reset_run; write_client_env "$PIN_A"; RELAY_PATH_OVERRIDE="$SB/badsha:$SB/bin:$PATH"
+run_relay "$SBLAB/relay.command" "" exit0
+[ "$(grep '^\[relay\] client=' "$LOG" | head -n 1)" = '[relay] client=8.8.8 sha8=unknown source=file' ] || reasons="$reasons badsha:client-line=[$(grep '^\[relay\] client=' "$LOG" | head -n 1)];"
+[[ "$(xfreerdp_argv)" == "xfreerdp pid="*" argv0=$PIN_A ["* ]] || reasons="$reasons badsha:dial-not-from-the-pin;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: a print_version_ex answer under an xfreerdp-1.1.1 directory is logged client=4.4.4 (one token), the probe's stderr and the relay's stdin stay away from it, and a non-digest answer gives sha8=unknown"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
 fi
 
 # M1. Boundary gate bypassed (`if ! crdp_assert_lab_boundary` -> `if false`): the refused
@@ -660,6 +1163,101 @@ else
 	fail "$CASE: could not build the mutant (the allowlist guard line moved?)"
 fi
 
+# M5. Client line removed (the `echo "[relay] client=` line deleted): 13a's own verdict --
+#     client_run_reasons over the 13a scenario -- must turn red, and for the right reason (the
+#     mutant still dials, it only stops naming the client).
+begin 'M5 client-line-removed mutant'
+MUTANT_CLIENTLINE="$SBLAB/labtest-mutant-clientline.command"
+if sed '/^[[:space:]]*echo "\[relay\] client=/d' "$SBLAB/relay.command" > "$MUTANT_CLIENTLINE" \
+	&& ! cmp -s "$MUTANT_CLIENTLINE" "$SBLAB/relay.command" && bash -n "$MUTANT_CLIENTLINE"; then
+	write_job 'C:\Windows\System32\notepad.exe'
+	run_relay "$MUTANT_CLIENTLINE" "" exit0
+	reasons="$(client_run_reasons 9.9.9 path "$SB/bin/xfreerdp")"
+	if [[ "$reasons" == *' client-lines=0;'* ]] && [ "$(xfreerdp_calls)" = "1" ]; then
+		pass "$CASE: detected -- 13a's verdict against the mutant:$reasons"
+	else
+		fail "$CASE: NOT detected -- 13a would pass against a relay that logs no client line"; note "reasons: [$reasons] calls=$(xfreerdp_calls)"
+	fi
+else
+	fail "$CASE: could not build the mutant (the client line moved?)"
+fi
+
+# M6. relay-client.env ignored (its presence test -> `if false`): 13b's own
+#     verdict must turn red, because the PATH shim dials instead of the pinned stub.
+begin 'M6 pin-ignored mutant'
+MUTANT_PIN="$SBLAB/labtest-mutant-pin.command"
+# shellcheck disable=SC2016  # deliberate literal `$RUNTIME` for sed
+if sed 's/if \[ -e "\$RUNTIME\/relay-client\.env" \] || \[ -L "\$RUNTIME\/relay-client\.env" \]; then/if false; then/' "$SBLAB/relay.command" > "$MUTANT_PIN" \
+	&& ! cmp -s "$MUTANT_PIN" "$SBLAB/relay.command" && bash -n "$MUTANT_PIN"; then
+	write_client_env "$PIN_A"
+	write_job 'C:\Windows\System32\notepad.exe'
+	run_relay "$MUTANT_PIN" "" exit0
+	reasons="$(client_run_reasons 8.8.8 file "$PIN_A")"
+	if [[ "$reasons" == *' dial-not-from-the-expected-binary;'* ]] && [[ "$(xfreerdp_argv)" == *" argv0=$SB/bin/xfreerdp ["* ]]; then
+		pass "$CASE: detected -- the PATH shim dials instead of the pin; 13b's verdict against the mutant:$reasons"
+	else
+		fail "$CASE: NOT detected -- 13b would pass against a relay that ignores relay-client.env"; note "reasons: [$reasons]"
+	fi
+else
+	fail "$CASE: could not build the mutant (the relay-client.env test moved?)"
+fi
+
+# M7. --version exit status ignored (`if [ "$ver_rc" -ne 0 ]` -> `if false`): 13k's exit-127 client
+#     must now be dialled -- i.e. 13k pins the probe's status.
+begin 'M7 probe-status-ignored mutant'
+MUTANT_PROBE="$SBLAB/labtest-mutant-probe.command"
+# shellcheck disable=SC2016  # deliberate literal `$ver_rc` for sed
+if sed 's/if \[ "\$ver_rc" -ne 0 \]; then/if false; then/' "$SBLAB/relay.command" > "$MUTANT_PROBE" \
+	&& ! cmp -s "$MUTANT_PROBE" "$SBLAB/relay.command" && bash -n "$MUTANT_PROBE"; then
+	write_client_env "$PIN_V127"
+	write_job 'C:\Windows\System32\notepad.exe'
+	run_relay "$MUTANT_PROBE" "" exit0
+	reasons="$(client_refused_reasons exit127 'client version probe failed')"
+	if [[ "$reasons" == *'exit127:no-CLIENT-INVALID-line;'* ]] && [ "$(xfreerdp_calls)" = "1" ]; then
+		pass "$CASE: detected -- the client that cannot start is dialled; 13k's verdict against the mutant:$reasons"
+	else
+		fail "$CASE: NOT detected -- 13k would pass against a relay that ignores the probe status"; note "reasons: [$reasons] calls=$(xfreerdp_calls)"
+	fi
+else
+	fail "$CASE: could not build the mutant (the probe status test moved?)"
+fi
+
+# M8. argv[0] no longer set (`( exec -a xfreerdp "$XFREERDP_BIN"` -> `( exec "$XFREERDP_BIN"`): 13l's
+#     own verdict must turn red -- its shape half always, its compiled-stub half where cc exists.
+begin 'M8 argv0-unset mutant'
+MUTANT_ARGV0="$SBLAB/labtest-mutant-argv0.command"
+# shellcheck disable=SC2016  # deliberate literal `$XFREERDP_BIN` for sed
+if sed 's/( exec -a xfreerdp "\$XFREERDP_BIN"/( exec "$XFREERDP_BIN"/' "$SBLAB/relay.command" > "$MUTANT_ARGV0" \
+	&& ! cmp -s "$MUTANT_ARGV0" "$SBLAB/relay.command" && bash -n "$MUTANT_ARGV0"; then
+	write_job 'C:\Windows\System32\notepad.exe'
+	reasons="$(argv0_reasons "$MUTANT_ARGV0")"
+	if [[ "$reasons" == *' shape:'* ]] && { [ "$CSTUB_OK" -ne 1 ] || [[ "$reasons" == *'pinned:argv0-is-not-xfreerdp;'* ]]; }; then
+		pass "$CASE: detected -- 13l's verdict against the mutant:$reasons"
+	else
+		fail "$CASE: NOT detected -- 13l would pass against a relay that dials with the pin path as argv[0]"; note "reasons: [$reasons]"
+	fi
+else
+	fail "$CASE: could not build the mutant (the dial statement moved?)"
+fi
+
+# 11. Across EVERY case above the refuse shims were never reached: the Terminal self-close
+#     branch was not taken and no socket helper was invoked (run-long trace, never reset). This
+#     block and 12 sit after the last relay run on purpose, so "every" covers all of them.
+begin '11 refuse shims never reached'
+if [ ! -s "$LABTEST_REFUSED_TRACE" ]; then
+	pass "$CASE: osascript/nc shims recorded no call across the whole run (TERM_PROGRAM cleared; no socket helper invoked)"
+else
+	fail "$CASE: $(sort "$LABTEST_REFUSED_TRACE" | uniq -c | tr '\n' ';')"
+fi
+
+# 12. Tracked-tree census: every run above wrote only under .build/lab-runtime.
+begin '12 tracked tree census'
+if diff -q "$TRACKED_PRISTINE" <(snapshot_tracked) >/dev/null; then
+	pass "$CASE: no case wrote into the tracked lab directory"
+else
+	fail "$CASE: tracked tree changed"; diff "$TRACKED_PRISTINE" <(snapshot_tracked) | sed 's/^/        /'
+fi
+
 # No sleeping shim recorded by THIS run may outlive the suite (the `exec sleep` shape plus
 # kill_recorded_shims). Checked against the pids this run recorded, not a machine-wide pgrep --
 # an unrelated `sleep 30` on the maintainer's Mac is not this suite's business.
@@ -680,7 +1278,7 @@ fi
 
 # Every case must have reported (review r2 B1): a case that neither passed nor failed would
 # otherwise vanish from the tally with exit 0.
-EXPECTED_CASES=27
+EXPECTED_CASES=45
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi
