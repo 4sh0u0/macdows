@@ -3,6 +3,17 @@
 #
 # Authorized e2e lab against the owner's own Windows test host, driven entirely through the
 # existing lab relay (relay.command / xfreerdp via Terminal.app, the local-network TCC holder).
+# Since relay.command's CLIENT PIN (2026-09-28, STATUS ㊖) the dialling client is resolved as
+# .build/lab-runtime/relay-client.env > environment MACDOWS_XFREERDP > PATH -- but that
+# resolution happens INSIDE relay.command's own Terminal-launched process, which this script's
+# environment does not share (Terminal does not pass this script's exported variables through;
+# see relay.command's own header on that point). A second resolver here would therefore be free
+# to name a DIFFERENT client than the one that actually dialled -- exactly the wrong-record class
+# STATUS ㊖ exists to remove (gate r1 I-3). So this script never re-resolves the client itself: it
+# only records whether relay-client.env exists before the first job, and after each relay job
+# transcribes THAT job's own `[relay] client=...` line out of relay.log verbatim (see
+# matrix_log_client()) -- the record this script keeps is always what relay.command itself dialled
+# with, never a guess.
 # Nothing here changes host state: the host-side script is read-only and the only elevated step
 # in the whole matrix -- Set-TsAllowListMatrix.ps1 -Mode Enforce -- is owner-manual and printed
 # as instructions rather than attempted. The lab account has no HKLM write access.
@@ -265,6 +276,9 @@ run_relay_job() { # <job> <timeout>
 		mlog "[step] TIMEOUT: relay job '$job' produced no DONE line within ${timeout}s"
 		return 1
 	fi
+	# Transcribe THIS job's own client record before anything else reads or truncates relay.log
+	# again (see matrix_log_client() and the header comment above, gate r1 I-3).
+	matrix_log_client "$job"
 	elapsed=$(($(date +%s) - t0))
 	if [ "${RELAY_DONE_RC:-}" != "0" ]; then
 		mlog "[step] relay job '$job' FAILED after ${elapsed}s: the relay reported exit=${RELAY_DONE_RC:-<unparsed>}"
@@ -274,6 +288,8 @@ run_relay_job() { # <job> <timeout>
 			mlog "[step]   exit=66 is relay.command's own JOB-ENV-MISSING refusal -- job.env was not readable; no connection attempted"
 		elif [ "${RELAY_DONE_RC:-}" = "65" ]; then
 			mlog "[step]   exit=65 is relay.command's own JOB-ENV-INVALID refusal -- job.env set no PROGRAM; no connection attempted"
+		elif [ "${RELAY_DONE_RC:-}" = "69" ]; then
+			mlog "[step]   exit=69 is relay.command's own CLIENT-INVALID refusal -- the client pin could not be resolved; no connection attempted"
 		fi
 		return 1
 	fi
@@ -339,6 +355,23 @@ OWNER_BLOCK
 	mrule
 }
 
+# Transcribes THIS job's own client record out of relay.log, verbatim -- never re-resolved here
+# (gate r1 I-3; see the header comment above). relay.command truncates relay.log at the start of
+# every run-scenario.sh relay call, so by the time run_relay_job returns from wait_for_relay_done
+# this file holds only what THIS job's relay.command wrote. A job refused before the client was
+# resolved (a boundary refusal, a job.env problem, CLIENT-INVALID) leaves no such line -- recorded
+# here as `absent` rather than guessed at, exactly the cases relay.command's own header lists as
+# never reaching the `[relay] client=` line.
+matrix_log_client() { # <job>
+	local job="$1" line
+	line="$(grep -m1 '^\[relay\] client=' "$RELAY_LOG" 2>/dev/null)"
+	if [ -n "$line" ]; then
+		mlog "[env] relay-client($job): ${line#\[relay\] }"
+	else
+		mlog "[env] relay-client($job): absent"
+	fi
+}
+
 # ------------------------------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------------------------------
@@ -387,9 +420,18 @@ run_matrix() {
 	boundary_gate || return 3
 
 	# The negative control asserts on a STRING that this specific binary emits
-	# ("RAIL exec error: execResult=RAIL_EXEC_E_NOT_IN_ALLOWLIST"). Record which build produced
-	# the evidence, so a later formatting change in FreeRDP is diagnosable rather than baffling.
-	mlog "[env] xfreerdp: $(xfreerdp --version 2>&1 | head -1 || echo '<not found>')"
+	# ("RAIL exec error: execResult=RAIL_EXEC_E_NOT_IN_ALLOWLIST"). Which build produced the
+	# evidence is recorded per job by matrix_log_client() (a real transcription of relay.command's
+	# own client= line, gate r1 I-3) rather than guessed at up front. Here, before the first job,
+	# only EXISTENCE is checked -- never content: reading relay-client.env's value here would be
+	# the same wrong-record risk the per-job transcription exists to remove (relay.command reads
+	# it inside its own Terminal-launched process, which does not share this one). A dangling
+	# symlink counts as present too, the same as relay.command's own presence test.
+	if [ -e "$RUNTIME/relay-client.env" ] || [ -L "$RUNTIME/relay-client.env" ]; then
+		mlog "[env] relay-client-env=present"
+	else
+		mlog "[env] relay-client-env=absent"
+	fi
 
 	# -- the runtime directory ------------------------------------------------------------------
 	# Every artefact this run reads or writes lives here. Filling the redirected drive itself is

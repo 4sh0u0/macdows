@@ -25,7 +25,15 @@
 # runs its OWN live-host boundary gate (relay.command, wdp-etw.command, smoke-job.command), and
 # this script only copies job files, watches log files and copies artefacts. It never kills a
 # process -- a wait that times out reports which step and stops, because the thing it would be
-# killing is somebody else's Terminal window (owner rule: a run in flight is evidence).
+# killing is somebody else's Terminal window (owner rule: a run in flight is evidence). It also
+# never resolves or pins a dialling xfreerdp itself. Of the three wrappers this script drives,
+# only (e) -- the snapshot relay -- goes through relay.command, whose CLIENT PIN (2026-09-28,
+# STATUS ㊖) resolves and fingerprints that binary on its own (relay-client.env > environment
+# MACDOWS_XFREERDP > PATH). (b)'s ETW capture is a Device Portal WebSocket subscription, never an
+# RDP connection, so no client is dialled at all; (c)'s smoke run launches the app under test
+# itself (Scripts/run-window-smoke.command), whose own vendored FreeRDP client dials -- never
+# relay.command, never relay-client.env. This script only reads the job files those steps name
+# and never touches any pin (gate r1 I-1: the earlier wording here named (c) and (e) both).
 #
 # THIS FILE IS TRACKED: no host address, no account name, no credential, no maintainer path. It
 # prints repo-relative paths for that reason. Its own stdout carries only file names, counts and
@@ -88,7 +96,12 @@
 # The codes in the `run:` / `capture:` / `snapshot relay:` lines below are the WRAPPERS' own and are
 # never re-used as this script's. The two job-file wrappers now answer the same way as each other:
 # 78 is a boundary refusal, 66 is a job file that is not readable, 65 is a job file that is not a
-# table of values, and everything else is the run's own. smoke-job.command adds 75 for the two
+# table of values, and everything else is the run's own -- EXCEPT that a `snapshot relay:` line is
+# relay.command's, which also has its own CLIENT-INVALID refusal at 69 (the client pin from
+# relay-client.env / MACDOWS_XFREERDP / PATH could not be resolved; gate r1 I-1 -- do not read a
+# `snapshot relay: … DONE exit=69` as the run's own code just because 69 is unassigned elsewhere in
+# this list; wdp-etw.command's OWN 69 below is a different code from a different wrapper).
+# smoke-job.command adds 75 for the two
 # preflights that judge the ENVIRONMENT rather than the definition (this machine's display is not
 # the geometry the run needs; this checkout does not carry the knob the job names), and passes the
 # launcher's codes through unchanged -- so a `run: DONE exit=3` is the launcher's declared-desktop

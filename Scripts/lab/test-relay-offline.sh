@@ -158,7 +158,32 @@ fi
 	for a in "$@"; do printf ' [%s]' "$a"; done
 	printf '\n'
 } >> "$LABTEST_TRACE"
-printf '%s\n' "$$" >> "$LABTEST_PID_LEDGER"
+# pid<TAB>identity: identity is this process's own start time plus argv (ps -o lstart=,args=),
+# fixed to LC_ALL=C TZ=UTC0 -- gate r1 I-2 measured that plain `ps -o lstart=` renders differently
+# under a maintainer's own locale or exported TZ (a Chinese Terminal, or TZ=UTC, made every
+# identity comparison miss and the orphan check below silently stopped catching real leaks). The
+# orphan check at the end of this suite re-reads the SAME fixed-locale command for the same pid
+# and only kills a match -- a pid the OS has since handed to an unrelated process practically
+# never reproduces the same start time and argv together.
+#
+# THE ARGS HALF IS RECORDED AS IT WILL READ ONCE SETTLED, not as it reads on this line: lstart is
+# an exec-invariant kernel property of THIS pid, but `exec sleep 30` below replaces this process's
+# own argv with the sleeping child's ("sleep 30", confirmed byte for byte against a real `ps`) the
+# instant it runs -- there is no code path after an exec to re-record anything. Recording the
+# PRE-exec args here would permanently disagree with what orphan_scan reads from the live process
+# afterwards, which is the exact kind of mismatch this fix exists to remove; predicting the known,
+# deterministic post-exec argv instead keeps the write side and the read side describing the SAME
+# process state. The non-sleeping modes never reach a live orphan check (they exit at once), so
+# their own argv is recorded as invoked -- it is written for completeness, not because anything
+# ever depends on it matching after the fact.
+case "${LABTEST_XFREERDP_MODE:-exit0}" in
+sleep) LABTEST_SHIM_ARGS='sleep 30' ;;
+*) LABTEST_SHIM_ARGS="$0" ;;
+esac
+LABTEST_SHIM_LSTART="$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$$" 2>/dev/null | tr -s '[:space:]' ' ')"
+LABTEST_SHIM_IDENT="$(printf '%s %s' "$LABTEST_SHIM_LSTART" "$LABTEST_SHIM_ARGS" | tr -s '[:space:]' ' ')"
+LABTEST_SHIM_IDENT="$(printf '%s' "$LABTEST_SHIM_IDENT" | sed 's/^ *//;s/ *$//')"
+printf '%s\t%s\n' "$$" "$LABTEST_SHIM_IDENT" >> "$LABTEST_PID_LEDGER"
 case "${LABTEST_XFREERDP_MODE:-exit0}" in
 sleep) exec sleep 30 ;;
 exit1) exit 1 ;;
@@ -257,6 +282,39 @@ if command -v cc >/dev/null 2>&1 && cc -o "$CSTUB_BIN" "$CSTUB_DIR/xfreerdp-stub
 	cp "$CSTUB_BIN" "$CSTUB_EXEC_ONLY" && chmod 0111 "$CSTUB_EXEC_ONLY" && CSTUB_OK=1
 fi
 
+# A real, reliably-observable zombie for the orphan-check zombie case: this platform's own
+# non-interactive bash reaps a plain `( exit 0 ) &` between one `ps` call and the next -- too fast
+# to catch the Z state from shell alone. This helper forks a child that exits at once and holds
+# off its own wait() (so the child stays a zombie) until it is sent SIGTERM, giving the test a
+# window of its own choosing. Same guard shape as CSTUB_OK; without a working `cc` the case says
+# so and does not claim anything. Opens nothing, connects nothing.
+ZOMBIE_MAKER="$SB/cstub/zombie-maker"
+ZOMBIE_MAKER_OK=0
+cat > "$SB/cstub/zombie-maker.c" <<'ZOMBIE_SRC' || exit 1
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+static volatile sig_atomic_t stop = 0;
+static void on_term(int sig) { (void)sig; stop = 1; }
+int main(void)
+{
+	pid_t child = fork();
+	if (child < 0) return 1;
+	if (child == 0) { _exit(0); }
+	printf("%d\n", (int)child);
+	fflush(stdout);
+	signal(SIGTERM, on_term);
+	while (!stop) { sleep(1); }
+	waitpid(child, NULL, 0);
+	return 0;
+}
+ZOMBIE_SRC
+if command -v cc >/dev/null 2>&1 && cc -o "$ZOMBIE_MAKER" "$SB/cstub/zombie-maker.c" >/dev/null 2>&1; then
+	ZOMBIE_MAKER_OK=1
+fi
+
 for tool in osascript nc; do
 	cat > "$SB/bin/$tool" <<SHIM_REFUSE || exit 1
 #!/usr/bin/env bash
@@ -289,8 +347,14 @@ if ! grep -qF 'osascript:unexpected-call' "$LABTEST_REFUSED_TRACE"; then
 fi
 : > "$LABTEST_REFUSED_TRACE"
 env -i LABTEST_TRACE="$LABTEST_TRACE" LABTEST_PID_LEDGER="$LABTEST_PID_LEDGER" LABTEST_XFREERDP_MODE=exit0 PATH="$SB/bin:$PATH" xfreerdp /probe >/dev/null 2>&1
-if ! grep -qE '^[0-9]+$' "$LABTEST_PID_LEDGER"; then
+if ! awk -F'\t' '{print $1}' "$LABTEST_PID_LEDGER" | grep -qE '^[0-9]+$'; then
 	printf 'ABORT: the pid ledger did not record a deliberate shim run\n'; exit 1
+fi
+# Gate r1 O3: a shim that stopped recording an identity (always writing an empty second field)
+# must fail the suite loudly here, before any case relies on it -- an empty identity can never be
+# matched by orphan_scan, which would otherwise silently blind the whole orphan check.
+if ! awk -F'\t' '{print $2}' "$LABTEST_PID_LEDGER" | grep -qE '.'; then
+	printf 'ABORT: the pid ledger recorded no identity for a deliberate shim run\n'; exit 1
 fi
 : > "$LABTEST_PID_LEDGER"
 : > "$LABTEST_TRACE"
@@ -350,6 +414,54 @@ kill_recorded_shims() {
 	sed -n 's/^xfreerdp pid=\([0-9]*\).*/\1/p' "$LABTEST_TRACE" | while IFS= read -r p; do
 		kill "$p" 2>/dev/null || true
 	done
+}
+
+# Locale/TZ-independent process identity: ps -o lstart=,args= under a fixed LC_ALL/TZ so the SAME
+# pid renders the SAME string regardless of the CALLER's own locale or timezone (gate r1 I-2 --
+# see write_xfreerdp_shim's own comment on the write side of this).
+proc_identity() { # <pid>
+	local raw
+	raw="$(LC_ALL=C TZ=UTC0 ps -o lstart=,args= -p "$1" 2>/dev/null | tr -s '[:space:]' ' ')"
+	printf '%s' "$raw" | sed 's/^ *//;s/ *$//'
+}
+
+# Scans a pid<TAB>identity ledger (see write_xfreerdp_shim) and kills only the entries that are
+# BOTH alive and still identify as the process that was recorded -- a bare pid number is not
+# enough: on a long-running suite the OS can hand a recorded pid to an unrelated process before
+# this runs, and killing on pid alone would kill a stranger.
+#   - a live process whose `ps -o stat=` starts with Z is a zombie -- already exited, awaiting
+#     reap -- and is left alone entirely: a signal to it is a no-op, and `kill -0` on a zombie
+#     still reports success, so this check runs BEFORE anything else looks at "alive".
+#   - a line with no recorded identity (the C stub in 13l logs a bare pid) can never be matched
+#     with confidence and is left alone too, counted separately from a genuine mismatch.
+#   - otherwise the SAME proc_identity() call decides: a match is killed, anything else is left
+#     running (a pid the OS has since reused for something else must never be touched).
+# Sets SCAN_LEDGERED / SCAN_LEFTOVER (killed) / SCAN_REUSED (alive, identity mismatch) /
+# SCAN_UNKNOWN (alive, no recorded identity) / SCAN_ZOMBIE (already exited) for the caller.
+orphan_scan() { # <ledger path>
+	SCAN_LEDGERED=0; SCAN_LEFTOVER=0; SCAN_REUSED=0; SCAN_UNKNOWN=0; SCAN_ZOMBIE=0
+	local p ident current stat
+	while IFS=$'\t' read -r p ident; do
+		[ -n "$p" ] || continue
+		SCAN_LEDGERED=$((SCAN_LEDGERED + 1))
+		if kill -0 "$p" 2>/dev/null; then
+			stat="$(LC_ALL=C TZ=UTC0 ps -o stat= -p "$p" 2>/dev/null | tr -d '[:space:]')"
+			case "$stat" in
+				Z*) SCAN_ZOMBIE=$((SCAN_ZOMBIE + 1)); continue ;;
+			esac
+			if [ -z "$ident" ]; then
+				SCAN_UNKNOWN=$((SCAN_UNKNOWN + 1))
+				continue
+			fi
+			current="$(proc_identity "$p")"
+			if [ -n "$current" ] && [ "$current" = "$ident" ]; then
+				SCAN_LEFTOVER=$((SCAN_LEFTOVER + 1))
+				kill "$p" 2>/dev/null || true
+			else
+				SCAN_REUSED=$((SCAN_REUSED + 1))
+			fi
+		fi
+	done < <(sort -u "$1")
 }
 
 write_job() { # <PROGRAM> [CMDARGS] [TIMEOUT]
@@ -1258,27 +1370,191 @@ else
 	fail "$CASE: tracked tree changed"; diff "$TRACKED_PRISTINE" <(snapshot_tracked) | sed 's/^/        /'
 fi
 
+# A GENUINE leak, still alive, with the identity write_xfreerdp_shim would itself have recorded
+# (proc_identity): the scan must actually kill it and count leftover=1. This is what catches gate
+# r1 O2 (identity check disabled -- always answers "no match", so the scan never kills anything):
+# without a case that requires a real match to be killed, a scan that never kills anything looks
+# identical to one that correctly declines to kill a mismatch. "gone" is polled rather than read
+# once, because a killed process sits as a zombie for a moment before it is reaped.
+begin 'orphan check kills a pid whose identity still matches'
+sleep 30 &
+match_pid=$!
+disown "$match_pid" 2>/dev/null || true
+match_ledger="$SB/pid-ledger-match-proof.txt"
+match_ident="$(proc_identity "$match_pid")"
+printf '%s\t%s\n' "$match_pid" "$match_ident" > "$match_ledger"
+orphan_scan "$match_ledger"
+match_ledgered=$SCAN_LEDGERED; match_leftover=$SCAN_LEFTOVER; match_reused=$SCAN_REUSED
+gone=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	if ! kill -0 "$match_pid" 2>/dev/null; then gone=1; break; fi
+	st="$(ps -o stat= -p "$match_pid" 2>/dev/null | tr -d '[:space:]')"
+	case "$st" in Z*) gone=1; break ;; esac
+	sleep 0.2
+done
+# Bounded cleanup regardless of verdict: a mutant that disables the kill (gate r1 O2) would
+# otherwise leave this a real, unkilled sleep for its whole 30s, and `wait` would block for all of
+# it -- this case must fail fast, not hang the suite.
+kill -9 "$match_pid" 2>/dev/null || true
+wait "$match_pid" 2>/dev/null || true
+if [ "$match_ledgered" = "1" ] && [ "$match_leftover" = "1" ] && [ "$match_reused" = "0" ] && [ "$gone" = "1" ]; then
+	pass "$CASE: a ledgered pid whose live identity still matches the recorded one is killed and counted leftover=1"
+else
+	fail "$CASE: ledgered=$match_ledgered leftover=$match_leftover reused=$match_reused gone=$gone"
+fi
+
+# A ledgered pid the OS has since reused for an unrelated process must NOT be killed by this
+# check, and must not be counted as a leftover either. Proved by INTERCEPTING every real kill
+# (non -0) call orphan_scan makes during this run and asserting none targeted this pid, rather
+# than trusting a post-hoc `kill -0` read: a pid this suite itself just killed sits as a zombie
+# until reaped, and `kill -0` on a zombie still reports success -- a `still_alive` check could not
+# tell a live stranger from one already killed and awaiting reap. This is what catches gate r1 O4
+# (the reused branch also calls kill) and, together with the counters below, gate r1 O1 (the
+# identity check is disabled by always answering "match").
+begin 'orphan check ignores a pid whose identity no longer matches'
+sleep 30 &
+reuse_pid=$!
+disown "$reuse_pid" 2>/dev/null || true
+reuse_ledger="$SB/pid-ledger-reuse-proof.txt"
+printf '%s\t%s\n' "$reuse_pid" 'labtest-mismatched-identity-can-never-equal-a-real-identity' > "$reuse_ledger"
+KILL_CALLS_FILE="$SB/kill-calls-reuse-proof.txt"; : > "$KILL_CALLS_FILE"
+# shellcheck disable=SC2329,SC2317  # shadows the kill builtin only for this case; called indirectly by orphan_scan
+kill() {
+	if [ "${1:-}" != '-0' ]; then printf '%s\n' "$*" >> "$KILL_CALLS_FILE"; fi
+	command kill "$@"
+}
+orphan_scan "$reuse_ledger"
+unset -f kill
+real_kill_hit=0
+grep -qF "$reuse_pid" "$KILL_CALLS_FILE" 2>/dev/null && real_kill_hit=1
+command kill "$reuse_pid" 2>/dev/null || true
+wait "$reuse_pid" 2>/dev/null || true
+if [ "$SCAN_LEDGERED" = "1" ] && [ "$SCAN_LEFTOVER" = "0" ] && [ "$SCAN_REUSED" = "1" ] && [ "$real_kill_hit" = "0" ]; then
+	pass "$CASE: a ledgered pid whose live identity no longer matches the recorded one is left running (reused=1), never sent a real kill"
+else
+	fail "$CASE: ledgered=$SCAN_LEDGERED leftover=$SCAN_LEFTOVER reused=$SCAN_REUSED real_kill_hit=$real_kill_hit"
+fi
+
+# A ledgered pid that is ALREADY a zombie (exited, awaiting reap) must not be treated as alive:
+# ps -o stat= is checked first and a leading Z short-circuits before any identity comparison or
+# kill attempt -- a signal to a zombie is a no-op that would only waste a syscall. Proved with a
+# REAL zombie made by zombie-maker (see its own comment: this platform's bash reaps a plain
+# background subshell too fast to observe from shell alone). Best-effort like CSTUB_OK: without a
+# working `cc` the case says so and claims nothing.
+begin 'orphan check treats a zombie as already gone'
+if [ "$ZOMBIE_MAKER_OK" -ne 1 ]; then
+	pass "$CASE: no working cc on this machine to build the zombie-maker helper -- skipped"
+else
+	zpid_file="$SB/zombie-child-pid.txt"
+	: > "$zpid_file"
+	"$ZOMBIE_MAKER" > "$zpid_file" &
+	maker_pid=$!
+	disown "$maker_pid" 2>/dev/null || true
+	zpid=''
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		[ -s "$zpid_file" ] && { zpid="$(cat "$zpid_file")"; break; }
+		sleep 0.1
+	done
+	if [ -z "$zpid" ]; then
+		fail "$CASE: the zombie-maker helper never reported its child's pid"
+	else
+		st="$(ps -o stat= -p "$zpid" 2>/dev/null | tr -d '[:space:]')"
+		case "$st" in
+		Z*)
+			zledger="$SB/pid-ledger-zombie-proof.txt"
+			printf '%s\t%s\n' "$zpid" 'labtest-zombie-identity-is-irrelevant' > "$zledger"
+			orphan_scan "$zledger"
+			if [ "$SCAN_LEDGERED" = "1" ] && [ "$SCAN_LEFTOVER" = "0" ] && [ "$SCAN_REUSED" = "0" ] && [ "$SCAN_ZOMBIE" = "1" ]; then
+				pass "$CASE: a zombie ledgered pid is counted zombie=1, never leftover or reused, never sent a kill"
+			else
+				fail "$CASE: ledgered=$SCAN_LEDGERED leftover=$SCAN_LEFTOVER reused=$SCAN_REUSED zombie=$SCAN_ZOMBIE"
+			fi
+			;;
+		*) fail "$CASE: zombie-maker's child (pid $zpid) is not in Z state (stat=[$st]) -- the helper itself did not hold up its end" ;;
+		esac
+	fi
+	kill -TERM "$maker_pid" 2>/dev/null || true
+	wait "$maker_pid" 2>/dev/null || true
+fi
+
+# The identity read at scan time must use the SAME fixed TZ (UTC0) as the write side regardless of
+# what TZ the CALLER happens to have exported -- the exact blind spot gate r1 I-2 measured (a
+# maintainer's exported TZ made `ps -o lstart=` disagree with what was recorded, and a real leak
+# went uncaught). Gate r2 B-1: writing and reading under the SAME exported TZ is a tautology --
+# proc_identity() would still agree with itself even with no pin at all, since both calls would
+# then be reading the SAME (wrong) ambient TZ. The write and the read below run under DIFFERENT
+# exported TZs (Asia/Tokyo, then America/Los_Angeles -- a difference of several hours, so an
+# unpinned `ps -o lstart=` would format a different hour on each side) precisely so that only a
+# real TZ=UTC0 pin can make the two sides agree.
+begin 'orphan check identity ignores the caller TZ'
+old_tz="${TZ-}"; had_tz=1; [ -z "${TZ+x}" ] && had_tz=0
+export TZ=Asia/Tokyo
+sleep 30 &
+tz_pid=$!
+disown "$tz_pid" 2>/dev/null || true
+tz_ledger="$SB/pid-ledger-tz-proof.txt"
+tz_ident="$(proc_identity "$tz_pid")"
+printf '%s\t%s\n' "$tz_pid" "$tz_ident" > "$tz_ledger"
+export TZ=America/Los_Angeles
+orphan_scan "$tz_ledger"
+tz_ledgered=$SCAN_LEDGERED; tz_leftover=$SCAN_LEFTOVER; tz_reused=$SCAN_REUSED
+if [ "$had_tz" = "1" ]; then export TZ="$old_tz"; else unset TZ; fi
+kill "$tz_pid" 2>/dev/null || true; wait "$tz_pid" 2>/dev/null || true
+if [ "$tz_ledgered" = "1" ] && [ "$tz_leftover" = "1" ] && [ "$tz_reused" = "0" ]; then
+	pass "$CASE: written under TZ=Asia/Tokyo, read under TZ=America/Los_Angeles -- proc_identity()'s fixed TZ=UTC0 still agrees on both sides (leftover=1)"
+else
+	fail "$CASE: ledgered=$tz_ledgered leftover=$tz_leftover reused=$tz_reused"
+fi
+
+# Same as above for LC_ALL -- the other half of gate r1 I-2's repro (a zh_CN Terminal), and the
+# same gate r2 B-1 fix: write under a non-C locale, then switch to LC_ALL=C before the read, so
+# only a real pin (not a shared ambient locale) can make the two sides agree. Best-effort: only
+# runs the behavioural half when a non-C locale is actually installed on this machine (CI images
+# often carry only C/C.UTF-8/en_US.UTF-8); LC_ALL=C is hardcoded in proc_identity either way.
+begin 'orphan check identity ignores the caller locale'
+lc_probe="$(locale -a 2>/dev/null | grep -im1 -E '^(zh_CN|de_DE|ja_JP|fr_FR)\.utf-?8$' || true)"
+if [ -z "$lc_probe" ]; then
+	pass "$CASE: no non-C locale installed on this machine to probe with -- skipped (LC_ALL=C is hardcoded in proc_identity regardless)"
+else
+	old_lc_all="${LC_ALL-}"; had_lc_all=1; [ -z "${LC_ALL+x}" ] && had_lc_all=0
+	export LC_ALL="$lc_probe"
+	sleep 30 &
+	lc_pid=$!
+	disown "$lc_pid" 2>/dev/null || true
+	lc_ledger="$SB/pid-ledger-lc-proof.txt"
+	lc_ident="$(proc_identity "$lc_pid")"
+	printf '%s\t%s\n' "$lc_pid" "$lc_ident" > "$lc_ledger"
+	export LC_ALL=C
+	orphan_scan "$lc_ledger"
+	lc_ledgered=$SCAN_LEDGERED; lc_leftover=$SCAN_LEFTOVER; lc_reused=$SCAN_REUSED
+	if [ "$had_lc_all" = "1" ]; then export LC_ALL="$old_lc_all"; else unset LC_ALL; fi
+	kill "$lc_pid" 2>/dev/null || true; wait "$lc_pid" 2>/dev/null || true
+	if [ "$lc_ledgered" = "1" ] && [ "$lc_leftover" = "1" ] && [ "$lc_reused" = "0" ]; then
+		pass "$CASE: written under LC_ALL=$lc_probe, read under LC_ALL=C -- proc_identity()'s fixed LC_ALL=C still agrees on both sides (leftover=1)"
+	else
+		fail "$CASE: ledgered=$lc_ledgered leftover=$lc_leftover reused=$lc_reused (locale=$lc_probe)"
+	fi
+fi
+
 # No sleeping shim recorded by THIS run may outlive the suite (the `exec sleep` shape plus
 # kill_recorded_shims). Checked against the pids this run recorded, not a machine-wide pgrep --
-# an unrelated `sleep 30` on the maintainer's Mac is not this suite's business.
+# an unrelated `sleep 30` on the maintainer's Mac is not this suite's business -- and only when
+# the recorded identity still matches the live process (see orphan_scan): a recorded pid the OS
+# has since reused for something else is left alone and counted in reused=, and a pid already a
+# zombie is counted in zombie=.
 begin 'orphan check'
-leftover=0; ledgered=0
-while IFS= read -r p; do
-	[ -n "$p" ] || continue
-	ledgered=$((ledgered + 1))
-	if kill -0 "$p" 2>/dev/null; then leftover=$((leftover + 1)); kill "$p" 2>/dev/null || true; fi
-done < <(sort -u "$LABTEST_PID_LEDGER")
-if [ "$ledgered" -eq 0 ]; then
+orphan_scan "$LABTEST_PID_LEDGER"
+if [ "$SCAN_LEDGERED" -eq 0 ]; then
 	fail "$CASE: the pid ledger is empty -- the recorder stopped working, so this check saw nothing"
-elif [ "$leftover" = "0" ]; then
-	pass "$CASE: none of the $ledgered shim pids this run recorded is still alive"
+elif [ "$SCAN_LEFTOVER" = "0" ]; then
+	pass "$CASE: none of the $SCAN_LEDGERED recorded shim pid(s) with a matching identity is still alive (reused=$SCAN_REUSED unknown=$SCAN_UNKNOWN zombie=$SCAN_ZOMBIE)"
 else
-	fail "$CASE: $leftover of $ledgered recorded shim pid(s) still alive"
+	fail "$CASE: $SCAN_LEFTOVER of $SCAN_LEDGERED recorded shim pid(s) with a matching identity still alive (reused=$SCAN_REUSED unknown=$SCAN_UNKNOWN zombie=$SCAN_ZOMBIE)"
 fi
 
 # Every case must have reported (review r2 B1): a case that neither passed nor failed would
 # otherwise vanish from the tally with exit 0.
-EXPECTED_CASES=45
+EXPECTED_CASES=50
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi
