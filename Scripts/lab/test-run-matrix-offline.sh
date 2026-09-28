@@ -194,6 +194,14 @@ relay.command)
 	# relay.command truncates its log at startup; mirror that or a previous job's DONE
 	# line would still be sitting there when the caller starts polling.
 	: > "$runtime/relay.log"
+	# LABTEST_CLIENT_LINE models relay.command's own `[relay] client=...` line (gate r1 I-3:
+	# run-matrix.sh no longer resolves a client itself, only transcribes this line out of
+	# relay.log after each job). Unset/empty leaves relay.log without one, the same as a job
+	# refused before relay_resolve_client() ever ran (a boundary refusal, a job.env problem,
+	# CLIENT-INVALID) -- which matrix_log_client() must then record as `absent`.
+	if [ -n "${LABTEST_CLIENT_LINE:-}" ]; then
+		printf '[relay] %s\n' "$LABTEST_CLIENT_LINE" >> "$runtime/relay.log"
+	fi
 	printf '[relay] OFFLINE SHIM job=%s -- no xfreerdp started, no packet sent\n' "$job" \
 		>> "$runtime/relay.log"
 	rc=0
@@ -344,6 +352,7 @@ reset_stubs() {
 	export LABTEST_NO_DONE=0
 	export LABTEST_NO_DONE_JOB=''
 	export LABTEST_PGREP_BUSY=1
+	export LABTEST_CLIENT_LINE=''
 }
 
 begin() { # <slug> <description>
@@ -353,12 +362,16 @@ begin() { # <slug> <description>
 	home_ok
 }
 
-run_sandbox() { # [script]
+run_sandbox() { # [script] [preseed function name]
 	local script="${1:-$SBLAB/run-matrix.sh}"
 	# The whole runtime tree, not a list of files: it is regenerated from the tracked tree by
 	# the staging step under test, so wiping it is both the cheapest reset and a per-case
 	# assertion that staging really does put everything back.
 	rm -rf "$SBRUNTIME"
+	# Optional hook, called after the wipe and before the run: the only legitimate way for a case
+	# to plant something run-matrix.sh's own staging step would not otherwise create (relay-client.env
+	# is a runtime artefact, never part of the tracked tree run-matrix.sh stages from).
+	if [ -n "${2:-}" ]; then mkdir -p "$SBRUNTIME" && "$2"; fi
 	: > "$LABTEST_TRACE"
 	OUT="$SB/out-$CASE.txt"
 	# Every WAIT_* is driven down to the smallest value that still exercises the real loop
@@ -526,6 +539,86 @@ assert_has '[state] host session: logged off'
 assert_launched 'relay:verify'
 assert_launched 'relay:negative'
 
+# -- 6b. the [env] client record: gate r1 I-3 redesign --------------------------------------------
+# (STATUS ㊖). run-matrix.sh no longer resolves a client itself -- the earlier mirrored resolver
+# could name a DIFFERENT client than the one Terminal's relay.command actually dialled, since
+# Terminal does not pass this script's own environment through (see run-matrix.sh's own header).
+# Two independent facts are checked instead, each pulled out of the transcript rather than
+# asserted with assert_has/assert_re where the property is a NEGATIVE one those helpers cannot
+# express (assert_lacks checks the whole transcript, and RUNTIME's own sandbox path legitimately
+# appears elsewhere in it):
+#   1. the ONE startup line records only whether relay-client.env EXISTS (present|absent) -- never
+#      its content, never a path;
+#   2. after each relay job, that job's own `[relay] client=...` line is transcribed verbatim out
+#      of relay.log (or recorded as `absent` when relay.log carries none for that job).
+env_line() { grep -m1 '\[env\] relay-client-env=' "$OUT" || true; }
+job_client_line() { grep -m1 "\[env\] relay-client($1):" "$OUT" || true; }
+
+begin client-env-file "relay-client.env present, whatever it contains -> startup line is relay-client-env=present"
+# shellcheck disable=SC2329,SC2317  # invoked indirectly by run_sandbox's preseed hook (0.11 emits SC2329, older CI shellcheck emits SC2317 for the same indirect-invocation shape)
+seed_client_present() { printf 'never read -- existence only\n' > "$SBRUNTIME/relay-client.env"; }
+run_sandbox "" seed_client_present
+line="$(env_line)"
+if [[ "$line" == *'relay-client-env=present'* ]]; then
+	pass "$CASE: startup line is '$line'"
+else
+	fail "$CASE: startup line is '$line' -- expected relay-client-env=present"
+fi
+if [[ "$line" != *'/'* ]]; then
+	pass "$CASE: startup line carries no '/' (gate r2 B-2)"
+else
+	fail "$CASE: startup line '$line' carries a '/' -- content, not just existence, leaked"
+fi
+
+begin client-env-dangling-symlink 'a dangling relay-client.env symlink still counts as present (matches relay.command own -e || -L presence test)'
+# shellcheck disable=SC2329,SC2317  # invoked indirectly by run_sandbox's preseed hook (0.11 emits SC2329, older CI shellcheck emits SC2317 for the same indirect-invocation shape)
+seed_client_symlink() { ln -s "$SBRUNTIME/relay-client-target-does-not-exist" "$SBRUNTIME/relay-client.env"; }
+run_sandbox "" seed_client_symlink
+line="$(env_line)"
+if [[ "$line" == *'relay-client-env=present'* ]]; then
+	pass "$CASE: startup line is '$line'"
+else
+	fail "$CASE: startup line is '$line' -- expected relay-client-env=present"
+fi
+if [[ "$line" != *'/'* ]]; then
+	pass "$CASE: startup line carries no '/' (gate r2 B-2)"
+else
+	fail "$CASE: startup line '$line' carries a '/' -- content, not just existence, leaked"
+fi
+
+begin client-env-path 'no relay-client.env at all -> startup line is relay-client-env=absent'
+run_sandbox
+line="$(env_line)"
+if [[ "$line" == *'relay-client-env=absent'* ]]; then
+	pass "$CASE: startup line is '$line'"
+else
+	fail "$CASE: startup line is '$line' -- expected relay-client-env=absent"
+fi
+if [[ "$line" != *'/'* ]]; then
+	pass "$CASE: startup line carries no '/' (gate r2 B-2)"
+else
+	fail "$CASE: startup line '$line' carries a '/' -- content, not just existence, leaked"
+fi
+
+begin client-line-present "relay.log carries a client= line for a job -> transcribed verbatim, no '/'"
+export LABTEST_CLIENT_LINE='client=7.7.7 sha8=deadbeef source=file'
+run_sandbox
+line="$(job_client_line regprobe)"
+if [[ "$line" == *'client=7.7.7'* ]] && [[ "$line" == *'sha8=deadbeef'* ]] && [[ "$line" == *'source=file'* ]] && [[ "$line" != *'/'* ]]; then
+	pass "$CASE: transcribed line is '$line'"
+else
+	fail "$CASE: transcribed line is '$line' -- expected client=7.7.7 sha8=deadbeef source=file verbatim, no '/'"
+fi
+
+begin client-line-absent 'relay.log carries no client= line for a job (default) -> transcribed as absent'
+run_sandbox
+line="$(job_client_line regprobe)"
+if [[ "$line" == *'relay-client(regprobe): absent'* ]]; then
+	pass "$CASE: transcribed line is '$line'"
+else
+	fail "$CASE: transcribed line is '$line' -- expected relay-client(regprobe): absent"
+fi
+
 # -- 7. the CRLF regression pin ---------------------------------------------------------------
 # THE bug from 2026-09-01: the probe writes 'fDisabledAllowList = 0\r', the CR survived into
 # the comparison, '0\r' != '0', and an enforced host scored PRECONDITION -- i.e. the matrix
@@ -595,6 +688,17 @@ run_sandbox
 assert_rc 1
 assert_has "relay job 'regprobe' FAILED"
 assert_has "exit=65 is relay.command's own JOB-ENV-INVALID refusal"
+
+# -- 9d. the relay refused because the client pin could not be resolved (gate r1 I-1) -------------
+# relay.command writes DONE exit=69 (CLIENT-INVALID) when relay_resolve_client() fails, the same
+# shape as 78/66/65: named here so a `snapshot relay:`-style reader never mistakes 69 for a code
+# the run itself produced (checkpoint.sh's own registered-stale sentence, gate r1 I-1).
+begin relay-69 'relay reports DONE exit=69 -> exit 1, CLIENT-INVALID named'
+export LABTEST_RC_REGPROBE=69
+run_sandbox
+assert_rc 1
+assert_has "relay job 'regprobe' FAILED"
+assert_has "exit=69 is relay.command's own CLIENT-INVALID refusal"
 
 # -- 10. the relay never reported at all --------------------------------------------------------
 # Both the job and the logoff time out, so the host is left logged in and main() has to say so.
@@ -941,7 +1045,7 @@ done
 printf '\n'
 printf -- '---------------------------------------------------------------------\n'
 if [ "$FAILURES" -eq 0 ]; then
-	printf 'OFFLINE GUARD TEST: PASS -- %s assertions, 23 cases (20 pins + 3 mutation proofs)\n' "$PASSES"
+	printf 'OFFLINE GUARD TEST: PASS -- %s assertions, 29 cases (26 pins + 3 mutation proofs)\n' "$PASSES"
 	exit 0
 fi
 printf 'OFFLINE GUARD TEST: FAIL -- %s failed, %s passed\n' "$FAILURES" "$PASSES"

@@ -206,7 +206,7 @@ jobs:
         # (the xfreerdp shim records argv and exits or sleeps; it opens no socket), HOME is
         # redirected to a sandbox whose host.env carries an RFC 5737 address and placeholder
         # strings, and TERM_PROGRAM is cleared so the Terminal self-close branch is never taken.
-        # Two mutation proofs (gate bypassed / kill removed) keep the pins honest.
+        # Eight mutation proofs (M1-M8) keep the pins honest.
         run: ./Scripts/lab/test-relay-offline.sh
 
       - name: Lab probe offline suite
