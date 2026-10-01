@@ -22,8 +22,19 @@
 # R-6 lane G (adr/0019 §2 row G) added --reconnect-leg <a>,<g>: one run, two connections, each on
 # a NEW client context, one --out file. S3-S6 below hold the structure that knob must not break
 # (one textual copy of the lifecycle, in order; no same-context reconnect entry point; the frozen
-# JSONL event-name set; one leg-line print point, after the plan's). P6-P8, I8-I16 and X1-X2 hold
-# its plan line, its grammar and its refusal next to --second-exec.
+# JSONL event-name set; one leg-line print point, after the plan's). P6-P8 and I8-I16 hold its plan
+# line and its grammar.
+#
+# Lane LB-1 (ADR-0021 L-B) turned the refusal of --reconnect-leg next to --second-exec into an
+# accepted combination: the second ClientExecute is sent in leg 1 only (leg 2's fresh context starts
+# with second_exec_sent already true, so the one send point never fires there), and the leg line
+# then ends in " second-exec=leg1-only" -- without --second-exec it is byte-identical to before
+# (P6-P7, I8-I16, I30-I31 unchanged). X1-X2 pin the accepted plan path in both argument orders; S8
+# pins the leg-1-only structure. The connect path's acceptance cannot be tested offline (it dials):
+# only an online batch can show it. Gate r1 I-1 fold: leg 1 must outlast --second-delay (the send
+# waits that long from leg 1's ConnectSucceeded), so the pair is refused when leg1_seconds <=
+# second_delay, default delay 8 included; X3-X9 pin the refusal, its boundary and the untouched
+# cases, and S8 pins that the refusal sits ahead of the --print-plan branch.
 #
 # The seconds knobs (--duration, --second-delay) were bare atoi() until the lane that added
 # parse_seconds_knob: "abc" ran as 0, "-5" as -5, "+10" and "25abc" as 10 and 25, all with exit 0.
@@ -44,22 +55,23 @@
 # g_probe at its OWN context, and that leg 2 only starts when leg 1's own timer ended it cleanly.
 #
 # Two kinds of case, same split as Scripts/test-lab-boundary.sh's rail-probe section:
-#   * SOURCE PINS (S1-S7) run always and hold the structural claims -- ONE implementation
+#   * SOURCE PINS (S1-S8) run always and hold the structural claims -- ONE implementation
 #     (probe_settings_plan) feeds both the connect path and --print-plan, so a settings write that
 #     bypasses it is visible as a changed count of freerdp_settings_set_ call sites; and a second
 #     leg is the same lifecycle text run twice, never a second path; and every numeric knob in
-#     S7's scope parses through the one field grammar. Tier 1 runs this suite
-#     (.github/workflows/tier1.yml, step "rail-probe plan source pins") and requires exactly seven
+#     S7's scope parses through the one field grammar; and the second launch of a two-leg run
+#     happens in leg 1 only (S8). Tier 1 runs this suite
+#     (.github/workflows/tier1.yml, step "rail-probe plan source pins") and requires exactly eight
 #     `PASS  S<n>` lines and no FAIL.
 #   * BINARY CASES run when Tools/rail-probe/build/rail-probe exists and is newer than its source;
 #     they need cmake and a FreeRDP prefix, which Tier 1 does not have (a missing binary is a NOTE,
-#     never a silent pass; Tier 1 accepts that NOTE and still requires the seven source pins). Tier 2
+#     never a silent pass; Tier 1 accepts that NOTE and still requires the eight source pins). Tier 2
 #     (.github/workflows/tier2.yml, step "rail-probe plan suite (source pins + binary cases)") does
-#     build the binary and requires all 56 to PASS with `not_run=0`. No case
-#     here can open a socket: --print-plan exits before any FreeRDP context exists, and the one
-#     connect-path case that gets past parse_args' missing-argument check (X2) names an --out file
-#     inside a directory that does not exist, so even with the refusal it tests regressed it would
-#     stop at fopen, which S3 pins ahead of freerdp_client_start. The fixture credentials are the
+#     build the binary and requires all 63 to PASS with `not_run=0`. No case
+#     here can open a socket: every case that gets past parse_args' missing-argument check runs on
+#     the --print-plan path, which exits before any FreeRDP context exists (S6). Since lane LB-1 no
+#     connect-path case gets that far: the one that did (X2, a refusal) became a plan-path case,
+#     because an accepted connect path would dial. The fixture credentials are the
 #     documentation-range host and placeholder strings test-lab-boundary.sh uses, and the launcher
 #     handshake value is set the way that suite's gated binary cases set it.
 set -euo pipefail
@@ -115,6 +127,12 @@ tr -s '[:space:]' ' ' <"$SRC" >"$FOLDED"
 fold_pos() {
 	awk -F '\n' -v needle="$1" '{ print index($0, needle) }' "$FOLDED"
 }
+# fold_pos_lit (gate r1 B-1): fold_pos for needles that carry a backslash. `awk -v` processes escape
+# sequences, so a needle's '\0' would reach awk as a NUL byte (macOS awk truncates the needle there,
+# gawk and mawk keep it and then never match). ENVIRON passes the needle verbatim, as file_cnt does.
+fold_pos_lit() {
+	NEEDLE="$1" awk -F '\n' '{ print index($0, ENVIRON["NEEDLE"]) }' "$FOLDED"
+}
 # fold_cnt: how many times a needle occurs in the folded source. Only needed for needles that
 # straddle a line break in rail-probe.c (grep -cF, which matches within one line, cannot see
 # those); single-line needles below still use grep -cF directly, as S1/S4 already did.
@@ -127,7 +145,7 @@ fold_cnt() {
 # path -- its own context creation, start or main-loop call, above main or below it -- is red here.
 # Call shapes, not names: a doc comment naming freerdp_client_context_new is not a call. And the
 # copy is in lifecycle order -- context, then the --out fopen, then start, then the main loop --
-# which is also the premise X2 below leans on to stay socket-free.
+# which the socket-free note in the header relies on for any future connect-path case.
 S3_OK=0
 S3_WHY=""
 : >"$TEST_DIR/s3.txt"
@@ -360,6 +378,73 @@ S7_DUR_ASSIGN="$(file_cnt 'cfg->duration =' "$FOLDED")"
 S7_NAME="S7 one field grammar"
 [ -z "$S7_WHY" ] || S7_NAME="S7${S7_WHY}"
 check "$S7_OK" "$S7_NAME" "leg halves, --duration, --second-delay parse through parse_decimal_field only; no own copy, no atoi" "$TEST_DIR/s7.txt"
+
+# S8 (lane LB-1, ADR-0021 L-B). --reconnect-leg with --second-exec sends the second ClientExecute in
+# leg 1 only, through the one send point that already existed -- not through a second one, and not
+# by a refusal. Call shapes on the folded source (S3's fold), each needle its exact expression:
+#   assign  second_exec_sent is assigned in exactly two places: `p->second_exec_sent = (leg != 1);`
+#           in main's leg loop, after the context is created and before freerdp_client_start, and
+#           `p->second_exec_sent = true;` right after the send. `(leg == 1)`, a dropped leg-loop
+#           write or a third write anywhere is red. Gate r1 m-1: `->second_exec_sent` occurs exactly
+#           three times (the condition, the `= true` write, the leg-loop write) and its address is
+#           never taken (`&p->second_exec_sent` 0), so a write through a pointer is red too.
+#   send    `!p->second_exec_sent` occurs once, inside the send condition, which occurs once and sits
+#           in probe_main_loop (before probe_leg_stop_signal, the next function), followed by the
+#           one `probe_run_second_exec(p);` call and then the `= true` write.
+#   refuse  the old refusal's wording ("cannot be combined") occurs nowhere.
+#   plan    the leg line's suffix is printed once, by
+#           `if (cfg.second_exec[0] != '\0' && fprintf(stdout, " second-exec=leg1-only") <= 0)`,
+#           after the leg line's own print and before the first context exists; the quoted literal
+#           occurs nowhere else.
+#   window  (gate r1 I-1) the refusal of a leg 1 that cannot outlast --second-delay is one guarded
+#           condition, `if (cfg->leg1_seconds > 0 && cfg->second_exec[0] != '\0' &&
+#           cfg->leg1_seconds <= (uint32_t)cfg->second_delay)`, ahead of `if (cfg->print_plan)`, so
+#           it covers the plan path and the connect path alike.
+# Needles carrying '\0' go through fold_pos_lit / file_cnt (ENVIRON), never fold_pos (gate r1 B-1).
+S8_OK=0
+S8_WHY=""
+S8_ASSIGN_ALL="$({ grep -oE 'second_exec_sent[[:space:]]*=[^=]' "$SRC" || true; } | wc -l | tr -d ' ')"
+S8_ASSIGN_LEG="$(file_cnt 'p->second_exec_sent = (leg != 1);' "$FOLDED")"
+S8_ASSIGN_TRUE="$(file_cnt 'p->second_exec_sent = true;' "$FOLDED")"
+S8_CTX="$(fold_pos '= freerdp_client_context_new(&entryPoints)')"
+S8_LEGPOS="$(fold_pos 'p->second_exec_sent = (leg != 1);')"
+S8_START="$(fold_pos 'freerdp_client_start(context)')"
+S8_ARROW="$(file_cnt '->second_exec_sent' "$FOLDED")"
+S8_ADDR="$(file_cnt '&p->second_exec_sent' "$FOLDED")"
+{ [ "$S8_ASSIGN_ALL" -eq 2 ] && [ "$S8_ASSIGN_LEG" -eq 1 ] && [ "$S8_ASSIGN_TRUE" -eq 1 ] && [ "$S8_ARROW" -eq 3 ] && [ "$S8_ADDR" -eq 0 ] && [ "$S8_CTX" -gt 0 ] && [ "$S8_CTX" -lt "$S8_LEGPOS" ] && [ "$S8_LEGPOS" -lt "$S8_START" ]; } || { S8_OK=1; S8_WHY="$S8_WHY assign"; }
+S8_NOT_SENT="$(file_cnt '!p->second_exec_sent' "$FOLDED")"
+S8_COND_SHAPE="if (p->cfg.second_exec[0] != '\\0' && !p->second_exec_sent && p->rail &&"
+S8_COND="$(file_cnt "$S8_COND_SHAPE" "$FOLDED")"
+S8_CALL="$(file_cnt 'probe_run_second_exec(p);' "$FOLDED")"
+S8_LOOP="$(fold_pos 'static DWORD probe_main_loop(')"
+S8_CONDPOS="$(fold_pos_lit "$S8_COND_SHAPE")"
+S8_CALLPOS="$(fold_pos 'probe_run_second_exec(p);')"
+S8_TRUEPOS="$(fold_pos 'p->second_exec_sent = true;')"
+S8_NEXT="$(fold_pos 'static void probe_leg_stop_signal(')"
+{ [ "$S8_NOT_SENT" -eq 1 ] && [ "$S8_COND" -eq 1 ] && [ "$S8_CALL" -eq 1 ] && [ "$S8_LOOP" -gt 0 ] && [ "$S8_LOOP" -lt "$S8_CONDPOS" ] && [ "$S8_CONDPOS" -lt "$S8_CALLPOS" ] && [ "$S8_CALLPOS" -lt "$S8_TRUEPOS" ] && [ "$S8_TRUEPOS" -lt "$S8_NEXT" ]; } || { S8_OK=1; S8_WHY="$S8_WHY send"; }
+S8_REFUSE="$(grep -cF 'cannot be combined' "$SRC" || true)"
+[ "$S8_REFUSE" -eq 0 ] || { S8_OK=1; S8_WHY="$S8_WHY refuse"; }
+S8_PLAN_SHAPE="if (cfg.second_exec[0] != '\\0' && fprintf(stdout, \" second-exec=leg1-only\") <= 0)"
+S8_PLAN="$(file_cnt "$S8_PLAN_SHAPE" "$FOLDED")"
+S8_LITERAL="$(file_cnt '" second-exec=leg1-only"' "$FOLDED")"
+S8_PLANPOS="$(fold_pos_lit "$S8_PLAN_SHAPE")"
+S8_LEGLINE="$(fold_pos '"reconnect-leg leg1-seconds=')"
+{ [ "$S8_PLAN" -eq 1 ] && [ "$S8_LITERAL" -eq 1 ] && [ "$S8_LEGLINE" -gt 0 ] && [ "$S8_LEGLINE" -lt "$S8_PLANPOS" ] && [ "$S8_PLANPOS" -lt "$S8_CTX" ]; } || { S8_OK=1; S8_WHY="$S8_WHY plan"; }
+S8_WIN_SHAPE="if (cfg->leg1_seconds > 0 && cfg->second_exec[0] != '\\0' && cfg->leg1_seconds <= (uint32_t)cfg->second_delay)"
+S8_WIN="$(file_cnt "$S8_WIN_SHAPE" "$FOLDED")"
+S8_WINPOS="$(fold_pos_lit "$S8_WIN_SHAPE")"
+S8_PPBRANCH="$(fold_pos 'if (cfg->print_plan)')"
+{ [ "$S8_WIN" -eq 1 ] && [ "$S8_WINPOS" -gt 0 ] && [ "$S8_WINPOS" -lt "$S8_PPBRANCH" ]; } || { S8_OK=1; S8_WHY="$S8_WHY window"; }
+{
+	printf 'assign second_exec_sent writes: %s (expected 2); leg-loop (leg != 1) %s, after-send true %s (expected 1 each); ->second_exec_sent %s (expected 3), &p->second_exec_sent %s (expected 0); folded offsets: context %s < leg-loop write %s < start %s\n' "$S8_ASSIGN_ALL" "$S8_ASSIGN_LEG" "$S8_ASSIGN_TRUE" "$S8_ARROW" "$S8_ADDR" "$S8_CTX" "$S8_LEGPOS" "$S8_START"
+	printf 'send !p->second_exec_sent %s, send condition %s, probe_run_second_exec(p); %s (expected 1 each); folded offsets: probe_main_loop %s < condition %s < call %s < true %s < probe_leg_stop_signal %s\n' "$S8_NOT_SENT" "$S8_COND" "$S8_CALL" "$S8_LOOP" "$S8_CONDPOS" "$S8_CALLPOS" "$S8_TRUEPOS" "$S8_NEXT"
+	printf 'refuse "cannot be combined": %s (expected 0)\n' "$S8_REFUSE"
+	printf 'plan guarded suffix print %s, quoted literal %s (expected 1 each); folded offsets: leg line %s < suffix %s < first context %s\n' "$S8_PLAN" "$S8_LITERAL" "$S8_LEGLINE" "$S8_PLANPOS" "$S8_CTX"
+	printf 'window leg-1-outlasts-delay refusal %s (expected 1); folded offsets: refusal %s < --print-plan branch %s\n' "$S8_WIN" "$S8_WINPOS" "$S8_PPBRANCH"
+} >"$TEST_DIR/s8.txt"
+S8_NAME="S8 second exec in leg 1 only"
+[ -z "$S8_WHY" ] || S8_NAME="S8${S8_WHY}"
+check "$S8_OK" "$S8_NAME" "one send point; leg 2 starts sent; no pair refusal; plan suffix only with --second-exec; leg 1 must outlast the delay" "$TEST_DIR/s8.txt"
 
 echo "== binary cases =="
 if [ ! -x "$BIN" ]; then
@@ -608,38 +693,107 @@ PLAN
 		check "$OK" "refuses $bad" "exit 2, grammar refusal names the option, usage on stdout, no plan line" "$TEST_DIR/bad.txt"
 	done
 
-	# X1/X2: --reconnect-leg with --second-exec is refused on both paths, in either argument order
-	# (leg 2's fresh context would send the second ClientExecute again): exit 2, the refusal on
-	# stderr, usage on stdout, no plan line, no --out file. X2 is the connect path with every
-	# required argument present, so its safety cannot come from parse_args: its --out names a file
-	# inside a directory that does not exist, and a regression that let the pair through would stop
-	# at that fopen (exit 1, red here), which S3 pins ahead of freerdp_client_start.
+	# X1/X2 (lane LB-1, ADR-0021 L-B): --reconnect-leg with --second-exec is accepted, in either
+	# argument order. The plan is the eight settings plus the leg line ending in
+	# " second-exec=leg1-only" (the second launch happens in leg 1 only); exit 0, stderr empty, no
+	# --out file. Both cases run on the --print-plan path: the connect path's acceptance would dial,
+	# so it cannot be tested offline and is left to an online batch (S8 pins its structure).
 	SECOND='C:\Windows\System32\notepad.exe'
-	run_probe --print-plan --app "$APP" --out "$NEVER" --reconnect-leg 20,5 --second-exec "$SECOND"
-	OK=0
-	[ "$RC" -eq 2 ] || OK=1
-	[ ! -e "$NEVER" ] || OK=1
-	[ "$(grep -c '^set ' "$TEST_DIR/stdout.txt" || true)" -eq 0 ] || OK=1
-	grep -q 'Usage:' "$TEST_DIR/stdout.txt" || OK=1
-	grep -qF -- '--reconnect-leg and --second-exec cannot be combined' "$TEST_DIR/stderr.txt" || OK=1
-	{
-		printf 'rc=%s\n--- stderr ---\n' "$RC"
-		head -3 "$TEST_DIR/stderr.txt"
-	} >"$TEST_DIR/x1.txt"
-	check "$OK" "leg + --second-exec refused (plan)" "exit 2 on the --print-plan path, refusal on stderr, no plan line, no JSONL" "$TEST_DIR/x1.txt"
+	{ cat "$EXPECTED_BASE"; printf 'reconnect-leg leg1-seconds=20 gap-seconds=5 leg2-seconds=25 context=new settings=same second-exec=leg1-only\n'; } >"$TEST_DIR/expected-x.txt"
+	for order in leg-first exec-first; do
+		if [ "$order" = leg-first ]; then
+			run_probe --print-plan --app "$APP" --out "$NEVER" --reconnect-leg 20,5 --second-exec "$SECOND"
+		else
+			run_probe --print-plan --second-exec "$SECOND" --reconnect-leg 20,5 --app "$APP" --out "$NEVER"
+		fi
+		OK=0
+		diff -u "$TEST_DIR/expected-x.txt" "$TEST_DIR/stdout.txt" >"$TEST_DIR/x.diff" || OK=1
+		[ "$RC" -eq 0 ] || OK=1
+		[ ! -s "$TEST_DIR/stderr.txt" ] || OK=1
+		[ ! -e "$NEVER" ] || OK=1
+		{
+			printf 'rc=%s\n--- stderr ---\n' "$RC"
+			head -3 "$TEST_DIR/stderr.txt"
+			cat "$TEST_DIR/x.diff"
+		} >"$TEST_DIR/x.txt"
+		check "$OK" "leg + --second-exec accepted ($order)" "exit 0, stderr empty, base + leg line ending second-exec=leg1-only, no JSONL" "$TEST_DIR/x.txt"
+	done
 
-	X2_OUT="$TEST_DIR/no-such-dir/x2.jsonl"
-	run_probe --second-exec "$SECOND" --reconnect-leg 20,5 --app "$APP" --out "$X2_OUT"
-	OK=0
-	[ "$RC" -eq 2 ] || OK=1
-	[ ! -e "$TEST_DIR/no-such-dir" ] || OK=1
-	grep -q 'Usage:' "$TEST_DIR/stdout.txt" || OK=1
-	grep -qF -- '--reconnect-leg and --second-exec cannot be combined' "$TEST_DIR/stderr.txt" || OK=1
-	{
-		printf 'rc=%s\n--- stderr ---\n' "$RC"
-		head -3 "$TEST_DIR/stderr.txt"
-	} >"$TEST_DIR/x2.txt"
-	check "$OK" "leg + --second-exec refused (connect)" "exit 2 on the connect path (all args present), refusal on stderr, nothing created" "$TEST_DIR/x2.txt"
+	# X3-X5 (gate r1 I-1): with --second-exec, leg 1 must outlast --second-delay, or the second launch
+	# is never sent (leg 1 shorter) or lands on the very disconnect (equal). Refused on the plan path
+	# like any knob error: exit 2, stderr exactly one line naming both values, usage on stdout, no
+	# plan line of either kind, no --out file. X3 is the equality boundary under the DEFAULT delay
+	# (8, never passed), X4 an explicit equal delay, X5 a shorter leg 1 in reversed argument order.
+	for bad in "8|8|--reconnect-leg 8,5 --second-exec SECOND" "5|5|--reconnect-leg 5,5 --second-exec SECOND --second-delay 5" "3|10|--second-delay 10 --second-exec SECOND --reconnect-leg 3,0"; do
+		want_leg="${bad%%|*}"
+		rest="${bad#*|}"
+		want_delay="${rest%%|*}"
+		argline="${rest#*|}"
+		set -f
+		# shellcheck disable=SC2206
+		args=($argline)
+		set +f
+		for i in "${!args[@]}"; do
+			[ "${args[$i]}" != SECOND ] || args[i]="$SECOND"
+		done
+		run_probe --print-plan --app "$APP" --out "$NEVER" "${args[@]}"
+		OK=0
+		[ "$RC" -eq 2 ] || OK=1
+		[ "$(grep -c '' "$TEST_DIR/stderr.txt" || true)" -eq 1 ] || OK=1
+		grep -qxF -- "--reconnect-leg leg 1 ($want_leg s) must exceed --second-delay ($want_delay s) when --second-exec is set" "$TEST_DIR/stderr.txt" || OK=1
+		grep -q 'Usage:' "$TEST_DIR/stdout.txt" || OK=1
+		[ "$(grep -c -e '^set ' -e '^reconnect-leg ' "$TEST_DIR/stdout.txt" || true)" -eq 0 ] || OK=1
+		[ ! -e "$NEVER" ] || OK=1
+		{
+			printf 'rc=%s\n--- stdout (plan lines only) ---\n' "$RC"
+			grep -e '^set ' -e '^reconnect-leg ' "$TEST_DIR/stdout.txt" || true
+			printf -- '--- stderr ---\n'
+			head -3 "$TEST_DIR/stderr.txt"
+		} >"$TEST_DIR/bad.txt"
+		check "$OK" "refuses leg 1 $want_leg s <= delay $want_delay s" "exit 2, one stderr line naming both values, usage on stdout, no plan line, no JSONL" "$TEST_DIR/bad.txt"
+	done
+
+	# X6-X9 (gate r1 I-1): the boundary's accepting side and the untouched cases. X6: 9,5 under the
+	# default delay 8 (one second over); X7: 1,0 with --second-delay 0 -- both print the leg1-only
+	# suffix. X8: no --second-exec at all, X9: --second-exec '' (absent, as before) -- neither is
+	# refused however short leg 1 is, and both print the leg line without the suffix, byte for byte
+	# as before this lane. Each: exit 0, stderr empty, no --out file.
+	for good in "9|5|second-exec=leg1-only|--reconnect-leg 9,5 --second-exec SECOND" "1|0|second-exec=leg1-only|--reconnect-leg 1,0 --second-exec SECOND --second-delay 0" "3|5||--reconnect-leg 3,5 --second-delay 10" "3|5||--reconnect-leg 3,5 --second-exec EMPTY"; do
+		g_leg="${good%%|*}"
+		rest="${good#*|}"
+		g_gap="${rest%%|*}"
+		rest="${rest#*|}"
+		g_suffix="${rest%%|*}"
+		argline="${rest#*|}"
+		set -f
+		# shellcheck disable=SC2206
+		args=($argline)
+		set +f
+		for i in "${!args[@]}"; do
+			[ "${args[$i]}" != SECOND ] || args[i]="$SECOND"
+			[ "${args[$i]}" != EMPTY ] || args[i]=""
+		done
+		{
+			cat "$EXPECTED_BASE"
+			if [ -n "$g_suffix" ]; then
+				printf 'reconnect-leg leg1-seconds=%s gap-seconds=%s leg2-seconds=25 context=new settings=same %s\n' "$g_leg" "$g_gap" "$g_suffix"
+			else
+				printf 'reconnect-leg leg1-seconds=%s gap-seconds=%s leg2-seconds=25 context=new settings=same\n' "$g_leg" "$g_gap"
+			fi
+		} >"$TEST_DIR/expected-x.txt"
+		run_probe --print-plan --app "$APP" --out "$NEVER" "${args[@]}"
+		OK=0
+		diff -u "$TEST_DIR/expected-x.txt" "$TEST_DIR/stdout.txt" >"$TEST_DIR/x.diff" || OK=1
+		[ "$RC" -eq 0 ] || OK=1
+		[ ! -s "$TEST_DIR/stderr.txt" ] || OK=1
+		[ ! -e "$NEVER" ] || OK=1
+		{
+			printf 'rc=%s\n--- stderr ---\n' "$RC"
+			head -3 "$TEST_DIR/stderr.txt"
+			cat "$TEST_DIR/x.diff"
+		} >"$TEST_DIR/x.txt"
+		check "$OK" "accepts $argline" "exit 0, stderr empty, base + leg line${g_suffix:+ ending $g_suffix}, no JSONL" "$TEST_DIR/x.txt"
+	done
 
 	# ---- seconds knobs: --duration and --second-delay (parse_seconds_knob) ----
 

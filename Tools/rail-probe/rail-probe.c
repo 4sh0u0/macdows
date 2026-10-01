@@ -87,7 +87,9 @@ typedef struct
 	 * one leg, which is today's lifecycle verbatim (main's leg loop runs once). Otherwise leg 1
 	 * runs leg1_seconds from its own ConnectSucceeded, then gap_seconds pass with no client
 	 * context alive, then leg 2 runs on a NEW context, same settings plan, for `duration`.
-	 * Validated in parse_args; refused together with --second-exec. */
+	 * Validated in parse_args. With --second-exec the second ClientExecute is sent in leg 1 only
+	 * (leg 2's context starts with second_exec_sent already true; see main's leg loop), and
+	 * leg1_seconds must exceed --second-delay or parse_args refuses the pair. */
 	uint32_t leg1_seconds;
 	uint32_t gap_seconds;
 	/* --print-plan: print the pre-connect settings sequence and exit before any context exists. */
@@ -156,6 +158,8 @@ typedef struct
 	 * log_event's two envelope templates by that exact spelling of the fprintf calls. */
 	FILE* out;
 	uint64_t connect_ms;
+	/* Leg 1 (and a one-leg run) starts false; leg 2 of a --reconnect-leg run starts true, so the
+	 * one send point in probe_main_loop never fires there (main's leg loop sets it). */
 	bool second_exec_sent;
 	/* Per leg: the seconds this leg lasts from its ConnectSucceeded (leg 1 of a --reconnect-leg
 	 * run: leg1_seconds; every other leg: --duration), and whether probe_main_loop ended on that
@@ -457,7 +461,8 @@ static void usage(const char* prog)
 	       "ConnectSucceeded, a clean disconnect (no logoff), g seconds (0..3600) with no client context "
 	       "alive, then leg 2 on a NEW client context, same settings plan, for --duration seconds. Both "
 	       "values required. One --out file holds both legs (leg 2 starts at the second PreConnect); "
-	       "--print-plan adds one 'reconnect-leg ...' line after the set lines. Not with --second-exec. "
+	       "--print-plan adds one 'reconnect-leg ...' line after the set lines. With --second-exec the second "
+	       "launch happens in leg 1 only, and a must exceed --second-delay. "
 	       "Without it: one connection, as before.\n"
 	       "  --print-plan             Print the pre-connect settings sequence this configuration would "
 	       "apply -- one 'set <FreeRDP_Key> = <value>' line each, in order -- and exit 0 without "
@@ -724,14 +729,21 @@ static bool parse_args(int argc, char** argv, probeConfig* cfg)
 		}
 	}
 
-	/* R-6 lane G: --reconnect-leg and --second-exec are refused together, on the plan path and
-	 * the connect path alike (this check precedes both). Each leg's fresh context starts with
-	 * second_exec_sent false, so leg 2 would send the second ClientExecute again and mix a new
-	 * launch into the very window list a two-leg run exists to read (what the server re-sends).
-	 * Not a v1 combination. */
-	if (cfg->leg1_seconds > 0 && cfg->second_exec[0] != '\0')
+	/* --reconnect-leg together with --second-exec is accepted (ADR-0021 L-B): the second
+	 * ClientExecute is sent in leg 1 only. Leg 2 reads the window list the server re-sends on
+	 * reconnect, so a new launch must not be mixed into it; main's leg loop starts leg 2's fresh
+	 * context with second_exec_sent already true, which keeps probe_main_loop's one send point
+	 * from firing there. --print-plan says so on its leg line.
+	 *
+	 * Fail closed when leg 1 cannot carry that launch (gate r1 I-1): the send waits --second-delay
+	 * seconds from leg 1's ConnectSucceeded, and leg 1 ends leg1_seconds after it -- with
+	 * leg1_seconds below the delay nothing is ever sent, and at equality the launch lands on the
+	 * very disconnect. So leg 1 must outlast the delay (the default delay 8 counts too), on the
+	 * plan path and the connect path alike (this check precedes both). */
+	if (cfg->leg1_seconds > 0 && cfg->second_exec[0] != '\0' && cfg->leg1_seconds <= (uint32_t)cfg->second_delay)
 	{
-		fprintf(stderr, "--reconnect-leg and --second-exec cannot be combined (leg 2 would send the second ClientExecute again)\n");
+		fprintf(stderr, "--reconnect-leg leg 1 (%u s) must exceed --second-delay (%d s) when --second-exec is set\n",
+		        (unsigned)cfg->leg1_seconds, cfg->second_delay);
 		usage(argv[0]);
 		return false;
 	}
@@ -1942,11 +1954,21 @@ int main(int argc, char** argv)
 		 * and not starting with "set ", so any reader that counts setting lines is unaffected.
 		 * There is no second set block: each leg's PreConnect applies this very plan to its own
 		 * fresh context, so the lines above are the truth for both legs. Without the knob
-		 * nothing is added -- the output is byte-identical to before. */
-		if (cfg.leg1_seconds > 0 &&
-		    fprintf(stdout, "reconnect-leg leg1-seconds=%u gap-seconds=%u leg2-seconds=%d context=new settings=same\n",
-		            (unsigned)cfg.leg1_seconds, (unsigned)cfg.gap_seconds, cfg.duration) <= 0)
-			return 1;
+		 * nothing is added -- the output is byte-identical to before.
+		 *
+		 * With --second-exec as well, the same line ends in second-exec=leg1-only: an archived
+		 * rail-plan must be the truth for both legs, and leg 2 never sends the second launch (see
+		 * the leg loop). Without --second-exec the line is byte-identical to before. */
+		if (cfg.leg1_seconds > 0)
+		{
+			if (fprintf(stdout, "reconnect-leg leg1-seconds=%u gap-seconds=%u leg2-seconds=%d context=new settings=same",
+			            (unsigned)cfg.leg1_seconds, (unsigned)cfg.gap_seconds, cfg.duration) <= 0)
+				return 1;
+			if (cfg.second_exec[0] != '\0' && fprintf(stdout, " second-exec=leg1-only") <= 0)
+				return 1;
+			if (fprintf(stdout, "\n") <= 0)
+				return 1;
+		}
 		return 0;
 	}
 
@@ -2025,6 +2047,11 @@ int main(int argc, char** argv)
 		}
 		p->out = out;
 		p->leg_seconds = (leg < legs) ? (int)cfg.leg1_seconds : cfg.duration;
+		/* ADR-0021 L-B: --second-exec launches in leg 1 only. Leg 2 starts with the flag already
+		 * set, so the one send condition in probe_main_loop excludes it and no new launch is
+		 * mixed into the window list leg 2 exists to read. A one-leg run starts false, as the
+		 * zeroed fresh context always did. */
+		p->second_exec_sent = (leg != 1);
 
 		rdpSettings* settings = context->settings;
 		if (!freerdp_settings_set_string(settings, FreeRDP_ServerHostname, p->cfg.host) ||
