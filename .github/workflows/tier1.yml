@@ -206,7 +206,10 @@ jobs:
         # (the xfreerdp shim records argv and exits or sleeps; it opens no socket), HOME is
         # redirected to a sandbox whose host.env carries an RFC 5737 address and placeholder
         # strings, and TERM_PROGRAM is cleared so the Terminal self-close branch is never taken.
-        # Eight mutation proofs (M1-M8) keep the pins honest.
+        # Cases 14a-14j pin the in-place `Logon Info V1/V2` mask of relay.log (same inode, byte
+        # fidelity under a UTF-8 locale, refused runs untouched, MASK-FAILED -> DONE exit=74 incl.
+        # a failed copy-back) and the logoff jobs' TIMEOUT=30.
+        # Eleven mutation proofs (M1-M11) keep the pins honest.
         run: ./Scripts/lab/test-relay-offline.sh
 
       - name: Lab probe offline suite

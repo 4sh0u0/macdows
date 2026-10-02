@@ -29,7 +29,7 @@
 #      parses an IP literal directly; no DNS is ever consulted for one).
 #
 # Each case starts with `begin`, which resets the per-case trace and the sandbox log, so no
-# case depends on what the previous one left behind. The mutation proofs (M1-M8) copy the
+# case depends on what the previous one left behind. The mutation proofs (M1-M11) copy the
 # relay with one guard disabled and require the case that claims to pin it to FAIL against
 # the mutant. A pin that would also pass against the broken code pins nothing.
 #
@@ -133,7 +133,8 @@ write_xfreerdp_shim() { # <path> <--version answer line> [probe mode: ok|exit127
 #   noisy    like ok, but also write $0 to stderr, record any stdin line it can read as
 #            `version stdin=<line>`, and answer in FreeRDP's print_version_ex form
 #            `This is FreeRDP version [<$0>] <line above>`
-# Any other call records its own path ($0) and its argv and either exits at once or `exec`s a
+# Any other call records its own path ($0) and its argv, writes LABTEST_SHIM_EMIT's bytes (if set)
+# to stdout, and either exits at once or `exec`s a
 # sleep so the relay's TIMEOUT kill has a real process to kill. `exec` matters: it makes THIS pid
 # the sleeping process, so the pid the relay kills (and the pid this suite reads from the trace)
 # is the sleep itself -- no orphaned child outlives the case. Opens nothing.
@@ -158,6 +159,9 @@ fi
 	for a in "$@"; do printf ' [%s]' "$a"; done
 	printf '\n'
 } >> "$LABTEST_TRACE"
+# Stand-in for FreeRDP's own log output (14*): when LABTEST_SHIM_EMIT names a file, its bytes go to
+# stdout -- which is relay.log -- before anything slower runs, so a TIMEOUT=2 run has them in.
+if [ -n "${LABTEST_SHIM_EMIT:-}" ]; then cat "$LABTEST_SHIM_EMIT"; fi
 # pid<TAB>identity: identity is this process's own start time plus argv (ps -o lstart=,args=),
 # fixed to LC_ALL=C TZ=UTC0 -- gate r1 I-2 measured that plain `ps -o lstart=` renders differently
 # under a maintainer's own locale or exported TZ (a Chinese Terminal, or TZ=UTC, made every
@@ -368,6 +372,11 @@ RELAY_ENV_PIN=''
 RELAY_PATH_OVERRIDE=''
 # The relay's stdin: /dev/null unless a case names a file (13n).
 RELAY_STDIN=''
+# A file whose bytes the xfreerdp shim writes to its stdout (relay.log) when dialled (14*); empty =
+# none. Passed to the shim as LABTEST_SHIM_EMIT.
+RELAY_SHIM_EMIT=''
+# LC_ALL for the relay (14g); empty = not passed at all (env -i leaves the relay without one).
+RELAY_LOCALE=''
 # Clears everything one relay run leaves or reads, except job.env (a case with several runs keeps
 # its job and changes only the client inputs between them). `-r`: 13m makes relay-client.env a
 # directory; on a symlink `rm -rf` removes the link, never its target.
@@ -378,6 +387,8 @@ reset_run() {
 	RELAY_ENV_PIN=''
 	RELAY_PATH_OVERRIDE=''
 	RELAY_STDIN=''
+	RELAY_SHIM_EMIT=''
+	RELAY_LOCALE=''
 }
 begin() { # <case label>
 	CASE="$1"
@@ -528,6 +539,8 @@ run_relay() { # <relay-path> <boundary-file|""> [xfreerdp-mode]
 		LABTEST_REFUSED_TRACE="$LABTEST_REFUSED_TRACE" \
 		LABTEST_PID_LEDGER="$LABTEST_PID_LEDGER" \
 		LABTEST_XFREERDP_MODE="${3:-exit0}" \
+		LABTEST_SHIM_EMIT="$RELAY_SHIM_EMIT" \
+		${RELAY_LOCALE:+"LC_ALL=$RELAY_LOCALE"} \
 		MACDOWS_LAB_BOUNDARY_FILE="$2" \
 		MACDOWS_XFREERDP="$RELAY_ENV_PIN" \
 		bash "$1" >/dev/null 2>&1 < "${RELAY_STDIN:-/dev/null}"
@@ -548,6 +561,8 @@ run_relay_bounded() { # <relay-path> <boundary-file|""> <xfreerdp-mode> <budget>
 		LABTEST_REFUSED_TRACE="$LABTEST_REFUSED_TRACE" \
 		LABTEST_PID_LEDGER="$LABTEST_PID_LEDGER" \
 		LABTEST_XFREERDP_MODE="$3" \
+		LABTEST_SHIM_EMIT="$RELAY_SHIM_EMIT" \
+		${RELAY_LOCALE:+"LC_ALL=$RELAY_LOCALE"} \
 		MACDOWS_LAB_BOUNDARY_FILE="$2" \
 		MACDOWS_XFREERDP="$RELAY_ENV_PIN" \
 		bash "$1" >/dev/null 2>&1 < "${RELAY_STDIN:-/dev/null}" &
@@ -1186,6 +1201,391 @@ else
 	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
 fi
 
+# 14. LOGON-INFO MASK (2026-10-02; relay.command header). FreeRDP logs `Logon Info V2 [<domain>\<user>
+#     [<n>]]` on every logon, which put the lab host's computer name and the lab account into
+#     relay.log and from there into evidence directories and the docs archives. A dialling run now
+#     rewrites relay.log once after xfreerdp has gone, in place (same inode), masking only the
+#     `<domain>\<user>` segment of `Logon Info V1 [` / `Logon Info V2 [` lines, and logs
+#     `[relay] masked logon-info lines=<n>` between `[relay] xfreerdp exited` and DONE. The fixtures
+#     stand in for FreeRDP's own output (the shim writes them to relay.log, see RELAY_SHIM_EMIT);
+#     EXAMPLE-HOST / exampleuser are placeholders, never a real host or account.
+MASK_FIX_LOGON="$SB/fixture-logon.txt"
+MASK_FIX_MASKED="$SB/fixture-logon-masked.txt"
+MASK_FIX_PLAIN="$SB/fixture-plain.txt"
+write_logon_fixture() { # <path> <domain\user segment>
+	{
+		printf '%s\n' '[12:00:00:001] [100:200] [INFO][com.freerdp.core.connection] - connection established'
+		printf '%s\n' "[12:00:01:500] [100:200] [INFO][com.freerdp.client.common] - [client_common_save_session_info]: Logon Info V2 [$2 [7]]"
+		printf '%s\n' "[12:00:01:501] [100:200] [INFO][com.freerdp.client.common] - [client_common_save_session_info]: Logon Info V1 [$2]"
+		printf '%s\n' '[12:00:01:502] [100:200] [INFO][com.freerdp.client.common] - [client_common_save_session_info]: Logon Extended Info [cookie: TRUE, LogonId: 7, errorInfo: FALSE, notifyType: 0, notifyData: 0]'
+		printf '%s\n' '[12:00:09:900] [100:200] [ERROR][com.freerdp.core] - ERRINFO_LOGOFF_BY_USER (0x0000000C)'
+	} > "$1"
+}
+write_logon_fixture "$MASK_FIX_LOGON" 'EXAMPLE-HOST\exampleuser' || exit 1
+write_logon_fixture "$MASK_FIX_MASKED" '<host>\<lab-user>' || exit 1
+# No line the mask may touch, but every shape that sits next to one: an unknown version, a missing
+# space before `[`, lower case, a backslash path, printf directives, a tab, a CR, trailing blanks
+# and a multi-byte UTF-8 character.
+{
+	printf '%s\n' 'Logon Info V3 [EXAMPLE-HOST\exampleuser [7]]'
+	printf '%s\n' 'Logon Info V2[EXAMPLE-HOST\exampleuser]'
+	printf '%s\n' 'logon info v2 [EXAMPLE-HOST\exampleuser [7]]'
+	printf '%s\n' 'Logon Extended Info [cookie: TRUE, LogonId: 7]'
+	printf '%s\n' 'C:\Windows\System32\logoff.exe 100% %s %d \\ \n end'
+	printf 'tab\there carriage-return\r\n'
+	printf '%s\n' 'trailing blanks   '
+	printf 'caf\303\251\n'
+} > "$MASK_FIX_PLAIN" || exit 1
+# awk stand-ins for 14e, PATH-first only for that case. They defer to the awk the suite itself
+# resolves for every call except the relay's mask filter (recognised by RELAY_MASK_COUNT in its
+# environment): one fails it, one "succeeds" without reporting a line count.
+REAL_AWK="$(command -v awk)"
+mkdir -p "$SB/awk-fail" "$SB/awk-nocount" || exit 1
+for variant in fail nocount; do
+	# shellcheck disable=SC2016  # shim source text: "$2" belongs to the shim, not to this shell
+	if [ "$variant" = fail ]; then mask_action='exit 2'; else mask_action='cat "$2"; exit 0'; fi
+	{
+		printf '#!/usr/bin/env bash\n'
+		printf '# OFFLINE TEST SHIM (14e): the relay mask filter -> %s; any other awk call is the real one.\n' "$variant"
+		# The relay calls the filter as `awk '<program>' relay.log`, so "$2" is the log.
+		# shellcheck disable=SC2016  # shim source text, expanded by the shim
+		printf 'if [ -n "${RELAY_MASK_COUNT:-}" ]; then %s; fi\n' "$mask_action"
+		printf 'exec %q "$@"\n' "$REAL_AWK"
+	} > "$SB/awk-$variant/awk" && chmod +x "$SB/awk-$variant/awk" || exit 1
+	bash -n "$SB/awk-$variant/awk" || exit 1
+done
+# `ls -i` on one known path: the portable inode read (stat's flags differ between BSD and GNU).
+# shellcheck disable=SC2012
+inode_of() { ls -i "$1" 2>/dev/null | sed 's/^ *//; s/ .*//'; }
+# relay.log up to and including the first `[relay] program=` line, then <fixture>, then the given
+# lines -- the whole log byte for byte. The head is taken from the log itself (it carries the
+# boundary gate's line and the shim's sha8) but must end in the client line and the program line,
+# or the expectation is not built at all.
+expected_log() { # <out> <fixture> <line>...
+	local out="$1" fixture="$2" pl
+	shift 2
+	pl="$(grep -n '^\[relay\] program=' "$LOG" | head -n 1 | cut -d: -f1)"
+	[ -n "$pl" ] && [ "$pl" -ge 2 ] || return 1
+	sed -n "$((pl - 1))p" "$LOG" | grep -q '^\[relay\] client=' || return 1
+	{ head -n "$pl" "$LOG"; cat "$fixture"; printf '%s\n' "$@"; } > "$out"
+}
+mask_leftovers() { find "$SBRUNTIME" -maxdepth 1 -name '.relay-mask*' | grep -c '' || true; }
+
+# 14a. Masking on the normal exit path: both logon lines become `<host>\<lab-user>` (V2 keeps its
+#      ` [7]]`), the Extended Info line and every other byte stay, the placeholders appear nowhere,
+#      `masked logon-info lines=2` sits between `xfreerdp exited` and DONE, no temp file is left.
+#      Red when the call to relay_mask_logon_info goes (M9), when the awk filter stops replacing the
+#      segment, or when the `masked logon-info` echo goes.
+mask_a_reasons() { # <relay-path>
+	local r=''
+	write_job 'C:\Windows\System32\notepad.exe'
+	RELAY_SHIM_EMIT="$MASK_FIX_LOGON"
+	run_relay "$1" "" exit0
+	if expected_log "$SB/expected-14a.txt" "$MASK_FIX_MASKED" '[relay] xfreerdp exited' '[relay] masked logon-info lines=2' 'DONE exit=0'; then
+		cmp -s "$SB/expected-14a.txt" "$LOG" || r="$r log-differs-from-expected;"
+	else
+		r="$r head-lines-not-client-and-program;"
+	fi
+	[ "$(grep -c 'EXAMPLE-HOST' "$LOG")" = 0 ] || r="$r EXAMPLE-HOST-in-log;"
+	[ "$(grep -c 'exampleuser' "$LOG")" = 0 ] || r="$r exampleuser-in-log;"
+	[ "$(grep -c '^\[relay\] masked logon-info' "$LOG")" = 1 ] || r="$r masked-lines=$(grep -c '^\[relay\] masked logon-info' "$LOG");"
+	[ "$(mask_leftovers)" = 0 ] || r="$r temp-files-left;"
+	printf '%s' "$r"
+}
+begin '14a logon-info masked on exit'
+reasons="$(mask_a_reasons "$SBLAB/relay.command")"
+if [ -z "$reasons" ]; then
+	pass "$CASE: V2/V1 logon segments masked to <host>\\<lab-user> (V2 keeps [7]]), Extended Info and every other byte untouched, lines=2 between exited and DONE"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
+# 14b. Same mask on the TIMEOUT-kill path: the shim writes the fixture, then sleeps until killed.
+#      The fixture region is compared byte for byte and the last four lines are the timeout line,
+#      exited, lines=2 and DONE in that order. Red when the mask step stops running for dialling
+#      runs (the `RELAY_DIALLED=1` line deleted) or moves before the TIMEOUT kill.
+begin '14b logon-info masked on the TIMEOUT path'
+write_job 'C:\Windows\System32\notepad.exe' '' 2
+RELAY_SHIM_EMIT="$MASK_FIX_LOGON"
+run_relay_bounded "$SBLAB/relay.command" "" sleep 15 >/dev/null; self_exited=$?
+kill_recorded_shims
+reasons=''
+[ "$self_exited" -eq 0 ] || reasons="$reasons relay-did-not-exit-by-itself;"
+sed -n '/^\[relay\] program=/,/^\[relay\] timeout reached/p' "$LOG" | sed '1d;$d' > "$SB/region-14b.txt"
+cmp -s "$SB/region-14b.txt" "$MASK_FIX_MASKED" || reasons="$reasons fixture-region-differs;"
+printf '%s\n' '[relay] timeout reached -- closing connection' '[relay] xfreerdp exited' '[relay] masked logon-info lines=2' 'DONE exit=0' > "$SB/tail-14b.txt"
+tail -n 4 "$LOG" | cmp -s - "$SB/tail-14b.txt" || reasons="$reasons tail-not-timeout-exited-masked-done;"
+[ "$(grep -c 'EXAMPLE-HOST\|exampleuser' "$LOG")" = 0 ] || reasons="$reasons placeholder-in-log;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: a killed client's logon lines are masked too; timeout, exited, lines=2, DONE in order"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
+# 14c. Nothing to mask: `lines=0`, and the whole log is byte for byte what the run wrote -- the
+#      near-miss shapes (V3, no space, lower case) are not taken for logon lines. With n=0 the relay
+#      never writes the log back, so this pins only that: no write-back at n=0, no near-miss match,
+#      `lines=0`. Red when the filter widens its match (a regex on `Logon Info`), when n=0 still
+#      writes back something else, or when the `lines=` echo goes. Byte fidelity of an actual
+#      rewrite is 14g's.
+begin '14c nothing to mask leaves every byte'
+write_job 'C:\Windows\System32\notepad.exe'
+RELAY_SHIM_EMIT="$MASK_FIX_PLAIN"
+run_relay "$SBLAB/relay.command" "" exit0
+reasons=''
+if expected_log "$SB/expected-14c.txt" "$MASK_FIX_PLAIN" '[relay] xfreerdp exited' '[relay] masked logon-info lines=0' 'DONE exit=0'; then
+	cmp -s "$SB/expected-14c.txt" "$LOG" || reasons="$reasons log-differs-from-expected;"
+else
+	reasons="$reasons head-lines-not-client-and-program;"
+fi
+if [ -z "$reasons" ]; then
+	pass "$CASE: no Logon Info V1/V2 line -> lines=0 and relay.log is byte-identical to what the run wrote (near-miss shapes, CR, tab, UTF-8 kept)"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"; diff "$SB/expected-14c.txt" "$LOG" | sed 's/^/        /'
+fi
+
+# 14d. relay.log keeps its inode through the rewrite, and a reader that opened it before the run
+#      (a `tail -f`, a poll loop) reads the masked log and the DONE line through that same open
+#      file. Red when the copy-back becomes a rename (M10: `mv tmp relay.log`) or `sed -i`.
+mask_d_reasons() { # <relay-path>
+	local r='' before after
+	write_job 'C:\Windows\System32\notepad.exe'
+	RELAY_SHIM_EMIT="$MASK_FIX_LOGON"
+	before="$(inode_of "$LOG")"
+	exec 9< "$LOG"
+	run_relay "$1" "" exit0
+	cat <&9 > "$SB/fd-view-14d.txt"
+	exec 9<&-
+	after="$(inode_of "$LOG")"
+	[ -n "$before" ] && [ "$before" = "$after" ] || r="$r inode-changed=[$before]->[$after];"
+	cmp -s "$SB/fd-view-14d.txt" "$LOG" || r="$r open-reader-sees-another-file;"
+	grep -qF '<host>\<lab-user>' "$SB/fd-view-14d.txt" || r="$r open-reader-sees-no-mask;"
+	[ "$(tail -n 1 "$SB/fd-view-14d.txt")" = 'DONE exit=0' ] || r="$r open-reader-sees-no-DONE;"
+	printf '%s' "$r"
+}
+begin '14d relay.log keeps its inode'
+reasons="$(mask_d_reasons "$SBLAB/relay.command")"
+if [ -z "$reasons" ]; then
+	pass "$CASE: same inode before and after; a reader opened before the run reads the masked log and DONE"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
+# 14e. The mask filter failing (awk exits 2) or answering no line count: `[relay] MASK-FAILED -- <reason>`
+#      after `xfreerdp exited`, DONE exit=74 still written as the last line, no `masked logon-info`
+#      line, relay.log otherwise as the run wrote it (the names stay -- hence 74), no temp file left
+#      and no path in the log. Red when the filter's exit status is ignored, when the count check
+#      goes (lines= would print empty), or when a failure skips the DONE echo.
+begin '14e mask failure still writes DONE'
+reasons=''
+for variant in fail nocount; do
+	reset_run
+	write_job 'C:\Windows\System32\notepad.exe'
+	RELAY_SHIM_EMIT="$MASK_FIX_LOGON"; RELAY_PATH_OVERRIDE="$SB/awk-$variant:$SB/bin:$PATH"
+	run_relay "$SBLAB/relay.command" "" exit0
+	case "$variant" in
+	fail) want='[relay] MASK-FAILED -- the mask filter failed; ' ;;
+	*) want='[relay] MASK-FAILED -- the mask filter reported no line count; ' ;;
+	esac
+	if expected_log "$SB/expected-14e.txt" "$MASK_FIX_LOGON" '[relay] xfreerdp exited'; then
+		# everything up to and including `xfreerdp exited` is the unmasked run, then two lines
+		head -n "$(grep -c '' "$SB/expected-14e.txt")" "$LOG" | cmp -s - "$SB/expected-14e.txt" || reasons="$reasons $variant:log-before-mask-changed;"
+	else
+		reasons="$reasons $variant:head-lines-not-client-and-program;"
+	fi
+	[[ "$(tail -n 2 "$LOG" | head -n 1)" == "$want"* ]] || reasons="$reasons $variant:second-last-line=[$(tail -n 2 "$LOG" | head -n 1)];"
+	[ "$(last_line)" = 'DONE exit=74' ] || reasons="$reasons $variant:last-line=[$(last_line)];"
+	[ "$(done_lines)" = 1 ] || reasons="$reasons $variant:done-lines=$(done_lines);"
+	! grep -q '^\[relay\] masked logon-info' "$LOG" || reasons="$reasons $variant:masked-line-present;"
+	[ "$(mask_leftovers)" = 0 ] || reasons="$reasons $variant:temp-files-left;"
+	! grep -qF "$SB/" "$LOG" || reasons="$reasons $variant:sandbox-path-in-log;"
+done
+if [ -z "$reasons" ]; then
+	pass "$CASE: a failing filter and a filter without a count both give MASK-FAILED after exited, DONE exit=74 last, no masked line, no temp file, no path"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
+# 14f. The two logoff jobs carry TIMEOUT=30 (2026-10-02: 12 s killed two logoffs 10.2 / 10.5 s
+#      after logon, before ERRINFO_LOGOFF_BY_USER), exactly one TIMEOUT line each. Red when either
+#      file goes back to 12 or gains a second TIMEOUT line.
+begin '14f logoff jobs TIMEOUT=30'
+reasons=''
+for jobfile in "$LAB/jobs/logoff-path.env" "$LAB/jobs/logoff.env"; do
+	[ "$(grep -c '^TIMEOUT=' "$jobfile")" = 1 ] || reasons="$reasons $(basename "$jobfile"):timeout-lines=$(grep -c '^TIMEOUT=' "$jobfile");"
+	grep -qx 'TIMEOUT=30' "$jobfile" || reasons="$reasons $(basename "$jobfile"):not-TIMEOUT=30;"
+done
+if [ -z "$reasons" ]; then
+	pass "$CASE: jobs/logoff-path.env and jobs/logoff.env both read TIMEOUT=30, one line each"
+else
+	fail "$CASE:$reasons"
+fi
+
+# 14g. Byte fidelity on the REWRITE path (gate r1 I-1). 14c's log has no Logon line, so the relay
+#      never writes it back and 14c cannot see what the filter does to bytes; here both logon lines
+#      are present and the fixture carries a CR, tabs, printf directives, backslashes, multi-byte
+#      UTF-8 and an invalid byte (\377) -- one in the masked V2 line's tail after ` [7]]`, one in
+#      another line. The relay runs under a UTF-8 LC_ALL (MASK_UTF8_LOCALE, chosen from `locale -a`),
+#      so an awk that honours the locale (gawk) would rewrite the invalid byte if the relay's own
+#      LC_ALL=C went. The expectation is built here from the same template with the placeholder
+#      segment written in -- never by the relay's awk. Red when LC_ALL=C goes under gawk (mutation
+#      H, scratch-verified), when the line is reprinted through printf, or when any byte outside the
+#      segment changes. No UTF-8 locale on the machine: the case still runs and compares, with a
+#      note that the locale-sensitive half was not exercised.
+MASK_FIX_BYTES="$SB/fixture-bytes.txt"
+MASK_FIX_BYTES_MASKED="$SB/fixture-bytes-masked.txt"
+write_bytes_fixture() { # <path> <domain\user segment>
+	{
+		printf '%s\n' '[12:00:00:001] [100:200] [INFO][com.freerdp.core.connection] - connection established'
+		printf '[12:00:01:500] [100:200] [INFO][com.freerdp.client.common] - [client_common_save_session_info]: Logon Info V2 [%s [7]] tail \377 caf\303\251 %%s %%d\tend\r\n' "$2"
+		printf '[12:00:01:501] [100:200] [INFO][com.freerdp.client.common] - [client_common_save_session_info]: Logon Info V1 [%s]\r\n' "$2"
+		printf '%s\n' 'C:\Windows\System32\logoff.exe 100% %s %d \\ \n end'
+		printf 'tab\there invalid \377 byte caf\303\251 carriage-return\r\n'
+		printf '%s\n' '[12:00:09:900] [100:200] [ERROR][com.freerdp.core] - ERRINFO_LOGOFF_BY_USER (0x0000000C)'
+	} > "$1"
+}
+write_bytes_fixture "$MASK_FIX_BYTES" 'EXAMPLE-HOST\exampleuser' || exit 1
+write_bytes_fixture "$MASK_FIX_BYTES_MASKED" '<host>\<lab-user>' || exit 1
+# `locale -a` spells the same locale differently (macOS en_US.UTF-8 / C.UTF-8, glibc en_US.utf8 /
+# C.utf8); the comparison folds case and the hyphen, the name is used as listed.
+MASK_UTF8_LOCALE=''
+MASK_LOCALES="$(locale -a 2>/dev/null || true)"
+for want in en_us.utf8 c.utf8; do
+	while IFS= read -r loc; do
+		if [ "$(printf '%s' "$loc" | tr '[:upper:]' '[:lower:]' | tr -d '-')" = "$want" ]; then MASK_UTF8_LOCALE="$loc"; break; fi
+	done <<EOF_LOCALES
+$MASK_LOCALES
+EOF_LOCALES
+	[ -n "$MASK_UTF8_LOCALE" ] && break
+done
+begin '14g rewrite keeps every other byte'
+write_job 'C:\Windows\System32\notepad.exe'
+RELAY_SHIM_EMIT="$MASK_FIX_BYTES"; RELAY_LOCALE="$MASK_UTF8_LOCALE"
+run_relay "$SBLAB/relay.command" "" exit0
+reasons=''
+if expected_log "$SB/expected-14g.txt" "$MASK_FIX_BYTES_MASKED" '[relay] xfreerdp exited' '[relay] masked logon-info lines=2' 'DONE exit=0'; then
+	cmp -s "$SB/expected-14g.txt" "$LOG" || reasons="$reasons log-differs-from-expected;"
+else
+	reasons="$reasons head-lines-not-client-and-program;"
+fi
+[ "$(grep -c 'EXAMPLE-HOST\|exampleuser' "$LOG")" = 0 ] || reasons="$reasons placeholder-in-log;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: CR, tab, %s %d, backslashes, UTF-8 and \\377 (in the masked tail and elsewhere) byte-identical after the rewrite, LC_ALL=[${MASK_UTF8_LOCALE:-<none>}]"
+	[ -n "$MASK_UTF8_LOCALE" ] || note "no UTF-8 locale in \`locale -a\`: the comparison ran, the locale-sensitive half (mutation H) was not exercised"
+else
+	fail "$CASE:$reasons"; note "LC_ALL=[${MASK_UTF8_LOCALE:-<none>}]"; cmp "$SB/expected-14g.txt" "$LOG" | sed 's/^/        /'
+fi
+
+# 14h. Refused runs are not rewritten (gate r1 I-2; header "Refused runs … are not rewritten"): a
+#      boundary refusal (78) and a JOB-ENV-MISSING (66) each leave no `masked logon-info` and no
+#      MASK-FAILED line, the refusal line stays second to last right above DONE, and no temp file is
+#      created. Red when the mask step runs for every run (M11: `-eq 1` -> `true`).
+mask_refused_reasons() { # <relay-path>
+	local r='' kind want
+	for kind in boundary jobenv; do
+		reset_run
+		rm -f "$SBRUNTIME/job.env"
+		if [ "$kind" = boundary ]; then
+			write_job 'C:\Windows\System32\notepad.exe'
+			run_relay "$1" "$DENY_FILE" exit0
+			want='[relay] BOUNDARY-REFUSED -- target is not a permitted lab host; no connection attempted'
+		else
+			run_relay "$1" "" exit0
+			want='[relay] JOB-ENV-MISSING -- .build/lab-runtime/job.env is not readable; no connection attempted'
+		fi
+		! grep -q '^\[relay\] masked logon-info' "$LOG" || r="$r $kind:masked-line-present;"
+		! grep -q 'MASK-FAILED' "$LOG" || r="$r $kind:MASK-FAILED-present;"
+		[ "$(tail -n 2 "$LOG" | head -n 1)" = "$want" ] || r="$r $kind:second-last-line=[$(tail -n 2 "$LOG" | head -n 1)];"
+		case "$kind" in
+		boundary) [ "$(last_line)" = 'DONE exit=78' ] || r="$r $kind:last-line=[$(last_line)];" ;;
+		*) [ "$(last_line)" = 'DONE exit=66' ] || r="$r $kind:last-line=[$(last_line)];" ;;
+		esac
+		[ "$(mask_leftovers)" = 0 ] || r="$r $kind:temp-files-left;"
+	done
+	printf '%s' "$r"
+}
+begin '14h refused runs are not rewritten'
+reasons="$(mask_refused_reasons "$SBLAB/relay.command")"
+if [ -z "$reasons" ]; then
+	pass "$CASE: boundary refusal (78) and JOB-ENV-MISSING (66): no masked / MASK-FAILED line, refusal line right above DONE, no temp file"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
+# 14i. The copy-back itself failing (gate r1 I-3): a PATH-first `cat` writes a few bytes and exits 1
+#      when -- and only when -- its argument is the relay's mask temp file under the runtime
+#      directory; every other call is the real cat. The run must log `MASK-FAILED -- the masked log
+#      could not be written back;`, end with DONE exit=74, carry no `masked logon-info` line, leave
+#      no temp file and no path in the log. (The partial bytes have no newline; the relay appends a
+#      newline first, so MASK-FAILED still starts its own line -- asserted below -- and so does DONE.)
+#      Red when that branch's `return 1` goes (mutation F, scratch-verified: lines=2 and DONE exit=0
+#      on a cut log) and when the newline guard goes (14i: MASK-FAILED not at line start).
+REAL_CAT="$(command -v cat)"
+mkdir -p "$SB/cat-fail" || exit 1
+# shellcheck disable=SC2016  # shim source text: "$1" belongs to the shim, not to this shell
+{
+	printf '#!/usr/bin/env bash\n'
+	printf '# OFFLINE TEST SHIM (14i): copy-back of the relay mask temp file -> partial write, exit 1.\n'
+	printf 'case "${1:-}" in\n'
+	printf '%q/.relay-mask.*) head -c 20 "$1"; exit 1 ;;\n' "$SBRUNTIME"
+	printf 'esac\n'
+	printf 'exec %q "$@"\n' "$REAL_CAT"
+} > "$SB/cat-fail/cat" && chmod +x "$SB/cat-fail/cat" || exit 1
+bash -n "$SB/cat-fail/cat" || exit 1
+mask_writeback_reasons() { # <relay-path>
+	local r=''
+	write_job 'C:\Windows\System32\notepad.exe'
+	RELAY_SHIM_EMIT="$MASK_FIX_LOGON"; RELAY_PATH_OVERRIDE="$SB/cat-fail:$SB/bin:$PATH"
+	run_relay "$1" "" exit0
+	[ "$(grep -cF '[relay] MASK-FAILED -- the masked log could not be written back; ' "$LOG")" = 1 ] || r="$r writeback-MASK-FAILED-lines=$(grep -cF '[relay] MASK-FAILED -- the masked log could not be written back; ' "$LOG");"
+	[ "$(last_line)" = 'DONE exit=74' ] || r="$r last-line=[$(last_line)];"
+	[ "$(done_lines)" = 1 ] || r="$r done-lines=$(done_lines);"
+	# The partial copy-back leaves the last data line without a newline: MASK-FAILED must still start
+	# its own line (controller fold after gate r1, fold-report deviation 4).
+	[ "$(grep -c '^\[relay\] MASK-FAILED -- ' "$LOG")" = 1 ] || r="$r MASK-FAILED-not-at-line-start;"
+	! grep -q 'masked logon-info' "$LOG" || r="$r masked-line-present;"
+	[ "$(mask_leftovers)" = 0 ] || r="$r temp-files-left;"
+	! grep -qF "$SB/" "$LOG" || r="$r sandbox-path-in-log;"
+	printf '%s' "$r"
+}
+begin '14i copy-back failure is MASK-FAILED'
+reasons="$(mask_writeback_reasons "$SBLAB/relay.command")"
+if [ -z "$reasons" ]; then
+	pass "$CASE: a failing copy-back gives MASK-FAILED (could not be written back), DONE exit=74 last, no masked line, no temp file, no path"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
+# 14j. A matched line whose segment carries no backslash is not a logon (gate r1 m-1): FreeRDP's
+#      `Logon Info V2 [<INVALID DATA>]` stays byte for byte and is not counted, next to a real V2
+#      line that is masked -- lines=1. Red when the backslash condition goes (the diagnostic line
+#      would read `<host>\<lab-user>]` and lines=2).
+MASK_FIX_INVALID="$SB/fixture-invalid.txt"
+MASK_FIX_INVALID_MASKED="$SB/fixture-invalid-masked.txt"
+write_invalid_fixture() { # <path> <domain\user segment>
+	{
+		printf '%s\n' '[12:00:01:400] [100:200] [INFO][com.freerdp.client.common] - [client_common_save_session_info]: Logon Info V2 [<INVALID DATA>]'
+		printf '%s\n' "[12:00:01:500] [100:200] [INFO][com.freerdp.client.common] - [client_common_save_session_info]: Logon Info V2 [$2 [7]]"
+	} > "$1"
+}
+write_invalid_fixture "$MASK_FIX_INVALID" 'EXAMPLE-HOST\exampleuser' || exit 1
+write_invalid_fixture "$MASK_FIX_INVALID_MASKED" '<host>\<lab-user>' || exit 1
+begin '14j segment without a backslash is left alone'
+write_job 'C:\Windows\System32\notepad.exe'
+RELAY_SHIM_EMIT="$MASK_FIX_INVALID"
+run_relay "$SBLAB/relay.command" "" exit0
+reasons=''
+if expected_log "$SB/expected-14j.txt" "$MASK_FIX_INVALID_MASKED" '[relay] xfreerdp exited' '[relay] masked logon-info lines=1' 'DONE exit=0'; then
+	cmp -s "$SB/expected-14j.txt" "$LOG" || reasons="$reasons log-differs-from-expected;"
+else
+	reasons="$reasons head-lines-not-client-and-program;"
+fi
+if [ -z "$reasons" ]; then
+	pass "$CASE: Logon Info V2 [<INVALID DATA>] unchanged and uncounted, the real V2 line masked, lines=1"
+else
+	fail "$CASE:$reasons"; note "log: $(cat "$LOG")"
+fi
+
 # M1. Boundary gate bypassed (`if ! crdp_assert_lab_boundary` -> `if false`): the refused
 #     scenario must now invoke xfreerdp, i.e. case 1's pin bites.
 begin 'M1 gate-bypass mutant'
@@ -1350,6 +1750,59 @@ if sed 's/( exec -a xfreerdp "\$XFREERDP_BIN"/( exec "$XFREERDP_BIN"/' "$SBLAB/r
 	fi
 else
 	fail "$CASE: could not build the mutant (the dial statement moved?)"
+fi
+
+# M9. Mask call removed (`if relay_mask_logon_info; then` -> `if MASK_LINES=0; then`): the mutant still
+#     logs `lines=0` and DONE exit=0 but leaves the names in -- 14a's own verdict must turn red.
+begin 'M9 mask-call-removed mutant'
+MUTANT_MASK="$SBLAB/labtest-mutant-mask.command"
+if sed 's/if relay_mask_logon_info; then/if MASK_LINES=0; then/' "$SBLAB/relay.command" > "$MUTANT_MASK" \
+	&& ! cmp -s "$MUTANT_MASK" "$SBLAB/relay.command" && bash -n "$MUTANT_MASK"; then
+	reset_run
+	reasons="$(mask_a_reasons "$MUTANT_MASK")"
+	if [[ "$reasons" == *'EXAMPLE-HOST-in-log;'* ]]; then
+		pass "$CASE: detected -- 14a's verdict against the mutant:$reasons"
+	else
+		fail "$CASE: NOT detected -- 14a would pass against a relay that never masks"; note "reasons: [$reasons]"
+	fi
+else
+	fail "$CASE: could not build the mutant (the mask call moved?)"
+fi
+
+# M10. Copy-back by rename (`cat "$RELAY_MASK_TMP" >"$LOG"` -> `mv "$RELAY_MASK_TMP" "$LOG"`): the log is masked
+#      but is a new file -- 14d's own verdict must turn red on the inode.
+begin 'M10 rename-copy-back mutant'
+MUTANT_MV="$SBLAB/labtest-mutant-mv.command"
+# shellcheck disable=SC2016  # deliberate literal `$RELAY_MASK_TMP` / `$LOG` for sed
+if sed 's/if ! cat "\$RELAY_MASK_TMP" >"\$LOG"; then/if ! mv "$RELAY_MASK_TMP" "$LOG"; then/' "$SBLAB/relay.command" > "$MUTANT_MV" \
+	&& ! cmp -s "$MUTANT_MV" "$SBLAB/relay.command" && bash -n "$MUTANT_MV"; then
+	reset_run
+	reasons="$(mask_d_reasons "$MUTANT_MV")"
+	if [[ "$reasons" == *'inode-changed='* ]]; then
+		pass "$CASE: detected -- 14d's verdict against the mutant:$reasons"
+	else
+		fail "$CASE: NOT detected -- 14d would pass against a relay that renames over relay.log"; note "reasons: [$reasons]"
+	fi
+else
+	fail "$CASE: could not build the mutant (the copy-back line moved?)"
+fi
+
+# M11. Refused runs rewritten too (`if [ "$RELAY_DIALLED" -eq 1 ]; then` -> `if true; then`, gate r1
+#      I-2's mutation I): every refusal now logs `masked logon-info lines=0` above DONE -- 14h's own
+#      verdict must turn red.
+begin 'M11 mask-on-refusal mutant'
+MUTANT_REFUSED="$SBLAB/labtest-mutant-refused.command"
+# shellcheck disable=SC2016  # deliberate literal `$RELAY_DIALLED` for sed
+if sed 's/^if \[ "\$RELAY_DIALLED" -eq 1 \]; then$/if true; then/' "$SBLAB/relay.command" > "$MUTANT_REFUSED" \
+	&& ! cmp -s "$MUTANT_REFUSED" "$SBLAB/relay.command" && bash -n "$MUTANT_REFUSED"; then
+	reasons="$(mask_refused_reasons "$MUTANT_REFUSED")"
+	if [[ "$reasons" == *'boundary:masked-line-present;'* ]] && [[ "$reasons" == *'jobenv:masked-line-present;'* ]]; then
+		pass "$CASE: detected -- 14h's verdict against the mutant:$reasons"
+	else
+		fail "$CASE: NOT detected -- 14h would pass against a relay that rewrites refused runs"; note "reasons: [$reasons]"
+	fi
+else
+	fail "$CASE: could not build the mutant (the dialled-run guard moved?)"
 fi
 
 # 11. Across EVERY case above the refuse shims were never reached: the Terminal self-close
@@ -1554,7 +2007,7 @@ fi
 
 # Every case must have reported (review r2 B1): a case that neither passed nor failed would
 # otherwise vanish from the tally with exit 0.
-EXPECTED_CASES=50
+EXPECTED_CASES=63
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi
