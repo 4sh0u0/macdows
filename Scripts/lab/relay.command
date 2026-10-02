@@ -54,6 +54,38 @@
 # carries the pin path, and the client is started as `exec -a xfreerdp`, so its argv[0] -- which
 # FreeRDP echoes into relay.log in its usage and error banners -- is `xfreerdp`, as before the pin.
 #
+# LOGON-INFO MASK (2026-10-02): on every successful logon FreeRDP's client_common_save_session_info
+# logs `Logon Info V2 [<domain>\<user> [<session id>]]` (V1 for the older PDU), i.e. the host's
+# computer name and the lab account, and relay.log is copied into evidence directories and from
+# there into the docs archives. So once xfreerdp has exited (by itself or by the TIMEOUT kill) and
+# before the DONE line, a dialling run rewrites relay.log once: on every line carrying
+# `Logon Info V1 [` or `Logon Info V2 [`, the text after that `[` up to the first ` [` or `]` (the
+# `<domain>\<user>` segment; the rest of the line when neither follows) becomes `<host>\<lab-user>`
+# -- but only when that segment carries a backslash: a segment without one (FreeRDP's
+# `<INVALID DATA>` when the PDU carried no logon info) is left as it was and is not counted, so a
+# diagnostic line never passes for a logon.
+# Every other byte stays as it was -- line order, the `[relay]` lines, timestamps, the ` [<n>]]`
+# tail and the `Logon Info V[12]` / ERRINFO_* tokens the preregistered greps key on. The rewrite
+# goes through a temp file under .build/lab-runtime and back with `cat tmp >relay.log`, never `mv`
+# or `sed -i`, so the log keeps its inode for anyone reading it with `tail -f` or a poll loop; it
+# runs after xfreerdp has gone, so nothing is inserted between the client and the log ($! stays
+# the client's pid). It is skipped when no line matched. The run then logs
+#   [relay] masked logon-info lines=<n>
+# after `[relay] xfreerdp exited` (n may be 0; the line names no host or account). If the rewrite
+# fails, the run logs `[relay] MASK-FAILED -- <reason>; …` instead (on a line of its own, even after a copy-back that stopped mid-line) and still writes DONE, with
+# exit=74 (EX_IOERR) -- the log may then carry the names, and the caller must not archive it as is.
+# Refused runs (78 / 66 / 65 / 69) dial nothing and are not rewritten. Lines xfreerdp wrote while
+# it was still running were unmasked until then; only a reader that waits for DONE sees the mask.
+# A reader following relay.log as a stream sees more than that: `cat tmp >relay.log` truncates
+# before it writes, so `tail -f` / `tail -F` report "file truncated" and replay the whole file
+# (the Logon Info and ERRINFO_* lines a second time) when the masked log is shorter than what they
+# had read, and may miss the truncation and print misaligned fragments when it is not. Readers
+# therefore judge a run by its DONE line and the log as it stands then, never by counting lines off
+# a tail stream. The two temp files are named in RELAY_MASK_TMP / RELAY_MASK_COUNT, not in function
+# locals, so the EXIT trap (HUP / INT / TERM exit through it) removes them when the relay dies
+# mid-rewrite -- relay.log may then be cut short and carry no DONE line, and the caller's own wait
+# ceiling ends the step.
+#
 # job.env keys:
 #   PROGRAM   Windows path of the RemoteApp program to run
 #   CMDARGS   command-line arguments (optional; must contain no commas -- xfreerdp's
@@ -73,6 +105,22 @@ mkdir -p "$SHARE"
 LOG="$RUNTIME/relay.log"
 : > "$LOG"
 RELAY_RC=0
+# 1 once xfreerdp has been started (LOGON-INFO MASK in the header applies to dialling runs only).
+RELAY_DIALLED=0
+# LOGON-INFO MASK temp files (header): script-level so the EXIT trap can remove them when the relay
+# dies mid-rewrite -- bash 3.2 has no function-local trap. Empty = none.
+RELAY_MASK_TMP=''
+RELAY_MASK_COUNT=''
+# shellcheck disable=SC2329,SC2317  # invoked by the EXIT trap below
+relay_mask_cleanup() {
+    if [ -n "$RELAY_MASK_TMP" ]; then rm -f "$RELAY_MASK_TMP"; fi
+    if [ -n "$RELAY_MASK_COUNT" ]; then rm -f "$RELAY_MASK_COUNT"; fi
+    RELAY_MASK_TMP=''; RELAY_MASK_COUNT=''
+}
+trap relay_mask_cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # XFREERDP_EXTRA (job.env, optional; T6-prime RA3 "other client", 2026-09-07): extra xfreerdp
 # switches from a CLOSED allowlist -- the scale declarations and /dynamic-resolution -- so a job
 # can join the retained session as a client that declares a non-100 % scale. Every token must
@@ -177,6 +225,60 @@ EOF_CLIENT_KEYS
     return 0
 }
 
+# LOGON-INFO MASK (header). Rewrites $LOG in place; on success sets MASK_LINES (the number of
+# lines masked, 0 included) and returns 0, on failure sets MASK_REASON (a fixed text, never a path)
+# and returns 1 having left $LOG as it was -- or, when the final copy-back itself failed, as far as
+# that copy got. LC_ALL=C makes every awk count bytes; index()/substr() only (no regex, no sub()
+# replacement string, no -v), so BSD awk, gawk and mawk produce the same bytes. $LOG always ends
+# with the relay's own `[relay] xfreerdp exited` line here, so awk's newline per record reproduces
+# the file's newlines exactly. A matched line whose segment carries no backslash is printed as read
+# and not counted (header). The temp files live in RELAY_MASK_TMP / RELAY_MASK_COUNT for the EXIT
+# trap and are removed through relay_mask_cleanup on every return.
+relay_mask_logon_info() {
+    MASK_LINES=''; MASK_REASON=''
+    RELAY_MASK_TMP="$(mktemp "$RUNTIME/.relay-mask.XXXXXX" 2>/dev/null)" || { RELAY_MASK_TMP=''; MASK_REASON="no temp file"; return 1; }
+    RELAY_MASK_COUNT="$(mktemp "$RUNTIME/.relay-mask-count.XXXXXX" 2>/dev/null)" || { RELAY_MASK_COUNT=''; relay_mask_cleanup; MASK_REASON="no temp file"; return 1; }
+    if ! LC_ALL=C RELAY_MASK_COUNT="$RELAY_MASK_COUNT" awk '
+        BEGIN { n = 0; bs = "\\"; masked = "<host>" bs "<lab-user>" }
+        {
+            line = $0
+            p = index(line, "Logon Info V1 [")
+            q = index(line, "Logon Info V2 [")
+            if (q > 0 && (p == 0 || q < p)) p = q
+            if (p > 0) {
+                s = p + 15
+                rest = substr(line, s)
+                e = index(rest, " [")
+                b = index(rest, "]")
+                if (b > 0 && (e == 0 || b < e)) e = b
+                seg = rest
+                tail = ""
+                if (e > 0) { seg = substr(rest, 1, e - 1); tail = substr(rest, e) }
+                if (index(seg, bs) > 0) {
+                    line = substr(line, 1, s - 1) masked tail
+                    n++
+                }
+            }
+            print line
+        }
+        END { print n > ENVIRON["RELAY_MASK_COUNT"] }
+    ' "$LOG" >"$RELAY_MASK_TMP" 2>/dev/null; then
+        relay_mask_cleanup; MASK_REASON="the mask filter failed"; return 1
+    fi
+    MASK_LINES="$(head -n 1 "$RELAY_MASK_COUNT" 2>/dev/null)"
+    case "$MASK_LINES" in
+        '' | *[!0-9]*) relay_mask_cleanup; MASK_LINES=''; MASK_REASON="the mask filter reported no line count"; return 1 ;;
+    esac
+    if [ "$MASK_LINES" -gt 0 ]; then
+        # Same inode (header): truncate-and-write through the existing name, never a rename.
+        if ! cat "$RELAY_MASK_TMP" >"$LOG"; then
+            relay_mask_cleanup; MASK_REASON="the masked log could not be written back"; return 1
+        fi
+    fi
+    relay_mask_cleanup
+    return 0
+}
+
 {
     # shellcheck source=/dev/null
     source "$HOME/.config/macdows/host.env"
@@ -200,7 +302,8 @@ EOF_CLIENT_KEYS
     # once yet reported DONE exit=0 (r4 I1). The contract is "every run writes DONE" -- the
     # job.env refusals keep it, each with a named reason and a sysexits code the caller can
     # tell apart (66 EX_NOINPUT / 65 EX_DATAERR; 78 EX_CONFIG stays the boundary's; 69
-    # EX_UNAVAILABLE is the client pin's CLIENT-INVALID, see CLIENT PIN in the header).
+    # EX_UNAVAILABLE is the client pin's CLIENT-INVALID, see CLIENT PIN in the header; 74
+    # EX_IOERR is a dialling run's MASK-FAILED, see LOGON-INFO MASK in the header).
     if ! crdp_assert_lab_boundary "${WIN_HOST:-}"; then
         echo "[relay] BOUNDARY-REFUSED -- target is not a permitted lab host; no connection attempted"
         RELAY_RC=78
@@ -258,6 +361,7 @@ EOF_JOB_KEYS
             # shellcheck disable=SC2086
             set -- $XFREERDP_EXTRA
             set +f
+            RELAY_DIALLED=1
             # `exec -a xfreerdp` keeps argv[0] what it was before the pin (CLIENT PIN in the header)
             # instead of the pin's absolute path. The subshell execs the client, so $! is the
             # client's own pid and the TIMEOUT kill below still reaches it.
@@ -278,6 +382,19 @@ EOF_JOB_KEYS
         fi
     fi
 } >>"$LOG" 2>&1
+# LOGON-INFO MASK (header): after `[relay] xfreerdp exited`, before DONE, dialling runs only.
+if [ "$RELAY_DIALLED" -eq 1 ]; then
+    if relay_mask_logon_info; then
+        echo "[relay] masked logon-info lines=${MASK_LINES}" >>"$LOG"
+    else
+        # A copy-back that failed half-way (suite 14i) can leave a partial last line with no newline;
+        # start the MASK-FAILED line on a line of its own so `^\[relay\] MASK-FAILED` readers never
+        # miss it ($(tail -c 1) is empty exactly when the last byte is a newline).
+        if [ -s "$LOG" ] && [ -n "$(tail -c 1 "$LOG")" ]; then echo >>"$LOG"; fi
+        echo "[relay] MASK-FAILED -- ${MASK_REASON}; this log may still carry the host and account names, do not archive it as is" >>"$LOG"
+        RELAY_RC=74
+    fi
+fi
 echo "DONE exit=$RELAY_RC" >>"$LOG"
 # self-close this Terminal window (same mechanism as Scripts/run-window-smoke.command)
 if [ -n "${TERM_PROGRAM:-}" ] && [ "$TERM_PROGRAM" = "Apple_Terminal" ]; then

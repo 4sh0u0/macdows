@@ -100,7 +100,10 @@
 # relay.command's, which also has its own CLIENT-INVALID refusal at 69 (the client pin from
 # relay-client.env / MACDOWS_XFREERDP / PATH could not be resolved; gate r1 I-1 -- do not read a
 # `snapshot relay: … DONE exit=69` as the run's own code just because 69 is unassigned elsewhere in
-# this list; wdp-etw.command's OWN 69 below is a different code from a different wrapper).
+# this list; wdp-etw.command's OWN 69 below is a different code from a different wrapper) -- and its
+# MASK-FAILED at 74 (the run dialled, but the LOGON-INFO MASK of relay.log could not be applied, so
+# the log may still carry the host and account names and must not be archived as is; a
+# `snapshot relay: … DONE exit=74` is not the run's own code either).
 # smoke-job.command adds 75 for the two
 # preflights that judge the ENVIRONMENT rather than the definition (this machine's display is not
 # the geometry the run needs; this checkout does not carry the knob the job names), and passes the
@@ -614,7 +617,7 @@ printf '%s\n' "$ETW_DURATION" | grep -qE '^[1-9][0-9]{0,4}$' \
 #
 # THE REFUSAL MESSAGE CLAIMS ONLY WHAT IS TRUE OF relay.command, not what would be convenient: a
 # MISSING TIMEOUT is not one of relay.command's own refusals -- it defaults a missing value to 25s
-# (relay.command:107) -- and its own regex (`^[1-9][0-9]*$`) accepts more digits than this script's
+# (relay.command's `TIMEOUT="${TIMEOUT:-25}"`) -- and its own regex (`^[1-9][0-9]*$`) accepts more digits than this script's
 # `^[1-9][0-9]{0,4}$` does. What relay.command WOULD refuse is a non-numeric value; what THIS
 # script additionally requires, for its own reason, is a positive integer of 1-5 digits to derive
 # a wait ceiling from -- it will not guess one for a job it cannot even read.

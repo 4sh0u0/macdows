@@ -700,6 +700,17 @@ assert_rc 1
 assert_has "relay job 'regprobe' FAILED"
 assert_has "exit=69 is relay.command's own CLIENT-INVALID refusal"
 
+# -- 9e. the relay dialled but could not mask relay.log (LB-7 gate r1 I-4) -------------------------
+# relay.command writes DONE exit=74 (MASK-FAILED) when the LOGON-INFO MASK could not be applied: the
+# log may still carry the host and account names. Named here, the twin of relay-69, so a reader of
+# the matrix log is told not to archive that relay.log as is.
+begin relay-74 'relay reports DONE exit=74 -> exit 1, MASK-FAILED named'
+export LABTEST_RC_REGPROBE=74
+run_sandbox
+assert_rc 1
+assert_has "relay job 'regprobe' FAILED"
+assert_has "exit=74 is relay.command's own MASK-FAILED"
+
 # -- 10. the relay never reported at all --------------------------------------------------------
 # Both the job and the logoff time out, so the host is left logged in and main() has to say so.
 begin no-done 'no DONE line -> exit 1 and HOST SESSION: STILL LOGGED IN'
@@ -1045,7 +1056,7 @@ done
 printf '\n'
 printf -- '---------------------------------------------------------------------\n'
 if [ "$FAILURES" -eq 0 ]; then
-	printf 'OFFLINE GUARD TEST: PASS -- %s assertions, 29 cases (26 pins + 3 mutation proofs)\n' "$PASSES"
+	printf 'OFFLINE GUARD TEST: PASS -- %s assertions, 30 cases (27 pins + 3 mutation proofs)\n' "$PASSES"
 	exit 0
 fi
 printf 'OFFLINE GUARD TEST: FAIL -- %s failed, %s passed\n' "$FAILURES" "$PASSES"

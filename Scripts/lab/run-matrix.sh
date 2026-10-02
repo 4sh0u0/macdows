@@ -249,6 +249,10 @@ wait_for_file() { # <path> <timeout>
 
 # One relay connection at a time, always. run-scenario.sh copies jobs/<job>.env over job.env,
 # removes relay.log and opens relay.command in Terminal.app; this waits for that run's DONE.
+# relay.command's own non-zero DONE codes, each named below when it is the one reported: 78
+# boundary refusal, 66 JOB-ENV-MISSING, 65 JOB-ENV-INVALID, 69 CLIENT-INVALID (none of these four
+# dialled), and 74 MASK-FAILED (it dialled, but the LOGON-INFO MASK could not be applied, so
+# relay.log may still carry the host and account names -- do not archive it as is).
 run_relay_job() { # <job> <timeout>
 	local job="$1" timeout="$2" t0 elapsed
 
@@ -290,6 +294,8 @@ run_relay_job() { # <job> <timeout>
 			mlog "[step]   exit=65 is relay.command's own JOB-ENV-INVALID refusal -- job.env set no PROGRAM; no connection attempted"
 		elif [ "${RELAY_DONE_RC:-}" = "69" ]; then
 			mlog "[step]   exit=69 is relay.command's own CLIENT-INVALID refusal -- the client pin could not be resolved; no connection attempted"
+		elif [ "${RELAY_DONE_RC:-}" = "74" ]; then
+			mlog "[step]   exit=74 is relay.command's own MASK-FAILED -- the logon-info mask could not be applied; relay.log may still carry the host and account names, do not archive it as is"
 		fi
 		return 1
 	fi
