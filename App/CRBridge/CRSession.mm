@@ -398,6 +398,13 @@ typedef struct
      * reads this flag when its loop exits and turns it into a distinct -lastConnectError
      * (gate a2-gfx-invariant r1 B-1: abort alone reads as a silent disconnect to the App). */
     BOOL decodePathRefused;
+
+    /* adr/0021 lane LC-2, witness X-C: how many times this connection's crb_monitored_desktop has
+     * started the RemoteApp program on ARC_COMPLETED (one RAIL ClientExecute each). Observation
+     * only. Per connection because this struct is: freerdp_client_context_new() allocates it
+     * zero-filled in -start, and -start writes 0 here again explicitly right after setting
+     * bridgeSelf, so the first send of every connection logs send=1. Touched on T_rdp only. */
+    uint32_t arcCompletedStartCmdSends;
 } CRBridgeContext;
 
 /* Only the RDPGFX wrappers need this: gdi_graphics_pipeline_init() claims
@@ -925,6 +932,11 @@ static BOOL crb_monitored_desktop(rdpContext *context, const WINDOW_ORDER_INFO *
      * program. Without this call the remote program never actually launches. */
     if ((orderInfo->fieldFlags & WINDOW_ORDER_FIELD_DESKTOP_ARC_COMPLETED) && p->rail)
     {
+        /* adr/0021 lane LC-2, witness X-C: observation only, behaviour unchanged. This line is a
+         * carrier line for the L-C preregistration -- its format string is frozen once that
+         * prereg is, and must not be reworded afterwards. */
+        p->arcCompletedStartCmdSends++;
+        WLog_INFO(TAG, "ClientRailServerStartCmd arc-completed send=%u", (unsigned)p->arcCompletedStartCmdSends);
         client_rail_server_start_cmd(p->rail);
     }
     return TRUE;
@@ -984,6 +996,11 @@ static UINT crb_rail_server_execute_result(RailClientContext *context,
                                             const RAIL_EXEC_RESULT_ORDER *execResult)
 {
     CRBridgeContext *p = (CRBridgeContext *)context->custom;
+    /* adr/0021 lane LC-2, witness X-R: observation only, behaviour unchanged. The three numeric
+     * fields and nothing else -- the program name the server echoes back may carry the stimulus
+     * path and must never be logged here. A carrier line for the L-C preregistration: its format
+     * string is frozen once that prereg is, and must not be reworded afterwards. */
+    WLog_INFO(TAG, "ServerExecuteResult flags=%u execResult=%u rawResult=%u", (unsigned)execResult->flags, (unsigned)execResult->execResult, (unsigned)execResult->rawResult);
     CrdpEvent ev;
     memset(&ev, 0, sizeof(ev));
     ev.type = CRDPQ_EVENT_EXEC_RESULT;
@@ -2060,7 +2077,14 @@ static void crb_outbound_visitor(const CrdpCommand *cmd, void *vctx)
             memcpy(programBuf, cmd->payload.execute.program.bytes, sizeof(programBuf));
             exec.RemoteApplicationProgram = programBuf;
             if (rail->ClientExecute)
-                rail->ClientExecute(rail, &exec);
+            {
+                const UINT rc = rail->ClientExecute(rail, &exec);
+                /* adr/0021 lane LC-2, witness X-S: observation only, behaviour unchanged (the
+                 * return value was discarded before and still drives nothing). Never the program
+                 * string. A carrier line for the L-C preregistration: its format string is frozen
+                 * once that prereg is, and must not be reworded afterwards. */
+                WLog_INFO(TAG, "outbound execute sent rc=%u", (unsigned)rc);
+            }
             break;
         }
         case CRDPQ_CMD_ACTIVATE:
@@ -2572,6 +2596,8 @@ static void crb_schedule_drain(void *ctx)
     }
 
     ((CRBridgeContext *)context)->bridgeSelf = (__bridge void *)self;
+    /* adr/0021 lane LC-2, witness X-C's counter: the per-connection initialisation point. */
+    ((CRBridgeContext *)context)->arcCompletedStartCmdSends = 0;
     _instance = context->instance;
 
     /* Set directly here, before freerdp_client_start -- NOT inside PreConnect. Mirrors

@@ -44,6 +44,11 @@ import Testing
 // `ShellAutolaunch.notePress(_:)`, immediately before each of Pin 5's and Pin 6's presses (Pin 7,
 // gate r1 I-1) -- neither press otherwise writes anything that says it happened.
 //
+// adr/0021 lane LC-2 added an eighth: the extra-exec knob schedules ONE one-shot Timer, appended
+// after the quit-ceiling block as the new tail of the launch method, whose callback prints the A-X
+// anchor line and then makes the file's only `session.executeProgram(` call (Pin 8). Its bridge-side
+// witness lines (X-S, X-R, X-C) are held by `BridgeExecWitnessPinTests`.
+//
 // REGISTERED GAP, stated rather than papered over: these pins check that the wiring is WRITTEN, not
 // that it RUNS. No offline test in this repository can launch this app, set an environment variable
 // for it, or watch its Timer fire. Closing the gap means splitting `AppDelegate` into a target this
@@ -434,12 +439,15 @@ struct AppDelegateAutolaunchPinTests {
     /// `ShellAutolaunch.notePress(` appears exactly twice in the whole file, once per real press
     /// this lane adds, and nowhere else -- there is no third occasion in this file for an anchor
     /// line.
-    @Test("ShellAutolaunch.notePress is called exactly twice, once per press this lane adds")
-    func exactlyTwoNotePressInvocations() throws {
+    ///
+    /// RE-COUNTED by adr/0021 lane LC-2: three, the third being the extra-exec press (Pin 8).
+    @Test("ShellAutolaunch.notePress is called exactly three times, once per scheduled press")
+    func exactlyThreeNotePressInvocations() throws {
         let code = try Self.code()
-        #expect(autolaunchOccurrences(of: "ShellAutolaunch.notePress(", in: code) == 2)
+        #expect(autolaunchOccurrences(of: "ShellAutolaunch.notePress(", in: code) == 3)
         #expect(autolaunchOccurrences(of: "ShellAutolaunch.notePress(.disconnect)", in: code) == 1)
         #expect(autolaunchOccurrences(of: "ShellAutolaunch.notePress(.connect)", in: code) == 1)
+        #expect(autolaunchOccurrences(of: "ShellAutolaunch.notePress(.extraExec", in: code) == 1)
     }
 
     /// MUST-RED for "the anchor is printed after the press, not before": the anchor line's only
@@ -457,6 +465,105 @@ struct AppDelegateAutolaunchPinTests {
     func reconnectAnchorPrecedesTheReconnectPress() throws {
         let code = try Self.code()
         #expect(code.contains("ShellAutolaunch.notePress(.connect) self.connectTapped()"))
+    }
+
+    // MARK: - Pin 8 (adr/0021 lane LC-2): the extra exec, once, from a one-shot Timer
+
+    /// The whole extra-exec block, folded, as the new tail of `applicationDidFinishLaunching`: it
+    /// opens right after the quit-ceiling block closes and ends at the method's own closing brace,
+    /// immediately before `connectTapped`'s declaration. Same purpose as
+    /// `theKnobsAreTheTailOfTheLaunchMethod`: a block moved into a helper nobody calls, a Timer that
+    /// repeats, an anchor printed after the send, or a send without the session check all break
+    /// this one needle.
+    @Test("the extra-exec block is the tail of applicationDidFinishLaunching, in its exact shape")
+    func theExtraExecBlockIsTheTailOfTheLaunchMethod() throws {
+        let code = try Self.code()
+        let needle: String =
+            "_ = Timer.scheduledTimer(withTimeInterval: quitAfter, repeats: false) { _ in "
+            + "MainActor.assumeIsolated { NSApp.terminate(nil) } } } "
+            + "if let extraExecAfter = autolaunch.extraExecAfterInterval, let extraExecProgram = autolaunch.extraExecProgram { "
+            + "_ = Timer.scheduledTimer(withTimeInterval: extraExecAfter, repeats: false) { _ in "
+            + "MainActor.assumeIsolated { let session = self.session "
+            + "ShellAutolaunch.notePress(.extraExec, programBytes: extraExecProgram.utf8.count, sessionPresent: session != nil) "
+            + "if let session { session.executeProgram(extraExecProgram) } } } } } "
+            + Self.firstDeclarationAfterLaunch
+        #expect(autolaunchOccurrences(of: needle, in: code) == 1)
+    }
+
+    /// One send site in the whole file, and it is the one inside the Timer. `executeProgram(` is
+    /// counted bare as well, so a second call through another receiver cannot hide.
+    @Test("session.executeProgram is called exactly once, inside the one-shot extra-exec Timer, after the anchor")
+    func exactlyOneExecuteProgramInsideTheTimer() throws {
+        let code = try Self.code()
+        #expect(autolaunchOccurrences(of: "session.executeProgram(", in: code) == 1)
+        #expect(autolaunchOccurrences(of: "executeProgram(", in: code) == 1)
+        #expect(
+            autolaunchOccurrences(
+                of: "_ = Timer.scheduledTimer(withTimeInterval: extraExecAfter, repeats: false) { _ in", in: code) == 1)
+
+        let timer = try autolaunchIndex(
+            of: "_ = Timer.scheduledTimer(withTimeInterval: extraExecAfter, repeats: false) { _ in", in: code)
+        let anchor = try autolaunchIndex(of: "ShellAutolaunch.notePress(.extraExec", in: code)
+        let send = try autolaunchIndex(of: "session.executeProgram(", in: code)
+        let nextDeclaration = try autolaunchIndex(of: Self.firstDeclarationAfterLaunch, in: code)
+        #expect(timer < anchor, "the anchor is inside the Timer's callback")
+        #expect(anchor < send, "the anchor is printed BEFORE the send")
+        #expect(send < nextDeclaration, "the send is inside applicationDidFinishLaunching")
+        // No other Timer opens between this one and the send: the send is in THIS Timer's block.
+        let between = code[timer..<send]
+        #expect(autolaunchOccurrences(of: "Timer.scheduledTimer(", in: String(between)) == 1)
+    }
+
+    /// The file's Timer budget: `drainTimer`'s repeating poll plus four one-shot knob Timers
+    /// (Disconnect, reconnect, quit, extra exec). Before lane LC-2 the count was 4; exactly one
+    /// was added. `repeats: true` stays `drainTimer`'s alone.
+    @Test("exactly one Timer was added, and only drainTimer repeats")
+    func timerBudget() throws {
+        let code = try Self.code()
+        #expect(autolaunchOccurrences(of: "Timer.scheduledTimer(", in: code) == 5)
+        #expect(autolaunchOccurrences(of: "repeats: true", in: code) == 1)
+        #expect(autolaunchOccurrences(of: "drainTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true)", in: code) == 1)
+    }
+
+    /// The program string reaches the anchor helper only as its byte count (gate r1 I-1), and
+    /// nothing in this file prints or logs it on its own.
+    @Test("the program string is only ever measured for notePress and handed to executeProgram")
+    func theProgramStringGoesNowhereElse() throws {
+        let code = try Self.code()
+        #expect(autolaunchOccurrences(of: "extraExecProgram", in: code) == 4,
+                "the binding, the autolaunch read, the byte count notePress receives, and the send")
+        #expect(autolaunchOccurrences(of: "print(", in: code) == 0)
+    }
+
+    /// Gate r1 I-1 (folded in, ruling (a)): the extra-exec anchor call hands `notePress` the
+    /// program's `.utf8.count` and never the program string itself, so the anchor helper cannot
+    /// log what it is never given. The argument list is cut out by balanced parentheses, and every
+    /// mention of `extraExecProgram` inside it must be the `.utf8.count` measurement.
+    @Test("notePress(.extraExec receives the program's .utf8.count, never the program string")
+    func theExtraExecAnchorReceivesOnlyTheByteCount() throws {
+        let code = try Self.code()
+        let head = "ShellAutolaunch.notePress"
+        let start = try autolaunchIndex(of: head + "(.extraExec", in: code)
+        let open = code.index(start, offsetBy: head.count)
+        var depth = 0
+        var end: String.Index?
+        var cursor = open
+        while cursor < code.endIndex {
+            if code[cursor] == "(" { depth += 1 }
+            if code[cursor] == ")" {
+                depth -= 1
+                if depth == 0 { end = code.index(after: cursor); break }
+            }
+            cursor = code.index(after: cursor)
+        }
+        let arguments = String(code[open..<(try #require(end, "unbalanced notePress(.extraExec call"))])
+        #expect(arguments.contains(".utf8.count"))
+        #expect(!arguments.contains("extraExecProgram)"), "the program string passed as the last argument")
+        #expect(!arguments.contains("extraExecProgram,"), "the program string passed as an argument")
+        let mentions = autolaunchOccurrences(of: "extraExecProgram", in: arguments)
+        #expect(mentions == 1)
+        #expect(mentions == autolaunchOccurrences(of: "extraExecProgram.utf8.count", in: arguments),
+                "every mention of the program string in the call is its byte count")
     }
 
     // MARK: - adr/0020 lane K, gate r1 I-4 (folded in): ShellAutolaunch.swift's own zero-output guard
@@ -484,6 +591,48 @@ struct AppDelegateAutolaunchPinTests {
         #expect(printSite < plan, "the one print( must be before plan(environment:), not inside it")
     }
 
+    /// Gate r1 I-1 (folded in, ruling (a)): neither anchor helper accepts a `String` parameter at
+    /// all, so the program string cannot reach `print` or the unified log through them. Both
+    /// signatures are pinned whole (one declaration each, no overload), and no parameter named
+    /// `program` of type `String` is declared anywhere in the file. Gate r1's mutant R12 (the
+    /// logger carrying the program out) needs exactly such a parameter and is killed here.
+    @Test("notePress and pressLine take a byte count, and no String program parameter exists")
+    func theAnchorHelpersTakeNoProgramString() throws {
+        let code = try Self.shellAutolaunchCode()
+        #expect(autolaunchOccurrences(of: "static func notePress(", in: code) == 1)
+        #expect(autolaunchOccurrences(of: "static func pressLine(", in: code) == 1)
+        #expect(autolaunchOccurrences(
+            of: "static func notePress(_ which: Press, programBytes: Int? = nil, sessionPresent: Bool? = nil) {",
+            in: code) == 1)
+        #expect(autolaunchOccurrences(
+            of: "static func pressLine(_ which: Press, programBytes: Int? = nil, sessionPresent: Bool? = nil) -> String {",
+            in: code) == 1)
+        #expect(autolaunchOccurrences(of: "program: String", in: code) == 0)
+    }
+
+    /// Gate r1 m-1 (folded in): every knob, the program string included, is read from the
+    /// environment dictionary `plan(environment:)` is handed, under one of the six key constants,
+    /// and from nowhere else. Exactly six subscripts, each one a key constant; no defaults
+    /// database, no file read, no command line. Gate r1's mutant R13 (a fallback to a second,
+    /// unlisted environment key) is killed here.
+    @Test("the knobs are read only through the six key constants, from the environment alone")
+    func theKnobsAreReadOnlyThroughTheSixKeys() throws {
+        let code = try Self.shellAutolaunchCode()
+        let keys: Set<String> = [
+            "autoconnectKey", "quitAfterKey", "disconnectAfterKey",
+            "reconnectAfterKey", "extraExecAfterKey", "extraExecProgramKey",
+        ]
+        let subscripts = code.components(separatedBy: "environment[").dropFirst()
+        #expect(subscripts.count == 6)
+        for rest in subscripts {
+            let key = String(rest.prefix { $0 != "]" })
+            #expect(keys.contains(key), "environment[\(key)] is not one of the six key constants")
+        }
+        #expect(autolaunchOccurrences(of: "UserDefaults", in: code) == 0)
+        #expect(autolaunchOccurrences(of: "contentsOf", in: code) == 0)
+        #expect(autolaunchOccurrences(of: "CommandLine", in: code) == 0)
+    }
+
     // MARK: - The knob names the orchestrator greps for
 
     /// `form1-batch.sh`'s third pre-check refuses to start a batch unless `ShellAutolaunch.swift`
@@ -497,13 +646,16 @@ struct AppDelegateAutolaunchPinTests {
     /// then exit at the ceiling) with nothing in-process to say so (no anchor line is ever printed
     /// for a knob whose name does not match). Gate r1's mutant M3c proved the old, two-name version
     /// of this test let exactly that renaming through.
-    @Test("all four knob names appear literally in ShellAutolaunch.swift")
+    @Test("all six knob names appear literally in ShellAutolaunch.swift")
     func knobNamesAreGreppable() throws {
         let raw = try autolaunchRawSource(Self.shellAutolaunch)
         #expect(raw.contains("\"MACDOWS_AUTOCONNECT\""))
         #expect(raw.contains("\"MACDOWS_QUIT_AFTER_SECONDS\""))
         #expect(raw.contains("\"MACDOWS_DISCONNECT_AFTER_SECONDS\""))
         #expect(raw.contains("\"MACDOWS_RECONNECT_AFTER_SECONDS\""))
+        // adr/0021 lane LC-2: the extra-exec pair, for the same "silently renamed key" reason.
+        #expect(raw.contains("\"MACDOWS_EXTRA_EXEC_AFTER_SECONDS\""))
+        #expect(raw.contains("\"MACDOWS_EXTRA_EXEC_PROGRAM\""))
     }
 
     /// The app's ONE permission, declared. `App/project.yml`'s own comment about the test bundle's

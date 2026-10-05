@@ -385,6 +385,245 @@ struct ShellAutolaunchTests {
                 == ShellAutolaunch.Plan(autoconnect: true, quitAfter: nil, disconnectAfter: .seconds(30), reconnectAfter: nil))
     }
 
+    // MARK: - adr/0021 lane LC-2: MACDOWS_EXTRA_EXEC_AFTER_SECONDS / MACDOWS_EXTRA_EXEC_PROGRAM
+
+    /// A neutral stand-in for a program string. Never a real path: the tests only need something
+    /// non-empty that `CRSession.executeProgram(_:)` would accept.
+    private static let fakeProgram = "D:\\fixture\\program.exe"
+
+    /// The unattended shape lane LC-2 is gated on, with the pair on top: autoconnect, a ceiling
+    /// `quit`, the extra-exec delay `after` and the program. `extra` overrides or adds keys.
+    private static func extraExecEnvironment(
+        after: String? = "20", program: String? = fakeProgram, quit: String? = "60",
+        autoconnect: String? = "1", extra: [String: String] = [:]
+    ) -> [String: String] {
+        var environment: [String: String] = [:]
+        if let autoconnect { environment[ShellAutolaunch.autoconnectKey] = autoconnect }
+        if let quit { environment[ShellAutolaunch.quitAfterKey] = quit }
+        if let after { environment[ShellAutolaunch.extraExecAfterKey] = after }
+        if let program { environment[ShellAutolaunch.extraExecProgramKey] = program }
+        environment.merge(extra) { _, new in new }
+        return environment
+    }
+
+    /// Asserts the pair is absent -- both halves, never one (R2: they live and die together).
+    private static func expectNoExtraExec(_ plan: ShellAutolaunch.Plan, sourceLocation: SourceLocation = #_sourceLocation) {
+        #expect(plan.extraExecAfter == nil, sourceLocation: sourceLocation)
+        #expect(plan.extraExecProgram == nil, sourceLocation: sourceLocation)
+        #expect(plan.extraExecAfterInterval == nil, sourceLocation: sourceLocation)
+    }
+
+    @Test("the key names are the two the orchestrator exports")
+    func extraExecKeyNames() {
+        #expect(ShellAutolaunch.extraExecAfterKey == "MACDOWS_EXTRA_EXEC_AFTER_SECONDS")
+        #expect(ShellAutolaunch.extraExecProgramKey == "MACDOWS_EXTRA_EXEC_PROGRAM")
+    }
+
+    @Test("off carries no extra exec")
+    func offHasNoExtraExec() {
+        Self.expectNoExtraExec(ShellAutolaunch.off)
+        Self.expectNoExtraExec(ShellAutolaunch.plan(environment: [:]))
+    }
+
+    @Test("a whole number of seconds below the ceiling schedules the extra exec, counted from launch",
+          arguments: [1, 2, 19, 59])
+    func extraExecWholeSecondsAccepted(seconds: Int) {
+        let plan = ShellAutolaunch.plan(environment: Self.extraExecEnvironment(after: String(seconds)))
+        #expect(plan.extraExecAfter == .seconds(seconds))
+        #expect(plan.extraExecAfterInterval == TimeInterval(seconds))
+        #expect(plan.extraExecProgram == Self.fakeProgram)
+        // The other knobs read exactly as they would without the pair.
+        #expect(plan.autoconnect)
+        #expect(plan.quitAfter == .seconds(60))
+        #expect(plan.disconnectAfter == nil)
+        #expect(plan.reconnectAfter == nil)
+    }
+
+    /// Same grammar as the other `_AFTER_SECONDS` knobs: digits only, strictly positive.
+    @Test("anything but a positive whole number of seconds is refused, and takes the program with it",
+          arguments: ["", "abc", "1.5", "-5", "0", "00", " 5", "5 ", "+5", "5s", "\u{0665}"])
+    func extraExecDelayRefusals(raw: String) {
+        Self.expectNoExtraExec(ShellAutolaunch.plan(environment: Self.extraExecEnvironment(after: raw)))
+    }
+
+    @Test("a program without a delay schedules nothing")
+    func extraExecProgramWithoutDelay() {
+        Self.expectNoExtraExec(ShellAutolaunch.plan(environment: Self.extraExecEnvironment(after: nil)))
+    }
+
+    @Test("a delay without a program schedules nothing")
+    func extraExecDelayWithoutProgram() {
+        Self.expectNoExtraExec(ShellAutolaunch.plan(environment: Self.extraExecEnvironment(program: nil)))
+    }
+
+    @Test("an empty or all-whitespace program schedules nothing", arguments: ["", " ", "   ", "\t", "\n", " \t\r\n "])
+    func extraExecBlankProgram(program: String) {
+        Self.expectNoExtraExec(ShellAutolaunch.plan(environment: Self.extraExecEnvironment(program: program)))
+    }
+
+    /// Trimmed at both ends, otherwise verbatim: inner spaces, case and backslashes survive.
+    @Test("the program is trimmed at both ends and otherwise passed verbatim")
+    func extraExecProgramIsTrimmedOnly() {
+        let padded = ShellAutolaunch.plan(environment: Self.extraExecEnvironment(program: " \t" + Self.fakeProgram + "\n "))
+        #expect(padded.extraExecProgram == Self.fakeProgram)
+        let inner = "D:\\Fixture Dir\\Some Program.EXE"
+        let verbatim = ShellAutolaunch.plan(environment: Self.extraExecEnvironment(program: inner))
+        #expect(verbatim.extraExecProgram == inner)
+    }
+
+    @Test("without autoconnect the pair is dropped", arguments: [nil, "0", "true", "yes", " 1"] as [String?])
+    func extraExecNeedsAutoconnect(autoconnect: String?) {
+        Self.expectNoExtraExec(ShellAutolaunch.plan(environment: Self.extraExecEnvironment(autoconnect: autoconnect)))
+    }
+
+    @Test("without a valid ceiling the pair is dropped", arguments: [nil, "", "later", "0"] as [String?])
+    func extraExecNeedsCeiling(quit: String?) {
+        Self.expectNoExtraExec(ShellAutolaunch.plan(environment: Self.extraExecEnvironment(quit: quit)))
+    }
+
+    /// N must be STRICTLY before the ceiling: at it, or past it, there is no live connection left
+    /// to deliver into.
+    @Test("a delay at or past the ceiling drops the pair", arguments: ["60", "61", "600"])
+    func extraExecAtOrPastCeiling(after: String) {
+        let plan = ShellAutolaunch.plan(environment: Self.extraExecEnvironment(after: after, quit: "60"))
+        Self.expectNoExtraExec(plan)
+        #expect(plan.quitAfter == .seconds(60), "the ceiling itself is untouched by the cut")
+    }
+
+    /// O-2: with a Disconnect press scheduled, N must be strictly before it as well, so the
+    /// extra exec can only land inside the first connection.
+    @Test("a delay at or past a scheduled Disconnect drops the pair", arguments: ["30", "31", "45"])
+    func extraExecAtOrPastDisconnect(after: String) {
+        let plan = ShellAutolaunch.plan(environment: Self.extraExecEnvironment(
+            after: after, quit: "60",
+            extra: [ShellAutolaunch.disconnectAfterKey: "30", ShellAutolaunch.reconnectAfterKey: "10"]))
+        Self.expectNoExtraExec(plan)
+        #expect(plan.disconnectAfter == .seconds(30), "the Disconnect press itself is untouched by the cut")
+        #expect(plan.reconnectAfter == .seconds(10))
+    }
+
+    @Test("N < Disconnect < ceiling schedules the pair alongside the Disconnect press")
+    func extraExecBeforeDisconnect() {
+        let plan = ShellAutolaunch.plan(environment: Self.extraExecEnvironment(
+            after: "29", quit: "60",
+            extra: [ShellAutolaunch.disconnectAfterKey: "30", ShellAutolaunch.reconnectAfterKey: "10"]))
+        #expect(plan.extraExecAfter == .seconds(29))
+        #expect(plan.extraExecProgram == Self.fakeProgram)
+        #expect(plan.disconnectAfter == .seconds(30))
+        #expect(plan.reconnectAfter == .seconds(10))
+    }
+
+    /// A Disconnect value at the ceiling is cancelled by gate r1 m-2, and the extra exec is then
+    /// judged against the ceiling alone. With D >= Q, N < Q already implies N < D, so this case
+    /// cannot tell "the scheduled Disconnect" from "the raw Disconnect value" apart (gate r1 I-3);
+    /// `extraExecWithDisconnectCancelledByTheReconnectSpan` below is the case that does.
+    @Test("a Disconnect value the ceiling already cancelled does not gate the pair")
+    func extraExecWithCancelledDisconnect() {
+        let plan = ShellAutolaunch.plan(environment: Self.extraExecEnvironment(
+            after: "40", quit: "50", extra: [ShellAutolaunch.disconnectAfterKey: "50"]))
+        #expect(plan.disconnectAfter == nil)
+        #expect(plan.extraExecAfter == .seconds(40))
+        #expect(plan.extraExecProgram == Self.fakeProgram)
+    }
+
+    /// Gate r1 I-3 (folded in): the O-2 comparison is against the Disconnect press the plan
+    /// actually SCHEDULES, after gate r1 m-2's cut. Here D = 30 is below the ceiling but D + R = 70
+    /// is not, so m-2 cancels both presses; there is then no Disconnect at all and N = 45 is
+    /// judged against the ceiling alone (N < Q), even though N is past the raw Disconnect value.
+    @Test("a Disconnect cancelled by the reconnect span does not gate the pair (Q=60, D=30, R=40, N=45)")
+    func extraExecWithDisconnectCancelledByTheReconnectSpan() {
+        let plan = ShellAutolaunch.plan(environment: Self.extraExecEnvironment(
+            after: "45", quit: "60",
+            extra: [ShellAutolaunch.disconnectAfterKey: "30", ShellAutolaunch.reconnectAfterKey: "40"]))
+        #expect(plan.disconnectAfter == nil)
+        #expect(plan.reconnectAfter == nil)
+        #expect(plan.extraExecAfter == .seconds(45))
+        #expect(plan.extraExecProgram == Self.fakeProgram)
+    }
+
+    /// The control for the case above: the same Q, D and N with a reconnect span that fits
+    /// (D + R = 40 < 60), so the Disconnect press at 30 is scheduled and N = 45 >= D drops the pair.
+    @Test("the same N past a scheduled Disconnect drops the pair (Q=60, D=30, R=10, N=45)")
+    func extraExecPastAScheduledDisconnectControl() {
+        let plan = ShellAutolaunch.plan(environment: Self.extraExecEnvironment(
+            after: "45", quit: "60",
+            extra: [ShellAutolaunch.disconnectAfterKey: "30", ShellAutolaunch.reconnectAfterKey: "10"]))
+        #expect(plan.disconnectAfter == .seconds(30))
+        Self.expectNoExtraExec(plan)
+    }
+
+    @Test("near-miss key names are not read")
+    func extraExecNearMissKeys() {
+        let plan = ShellAutolaunch.plan(environment: [
+            ShellAutolaunch.autoconnectKey: "1",
+            ShellAutolaunch.quitAfterKey: "60",
+            "MACDOWS_EXTRA_EXEC_AFTER_SECOND": "20",
+            "MACDOWS_EXTRA_EXEC_PROGRAMS": Self.fakeProgram,
+            "XMACDOWS_EXTRA_EXEC_AFTER_SECONDS": "20",
+            "MACDOWS_EXTRA_EXEC_PROGRAM_": Self.fakeProgram,
+        ])
+        Self.expectNoExtraExec(plan)
+    }
+
+    /// `Plan.init` stores a half-set pair as neither, so no reader can see one without the other.
+    @Test("Plan stores a half-set pair as neither half")
+    func planInitKeepsThePairTogether() {
+        let delayOnly = ShellAutolaunch.Plan(
+            autoconnect: true, quitAfter: .seconds(60), disconnectAfter: nil, reconnectAfter: nil,
+            extraExecAfter: .seconds(5), extraExecProgram: nil)
+        Self.expectNoExtraExec(delayOnly)
+        let programOnly = ShellAutolaunch.Plan(
+            autoconnect: true, quitAfter: .seconds(60), disconnectAfter: nil, reconnectAfter: nil,
+            extraExecAfter: nil, extraExecProgram: Self.fakeProgram)
+        Self.expectNoExtraExec(programOnly)
+        #expect(delayOnly == ShellAutolaunch.Plan(autoconnect: true, quitAfter: .seconds(60), disconnectAfter: nil, reconnectAfter: nil))
+    }
+
+    // MARK: - adr/0021 lane LC-2: the A-X anchor line
+
+    @Test("pressLine(.extraExec) is the fixed A-X literal, and the earlier presses keep their shape")
+    func extraExecPressLineLiteral() {
+        #expect(ShellAutolaunch.pressLine(.extraExec) == "[autolaunch] press=extra-exec")
+        #expect(ShellAutolaunch.Press.extraExec.rawValue == "extra-exec")
+        #expect(ShellAutolaunch.pressLine(.disconnect) == "[autolaunch] press=disconnect")
+        #expect(ShellAutolaunch.pressLine(.connect) == "[autolaunch] press=connect")
+    }
+
+    @Test("the A-X line carries the program's UTF-8 byte count and the session flag")
+    func extraExecPressLineFields() {
+        #expect(
+            ShellAutolaunch.pressLine(.extraExec, programBytes: Self.fakeProgram.utf8.count, sessionPresent: true)
+                == "[autolaunch] press=extra-exec program-bytes=22 session=present")
+        #expect(
+            ShellAutolaunch.pressLine(.extraExec, programBytes: Self.fakeProgram.utf8.count, sessionPresent: false)
+                == "[autolaunch] press=extra-exec program-bytes=22 session=absent")
+        // Bytes, not characters: "é" is two UTF-8 bytes, so 1 + 1 + 2 = 4 (the same `.utf8.count`
+        // measurement AppDelegate's call site makes, gate r1 I-1).
+        #expect(
+            ShellAutolaunch.pressLine(.extraExec, programBytes: "a\u{00E9}b".utf8.count, sessionPresent: true)
+                == "[autolaunch] press=extra-exec program-bytes=4 session=present")
+    }
+
+    /// The red line: whatever the program string is, none of it reaches the line notePress emits.
+    /// A unique sentinel makes "none of it" checkable, and every fragment of the fake program is
+    /// checked too, not only the sentinel. Since gate r1 I-1 the helper only ever receives the
+    /// byte count (its signature is pinned in `AppDelegateAutolaunchPinTests`); this value test
+    /// keeps the line itself honest at the pressLine layer.
+    @Test("the A-X line never contains the program string or any fragment of it")
+    func extraExecPressLineNeverCarriesTheProgram() {
+        let sentinel = "zz-sentinel-6c41d0-zz"
+        let program = "D:\\fixture\\" + sentinel + "\\program.exe"
+        for present in [true, false] {
+            let line = ShellAutolaunch.pressLine(.extraExec, programBytes: program.utf8.count, sessionPresent: present)
+            #expect(!line.contains(sentinel))
+            #expect(!line.contains("fixture"))
+            #expect(!line.contains("program.exe"))
+            #expect(!line.contains("\\"))
+            #expect(!line.contains("D:"))
+            #expect(line.hasPrefix("[autolaunch] press=extra-exec program-bytes=\(program.utf8.count) session="))
+        }
+    }
+
     // MARK: - The Duration → TimeInterval conversion AppDelegate hands to Timer
 
     /// The arithmetic `AppDelegate` cannot carry itself (it is not in this bundle). Sub-second
