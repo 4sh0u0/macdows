@@ -1,8 +1,8 @@
 import Foundation
 import os
 
-// adr/0019 §2 R-6 tool lane T1, extended by adr/0020 lane K. Four unattended-launch knobs, as ONE
-// pure function of the process environment.
+// adr/0019 §2 R-6 tool lane T1, extended by adr/0020 lane K and by adr/0021 lane LC-2. Six
+// unattended-launch knobs, as ONE pure function of the process environment.
 //
 // ## What this is for
 //
@@ -20,7 +20,7 @@ import os
 // `WIN_PASS` from the environment: this is a GUI app, it is launched by Finder, by Xcode's Run
 // button or by `open`, and honouring those variables would add a way to change WHICH HOST A BUTTON
 // PRESS DIALS that is invisible in the window the human is looking at. That reasoning is about the
-// TARGET of a connection, and it is untouched here -- none of the four knobs below introduces
+// TARGET of a connection, and it is untouched here -- none of the six knobs below introduces
 // any host, account or credential source, and `host.env` remains the app's single source for all
 // three.
 //
@@ -70,8 +70,38 @@ import os
 // is the fix: one fixed-shape line per press, printed immediately before `AppDelegate` makes it,
 // on the same stdout channel plus a timestamped unified-log copy -- never `[reconnect]` itself, so
 // it cannot be mistaken for a member of that frozen family.
+//
+// ## adr/0021 lane LC-2: a fifth and sixth knob, and why they are still not that precedent
+//
+// Shape L-C (adr/0021 §3) needs the stimulus that locks the remote session to arrive INSIDE the
+// App's own live connection, and the only delivery left under S2' is a second RAIL ClientExecute
+// on that connection. `MACDOWS_EXTRA_EXEC_AFTER_SECONDS` (a whole number of seconds, counted from
+// launch, same grammar and same parse function as `MACDOWS_DISCONNECT_AFTER_SECONDS`) and
+// `MACDOWS_EXTRA_EXEC_PROGRAM` (a program string, trimmed of surrounding whitespace and otherwise
+// passed verbatim) make the app call `CRSession.executeProgram(_:)` once, that long after launch,
+// on the session it is holding at that moment.
+//
+// This pair is different in kind from the first four, and the difference is stated rather than
+// hidden: it adds WHAT is executed on the remote side, not merely whether somebody has to be
+// present to press a button. It still does not touch what `connectTapped`'s refusal is about.
+// It names no host and no account, carries no credential, and cannot change WHICH HOST is dialled
+// or WITH WHAT IDENTITY -- the connection it rides on is the one the autoconnect press made, through
+// `host.env` and the live-host boundary gate, exactly as before. It is OFF by default (both
+// variables have to be set, and `plan(environment:)` drops the pair unless `MACDOWS_AUTOCONNECT=1`
+// and a `MACDOWS_QUIT_AFTER_SECONDS` ceiling are set too, i.e. only in the unattended shape an
+// orchestrator exports deliberately). The program string comes from the environment only and never
+// reaches a log line: the anchor line carries its UTF-8 byte count, nothing else. The owner ruled
+// this knob in on 2026-10-05 (O-1, recorded in the docs STATUS entry 43 and in the 2026-10-05
+// addendum to adr/0021 D-3, which revises S2 from "should not exist either" to "an experimental
+// entry point that is off by default").
+//
+// Gate r1 m-3, registered rather than changed: the anchor line (A-X) does not tell the first
+// connection apart from one `ReconnectDriver` re-established after a drop. Both run on the same
+// `CRSession`, so `session=present` still holds after an automatic reconnect, and the bridge's
+// X-C count restarts at 0 on every `-start`. A reader identifies the first connection from the
+// captured output instead: exactly one X-C line before A-X, and no non-live `[reconnect]` line.
 
-/// The four unattended-launch knobs, parsed together, from the process environment.
+/// The six unattended-launch knobs, parsed together, from the process environment.
 ///
 /// Pure and non-isolated on purpose: it reads nothing (the caller passes the environment in), it
 /// touches no AppKit object, and it has no opinion about when any knob is acted on.
@@ -94,9 +124,20 @@ enum ShellAutolaunch {
     /// `plan(environment:)` (gate r1 I-2).
     static let reconnectAfterKey = "MACDOWS_RECONNECT_AFTER_SECONDS"
 
-    /// What a launch should do about the four knobs. `Plan(autoconnect: false, quitAfter: nil,
+    /// adr/0021 lane LC-2. Set to a whole number of seconds to have the app send one extra RAIL
+    /// ClientExecute, inside its own connection, that long after launch. Has no effect unless
+    /// `extraExecProgramKey` is set as well and `plan(environment:)`'s gate admits the pair -- see
+    /// the file header.
+    static let extraExecAfterKey = "MACDOWS_EXTRA_EXEC_AFTER_SECONDS"
+
+    /// adr/0021 lane LC-2. The program string that extra ClientExecute sends. Trimmed of leading and
+    /// trailing whitespace, otherwise passed to `CRSession.executeProgram(_:)` verbatim; its
+    /// 255-byte limit is enforced by that method's own refusal, not repeated here. NEVER logged.
+    static let extraExecProgramKey = "MACDOWS_EXTRA_EXEC_PROGRAM"
+
+    /// What a launch should do about the six knobs. `Plan(autoconnect: false, quitAfter: nil,
     /// disconnectAfter: nil, reconnectAfter: nil)` is both the default and the answer for every
-    /// environment that does not set any of them.
+    /// environment that does not set any of them (the two lane LC-2 fields default to `nil`).
     struct Plan: Equatable, Sendable {
         /// Press Connect once, at the end of `applicationDidFinishLaunching`.
         let autoconnect: Bool
@@ -112,6 +153,37 @@ enum ShellAutolaunch {
         /// whatever reason (gate r1 I-2), or whenever `quitAfter` would leave no room for this
         /// press either (gate r1 m-2).
         let reconnectAfter: Duration?
+        /// adr/0021 lane LC-2. Send the extra ClientExecute that long after launch, or `nil` for
+        /// "never". Always `nil` exactly when `extraExecProgram` is `nil` -- `init` enforces it.
+        let extraExecAfter: Duration?
+        /// adr/0021 lane LC-2. The program the extra ClientExecute sends, or `nil` for "never".
+        /// Always `nil` exactly when `extraExecAfter` is `nil` -- `init` enforces it.
+        let extraExecProgram: String?
+
+        /// The memberwise shape every earlier lane already spells, plus the two lane LC-2 fields,
+        /// defaulted so a plan written without them still means "no extra exec". The pair lives or
+        /// dies together: a half-set pair is stored as neither, so no reader can ever see a delay
+        /// without a program or a program without a delay.
+        init(
+            autoconnect: Bool,
+            quitAfter: Duration?,
+            disconnectAfter: Duration?,
+            reconnectAfter: Duration?,
+            extraExecAfter: Duration? = nil,
+            extraExecProgram: String? = nil
+        ) {
+            self.autoconnect = autoconnect
+            self.quitAfter = quitAfter
+            self.disconnectAfter = disconnectAfter
+            self.reconnectAfter = reconnectAfter
+            if let extraExecAfter, let extraExecProgram {
+                self.extraExecAfter = extraExecAfter
+                self.extraExecProgram = extraExecProgram
+            } else {
+                self.extraExecAfter = nil
+                self.extraExecProgram = nil
+            }
+        }
 
         /// The same ceiling as a `TimeInterval`, which is what `Timer` takes.
         ///
@@ -137,17 +209,28 @@ enum ShellAutolaunch {
             guard let reconnectAfter else { return nil }
             return ShellAutolaunch.seconds(reconnectAfter)
         }
+
+        /// adr/0021 lane LC-2. The extra-exec delay as a `TimeInterval`, for the same reason as
+        /// `quitAfterInterval` above.
+        var extraExecAfterInterval: TimeInterval? {
+            guard let extraExecAfter else { return nil }
+            return ShellAutolaunch.seconds(extraExecAfter)
+        }
     }
 
-    /// The default: all four knobs off.
+    /// The default: all six knobs off.
     static let off = Plan(autoconnect: false, quitAfter: nil, disconnectAfter: nil, reconnectAfter: nil)
 
     /// adr/0020 lane K (gate r1 I-1): which real button a launch is about to press. The two cases
     /// line up with the two Timers `AppDelegate` nests at the tail of
     /// `applicationDidFinishLaunching`, in the order they can fire -- Disconnect, then Connect.
+    ///
+    /// adr/0021 lane LC-2 adds `extraExec`: not a button, but the same kind of instant an
+    /// orchestrator has to locate (witness A-X), so it gets the same anchor line.
     enum Press: String {
         case disconnect
         case connect
+        case extraExec = "extra-exec"
     }
 
     /// adr/0019 §2 lane D's own logger, extended here rather than duplicated: this file's anchor
@@ -163,8 +246,24 @@ enum ShellAutolaunch {
     /// `[autolaunch]`, never `[reconnect]`: this line is not a member of that frozen line family
     /// (`ReconnectLogChannelPinTests` pins `[reconnect]`'s own vocabulary and knows nothing of
     /// this one).
-    static func pressLine(_ which: Press) -> String {
-        "[autolaunch] press=\(which.rawValue)"
+    ///
+    /// adr/0021 lane LC-2: the extra-exec press may append two fields, ` program-bytes=<n>` (the
+    /// UTF-8 byte count of the program string, computed by the caller) and
+    /// ` session=present|absent`. Gate r1 I-1 (folded in): this function and `notePress(_:)` take
+    /// the byte count, never the program string itself, so neither the printed line nor the
+    /// unified-log copy can carry any of its characters by construction rather than by
+    /// convention (`AppDelegateAutolaunchPinTests` pins both signatures and the caller's
+    /// `.utf8.count`). Both fields are omitted when their argument is `nil`, so the two earlier
+    /// presses keep their exact shape.
+    static func pressLine(_ which: Press, programBytes: Int? = nil, sessionPresent: Bool? = nil) -> String {
+        var line = "[autolaunch] press=\(which.rawValue)"
+        if let programBytes {
+            line += " program-bytes=\(programBytes)"
+        }
+        if let sessionPresent {
+            line += sessionPresent ? " session=present" : " session=absent"
+        }
+        return line
     }
 
     /// adr/0020 lane K (gate r1 I-1): prints, and logs to the unified log, the anchor line for
@@ -179,13 +278,16 @@ enum ShellAutolaunch {
     /// `.notice`, not `.info`, for the reason `ReconnectDriver`'s own logger doc comment gives:
     /// `.info` does not persist to disk by default, and a `log show` export run minutes later can
     /// come back empty.
-    static func notePress(_ which: Press) {
-        let line = pressLine(which)
+    ///
+    /// adr/0021 lane LC-2: `programBytes` and `sessionPresent` are forwarded to `pressLine`
+    /// unchanged; see there for why only the byte count, never the program string, is accepted.
+    static func notePress(_ which: Press, programBytes: Int? = nil, sessionPresent: Bool? = nil) {
+        let line = pressLine(which, programBytes: programBytes, sessionPresent: sessionPresent)
         print(line)
         logger.notice("\(line, privacy: .public)")
     }
 
-    /// Reads all four knobs out of `environment`. `autoconnect` and `quitAfter` are fully
+    /// Reads all six knobs out of `environment`. `autoconnect` and `quitAfter` are fully
     /// independent of everything else, exactly as they always have been. `disconnectAfter` and
     /// `reconnectAfter` are NOT independent of the other three (gate r1 I-2, folded in):
     /// `disconnectAfter` only ever holds a value when `autoconnect` is on (a Disconnect press with
@@ -218,6 +320,15 @@ enum ShellAutolaunch {
     /// launch that scheduled it has finished doing anything else, which reads in the evidence
     /// exactly like a launch that died, and these knobs exist to be a safety net (or a fixed,
     /// legible rehearsal) rather than a way to produce that.
+    ///
+    /// adr/0021 lane LC-2: `MACDOWS_EXTRA_EXEC_AFTER_SECONDS` uses the same parse (counted from
+    /// launch, like the Disconnect delay) and `MACDOWS_EXTRA_EXEC_PROGRAM` must be non-empty once
+    /// trimmed of surrounding whitespace. The pair is scheduled only when ALL of these hold, and is
+    /// otherwise silently `nil` -- both fields, never one (the gate r1 m-2 shape): autoconnect is
+    /// on (there is no session of this knob's own making to execute in otherwise); a ceiling is
+    /// set and the delay N is strictly before it (the unattended shape, with room left); and, if a
+    /// Disconnect press is scheduled, N is strictly before that too (owner ruling O-2: the extra
+    /// exec may share a run with Disconnect, but only inside the first connection).
     static func plan(environment: [String: String]) -> Plan {
         let autoconnect = environment[autoconnectKey] == "1"
         let quit = quitAfter(environment[quitAfterKey])
@@ -236,18 +347,36 @@ enum ShellAutolaunch {
             ceilingLeavesNoRoom = reconnectSpan >= quit
         }
 
+        let disconnect = ceilingLeavesNoRoom ? nil : disconnectIfAutoconnected
+
+        // adr/0021 lane LC-2: the extra-exec pair, gated as this function's doc comment says.
+        var extraExecAfter: Duration?
+        var extraExecProgram: String?
+        if autoconnect, let quit, let delay = quitAfter(environment[extraExecAfterKey]),
+            let program = environment[extraExecProgramKey]?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !program.isEmpty, delay < quit
+        {
+            // O-2: strictly before a scheduled Disconnect, never on the reconnected session.
+            if disconnect.map({ delay < $0 }) ?? true {
+                extraExecAfter = delay
+                extraExecProgram = program
+            }
+        }
+
         return Plan(
             autoconnect: autoconnect,
             quitAfter: quit,
-            disconnectAfter: ceilingLeavesNoRoom ? nil : disconnectIfAutoconnected,
-            reconnectAfter: ceilingLeavesNoRoom ? nil : reconnectIfDisconnecting
+            disconnectAfter: disconnect,
+            reconnectAfter: ceilingLeavesNoRoom ? nil : reconnectIfDisconnecting,
+            extraExecAfter: extraExecAfter,
+            extraExecProgram: extraExecProgram
         )
     }
 
     /// The "whole positive number of seconds, else nothing" parse shared by
-    /// `MACDOWS_QUIT_AFTER_SECONDS`, `MACDOWS_DISCONNECT_AFTER_SECONDS` and
-    /// `MACDOWS_RECONNECT_AFTER_SECONDS`, split out so its refusals can be tested by value once
-    /// rather than three times. Digits only: a sign, whitespace, a decimal point or any
+    /// `MACDOWS_QUIT_AFTER_SECONDS`, `MACDOWS_DISCONNECT_AFTER_SECONDS`,
+    /// `MACDOWS_RECONNECT_AFTER_SECONDS` and `MACDOWS_EXTRA_EXEC_AFTER_SECONDS`, split out so its
+    /// refusals can be tested by value once rather than four times. Digits only: a sign, whitespace, a decimal point or any
     /// non-ASCII digit is refused, even one `Int(_:)` alone would otherwise have accepted (a
     /// leading `+`) -- the same grammar `Tools/rail-probe`'s `parse_decimal_field` uses for its
     /// own seconds knobs. Leading zeros normalise the way `Int(_:)` already normalises them

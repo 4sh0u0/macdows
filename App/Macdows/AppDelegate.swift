@@ -159,13 +159,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			self.statusLabel.stringValue = note
 		}
 
-		// adr/0019 §2 R-6 tool lane T1, extended by adr/0020 lane K: four unattended-launch knobs,
-		// all default OFF. With none of the four variables exported -- which is every launch by
-		// Finder, by Xcode's Run button or by `open` -- `plan` is `ShellAutolaunch.off`, none of
-		// the `if`s below are taken, and this app finishes launching byte-for-byte as it did
-		// before either lane. See `ShellAutolaunch` for why reading these names is not the thing
-		// `connectTapped` refuses to do (that refusal is about where a HOST comes from; none of
-		// the four knobs names a host, an account or a credential).
+		// adr/0019 §2 R-6 tool lane T1, extended by adr/0020 lane K and adr/0021 lane LC-2: six
+		// unattended-launch knobs, all default OFF. With none of the six variables exported --
+		// which is every launch by Finder, by Xcode's Run button or by `open` -- `plan` is
+		// `ShellAutolaunch.off`, none of the `if`s below are taken, and this app finishes launching
+		// byte-for-byte as it did before any of these lanes. See `ShellAutolaunch` for why reading
+		// these names is not the thing `connectTapped` refuses to do (that refusal is about where a
+		// HOST comes from; none of the six knobs names a host, an account or a credential).
 		//
 		// Read once, into one value, because the pin next door holds `ShellAutolaunch.plan(` to
 		// exactly one occurrence in this file: two call sites could disagree about the same launch.
@@ -232,6 +232,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			_ = Timer.scheduledTimer(withTimeInterval: quitAfter, repeats: false) { _ in
 				MainActor.assumeIsolated {
 					NSApp.terminate(nil)
+				}
+			}
+		}
+		if let extraExecAfter = autolaunch.extraExecAfterInterval, let extraExecProgram = autolaunch.extraExecProgram {
+			// adr/0021 lane LC-2 (owner ruling O-1): one extra RAIL ClientExecute, inside the
+			// connection this app holds when the Timer fires, counted from launch. One-shot and
+			// unstored, like the ceiling above: it is sent once, never re-sent, and never routed
+			// through the ARC_COMPLETED start path. `ShellAutolaunch.plan` already guarantees
+			// autoconnect, a ceiling after this delay and, if a Disconnect press is scheduled at
+			// all, one strictly after it (O-2), so nothing is re-checked here.
+			//
+			// The anchor line (witness A-X) is printed FIRST and always, carrying only the program's
+			// byte count and whether a session exists -- never the program itself. With no session
+			// (the autoconnect press failed, or has not reached `beginSession`) nothing is sent; the
+			// line's `session=absent` is what says so. `session` is read once, so the line and the
+			// send cannot disagree. A session whose RAIL channel is not up yet drops the command in
+			// the bridge with its own WARN line.
+			_ = Timer.scheduledTimer(withTimeInterval: extraExecAfter, repeats: false) { _ in
+				MainActor.assumeIsolated {
+					let session = self.session
+					ShellAutolaunch.notePress(.extraExec, programBytes: extraExecProgram.utf8.count, sessionPresent: session != nil)
+					if let session {
+						session.executeProgram(extraExecProgram)
+					}
 				}
 			}
 		}
