@@ -2,71 +2,73 @@ import AppKit
 import MacdowsCore
 import os
 
-/// Owns every `NSStatusItem` this session's RAIL notification-area (systray) icons map to
-/// (Phase 2 W6, docs/plans/phase2.md §2 W6 / §4 W6 acceptance: "NSStatusItem 数量 ==
-/// create−delete, 图标非空位图, delete 清零"). `@MainActor`, matching `RemoteWindowRegistry`
-/// (the sole owner of one `TrayStatusController` instance, session-scoped) — `NSStatusBar`/
-/// `NSStatusItem` are AppKit main-thread-only APIs.
+/// Mirrors this session's RAIL notification-area (systray) icons as ordered MENU ENTRIES for the
+/// "Remote tray" section of the Macdows status item's menu (adr/0023, which retires Phase 2 W6's
+/// one-`NSStatusItem`-per-icon form, docs/plans/phase2.md §2 W6 / §4 W6). `@MainActor`, matching
+/// `RemoteWindowRegistry` (the sole owner of one `TrayStatusController` instance,
+/// session-scoped) -- the `NSImage`s it builds and the click it forwards are main-thread work.
 ///
-/// **Degradation form implemented, per docs/plans/phase2.md §2 W6's own timebox fallback**:
-/// icon display + left-click forwarding only. No balloon notifications, no right-click
-/// context menus. This is the plan's OWN designated v1 shape, not a shortcut taken here.
+/// **What this type owns, and what it does not (adr/0023 D-6 P-a).** It owns the entry table --
+/// key, sanitised title, full tooltip text, image, placeholder flag, in first-seen order -- and
+/// publishes every change to it through `onMenuChange` (insert / update / remove at a position,
+/// or "everything removed"). It never builds, holds or edits an `NSMenu` or an `NSMenuItem`, and it
+/// never touches the system status bar (adr/0023 D-5 R1): the status item controller in `App/Macdows`
+/// is the one writer of the menu's structure and mirrors these entries into it, including while
+/// the menu is open (D-3 M-a). Because the table lives here, `Diagnostics.liveCount` (the W6-1
+/// count) is the same number whether or not any menu mirrors it -- `Tools/window-smoke` has no
+/// status item and reads it all the same.
 ///
-/// **Gap 1 (no icon pixels, no tooltip) is CLOSED by adr/0013.** It used to read: both
-/// `crb_notify_icon_create` and `crb_notify_icon_update` discarded the entire
-/// `NOTIFY_ICON_STATE_ORDER` (`(void)notifyIconState;`) and `crdpq_notify_icon_t` carried
-/// nothing but `windowId`/`notifyIconId`, so every `NSStatusItem` showed the same placeholder
-/// template image and its tooltip -- when set at all -- was the icon's OWNER WINDOW's title
-/// rather than a notify-icon-specific one. adr/0013 resolved the "variable-size pixel payload"
-/// question the old note called ADR-worthy: pixels ride a bounded side store
+/// **Shape kept from W6 (adr/0023 D-5 K-a: the name, the registry property, `removeAll()`,
+/// `handleLeftClick(tag:)`, the `note*` pushes, `diagnostics()` and `maxObservedVersions` are
+/// unchanged).** Icon display + left-click forwarding only. No balloon notifications (adr/0023
+/// D-7 B-a), no right-click, double-click or middle-click (D-2 C1, adr/0014 §1).
+///
+/// **Gap 1 (no icon pixels, no tooltip) is CLOSED by adr/0013.** Pixels ride a bounded side store
 /// (`crdpq_icon_store_t`, 16 slots x 48x48 RGBA) and the control event carries only a slot
-/// reference, so the control lane's own growth ceiling never inflates by a bitmap's worth
-/// (adr/0013 §1); `crdpq_icon_convert` does the DIB->premultiplied-RGBA decode on T_rdp
-/// (adr/0013 §2); and the tooltip appends to the POD via the `crdpq_text_t` truncation
-/// precedent that same note pointed at. This type now renders `event.iconRGBA` as a real
-/// `NSImage` and prefers `event.toolTip` over the owner-window-title fallback. What remains
-/// intentionally degraded: an icon this client refuses (oversize/unsupported bpp/store
-/// exhaustion/the deferred `CACHED_ICON` variant, adr/0013 §2) still falls back to the same
-/// placeholder, counted via `Diagnostics.iconSkippedCount` -- fail-open, not silent.
+/// reference (adr/0013 §1); `crdpq_icon_convert` does the DIB->premultiplied-RGBA decode on T_rdp
+/// (adr/0013 §2); the tooltip appends to the POD via the `crdpq_text_t` truncation precedent. This
+/// type renders `event.iconRGBA` as a real `NSImage` and prefers `event.toolTip` over the
+/// owner-window-title fallback. What remains intentionally degraded: an icon this client refuses
+/// (oversize/unsupported bpp/store exhaustion/the deferred `CACHED_ICON` variant, adr/0013 §2)
+/// falls back to the placeholder, counted via `Diagnostics.iconSkippedCount` -- fail-open, not
+/// silent.
 ///
-/// **Gap 2 (no outbound wire lane for tray clicks) is CLOSED by adr/0014.** It used to read:
-/// FreeRDP defines `RAIL_NOTIFY_EVENT_ORDER { windowId, notifyIconId, message }`
-/// (`ThirdParty/FreeRDP/include/freerdp/rail.h:433-438`) sent via
-/// `RailClientContext.ClientNotifyEvent` (`freerdp/client/rail.h:58-59`), but `CRSession.h`
-/// exposed no `-sendNotifyEvent:...` method for it, so a click could only be LOGGED. adr/0014
-/// added that method (and `CRDPQ_CMD_NOTIFY_EVENT` behind it, appended to the same outbound
-/// queue every other outbound command already rides — no new mechanism); `handleLeftClick(
-/// tag:)` below now hands the unpacked key to `onLeftClick`, which `RemoteWindowRegistry`
-/// wires to two `CRSession.sendNotifyEvent` calls: `WM_LBUTTONDOWN` then `WM_LBUTTONUP`
-/// (`MacdowsCore.TrayNotifyEvent.leftClickSequence`). What remains intentionally out of
-/// scope, per adr/0014 §1: `NIN_SELECT` and the rest of the `NIN_*` family (their MS-RDPERP
-/// version precondition is unverifiable from here — see `TrayNotifyEvent`'s own doc comment),
-/// right-click/`WM_CONTEXTMENU`, double-click, and balloons. The W6 degradation form is
-/// otherwise unchanged.
+/// **Gap 2 (no outbound wire lane for tray clicks) is CLOSED by adr/0014.** `handleLeftClick(tag:)`
+/// hands the unpacked key to `onLeftClick`, which `RemoteWindowRegistry` wires to two
+/// `CRSession.sendNotifyEvent` calls: `WM_LBUTTONDOWN` then `WM_LBUTTONUP`
+/// (`MacdowsCore.TrayNotifyEvent.leftClickSequence`). Choosing an entry's menu item is that one
+/// left click (adr/0023 D-2 C1), forwarded synchronously from the item's action (T-a). Out of
+/// scope, per adr/0014 §1: `NIN_SELECT` and the rest of the `NIN_*` family, right-click /
+/// `WM_CONTEXTMENU`, double-click, and balloons.
 @MainActor
 final class TrayStatusController {
     private var model = TrayModel()
-    /// One `NSStatusItem` per live notify icon, keyed the same way `model.icons` is (adr/0008-
-    /// aligned `(windowId, notifyIconId)` composite identity — see `TrayModel`'s own doc
-    /// comment for why `notifyIconId` alone isn't a safe key). Reset (along with `model`) by
-    /// `removeAll()`; EVERY counter below (`createsSeen`/`updatesSeen`/`deletesSeen`, the
-    /// adr/0013 icon counters, and adr/0014's own click/PDU/version counters) is NOT reset —
-    /// same "cumulative for this registry's lifetime, not reset on reconnect" precedent
-    /// `RemoteWindowRegistry`'s own `zOrderArraysReceivedCount`/`zOrderAppliesPerformedCount`/
-    /// `zOrderSkippedUnknownTotal` already establish (see those ivars' own doc comment) — a
-    /// post-shutdown `Tools/window-smoke` diagnostics read (`finish()`, after
-    /// `session.shutdownAndWait()` has already torn down every live item via `removeAll()`)
-    /// must still see the real per-session totals, not zeros.
-    private var statusItems: [NotifyIconState: NSStatusItem] = [:]
+    /// One entry per live notify icon, in first-seen order (the wire carries no tray ordering,
+    /// adr/0023 D-1), keyed the same way `model.icons` is (adr/0008-aligned `(windowId,
+    /// notifyIconId)` composite identity -- see `TrayModel`'s own doc comment for why
+    /// `notifyIconId` alone isn't a safe key). Reset (along with `model`) by `removeAll()`;
+    /// EVERY counter below (`createsSeen`/`updatesSeen`/`deletesSeen`, the adr/0013 icon
+    /// counters, and adr/0014's own click/PDU/version counters) is NOT reset -- same "cumulative
+    /// for this registry's lifetime, not reset on reconnect" precedent `RemoteWindowRegistry`'s
+    /// own `zOrderArraysReceivedCount`/`zOrderAppliesPerformedCount`/`zOrderSkippedUnknownTotal`
+    /// already establish (see those ivars' own doc comment) -- a post-shutdown
+    /// `Tools/window-smoke` diagnostics read (`finish()`, after `session.shutdownAndWait()` has
+    /// already torn down every live entry via `removeAll()`) must still see the real per-session
+    /// totals, not zeros.
+    private(set) var entries: [MenuEntry] = []
 
-    /// The subset of `statusItems`'s keys whose button currently shows a REAL remote bitmap
-    /// rather than `placeholderImage` (adr/0013 §3). Kept as a separate set rather than
-    /// re-derived from `NSStatusItem.button?.image` at diagnostics time, because "is this the
-    /// placeholder" is not a question an `NSImage` answers reliably (`.isTemplate` is a
-    /// property of what we set, not an identity), and the acceptance criterion this feeds
-    /// (`realIconCount >= 1`) needs to be exact. Kept in sync with `statusItems` at every
-    /// mutation point, and cleared alongside it by `removeAll()`.
+    /// The subset of `entries`' keys whose entry currently shows a REAL remote bitmap rather than
+    /// `placeholderImage` (adr/0013 §3). Kept as a separate set rather than re-derived from the
+    /// entries' images at diagnostics time, because the acceptance criterion this feeds
+    /// (`realIconCount >= 1`) needs to be exact. Kept in sync with `entries` at every mutation
+    /// point, and cleared alongside it by `removeAll()`.
     private var realIconKeys: Set<NotifyIconState> = []
+
+    /// adr/0023 D-1 N-a: the number a key's fallback title ("Tray app %d") carries, handed out
+    /// in first-seen order and kept for the key while this connection lasts, so an icon that is
+    /// deleted and re-created keeps its number. Cleared by `removeAll()`: a new connection numbers
+    /// from 1 again.
+    private var fallbackOrdinals: [NotifyIconState: Int] = [:]
 
     private(set) var createsSeen = 0
     private(set) var updatesSeen = 0
@@ -86,7 +88,7 @@ final class TrayStatusController {
     /// `iconSkippedCount` above.
     private(set) var cachedIconCount = 0
     /// R1 finding 2: the maximum `realIconKeys.count` ever reached -- latched exactly, at
-    /// the moment a real bitmap is installed in `upsertStatusItem`, NOT timer-sampled (a
+    /// the moment a real bitmap is installed in `upsertEntry`, NOT timer-sampled (a
     /// create+delete pair landing inside one drain batch is invisible to any poll, and the
     /// adr/0013 §4 acceptance gate must not fail a pipeline that worked). Cumulative for
     /// this controller's lifetime, NOT reset by `removeAll()`, same post-shutdown-read
@@ -107,11 +109,13 @@ final class TrayStatusController {
     /// CLICK, not per PDU (see `notifyEventsSent`). Cumulative, NOT reset by `removeAll()`,
     /// same post-shutdown-read reasoning as `createsSeen` above.
     private(set) var clicksForwarded = 0
-    /// adr/0014 §4: left clicks dropped because the icon's `NSStatusItem` was already gone by
-    /// the time the click handler ran. Expected to stay 0 in steady state -- AppKit removes a
-    /// status item's button along with the item, so a click arriving for a key this
-    /// controller no longer tracks means the two got out of sync, which is a BUG SIGNAL, not
-    /// a routine race. Deliberately logged at `.warning` EVERY time rather than once
+    /// adr/0014 §4: left clicks dropped because the icon's entry was already gone by the time the
+    /// click handler ran. Expected to stay 0 in steady state -- the menu side removes an entry's
+    /// item in the same main-actor turn the delete arrives in, including while the menu is open
+    /// (adr/0023 D-3 M-a), so a click arriving for a key this controller no longer tracks means
+    /// the two got out of sync, which is a BUG SIGNAL, not a routine race (adr/0023 U-3 records
+    /// the one ordering that could make it one: a drain between the menu's selection and the
+    /// action). Deliberately logged at `.warning` EVERY time rather than once
     /// (unlike the log-once budgets elsewhere in this file): if this ever fires, the
     /// frequency and the keys involved are the diagnosis. Cumulative, same discipline as
     /// every counter above.
@@ -150,39 +154,41 @@ final class TrayStatusController {
 
     private static let logger = Logger(subsystem: "dev.haru.macdows", category: "TrayStatusController")
 
-    /// Menu-bar icon edge length, in points. 18pt is the conventional square for a
-    /// `NSStatusItem.squareLength` item's artwork on a standard-height menu bar — the remote
-    /// bitmap arrives at whatever the server sent (16/32/48 square in practice), and is
-    /// scaled to this by setting `NSImage.size` rather than by resampling the pixels, so
-    /// AppKit picks the filtering and the backing store stays at native resolution for
-    /// Retina.
-    private static let menuBarIconEdge: CGFloat = 18
+    /// Menu-item icon edge length, in points (adr/0023 D-1 I-a: 16 pt, down from the 18 pt square
+    /// a W6 `NSStatusItem` used -- a deliberate change, UI-1 spec §6.3). The remote bitmap arrives
+    /// at whatever the server sent (16/32/48 square in practice) and is scaled to this by setting
+    /// `NSImage.size` rather than by resampling the pixels, so AppKit picks the filtering and the
+    /// backing store stays at native resolution for Retina.
+    static let menuItemIconEdge: CGFloat = 16
+
+    /// adr/0023 D-1 N-a: a menu title is cut to this many grapheme clusters, plus an ellipsis.
+    static let menuTitleLimit = 48
 
     /// SF Symbol placeholder — post-adr/0013 this is the FALLBACK, not the only form: it is
-    /// what a status item shows when the order carried no icon at all, or when the icon it
-    /// carried was refused (adr/0013 §2's `iconSkipped`). `.isTemplate` so AppKit tints it
-    /// correctly against both light and dark menu bars, matching every other system status
-    /// item's own rendering convention. `app.badge` (available since SF Symbols 2 / macOS 11)
+    /// what an entry shows when the order carried no icon at all, or when the icon it carried
+    /// was refused (adr/0013 §2's `iconSkipped`). `.isTemplate` so AppKit tints it correctly
+    /// against both light and dark menus (adr/0023 D-1 I-a keeps the template placeholder). `app.badge` (available since SF Symbols 2 / macOS 11)
     /// reads as "an app has something to tell you," a reasonable stand-in for an unknown
     /// remote tray icon. Falls back to a plain empty `NSImage` (never crashes/force-unwraps)
     /// if the symbol name is ever unavailable in some future SDK -- the same fail-open
     /// discipline this codebase already applies everywhere else (adr/0008 §4).
-    private static let placeholderImage: NSImage = {
+    static let placeholderImage: NSImage = {
         let image = NSImage(systemSymbolName: "app.badge", accessibilityDescription: "Remote notification area icon")
         image?.isTemplate = true
         return image ?? NSImage()
     }()
 
-    /// The live `NSStatusItem` count -- the LHS of phase2.md §4 W6's own acceptance formula
-    /// ("NSStatusItem 数量 == create−delete"). Exposed for `Tools/window-smoke`'s `[tray]`
-    /// diagnostics line via `RemoteWindowRegistry.trayDiagnostics()`.
+    /// `liveCount` is the live ENTRY count -- the LHS of the W6-1 acceptance formula as adr/0023
+    /// D-3 rewrites phase2.md §4 W6 ("托盘侧活条目数 == create − delete"), whether or not a menu
+    /// mirrors the entries. Exposed for `Tools/window-smoke`'s `[tray]` diagnostics line via
+    /// `RemoteWindowRegistry.trayDiagnostics()`, whose field names and order are unchanged.
     struct Diagnostics {
         let createsSeen: Int
         let updatesSeen: Int
         let deletesSeen: Int
         let liveCount: Int
-        /// adr/0013 §4's real-machine acceptance criterion (`realIconCount >= 1`): live status
-        /// items currently showing a real remote bitmap, i.e. `liveCount` MINUS the ones still
+        /// adr/0013 §4's real-machine acceptance criterion (`realIconCount >= 1`): live entries
+        /// currently showing a real remote bitmap, i.e. `liveCount` MINUS the ones still
         /// on `placeholderImage`. A point-in-time count, not a cumulative one -- unlike the
         /// three `*Seen` counters above, this drops back to 0 when the icons are torn down.
         let realIconCount: Int
@@ -205,8 +211,8 @@ final class TrayStatusController {
         /// Cumulative; see `clicksForwarded`'s own doc comment (adr/0014 §5).
         let clicksForwarded: Int
         /// Cumulative; see `clicksDroppedIconGone`'s own doc comment -- an acceptance gate
-        /// asserts this is 0, because a nonzero value is a status-item bookkeeping bug, not
-        /// a tolerated race.
+        /// asserts this is 0, because a nonzero value is an entry bookkeeping bug, not a
+        /// tolerated race.
         let clicksDroppedIconGone: Int
         /// Cumulative; see `notifyEventsSent`'s own doc comment, including why this and
         /// `clicksForwarded` are BOTH carried despite `notifyEventsSent == 2 *
@@ -223,7 +229,7 @@ final class TrayStatusController {
     func diagnostics() -> Diagnostics {
         Diagnostics(
             createsSeen: createsSeen, updatesSeen: updatesSeen, deletesSeen: deletesSeen,
-            liveCount: statusItems.count, realIconCount: realIconKeys.count,
+            liveCount: entries.count, realIconCount: realIconKeys.count,
             iconSkippedCount: iconSkippedCount, cachedIconCount: cachedIconCount,
             realIconMaxObserved: realIconMaxObserved,
             storeOverflowCount: storeOverflowCount,
@@ -301,71 +307,53 @@ final class TrayStatusController {
 
     /// A `NotifyIconCreate` order. `ownerWindowTitle` is whatever `RemoteWindowRegistry`
     /// already knows for `ownerWindowId` (its own `geometry[windowId]?.title`, or `nil` if
-    /// unknown/empty) -- post-adr/0013 it is the FALLBACK tooltip only, used when the order
-    /// itself carried no `toolTip` (see `resolvedTooltip`).
+    /// unknown/empty) -- post-adr/0013 it is the FALLBACK title only, used when the order
+    /// itself carried no usable `toolTip` (see `menuText(wire:ownerWindowTitle:ordinal:)`).
     func handleNotifyIconCreate(windowId: UInt32, notifyIconId: UInt32, ownerWindowTitle: String?, icon: IconPayload = .absent) {
         createsSeen += 1
         // R1 finding 1: the model stores the WIRE tooltip truth (nil = the order didn't
         // carry the NOTIFY_TIP bit), never the display-resolved value -- the owner-title
-        // fallback is applied at NSStatusItem time below, so a later tooltip-less delta
+        // fallback is applied when the entry is built below, so a later tooltip-less delta
         // can't launder the fallback into "what the server said".
         model.create(windowId: windowId, notifyIconId: notifyIconId, info: TrayIconInfo(tooltip: icon.toolTip))
-        upsertStatusItem(
-            windowId: windowId, notifyIconId: notifyIconId,
-            tooltip: Self.resolvedTooltip(wire: storedTooltip(windowId: windowId, notifyIconId: notifyIconId), ownerWindowTitle: ownerWindowTitle),
-            icon: icon
-        )
+        upsertEntry(windowId: windowId, notifyIconId: notifyIconId, ownerWindowTitle: ownerWindowTitle, icon: icon)
     }
 
-    /// A `NotifyIconUpdate` order -- update-in-place: reuses the existing `NSStatusItem` for
-    /// this key if one is already live (the common case), or creates one if this is the first
-    /// order this controller has seen for this key at all (`TrayModel.update`'s own tolerance
-    /// for an update-before-create ordering, see its doc comment).
+    /// A `NotifyIconUpdate` order -- update-in-place: rewrites the existing entry for this key
+    /// at its existing position if one is already live (the common case), or appends one if this
+    /// is the first order this controller has seen for this key at all (`TrayModel.update`'s own
+    /// tolerance for an update-before-create ordering, see its doc comment).
     func handleNotifyIconUpdate(windowId: UInt32, notifyIconId: UInt32, ownerWindowTitle: String?, icon: IconPayload = .absent) {
         updatesSeen += 1
         // R1 finding 1: `TrayModel.update` delta-merges -- an update without the NOTIFY_TIP
         // bit keeps the key's previously-seen wire tooltip (the exact mirror of the C
         // side-store re-referencing this key's pixel slot for an icon-less update), so an
         // ordinary icon-only state change no longer blanks a real tooltip down to the
-        // owner-title fallback. The button then shows the MERGED wire truth, resolved
+        // owner-title fallback. The entry then shows the MERGED wire truth, resolved
         // against the fallback only when no order ever carried a tooltip at all.
         model.update(windowId: windowId, notifyIconId: notifyIconId, info: TrayIconInfo(tooltip: icon.toolTip))
-        upsertStatusItem(
-            windowId: windowId, notifyIconId: notifyIconId,
-            tooltip: Self.resolvedTooltip(wire: storedTooltip(windowId: windowId, notifyIconId: notifyIconId), ownerWindowTitle: ownerWindowTitle),
-            icon: icon
-        )
+        upsertEntry(windowId: windowId, notifyIconId: notifyIconId, ownerWindowTitle: ownerWindowTitle, icon: icon)
     }
 
-    /// The delta-merged wire tooltip `TrayModel` currently tracks for this key — the single
-    /// source `resolvedTooltip` reads, so display resolution always sees the merge result,
+    /// The delta-merged wire tooltip `TrayModel` currently tracks for this key -- the single
+    /// source the title resolution reads, so display resolution always sees the merge result,
     /// never one order's own (possibly bit-absent) field.
-    private func storedTooltip(windowId: UInt32, notifyIconId: UInt32) -> String? {
-        model.icons[NotifyIconState(windowId: windowId, notifyIconId: notifyIconId)]?.tooltip
+    private func storedTooltip(for key: NotifyIconState) -> String? {
+        model.icons[key]?.tooltip
     }
 
-    /// adr/0013 §3's tooltip precedence: the wire's own notify-icon tooltip wins; the owner
-    /// window's title is the pre-adr/0013 fallback, kept because a server may legitimately
-    /// send a notify icon with no tooltip at all, and a labelled status item is more useful
-    /// than an unlabelled one. An empty wire tooltip counts as absent (a zero-length
-    /// `NSStatusItem.button.toolTip` and `nil` render identically anyway, so preferring it
-    /// over a known window title would be a pure loss).
-    private static func resolvedTooltip(wire: String?, ownerWindowTitle: String?) -> String? {
-        if let wire, !wire.isEmpty { return wire }
-        return ownerWindowTitle
-    }
-
-    /// A `NotifyIconDelete` order. Tolerates a key with no live `NSStatusItem` (unknown-delete,
-    /// matching `TrayModel.delete`'s own tolerance) -- `deletesSeen` still counts the ORDER
-    /// received, matching `TrayModel`'s own "count the wire event, not just the ones that hit
-    /// something" reasoning, since the phase2.md §4 W6 acceptance formula needs that count.
+    /// A `NotifyIconDelete` order. Tolerates a key with no live entry (unknown-delete, matching
+    /// `TrayModel.delete`'s own tolerance) -- `deletesSeen` still counts the ORDER received,
+    /// matching `TrayModel`'s own "count the wire event, not just the ones that hit something"
+    /// reasoning, since the W6-1 acceptance formula needs that count.
     func handleNotifyIconDelete(windowId: UInt32, notifyIconId: UInt32) {
         deletesSeen += 1
         model.delete(windowId: windowId, notifyIconId: notifyIconId)
         let key = NotifyIconState(windowId: windowId, notifyIconId: notifyIconId)
         realIconKeys.remove(key)
-        if let item = statusItems.removeValue(forKey: key) {
-            NSStatusBar.system.removeStatusItem(item)
+        if let index = entryIndex(for: key) {
+            entries.remove(at: index)
+            onMenuChange?(.removed(index: index, key: key))
         }
     }
 
@@ -373,19 +361,62 @@ final class TrayStatusController {
     /// four of its callers: the generation-rollover branch in `handle(_:)`, the
     /// `.disconnected` case, the explicit `prepareForReconnect()` driver, and the session-end
     /// entry, `closeWindowsForSessionEnd()`), matching how that method already tears down
-    /// every other per-connection resource it owns. Clears the LIVE model/items only -- see
-    /// `statusItems`'s own doc comment for why none of this type's counters (including
-    /// adr/0014's `clicksForwarded`/`notifyEventsSent`) are reset here.
+    /// every other per-connection resource it owns. Clears the LIVE model/entries only -- see
+    /// `entries`' own doc comment for why none of this type's counters (including adr/0014's
+    /// `clicksForwarded`/`notifyEventsSent`) are reset here. Announced as `.removedAll` even when
+    /// nothing was live, so a mirror re-reads its section state on every teardown.
     func removeAll() {
-        for (_, item) in statusItems {
-            NSStatusBar.system.removeStatusItem(item)
-        }
-        statusItems.removeAll()
+        entries.removeAll()
         realIconKeys.removeAll()
+        fallbackOrdinals.removeAll()
         model = TrayModel()
+        onMenuChange?(.removedAll)
     }
 
-    private func upsertStatusItem(windowId: UInt32, notifyIconId: UInt32, tooltip: String?, icon: IconPayload) {
+    // MARK: - The entry table (adr/0023 D-6 P-a)
+
+    /// One live notify icon, as the menu side mirrors it. A value: the menu side copies what it
+    /// needs into its own `NSMenuItem` and never hands anything back.
+    struct MenuEntry {
+        let key: NotifyIconState
+        /// Sanitised, single-line, at most `menuTitleLimit` grapheme clusters plus an ellipsis
+        /// (adr/0023 D-1 N-a). Never empty: the last fallback is the numbered "Tray app %d".
+        let title: String
+        /// The whole sanitised text the title was cut from, for `NSMenuItem.toolTip`; nil when
+        /// the title is the numbered fallback (there is nothing more to show).
+        let toolTip: String?
+        /// The remote bitmap (16 pt, not a template) or `placeholderImage` (a template).
+        let image: NSImage
+        let isPlaceholder: Bool
+        /// `TrayButtonTag.pack(key)` -- what the menu side writes into `NSMenuItem.tag` and
+        /// hands back to `handleLeftClick(tag:)`.
+        var tag: Int { TrayButtonTag.pack(windowId: key.windowId, notifyIconId: key.notifyIconId) }
+    }
+
+    /// A change to `entries`, with the position it happened at (adr/0023 D-6 P-a: fine-grained,
+    /// so the menu side can insert / rewrite / remove one item in an open menu, D-3 M-a).
+    enum MenuChange: Equatable {
+        /// `entries[index]` is new.
+        case inserted(index: Int)
+        /// `entries[index]` was rewritten in place (image, title or tooltip).
+        case updated(index: Int)
+        /// The entry that was at `index` is gone.
+        case removed(index: Int, key: NotifyIconState)
+        /// `removeAll()`: no entry is left.
+        case removedAll
+    }
+
+    /// The menu side's subscription (one subscriber: the status item controller's tray section).
+    /// Called after `entries` has changed, on the main actor, in the same turn as the RAIL order
+    /// that caused it. `nil` is a safe no-op -- `Tools/window-smoke` reads `entries` and
+    /// `diagnostics()` without ever subscribing.
+    var onMenuChange: ((MenuChange) -> Void)?
+
+    private func entryIndex(for key: NotifyIconState) -> Int? {
+        entries.firstIndex { $0.key == key }
+    }
+
+    private func upsertEntry(windowId: UInt32, notifyIconId: UInt32, ownerWindowTitle: String?, icon: IconPayload) {
         let key = NotifyIconState(windowId: windowId, notifyIconId: notifyIconId)
         if icon.skipped {
             iconSkippedCount += 1
@@ -394,60 +425,125 @@ final class TrayStatusController {
                 "notify icon windowId=\(windowId, privacy: .public) notifyIconId=\(notifyIconId, privacy: .public) carried an icon this client refused (adr/0013 §2 iconSkipped, cached=\(icon.cached, privacy: .public)) -- showing the placeholder instead"
             )
         }
-        let item: NSStatusItem
-        if let existing = statusItems[key] {
-            item = existing
+        let ordinal: Int
+        if let known = fallbackOrdinals[key] {
+            ordinal = known
         } else {
-            item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-            statusItems[key] = item
-        }
-        guard let button = item.button else {
-            Self.logger.warning("NSStatusItem for notifyIconId=\(notifyIconId, privacy: .public) windowId=\(windowId, privacy: .public) has no button -- cannot set image/tooltip/click target")
-            return
+            ordinal = fallbackOrdinals.count + 1
+            fallbackOrdinals[key] = ordinal
         }
         // adr/0013 §3: a real remote bitmap when one arrived and could be turned into an
         // image, the placeholder otherwise -- deliberately unconditional in both directions,
-        // so what a status item shows is always a function of the order that just arrived and
+        // so what an entry shows is always a function of the order that just arrived and
         // never of accumulated history. An icon-less NotifyIconUpdate (a tooltip-only change,
         // say) still lands in the first branch, because the bridge re-references this key's
         // existing side-store slot for exactly that case rather than sending no pixels; the
         // placeholder branch really does mean "the server has no icon for this, or the one it
         // sent was refused". `realIconKeys` mirrors the branch taken, because
-        // `Diagnostics.realIconCount` (adr/0013 §4's acceptance assertion) has to be exact and
-        // `NSImage` identity isn't a reliable way to re-derive it afterwards.
-        if let image = Self.menuBarImage(from: icon) {
-            button.image = image
+        // `Diagnostics.realIconCount` (adr/0013 §4's acceptance assertion) has to be exact.
+        let image: NSImage
+        let isPlaceholder: Bool
+        if let real = Self.menuItemImage(from: icon) {
+            image = real
+            isPlaceholder = false
             realIconKeys.insert(key)
             realIconMaxObserved = max(realIconMaxObserved, realIconKeys.count)
         } else {
-            button.image = Self.placeholderImage
+            image = Self.placeholderImage
+            isPlaceholder = true
             realIconKeys.remove(key)
         }
-        button.toolTip = tooltip
-        button.target = self
-        button.action = #selector(statusItemClicked(_:))
-        // Degradation form: no `item.menu` is ever assigned -- an `NSStatusItem` with no menu
-        // and a plain button action responds only to the primary (left) click by default, so
-        // this alone is what satisfies "left-click forwarding only, no right-click menus"
-        // (phase2.md §2 W6's own timebox fallback) without any extra event-type filtering.
-        button.tag = TrayButtonTag.pack(windowId: windowId, notifyIconId: notifyIconId)
+        let text = Self.menuText(wire: storedTooltip(for: key), ownerWindowTitle: ownerWindowTitle, ordinal: ordinal)
+        let entry = MenuEntry(key: key, title: text.title, toolTip: text.toolTip, image: image, isPlaceholder: isPlaceholder)
+        if let index = entryIndex(for: key) {
+            entries[index] = entry
+            onMenuChange?(.updated(index: index))
+        } else {
+            entries.append(entry)
+            onMenuChange?(.inserted(index: entries.count - 1))
+        }
+    }
+
+    // MARK: - Titles (adr/0023 D-1 N-a)
+
+    /// adr/0023 D-1 N-a, adr/0013 §3's precedence: the wire's own notify-icon tooltip wins; the
+    /// owner window's title is next, kept because a server may legitimately send a notify icon
+    /// with no tooltip at all; the numbered "Tray app %d" (string key `si_tray_n`) is last. Each
+    /// candidate is sanitised BEFORE it is judged empty, so a tooltip made only of control
+    /// characters or blank lines counts as absent. The tooltip is untrusted remote text (up to
+    /// 256 bytes after the bridge's own cut, adr/0013), so the title is its first line with
+    /// control and format characters removed, cut at `menuTitleLimit` grapheme clusters; the
+    /// whole sanitised text goes to the tooltip.
+    static func menuText(wire: String?, ownerWindowTitle: String?, ordinal: Int) -> (title: String, toolTip: String?) {
+        for candidate in [wire, ownerWindowTitle] {
+            guard let candidate else { continue }
+            let full = sanitizedText(candidate)
+            let firstLine = full.split(separator: "\n", omittingEmptySubsequences: true)
+                .lazy.map { $0.trimmingCharacters(in: .whitespaces) }.first { !$0.isEmpty }
+            guard let firstLine else { continue }
+            return (truncatedTitle(firstLine), full)
+        }
+        let format = Bundle.main.localizedString(forKey: "si_tray_n", value: "Tray app %d", table: nil)
+        return (String(format: format, Int32(clamping: ordinal)), nil)
+    }
+
+    /// Line breaks of every kind folded to "\n" and tabs to spaces, then every other Unicode
+    /// control (Cc) and format (Cf) scalar removed except the zero-width joiner U+200D (which emoji
+    /// sequences need); BiDi embeddings, overrides and isolates are Cf and go. Leading and
+    /// trailing whitespace trimmed.
+    static func sanitizedText(_ text: String) -> String {
+        var scalars = String.UnicodeScalarView()
+        var previousWasCR = false
+        for scalar in text.unicodeScalars {
+            let isCR = scalar == "\r"
+            defer { previousWasCR = isCR }
+            switch scalar.value {
+            case 0x0A where previousWasCR:
+                continue // CR LF is one break
+            case 0x0A, 0x0D, 0x0B, 0x0C, 0x85, 0x2028, 0x2029:
+                scalars.append("\n")
+                continue
+            case 0x09:
+                scalars.append(" ") // a tab separates words; keep it as a space
+                continue
+            case 0x200D:
+                scalars.append(scalar)
+                continue
+            default:
+                break
+            }
+            switch scalar.properties.generalCategory {
+            case .control, .format:
+                continue
+            default:
+                scalars.append(scalar)
+            }
+        }
+        return String(scalars).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Cut at `menuTitleLimit` grapheme clusters (Swift `Character`s, so an emoji or a base letter
+    /// with its combining marks is never split), with "…" appended when anything was cut.
+    static func truncatedTitle(_ line: String) -> String {
+        guard line.count > menuTitleLimit else { return line }
+        return String(line.prefix(menuTitleLimit)) + "…"
     }
 
     /// adr/0013 §3: `Data` (premultiplied RGBA8888, top-down, tight `width * 4` rows -- the
     /// exact shape `crdpq_icon_convert` writes) -> `CGDataProvider` -> `CGImage` -> `NSImage`,
-    /// sized to a menu-bar square. Returns `nil` -- never a blank image -- for any absent or
+    /// sized to a `menuItemIconEdge` square. Returns `nil` -- never a blank image -- for any absent or
     /// malformed payload, so the caller's placeholder branch stays the single fallback path.
     ///
     /// Deliberately NOT `.isTemplate`: a template image is flattened to a tint mask, which
     /// would discard the remote icon's colors entirely and make every tray icon look identical
-    /// again (the exact placeholder problem adr/0013 exists to fix). The trade-off is that a
-    /// remote icon does not auto-tint for menu-bar appearance changes, which is the same
-    /// trade-off any colored third-party status item on macOS already makes.
+    /// again (the exact placeholder problem adr/0013 exists to fix; adr/0023 D-1 I-a keeps it).
+    /// The trade-off is that a remote icon does not auto-tint for appearance changes, which is
+    /// the same trade-off any colored menu-item image on macOS already makes.
     ///
     /// `NSImage.size` is set in POINTS while the `CGImage` keeps its native pixel dimensions,
-    /// so a 32x32 remote bitmap on a Retina display renders at native resolution inside an
-    /// 18pt square rather than being resampled down first.
-    private static func menuBarImage(from icon: IconPayload) -> NSImage? {
+    /// so a 32x32 remote bitmap on a Retina display renders at native resolution inside a
+    /// 16 pt square rather than being resampled down first.
+    static func menuItemImage(from icon: IconPayload) -> NSImage? {
         guard let rgba = icon.rgba, icon.width > 0, icon.height > 0 else { return nil }
         let bytesPerRow = icon.width * 4
         guard rgba.count >= bytesPerRow * icon.height else {
@@ -476,18 +572,16 @@ final class TrayStatusController {
             logger.warning("CGImage construction failed for a \(icon.width, privacy: .public)x\(icon.height, privacy: .public) notify icon -- placeholder shown")
             return nil
         }
-        let image = NSImage(cgImage: cgImage, size: NSSize(width: menuBarIconEdge, height: menuBarIconEdge))
+        let image = NSImage(cgImage: cgImage, size: NSSize(width: menuItemIconEdge, height: menuItemIconEdge))
         image.isTemplate = false
         return image
     }
 
-    // The `(windowId, notifyIconId)` <-> `NSStatusBarButton.tag` packing that used to live
-    // here (`packTag`/`unpackTag`) is now `MacdowsCore.TrayButtonTag`, bit layout unchanged and
-    // pinned there against literals. The move predates this target's test bundle
-    // (MacdowsAppTests, D7, 2026-09-02) and stays on its merits: the package pin runs in
-    // every `swift test`/replay-gate pass, a coverage class the app-side bundle does not
-    // claim. Both call sites here and `RemoteWindowRegistry.debugSimulateTrayClick` go
-    // through that one implementation.
+    // The `(windowId, notifyIconId)` <-> tag packing lives in `MacdowsCore.TrayButtonTag`, bit
+    // layout pinned there against literals. It used to pack a status-bar button's tag; since
+    // adr/0023 it packs the Remote tray section's `NSMenuItem.tag` (`MenuEntry.tag`). Both the
+    // menu side and `RemoteWindowRegistry.debugSimulateTrayClick` go through that one
+    // implementation.
 
     /// Called by `RemoteWindowRegistry` (which owns the `CRSession`) for each forwarded left
     /// click, with the clicked icon's own `(windowId, notifyIconId)` wire identity. `nil` (the
@@ -495,20 +589,14 @@ final class TrayStatusController {
     /// `CRSession.onEventsAvailable`'s own precedent.
     var onLeftClick: ((_ windowId: UInt32, _ notifyIconId: UInt32) -> Void)?
 
-    /// Left-click handler (degradation form: no right-click menu is ever installed, see
-    /// `upsertStatusItem`'s own comment on why that alone excludes right-click). AppKit entry
-    /// point only -- everything that isn't "get the key out of the sender" lives in
-    /// `handleLeftClick(tag:)`, so the offline harness path can exercise the identical logic
-    /// (`RemoteWindowRegistry.debugSimulateTrayClick`) with AppKit event delivery as the ONLY
-    /// missing piece.
-    @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
-        handleLeftClick(tag: sender.tag)
-    }
-
-    /// adr/0014 §1: unpacks the button tag, re-checks that the icon is still live, and hands
-    /// the key to `onLeftClick`. The liveness re-check is not ceremony: a click is dispatched
-    /// by AppKit, so a `NotifyIconDelete` drained between the press and this call would
-    /// otherwise send a notify event addressed at an icon the server has already destroyed.
+    /// adr/0014 §1: unpacks the tag, re-checks that the icon is still live, and hands the key to
+    /// `onLeftClick`. The one entry point for a click: the Remote tray section's menu-item action
+    /// calls it with the chosen item's tag (adr/0023 D-2 C1 + T-a, synchronously from the
+    /// action), and the offline harness path (`RemoteWindowRegistry.debugSimulateTrayClick`)
+    /// enters it with the same packed tag. The liveness re-check is not ceremony: an entry's item
+    /// is chosen through AppKit, so a `NotifyIconDelete` drained between the selection and this
+    /// call would otherwise send a notify event addressed at an icon the server has already
+    /// destroyed (adr/0023 U-3).
     ///
     /// **This path deliberately does NOT touch `FocusAuthority`** (adr/0014 §3): no
     /// `activateWindow`, no `focusAuthority.localActivate`, no keyboard-lane interaction of
@@ -522,12 +610,12 @@ final class TrayStatusController {
     func handleLeftClick(tag: Int) {
         let (windowId, notifyIconId) = TrayButtonTag.unpack(tag)
         let key = NotifyIconState(windowId: windowId, notifyIconId: notifyIconId)
-        guard statusItems[key] != nil else {
+        guard entryIndex(for: key) != nil else {
             clicksDroppedIconGone += 1
             // Every time, not once (see `clicksDroppedIconGone`'s own doc comment): this is
             // a bug signal, and its rate and its keys are the diagnosis.
             Self.logger.warning(
-                "tray icon left-clicked notifyIconId=\(notifyIconId, privacy: .public) ownerWindowId=\(windowId, privacy: .public) -- but no live NSStatusItem is tracked for that key; dropping the click rather than addressing a ClientNotifyEvent at a destroyed icon (droppedIconGone=\(self.clicksDroppedIconGone, privacy: .public))"
+                "tray icon left-clicked notifyIconId=\(notifyIconId, privacy: .public) ownerWindowId=\(windowId, privacy: .public) -- but no live tray entry is tracked for that key; dropping the click rather than addressing a ClientNotifyEvent at a destroyed icon (droppedIconGone=\(self.clicksDroppedIconGone, privacy: .public))"
             )
             return
         }

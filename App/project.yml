@@ -488,6 +488,10 @@ targets:
       # adr/0022 D-8 T-1: the main-menu constructor, one file of `Macdows` -- the rest of that
       # directory (AppDelegate, main.swift) stays out of this bundle, as above.
       - path: Macdows/MainMenu.swift
+      # adr/0023 D-6 P-a / adr/0022 D-6: the status item's menu side (its Remote tray section and,
+      # from adr/0022 slice ②, the status item controller), so the section is asserted against an
+      # NSMenu built in the test, offline.
+      - path: Macdows/StatusMenu
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.haru.macdows.dev.apptests

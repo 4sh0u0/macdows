@@ -432,6 +432,102 @@
           }
         }
       }
+    },
+    "si_tray" : {
+      "comment" : "Status menu: Remote tray section header, followed by the host name",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote tray"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "リモートのトレイ"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "远程托盘"
+          }
+        }
+      }
+    },
+    "si_tray_n" : {
+      "comment" : "Status menu: fallback title of a remote tray icon with no tooltip and no owner window title; %d is its number",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tray app %d"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "トレイのアプリ %d"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "托盘应用 %d"
+          }
+        }
+      }
+    },
+    "si_tray_none" : {
+      "comment" : "Status menu: Remote tray section with no icons",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No tray icons in this session"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このセッションにはトレイのアイコンがありません"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此会话没有托盘图标"
+          }
+        }
+      }
+    },
+    "si_tray_retry" : {
+      "comment" : "Status menu: Remote tray section while reconnecting",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tray icons come back after reconnecting"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "再接続するとトレイのアイコンが戻ります"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重新连接后托盘图标会回来"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

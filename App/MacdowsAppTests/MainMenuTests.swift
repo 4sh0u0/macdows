@@ -180,23 +180,56 @@ struct MainMenuTests {
 
     // MARK: - The String Catalog (three languages)
 
-    @Test("every menu title key is in Localizable.xcstrings with en, zh-Hans and ja, and en equals the default value")
-    func stringCatalogCoversEveryTitle() throws {
-        let raw = try mainMenuSource("App/Macdows/MainMenu.swift")
-        let regex = try NSRegularExpression(pattern: #"String\(localized: "(\w+)", defaultValue: "([^"]+)""#)
-        let matches = regex.matches(in: raw, range: NSRange(raw.startIndex..., in: raw))
-        let used: [(String, String)] = matches.compactMap { match in
-            guard let key = Range(match.range(at: 1), in: raw), let value = Range(match.range(at: 2), in: raw) else { return nil }
-            return (String(raw[key]), String(raw[value]))
+    /// Every Swift file that can resolve a string from the App's catalog: the App's own sources
+    /// and the shared rendering sources (the tray's numbered fallback title lives there).
+    private static func catalogClientSources() throws -> [String] {
+        var files: [String] = []
+        for directory in ["App/Macdows", "App/RemoteWindowRendering"] {
+            let root = mainMenuRepoRoot().appendingPathComponent(directory)
+            let walker = try #require(FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil))
+            for case let url as URL in walker where url.pathExtension == "swift" {
+                files.append(String(url.path.dropFirst(mainMenuRepoRoot().path.count + 1)))
+            }
         }
-        #expect(used.count == 18)
+        return files.sorted()
+    }
+
+    /// The literal key / default-value pairs a source resolves: `String(localized:defaultValue:)`
+    /// for plain titles, `Bundle.localizedString(forKey:value:table:)` for format strings (whose
+    /// catalog value is returned unformatted and filled in with `String(format:)`).
+    private static func catalogKeys(in raw: String) throws -> [(String, String)] {
+        var used: [(String, String)] = []
+        for pattern in [#"String\(localized: "(\w+)", defaultValue: "([^"]+)""#, #"localizedString\(forKey: "(\w+)", value: "([^"]+)""#] {
+            let regex = try NSRegularExpression(pattern: pattern)
+            for match in regex.matches(in: raw, range: NSRange(raw.startIndex..., in: raw)) {
+                guard let key = Range(match.range(at: 1), in: raw), let value = Range(match.range(at: 2), in: raw) else { continue }
+                used.append((String(raw[key]), String(raw[value])))
+            }
+        }
+        return used
+    }
+
+    @Test("every string key the App resolves is in Localizable.xcstrings with en, zh-Hans and ja, en equals the default value, and no key is orphaned")
+    func stringCatalogCoversEveryTitle() throws {
+        var used: [(String, String)] = []
+        for file in try Self.catalogClientSources() {
+            used += try Self.catalogKeys(in: try mainMenuSource(file))
+        }
+        let menuKeys = try Self.catalogKeys(in: try mainMenuSource("App/Macdows/MainMenu.swift"))
+        #expect(menuKeys.count >= 18, "the walk found MainMenu.swift's titles")
+        // One default value per key, wherever the key is used.
+        var defaults: [String: String] = [:]
+        for (key, value) in used {
+            #expect(defaults[key] == nil || defaults[key] == value, "\(key) has two default values")
+            defaults[key] = value
+        }
 
         let data = try Data(contentsOf: mainMenuRepoRoot().appendingPathComponent("App/Macdows/Localizable.xcstrings"))
         let catalog = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
         #expect(catalog["sourceLanguage"] as? String == "en")
         let strings = try #require(catalog["strings"] as? [String: Any])
-        #expect(Set(strings.keys) == Set(used.map(\.0)), "no missing and no orphaned keys")
-        for (key, defaultValue) in used {
+        #expect(Set(strings.keys) == Set(defaults.keys), "no missing and no orphaned keys")
+        for (key, defaultValue) in defaults {
             let entry = try #require(strings[key] as? [String: Any], "\(key)")
             let localizations = try #require(entry["localizations"] as? [String: Any], "\(key)")
             #expect(Set(localizations.keys) == ["en", "zh-Hans", "ja"], "\(key)")
@@ -205,6 +238,8 @@ struct MainMenuTests {
                 #expect(unit?["state"] as? String == "translated", "\(key) \(language)")
                 let text = unit?["value"] as? String ?? ""
                 #expect(text.count > 0, "\(key) \(language)")
+                // A format string keeps its placeholders in every language.
+                #expect(text.components(separatedBy: "%").count == defaultValue.components(separatedBy: "%").count, "\(key) \(language)")
                 if language == "en" {
                     #expect(unit?["value"] as? String == defaultValue, "\(key)")
                 }
