@@ -184,6 +184,10 @@ struct AppDelegateAutolaunchPinTests {
     /// `ShellAutolaunch.notePress(_:)` immediately in front of it, inside the same
     /// `MainActor.assumeIsolated` block -- this is also what Pin 7's adjacency tests below rely on,
     /// stated here as one contiguous needle instead of two.
+    ///
+    /// RE-FROZEN by adr/0021 lane CA-2: the key-witness switch (`if autolaunch.keyWitness {
+    /// CRSession.keyWitnessEnabled = true }`) sits between the one `plan` read and the autoconnect
+    /// press, so it is set before any connection this launch starts (Pin 9).
     @Test("the four statements are the tail of applicationDidFinishLaunching, not a stray helper")
     func theKnobsAreTheTailOfTheLaunchMethod() throws {
         let code = try Self.code()
@@ -193,6 +197,7 @@ struct AppDelegateAutolaunchPinTests {
         let needle: String =
             "self.lastDisplayChangeNote = note self.statusLabel.stringValue = note } "
             + "let autolaunch = ShellAutolaunch.plan(environment: ProcessInfo.processInfo.environment) "
+            + "if autolaunch.keyWitness { CRSession.keyWitnessEnabled = true } "
             + "if autolaunch.autoconnect { connectTapped() } "
             + "if let disconnectAfter = autolaunch.disconnectAfterInterval { "
             + "_ = Timer.scheduledTimer(withTimeInterval: disconnectAfter, repeats: false) { _ in "
@@ -611,22 +616,24 @@ struct AppDelegateAutolaunchPinTests {
     }
 
     /// Gate r1 m-1 (folded in): every knob, the program string included, is read from the
-    /// environment dictionary `plan(environment:)` is handed, under one of the six key constants,
-    /// and from nowhere else. Exactly six subscripts, each one a key constant; no defaults
+    /// environment dictionary `plan(environment:)` is handed, under one of the seven key constants,
+    /// and from nowhere else. Exactly seven subscripts, each one a key constant; no defaults
     /// database, no file read, no command line. Gate r1's mutant R13 (a fallback to a second,
     /// unlisted environment key) is killed here.
-    @Test("the knobs are read only through the six key constants, from the environment alone")
+    @Test("the knobs are read only through the seven key constants, from the environment alone")
     func theKnobsAreReadOnlyThroughTheSixKeys() throws {
         let code = try Self.shellAutolaunchCode()
+        // adr/0021 lane CA-2 adds the seventh constant, `keyWitnessKey`, and the seventh subscript.
         let keys: Set<String> = [
             "autoconnectKey", "quitAfterKey", "disconnectAfterKey",
             "reconnectAfterKey", "extraExecAfterKey", "extraExecProgramKey",
+            "keyWitnessKey",
         ]
         let subscripts = code.components(separatedBy: "environment[").dropFirst()
-        #expect(subscripts.count == 6)
+        #expect(subscripts.count == 7)
         for rest in subscripts {
             let key = String(rest.prefix { $0 != "]" })
-            #expect(keys.contains(key), "environment[\(key)] is not one of the six key constants")
+            #expect(keys.contains(key), "environment[\(key)] is not one of the seven key constants")
         }
         #expect(autolaunchOccurrences(of: "UserDefaults", in: code) == 0)
         #expect(autolaunchOccurrences(of: "contentsOf", in: code) == 0)
@@ -646,7 +653,7 @@ struct AppDelegateAutolaunchPinTests {
     /// then exit at the ceiling) with nothing in-process to say so (no anchor line is ever printed
     /// for a knob whose name does not match). Gate r1's mutant M3c proved the old, two-name version
     /// of this test let exactly that renaming through.
-    @Test("all six knob names appear literally in ShellAutolaunch.swift")
+    @Test("all seven knob names appear literally in ShellAutolaunch.swift")
     func knobNamesAreGreppable() throws {
         let raw = try autolaunchRawSource(Self.shellAutolaunch)
         #expect(raw.contains("\"MACDOWS_AUTOCONNECT\""))
@@ -656,6 +663,30 @@ struct AppDelegateAutolaunchPinTests {
         // adr/0021 lane LC-2: the extra-exec pair, for the same "silently renamed key" reason.
         #expect(raw.contains("\"MACDOWS_EXTRA_EXEC_AFTER_SECONDS\""))
         #expect(raw.contains("\"MACDOWS_EXTRA_EXEC_PROGRAM\""))
+        // adr/0021 lane CA-2: the key-witness switch, for the same "silently renamed key" reason.
+        #expect(raw.contains("\"MACDOWS_KEY_WITNESS\""))
+    }
+
+    // MARK: - Pin 9 (adr/0021 lane CA-2): the key-witness switch, set once, only when asked
+
+    /// The class switch is assigned exactly once in this file, to the literal `true`, only inside
+    /// `if autolaunch.keyWitness {`, between the one `plan` read and the autoconnect press. With the
+    /// knob off nothing assigns it, so it keeps `CRSession.mm`'s initial `NO` and the bridge prints
+    /// nothing (`KeyWitnessBridgePinTests` holds that half). MUST-RED for: an unconditional
+    /// assignment, an assignment of `autolaunch.keyWitness` itself outside the `if` (still
+    /// behaviour-equal, but a second shape the zero-output claim would have to re-argue), a second
+    /// writer, and the switch set after the autoconnect press.
+    @Test("CRSession.keyWitnessEnabled is set once, to true, only under autolaunch.keyWitness, before autoconnect")
+    func theKeyWitnessSwitchIsSetOnceBeforeAutoconnect() throws {
+        let code = try Self.code()
+        #expect(autolaunchOccurrences(of: "keyWitnessEnabled", in: code) == 1)
+        #expect(autolaunchOccurrences(of: "if autolaunch.keyWitness { CRSession.keyWitnessEnabled = true }", in: code) == 1)
+        #expect(autolaunchOccurrences(of: "autolaunch.keyWitness", in: code) == 1)
+        let plan = try autolaunchIndex(of: "ShellAutolaunch.plan(", in: code)
+        let set = try autolaunchIndex(of: "CRSession.keyWitnessEnabled = true", in: code)
+        let press = try autolaunchIndex(of: "if autolaunch.autoconnect { connectTapped() }", in: code)
+        #expect(plan < set)
+        #expect(set < press)
     }
 
     /// The app's ONE permission, declared. `App/project.yml`'s own comment about the test bundle's

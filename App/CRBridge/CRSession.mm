@@ -405,6 +405,16 @@ typedef struct
      * zero-filled in -start, and -start writes 0 here again explicitly right after setting
      * bridgeSelf, so the first send of every connection logs send=1. Touched on T_rdp only. */
     uint32_t arcCompletedStartCmdSends;
+
+    /* adr/0021 lane CA-2, the key witness: observation only. `keyWitness` is the process-wide
+     * +[CRSession keyWitnessEnabled] switch, copied in once by -start so a connection never sees
+     * it change underneath it; it is read in exactly two places, the two [key-witness] lines in
+     * crb_outbound_visitor's CRDPQ_CMD_INPUT branch. `keyWitnessSeq` is the per-connection
+     * sequence number both lines share: -start writes 0 here explicitly, it is incremented only
+     * when `keyWitness` is set, so the first witnessed keyboard event of every connection logs
+     * seq=1. Both touched on T_rdp only after -start. */
+    BOOL keyWitness;
+    uint32_t keyWitnessSeq;
 } CRBridgeContext;
 
 /* Only the RDPGFX wrappers need this: gdi_graphics_pipeline_init() claims
@@ -425,6 +435,12 @@ typedef struct
  * assumption itself has been violated and needs revisiting, not just this variable's
  * type. */
 static CRBridgeContext *g_crbGfxContext = NULL;
+
+/* adr/0021 lane CA-2: the storage behind +[CRSession keyWitnessEnabled]. Written on T_main only
+ * (the class setter, at the end of App launch), read on T_main only (-start copies it into the
+ * new connection's CRBridgeContext::keyWitness before T_rdp exists; pthread_create is the
+ * happens-before edge to T_rdp). Default NO. */
+static BOOL g_crbKeyWitnessEnabled = NO;
 
 /* ==================================================================================== *
  * CRSession
@@ -2142,8 +2158,19 @@ static void crb_outbound_visitor(const CrdpCommand *cmd, void *vctx)
                 break;
             if (cmd->payload.input.kind == CRDPQ_INPUT_KEYBOARD)
             {
-                freerdp_input_send_keyboard_event(context->input, cmd->payload.input.flags,
+                const BOOL keyRc = freerdp_input_send_keyboard_event(context->input, cmd->payload.input.flags,
                                                    (UINT8)cmd->payload.input.code);
+                /* adr/0021 lane CA-2, the key witness (scancode path): observation only,
+                 * behaviour unchanged (the return value was discarded before and still drives
+                 * nothing). Off by default: one BOOL test and nothing else. The exact UINT16
+                 * flags and UINT8 scancode just handed to FreeRDP, and its return code. A
+                 * carrier line for the C-A preregistration: its format string is frozen once
+                 * that prereg is, and must not be reworded afterwards. */
+                if (p->keyWitness)
+                {
+                    p->keyWitnessSeq++;
+                    WLog_INFO(TAG, "[key-witness] seq=%u kind=scancode flags=0x%04x code=0x%02x rc=%d", (unsigned)p->keyWitnessSeq, (unsigned)(UINT16)cmd->payload.input.flags, (unsigned)(UINT8)cmd->payload.input.code, keyRc ? 1 : 0);
+                }
             }
             else if (cmd->payload.input.kind == CRDPQ_INPUT_UNICODE)
             {
@@ -2155,9 +2182,20 @@ static void crb_outbound_visitor(const CrdpCommand *cmd, void *vctx)
                  * check -unicodeInputSupported before ever calling -sendUnicodeText: at all
                  * (adr/0011 §2), so this call is not expected to fail in practice; the
                  * return value is intentionally unchecked here, matching every other
-                 * fire-and-forget call in this visitor. */
-                freerdp_input_send_unicode_keyboard_event(context->input, cmd->payload.input.flags,
+                 * fire-and-forget call in this visitor (adr/0021 lane CA-2 keeps it in
+                 * `unicodeRc` for the key witness below only; it still drives nothing). */
+                const BOOL unicodeRc = freerdp_input_send_unicode_keyboard_event(context->input, cmd->payload.input.flags,
                                                            cmd->payload.input.code);
+                /* adr/0021 lane CA-2, the key witness (Unicode path): observation only,
+                 * behaviour unchanged. The kind, the flags and the return code -- NEVER the
+                 * UTF-16 code unit, which is a character the user typed. A carrier line for the
+                 * C-A preregistration: its format string is frozen once that prereg is, and
+                 * must not be reworded afterwards. */
+                if (p->keyWitness)
+                {
+                    p->keyWitnessSeq++;
+                    WLog_INFO(TAG, "[key-witness] seq=%u kind=unicode flags=0x%04x rc=%d", (unsigned)p->keyWitnessSeq, (unsigned)(UINT16)cmd->payload.input.flags, unicodeRc ? 1 : 0);
+                }
             }
             else
             {
@@ -2373,6 +2411,16 @@ static BOOL crb_openssl_legacy_provider_available(void)
  * ==================================================================================== */
 
 @implementation CRSession
+
++ (BOOL)keyWitnessEnabled
+{
+    return g_crbKeyWitnessEnabled;
+}
+
++ (void)setKeyWitnessEnabled:(BOOL)keyWitnessEnabled
+{
+    g_crbKeyWitnessEnabled = keyWitnessEnabled;
+}
 
 + (void)logFreeRDPVersion
 {
@@ -2598,6 +2646,10 @@ static void crb_schedule_drain(void *ctx)
     ((CRBridgeContext *)context)->bridgeSelf = (__bridge void *)self;
     /* adr/0021 lane LC-2, witness X-C's counter: the per-connection initialisation point. */
     ((CRBridgeContext *)context)->arcCompletedStartCmdSends = 0;
+    /* adr/0021 lane CA-2, the key witness: the switch copied in once, the sequence reset, per
+     * connection. */
+    ((CRBridgeContext *)context)->keyWitness = g_crbKeyWitnessEnabled;
+    ((CRBridgeContext *)context)->keyWitnessSeq = 0;
     _instance = context->instance;
 
     /* Set directly here, before freerdp_client_start -- NOT inside PreConnect. Mirrors
