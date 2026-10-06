@@ -335,6 +335,10 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 - (instancetype)init NS_UNAVAILABLE;
 @end
 
+/// UI slice ③ (ADR-0024 D-8): one WinPR log line handed to the App (see
+/// `+[CRSession setProcessLogLineSink:]`).
+typedef void (^CRProcessLogLineSink)(NSInteger level, NSString *tag, NSString *message) NS_SWIFT_SENDABLE;
+
 /// One RDP/RAIL/RDPGFX session bridging a remote Windows host into this process, per
 /// adr/0005. `CRSession.mm`'s implementation links FreeRDP and CRDPQueue's C API
 /// directly; none of that leaks across this header — it stays pure Objective-C so Swift
@@ -375,13 +379,38 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// ADR-0024 D-8 (F-3): pins the process-wide WinPR log configuration and ignores every `WLOG_*`
 /// environment variable. Removes the eight variables WinPR's root logger reads at its first use
 /// (appender type, level, filter, prefix, file path / name, UDP target, journald id), then sets the
-/// root logger's appender to CONSOLE and its level to INFO through the API -- the same output the
-/// default configuration produces, so the stdout channel the bridge's judgement lines use
-/// (`[key-witness]` and the other INFO lines) is unchanged, while a `WLOG_APPENDER=FILE` / `UDP` or
-/// a `WLOG_FILTER` that raises a tag to DEBUG (where FreeRDP prints account names) has no effect.
-/// Call it once, as the App's very first statement, before anything can create the root logger
-/// (WinPR reads the variables only then). Returns NO if the root logger or either setter failed.
+/// root logger's appender to CALLBACK and its level to INFO through the API. The callback (UI slice
+/// ③, ADR-0024 D-8 export pipeline) does two things with every text line:
+///  1. it writes the line to stdout / stderr exactly as WinPR's CONSOLE appender does with its
+///     default stream (`"%s%s\n"`, prefix then text; TRACE / DEBUG / INFO to stdout, WARN and above
+///     to stderr), so the stdout channel the bridge's judgement lines use (`[key-witness]` and the
+///     other INFO lines) is byte-for-byte unchanged;
+///  2. it hands (level, logger name, text) to the sink set with `setProcessLogLineSink:`, if any --
+///     the App's diagnostics ring buffer.
+/// Data / image / packet messages are dropped (the CONSOLE appender would have written them to
+/// files; nothing of the stdout channel). A `WLOG_APPENDER=FILE` / `UDP` or a `WLOG_FILTER` that
+/// raises a tag to DEBUG (where FreeRDP prints account names) has no effect. Call it once, as the
+/// App's very first statement, before anything can create the root logger (WinPR reads the
+/// variables only then). Returns NO if the root logger or a setter failed; if the callbacks could
+/// not be installed the root logger is put back on the CONSOLE appender, so FreeRDP's lines still
+/// reach stdout / stderr.
 + (BOOL)pinProcessLogConfiguration;
+
+/// UI slice ③ (ADR-0024 D-8): where the process log callback hands every text line after writing
+/// it to stdout / stderr. `level` is WinPR's (TRACE 0 … FATAL 5), `tag` is the logger name taken
+/// from the line's prefix (empty if the prefix is not WinPR's default layout), `message` is the
+/// text without the prefix. Called on whatever thread logged, while WinPR holds its appender lock:
+/// the sink must be quick, must not block and must not log through WinPR. Nil detaches. Only the
+/// root logger configured by `pinProcessLogConfiguration` (and loggers given the same callbacks
+/// with `attachProcessLogCallbacksToLoggerNamed:`) reach it.
++ (void)setProcessLogLineSink:(nullable CRProcessLogLineSink)sink;
+
+/// UI slice ③ offline pins: gives the named WinPR logger (created if needed) its own CALLBACK
+/// appender with the same callbacks `pinProcessLogConfiguration` installs on the root logger, so a
+/// test can drive the stdout + sink path through a logger of its own instead of swapping the
+/// process root's appender while other threads may be logging through it. The App never calls
+/// this. Returns NO if the logger or a setter failed.
++ (BOOL)attachProcessLogCallbacksToLoggerNamed:(NSString *)name;
 
 /// ADR-0024 D-10 ③: the SHA-256 fingerprint FreeRDP computes for the FIRST certificate in `pem`
 /// (`freerdp_certificate_new_from_pem` + `freerdp_certificate_get_fingerprint_by_hash_ex(cert,

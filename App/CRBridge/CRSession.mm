@@ -8,6 +8,7 @@
 
 #include <dispatch/dispatch.h> /* dispatch_async(dispatch_get_main_queue(), ...) -- W4c review's push-drain fix */
 #include <float.h> /* FLT_EPSILON -- W4c review L1's wheel-delta epsilon check */
+#include <os/lock.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -2557,6 +2558,102 @@ static BOOL crb_openssl_legacy_provider_available(void)
  * CRSession
  * ==================================================================================== */
 
+/* ---- UI slice ③ (ADR-0024 D-8): the process log callback ------------------------------------
+ * The App's root WinPR logger uses a CALLBACK appender (pinProcessLogConfiguration) whose text
+ * callback keeps the stdout channel byte-for-byte and copies each line into the App's diagnostics
+ * ring buffer through a sink block. Window-smoke and bridge-smoke never call
+ * pinProcessLogConfiguration, so their WinPR logging stays on WinPR's own CONSOLE default. */
+
+static os_unfair_lock g_crbLogSinkLock = OS_UNFAIR_LOCK_INIT;
+static CRProcessLogLineSink g_crbLogSink = nil;
+
+/* The logger name ([%mn]) out of a prefix in WinPR's default layout,
+ * "[%hr:%mi:%se:%ml] [%pid:%tid] [%lv][%mn] - [%fn]...: " (Layout.c; WLOG_PREFIX is unset before
+ * the root logger exists): the text between the '[' that opens the last bracket before " - [" and
+ * that "] - [". Empty when the prefix has no such shape. */
+static void crb_wlog_tag_from_prefix(const char *prefix, char *out, size_t outSize)
+{
+    out[0] = '\0';
+    if (!prefix)
+        return;
+    const char *separator = strstr(prefix, "] - [");
+    if (!separator)
+        return;
+    const char *open = separator;
+    while (open > prefix && *(open - 1) != '[')
+        open--;
+    if (open == prefix)
+        return;
+    size_t length = (size_t)(separator - open);
+    if (length >= outSize)
+        length = outSize - 1;
+    memcpy(out, open, length);
+    out[length] = '\0';
+}
+
+static NSString *crb_log_string(const char *text)
+{
+    if (!text)
+        return @"";
+    NSString *string = [[NSString alloc] initWithBytes:text length:strlen(text) encoding:NSUTF8StringEncoding];
+    return string ?: @"<undecodable>";
+}
+
+static BOOL crb_wlog_text_message(const wLogMessage *msg)
+{
+    if (!msg)
+        return FALSE;
+    const char *prefix = msg->PrefixString ? msg->PrefixString : "";
+    if (msg->Level == WLOG_OFF)
+        return TRUE;
+    /* 1. stdout / stderr, as ConsoleAppender.c writes with its default stream: TRACE / DEBUG /
+     *    INFO to stdout, everything else to stderr, prefix then text then a newline. */
+    FILE *fp = (msg->Level <= WLOG_INFO) ? stdout : stderr;
+    (void)fprintf(fp, "%s%s\n", prefix, msg->TextString);
+
+    /* 2. The App's sink, if one is attached. */
+    CRProcessLogLineSink sink = nil;
+    os_unfair_lock_lock(&g_crbLogSinkLock);
+    sink = g_crbLogSink;
+    os_unfair_lock_unlock(&g_crbLogSinkLock);
+    if (sink) {
+        @autoreleasepool {
+            char tag[256];
+            crb_wlog_tag_from_prefix(prefix, tag, sizeof(tag));
+            sink((NSInteger)msg->Level, crb_log_string(tag), crb_log_string(msg->TextString));
+        }
+    }
+    return TRUE;
+}
+
+/* Data, image and packet messages: dropped. (The CONSOLE appender writes them to files under a
+ * temporary directory; none of them was ever part of the stdout channel.) */
+static BOOL crb_wlog_drop_message(const wLogMessage *msg)
+{
+    (void)msg;
+    return TRUE;
+}
+
+/* Gives `log` a CALLBACK appender with the callbacks above. If the callbacks cannot be installed,
+ * `log` goes back to a CONSOLE appender (an unconfigured CALLBACK appender would swallow every
+ * line, the stdout channel included) and this returns FALSE. */
+static BOOL crb_attach_process_log_callbacks(wLog *log)
+{
+    if (!WLog_SetLogAppenderType(log, WLOG_APPENDER_CALLBACK))
+        return FALSE;
+    wLogCallbacks callbacks = { 0 };
+    callbacks.data = crb_wlog_drop_message;
+    callbacks.image = crb_wlog_drop_message;
+    callbacks.message = crb_wlog_text_message;
+    callbacks.package = crb_wlog_drop_message;
+    wLogAppender *appender = WLog_GetLogAppender(log);
+    if (!appender || !WLog_ConfigureAppender(appender, "callbacks", &callbacks)) {
+        (void)WLog_SetLogAppenderType(log, WLOG_APPENDER_CONSOLE);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 @implementation CRSession
 
 + (BOOL)keyWitnessEnabled
@@ -2592,13 +2689,31 @@ static BOOL crb_openssl_legacy_provider_available(void)
     if (!root)
         return NO;
     /* Then the API, so the configuration does not rest on the environment being clean: the
-     * CONSOLE appender and INFO level are WinPR's own defaults, i.e. the stdout channel the
-     * bridge's INFO judgement lines use stays exactly as it was. */
-    if (!WLog_SetLogAppenderType(root, WLOG_APPENDER_CONSOLE))
+     * CALLBACK appender (UI slice ③), whose text callback first writes every line to stdout /
+     * stderr exactly as the CONSOLE appender's default stream does -- so the stdout channel the
+     * bridge's INFO judgement lines use stays exactly as it was -- and then hands it to the App's
+     * diagnostics sink; and WinPR's own default INFO level. */
+    if (!crb_attach_process_log_callbacks(root))
         return NO;
     if (!WLog_SetLogLevel(root, WLOG_INFO))
         return NO;
     return YES;
+}
+
++ (void)setProcessLogLineSink:(nullable CRProcessLogLineSink)sink
+{
+    CRProcessLogLineSink copied = [sink copy];
+    os_unfair_lock_lock(&g_crbLogSinkLock);
+    g_crbLogSink = copied;
+    os_unfair_lock_unlock(&g_crbLogSinkLock);
+}
+
++ (BOOL)attachProcessLogCallbacksToLoggerNamed:(NSString *)name
+{
+    wLog *log = WLog_Get(name.UTF8String);
+    if (!log)
+        return NO;
+    return crb_attach_process_log_callbacks(log);
 }
 
 + (nullable NSString *)sha256FingerprintOfCertificatePEM:(NSData *)pem

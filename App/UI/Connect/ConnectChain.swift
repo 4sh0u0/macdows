@@ -27,8 +27,9 @@ struct PendingCertificateReview {
 @MainActor
 enum ConnectChain {
     /// The `[connect]` lines (ADR-0024 D-8 registers their shape). Never an address, an account or
-    /// a secret.
-    static let log = Logger(subsystem: "dev.haru.macdows", category: "Connect")
+    /// a secret. UI slice ③: `DiagnosticLogger` writes each line to the unified log as before and
+    /// copies it into the diagnostics ring buffer the export reads.
+    static let log = DiagnosticLogger(subsystem: "dev.haru.macdows", category: "Connect")
 
     /// Saves a Password-sheet password with Remember ticked. Returns false on failure (the chain
     /// still connects; the password just is not remembered).

@@ -108,7 +108,9 @@ struct ReconnectLogChannelPinTests {
     func theLoggedLineIsNotRedacted() throws {
         let stripped = try sourceWithoutComments(Self.driverPath)
         #expect(occurrences(of: "privacy: .public", in: stripped) == 1)
-        #expect(occurrences(of: "Logger(subsystem: \"dev.haru.macdows\", category: \"Reconnect\")",
+        // UI slice ③: the logger is a `DiagnosticLogger`, which forwards to an `os.Logger` with the
+        // same subsystem and category (`DiagnosticPipelineTests` pins the forwarding).
+        #expect(occurrences(of: "DiagnosticLogger(subsystem: \"dev.haru.macdows\", category: \"Reconnect\")",
                             in: stripped) == 1,
                 "the predicate a `log show` export will filter on")
     }

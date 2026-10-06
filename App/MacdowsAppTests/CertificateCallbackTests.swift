@@ -200,7 +200,10 @@ struct BridgeSecurityPinTests {
         let unset = try #require(body.range(of: "unsetenv(ignored[i]);"))
         let root = try #require(body.range(of: "WLog_GetRoot()"))
         #expect(unset.lowerBound < root.lowerBound, "the variables are gone before the root logger can be created")
-        #expect(body.contains("WLog_SetLogAppenderType(root, WLOG_APPENDER_CONSOLE)"))
+        // UI slice ③: the root logger's appender is the CALLBACK one (stdout kept byte-for-byte,
+        // a copy to the diagnostics buffer); `DiagnosticPipelineTests` pins the callback itself.
+        #expect(body.contains("crb_attach_process_log_callbacks(root)"))
+        #expect(!body.contains("WLOG_APPENDER_CONSOLE"), "the console appender is only the callbacks' failure fallback")
         #expect(body.contains("WLog_SetLogLevel(root, WLOG_INFO)"))
         for name in ["WLOG_APPENDER", "WLOG_LEVEL", "WLOG_FILTER", "WLOG_PREFIX", "WLOG_FILEAPPENDER_OUTPUT_FILE_PATH",
                      "WLOG_FILEAPPENDER_OUTPUT_FILE_NAME", "WLOG_UDP_TARGET", "WLOG_JOURNALD_ID"] {
