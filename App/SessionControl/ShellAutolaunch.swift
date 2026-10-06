@@ -100,8 +100,19 @@ import os
 // `CRSession`, so `session=present` still holds after an automatic reconnect, and the bridge's
 // X-C count restarts at 0 on every `-start`. A reader identifies the first connection from the
 // captured output instead: exactly one X-C line before A-X, and no non-live `[reconnect]` line.
+//
+// ## adr/0021 lane CA-2: a seventh knob that is not a launch knob at all
+//
+// `MACDOWS_KEY_WITNESS` (exactly `1`, nothing else) turns on the bridge's `[key-witness]` lines:
+// one INFO line per keyboard event the outbound lane hands to FreeRDP, printed by `CRSession.mm`
+// on T_rdp (owner ruling 2026-10-06 on P-CA1-1, "add the observation-only key witness first, then
+// check in the field"). It is parsed here only so the process environment is still read in one
+// place, once; it presses nothing, schedules nothing and changes nothing that is sent. It is
+// independent of the six launch knobs (a human pressing Connect gets the lines too), names no
+// host, account or credential, and its lines never carry a typed character (the Unicode path
+// logs the kind, the flags and the return code, never the code unit).
 
-/// The six unattended-launch knobs, parsed together, from the process environment.
+/// The six unattended-launch knobs, plus lane CA-2's key-witness switch, parsed together, from the process environment.
 ///
 /// Pure and non-isolated on purpose: it reads nothing (the caller passes the environment in), it
 /// touches no AppKit object, and it has no opinion about when any knob is acted on.
@@ -135,7 +146,13 @@ enum ShellAutolaunch {
     /// 255-byte limit is enforced by that method's own refusal, not repeated here. NEVER logged.
     static let extraExecProgramKey = "MACDOWS_EXTRA_EXEC_PROGRAM"
 
-    /// What a launch should do about the six knobs. `Plan(autoconnect: false, quitAfter: nil,
+    /// adr/0021 lane CA-2. Set to exactly `1` to have every connection print one `[key-witness]`
+    /// line per keyboard event it sends -- see the file header. Any other value, including the
+    /// empty string, ` 1`, `1 `, `01`, `true` and `yes`, is off: the same exact-literal grammar as
+    /// `autoconnectKey`, with no trimming.
+    static let keyWitnessKey = "MACDOWS_KEY_WITNESS"
+
+    /// What a launch should do about the six launch knobs and the key-witness switch. `Plan(autoconnect: false, quitAfter: nil,
     /// disconnectAfter: nil, reconnectAfter: nil)` is both the default and the answer for every
     /// environment that does not set any of them (the two lane LC-2 fields default to `nil`).
     struct Plan: Equatable, Sendable {
@@ -159,6 +176,9 @@ enum ShellAutolaunch {
         /// adr/0021 lane LC-2. The program the extra ClientExecute sends, or `nil` for "never".
         /// Always `nil` exactly when `extraExecAfter` is `nil` -- `init` enforces it.
         let extraExecProgram: String?
+        /// adr/0021 lane CA-2. Turn the bridge's `[key-witness]` lines on for every connection
+        /// this process starts. Independent of every other field.
+        let keyWitness: Bool
 
         /// The memberwise shape every earlier lane already spells, plus the two lane LC-2 fields,
         /// defaulted so a plan written without them still means "no extra exec". The pair lives or
@@ -170,7 +190,8 @@ enum ShellAutolaunch {
             disconnectAfter: Duration?,
             reconnectAfter: Duration?,
             extraExecAfter: Duration? = nil,
-            extraExecProgram: String? = nil
+            extraExecProgram: String? = nil,
+            keyWitness: Bool = false
         ) {
             self.autoconnect = autoconnect
             self.quitAfter = quitAfter
@@ -183,6 +204,7 @@ enum ShellAutolaunch {
                 self.extraExecAfter = nil
                 self.extraExecProgram = nil
             }
+            self.keyWitness = keyWitness
         }
 
         /// The same ceiling as a `TimeInterval`, which is what `Timer` takes.
@@ -218,7 +240,7 @@ enum ShellAutolaunch {
         }
     }
 
-    /// The default: all six knobs off.
+    /// The default: all six launch knobs off and the key-witness switch off.
     static let off = Plan(autoconnect: false, quitAfter: nil, disconnectAfter: nil, reconnectAfter: nil)
 
     /// adr/0020 lane K (gate r1 I-1): which real button a launch is about to press. The two cases
@@ -287,7 +309,7 @@ enum ShellAutolaunch {
         logger.notice("\(line, privacy: .public)")
     }
 
-    /// Reads all six knobs out of `environment`. `autoconnect` and `quitAfter` are fully
+    /// Reads all six launch knobs and the key-witness switch (seven keys) out of `environment`. `autoconnect` and `quitAfter` are fully
     /// independent of everything else, exactly as they always have been. `disconnectAfter` and
     /// `reconnectAfter` are NOT independent of the other three (gate r1 I-2, folded in):
     /// `disconnectAfter` only ever holds a value when `autoconnect` is on (a Disconnect press with
@@ -369,7 +391,9 @@ enum ShellAutolaunch {
             disconnectAfter: disconnect,
             reconnectAfter: ceilingLeavesNoRoom ? nil : reconnectIfDisconnecting,
             extraExecAfter: extraExecAfter,
-            extraExecProgram: extraExecProgram
+            extraExecProgram: extraExecProgram,
+            // adr/0021 lane CA-2: exactly "1", independent of every other knob.
+            keyWitness: environment[keyWitnessKey] == "1"
         )
     }
 

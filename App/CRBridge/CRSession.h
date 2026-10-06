@@ -409,6 +409,17 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// caller's responsibility — this string is passed through verbatim.
 @property (nonatomic, copy, nullable) NSString *programArguments;
 
+/// adr/0021 lane CA-2 (owner ruling 2026-10-06 on P-CA1-1): the client-side key witness switch,
+/// OBSERVATION ONLY. Process-wide and default `NO`. When `YES`, every connection started AFTER it
+/// was set prints one `[key-witness]` INFO line per keyboard event the outbound lane actually
+/// hands to FreeRDP (scancode path: flags, scancode and return code; Unicode path: flags and
+/// return code, never the code unit), in send order, on T_rdp. Nothing that is sent, its order,
+/// its timing or any drop decision depends on it. `-start` copies the value into the new
+/// connection once, so set it on T_main before the first `-start` (the App sets it from
+/// `MACDOWS_KEY_WITNESS` at the end of launch, before any connect press); a change while a
+/// connection is up takes effect at the next `-start`.
+@property (class, nonatomic) BOOL keyWitnessEnabled;
+
 /// Starts a fresh connection attempt: spawns T_rdp, which connects and (on success) runs
 /// the RAIL/RDPGFX event loop until told to stop. Returns immediately — connection
 /// progress and results surface as drained events (HandshakeFlags/ExecResult/...) or via

@@ -170,6 +170,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// Read once, into one value, because the pin next door holds `ShellAutolaunch.plan(` to
 		// exactly one occurrence in this file: two call sites could disagree about the same launch.
 		let autolaunch = ShellAutolaunch.plan(environment: ProcessInfo.processInfo.environment)
+		if autolaunch.keyWitness {
+			// adr/0021 lane CA-2: the bridge's observation-only `[key-witness]` lines. Set before the
+			// autoconnect press below, so every connection this process starts copies it in at its
+			// own `-start`. Off (the default) leaves the class switch at its initial `NO`.
+			CRSession.keyWitnessEnabled = true
+		}
 		if autolaunch.autoconnect {
 			// `connectTapped()` itself, never a copy of any step inside it: the host.env read, the
 			// live-host boundary gate and the button/`isCheckingBoundary` interlock all have to run
