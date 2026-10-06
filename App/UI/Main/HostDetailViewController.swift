@@ -121,6 +121,9 @@ final class HostDetailViewController: NSViewController {
             root.widthAnchor.constraint(greaterThanOrEqualToConstant: 480),
         ])
         view = root
+        // UI-1 spec §4.1: with no session the status bar reads "Not connected" from the start;
+        // the App overwrites it once a connection chain begins.
+        setStatusBar(UIStrings.notConnected, marker: .idle)
     }
 
     /// The App's session controls -- the host title, the status line and the Connect / Disconnect
@@ -160,6 +163,13 @@ final class HostDetailViewController: NSViewController {
         statusBarLabel.stringValue = text
         statusBarMarker.image = NSImage(systemSymbolName: marker.symbol, accessibilityDescription: nil)
         statusBarMarker.contentTintColor = marker.color
+    }
+
+    /// The status bar's text without touching its marker (UI slice ④). Written only when it
+    /// changed, because the App calls this on every drain tick.
+    func setStatusBarText(_ text: String) {
+        loadViewIfNeeded()
+        if statusBarLabel.stringValue != text { statusBarLabel.stringValue = text }
     }
 
     /// Fills the Connection and Recent cards for `record`.

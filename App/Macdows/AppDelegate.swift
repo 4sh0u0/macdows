@@ -85,6 +85,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	private var reconnectDriver: ReconnectDriver?
 	private var drainTimer: Timer?
 	private var eventCount: Int = 0
+	/// UI slice ④ (UI-1 spec §4.1 "since 12:03"): when the current connection leg reached `.live`
+	/// -- the RAIL handshake completed. The App's ONE record of that moment: the status bar
+	/// (`connectedSummary()`) and the status item (`statusItemReading()`) both read it. Set on the
+	/// first `.live` of a leg, cleared by every other state and when the chain ends.
+	private var liveSince: Date?
 	/// True between the Connect press and the boundary gate's verdict. `session` is still nil
 	/// across that window, so it cannot serve as the "already busy" flag on its own.
 	private var isCheckingBoundary = false
@@ -114,10 +119,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		let label = NSTextField(labelWithString: "")
 		label.translatesAutoresizingMaskIntoConstraints = false
 
-		let status = NSTextField(labelWithString: "Not connected.")
+		let status = NSTextField(labelWithString: UIStrings.notConnected)
 		status.font = .systemFont(ofSize: 13)
 		status.textColor = .secondaryLabelColor
-		status.maximumNumberOfLines = 0 // now shows a second line (remote window count)
+		status.maximumNumberOfLines = 0 // a display-change note adds a second line
 		status.translatesAutoresizingMaskIntoConstraints = false
 		statusLabel = status
 
@@ -327,7 +332,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// (AppKit delivers actions serially on the main actor, so a disable that happens before this
 		// method returns cannot be raced).
 		guard session == nil, !isCheckingBoundary else {
-			statusLabel.stringValue = "Already connecting/connected."
+			statusLabel.stringValue = UIStrings.oneSessionAtATime
 			return
 		}
 		// ADR-0024 D-9 (M-a): the host is the record selected in the Hosts window -- the one place a
@@ -338,7 +343,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// that names no address.
 		guard let record = mainWindow.selectedRecord else {
 			ConnectChain.log.notice("[connect] refused: no host selected (host records: \(self.hostStore.records.count, privacy: .public))")
-			statusLabel.stringValue = "Select a host, then press Connect."
+			statusLabel.stringValue = UIStrings.notConnected
 			return
 		}
 		// A new press abandons a certificate question still open from the last chain: dropping the
@@ -367,7 +372,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// arm that does not start a session hands the button back with a literal `true`.
 		isCheckingBoundary = true
 		connectButton.isEnabled = false
-		statusLabel.stringValue = "Checking the live-host boundary..."
+		statusLabel.stringValue = UIStrings.connecting
 		mainWindow.activeHostID = record.id
 		applyHostsWindow(state: nil, host: record.id)
 		let credentials = credentialStore
@@ -411,7 +416,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		mainWindow.presentPasswordSheet(for: record) { [weak self] result in
 			guard let self else { return }
 			guard let result else {
-				self.statusLabel.stringValue = "Not connected."
+				self.statusLabel.stringValue = UIStrings.notConnected
 				self.connectButton.isEnabled = true
 				self.chainEnded()
 				return
@@ -549,7 +554,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		driver.attach()
 		reconnectDriver = driver
 		eventCount = 0
-		statusLabel.stringValue = "Connecting..."
+		statusLabel.stringValue = UIStrings.connecting
 		connectButton.isEnabled = false
 
 		// W4c review: push-style draining, replacing what used to be this timer's only
@@ -587,18 +592,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	private func drainTick() {
 		guard let session else { return }
 		if let error = session.lastConnectError {
-			statusLabel.stringValue = "Connect failed: \(error.localizedDescription)"
+			// UI slice ④ (UI-1 spec §4.1): the status line says `st_err`; the error itself goes to
+			// the `[connect]` log line only (and with it to the diagnostics export), as its domain
+			// and code -- never its description, which can carry the host's address.
+			ConnectChain.log.notice("[connect] failed: domain=\((error as NSError).domain, privacy: .public) code=\((error as NSError).code, privacy: .public)")
+			statusLabel.stringValue = UIStrings.connectionFailed
 			connectButton.isEnabled = true
 			// The session-end lane (lane D impl-report §8 #1): this branch now ENDS the session
 			// instead of only announcing that it failed. It used to stop the timer, re-enable the
 			// button and drop the topology freeze but keep `session` -- and `connectTapped`'s first
-			// guard is `session == nil`, so the button it had just enabled answered "Already
-			// connecting/connected." to every press. `tearDownSession()` drops the session along
-			// with everything else a session owns, so the button really starts a new connection.
+			// guard is `session == nil`, so the button it had just enabled refused every press.
+			// `tearDownSession()` drops the session along with everything else a session owns, so
+			// the button really starts a new connection.
 			//
 			// UI first, teardown second: the order the give-up path has too. The failure line and
 			// the literal `true` are what lane D froze here that a human actually sees, and both are
-			// kept; this branch stays the one place a connect ERROR re-enables the button.
+			// kept (the line re-worded to the catalog's `st_err` by UI slice ④); this branch stays
+			// the one place a connect ERROR re-enables the button.
 			//
 			// Still BEFORE the drain below, so the `.disconnected` that accompanies a bridge refusal
 			// never reaches the driver on this path. The teardown disarms and drops the driver,
@@ -645,8 +655,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			// means by "the status line stops at the last Connected". What the label says is now a
 			// function of the driver's state, and that function lives in one place.
 			//
-			// `?? .live` is the no-driver reading and is deliberately today's wording: a tick with
-			// no driver is the pre-lane-D shell, unchanged.
+			// `?? .live` is the no-driver reading: a tick with no driver says "Connected" (with no
+			// handshake moment recorded, the status bar keeps the short form too).
 			applyShell(for: reconnectDriver?.state ?? .live)
 		}
 	}
@@ -669,6 +679,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			// the label in that interval stays there alone. The `.reconnecting` line itself does not
 			// depend on the tick: `applyShell` below writes it on this very call.
 			eventCount = 0
+		}
+		// UI slice ④: the handshake moment of this leg, recorded before anything below reads it.
+		if case .live = state {
+			if liveSince == nil { liveSince = Date() }
+		} else {
+			liveSince = nil
 		}
 		applyShell(for: state)
 		// UI slice ①: the Hosts window's marker, subtitle and status bar follow the same state, and
@@ -713,7 +729,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// lane K), not from the button itself.
 	@objc private func endSessionTapped() {
 		guard session != nil else { return }
-		statusLabel.stringValue = "Session ended. Press Connect to start a new one."
+		statusLabel.stringValue = UIStrings.sessionEnded
 		connectButton.isEnabled = true
 		tearDownSession()
 	}
@@ -771,7 +787,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// (f) Drop `session` and `registry`. `session = nil` is the load-bearing statement:
 	/// `connectTapped`'s first guard is `session == nil`, and an automatic reconnect reuses the SAME
 	/// `CRSession`, so an ending that re-enabled the button without dropping the session would
-	/// produce a button that answers "Already connecting/connected." to every press -- enabled and
+	/// produce a button that refuses every press (`connectTapped`'s first guard) -- enabled and
 	/// useless.
 	///
 	/// (g) The topology's session end, last. With no session left, a later display change must not
@@ -844,26 +860,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		displayTopology.endSession()
 	}
 
-	/// The Connect button and the status label, written together out of one decision.
+	/// The Connect button, the status label and the status bar, written together out of one
+	/// decision.
 	///
-	/// The only place in this file that derives either of them from a reconnect state, which is
-	/// what keeps `ShellReconnectPresenter`'s offline tests worth anything: this app contributes
-	/// the binding and nothing else. The button's five literal `isEnabled = true` sites -- the
+	/// The only place in this file that derives any of them from a reconnect state, which is what
+	/// keeps `ShellReconnectPresenter`'s offline tests worth anything: this app contributes the
+	/// binding and nothing else. The button's five literal `isEnabled = true` sites -- the
 	/// boundary refusal and the connect-error branch, which predate the driver, the End-session
 	/// action (adr/0020 D-5), the unreadable pin item (ADR-0024 D-3′) and the Password sheet's
 	/// Cancel (ADR-0024 D-1) -- keep their literal: none of them is a reconnect state.
+	///
+	/// UI slice ④: the status bar is written here too, because the drain tick calls this and the
+	/// bar's live text carries the window count; `applyHostsWindow` writes the same text on a state
+	/// change, from the same presenter function.
 	private func applyShell(for state: ReconnectDriver.State) {
 		let shell = ShellReconnectPresenter.shell(
 			for: state,
-			connected: .init(
-				events: eventCount,
-				generation: session?.currentGeneration ?? 0,
-				windows: registry?.windowSnapshots().count ?? 0
-			),
+			connected: connectedSummary(),
 			displayNote: lastDisplayChangeNote
 		)
 		statusLabel.stringValue = shell.statusLine
 		connectButton.isEnabled = shell.connectEnabled
+		mainWindow.setStatusBarText(shell.statusBar)
+	}
+
+	/// The current session as the presenter reads it: its live-window count, the handshake moment
+	/// of its current leg (`liveSince`). One builder, so the status line's writer and the Hosts
+	/// window's cannot describe two different sessions.
+	private func connectedSummary() -> ShellReconnectPresenter.ConnectedSummary {
+		.init(windows: registry?.windowSnapshots().count ?? 0, liveSince: liveSince)
 	}
 
 	/// What the status item shows, read from this delegate's own state (adr/0022 D-6): whether a
@@ -871,7 +896,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// address. Read, never written.
 	private func statusItemReading() -> StatusItemController.SessionReading {
 		StatusItemController.SessionReading(
-			hasSession: session != nil, state: reconnectDriver?.state, host: statusItemHost
+			hasSession: session != nil, state: reconnectDriver?.state, host: statusItemHost, liveSince: liveSince
 		)
 	}
 
@@ -929,14 +954,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// A pending certificate question keeps its own session; it is not touched here.
 	private func chainEnded() {
 		let host = chainHost
+		// UI slice ④ (UI-1 spec §4.1): a chain that gave up keeps its give-up row -- red marker,
+		// `s_gx` / `s_gr` in the status bar, `st_off` subtitle -- until the next press.
+		let gaveUp = endingByGiveUp
 		chainHost = nil
 		chainContext = nil
 		chainReachedLive = false
 		endingByGiveUp = false
+		liveSince = nil
 		if pendingReview == nil {
 			mainWindow.activeHostID = nil
 		}
-		if let host, mainWindow.bannerIDs.isEmpty {
+		if let host, !gaveUp, mainWindow.bannerIDs.isEmpty {
 			applyHostsWindow(state: nil, host: host, ended: true)
 		}
 	}
@@ -963,14 +992,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// UI-1 spec §4.1: the Hosts window's marker, subtitle and status bar for the current state.
 	private func applyHostsWindow(state: ReconnectDriver.State?, host: HostID?, ended: Bool = false) {
 		let title = host.flatMap(hostStore.record)?.title ?? ""
-		let presentation = ConnectChain.presentation(hasSession: !ended, state: state, hostTitle: title)
+		let presentation = ConnectChain.presentation(hasSession: !ended, state: state, hostTitle: title, connected: connectedSummary())
 		mainWindow.setShell(subtitle: presentation.subtitle, statusBar: presentation.statusBar, marker: presentation.marker, for: host)
 	}
 
 	/// ADR-0024 D-3′: the pin item could not be read -- no connection, no first-use sheet, no retry.
 	private func showPinUnavailable(_ record: HostRecord, status: Int32) {
 		ConnectChain.log.notice("[connect] pin item unreadable status=\(status, privacy: .public); not connecting")
-		statusLabel.stringValue = "Not connected."
+		statusLabel.stringValue = UIStrings.notConnected
 		mainWindow.showBanner(.init(
 			id: "pin-unavailable", title: UIStrings.pinUnavailableTitle(record.title), body: UIStrings.pinUnavailableBody,
 			tone: .error, actions: [.init(title: UIStrings.dismiss) { [weak self] in self?.mainWindow.removeBanner(id: "pin-unavailable") }]
@@ -1012,7 +1041,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// `pendingReview` only while a sheet can still confirm it.
 	private func presentCertificateQuestion(_ record: HostRecord, verdict: CertificateDecision.Verdict,
 											session ended: CRSession, rejection: CRCertificateRejection) {
-		statusLabel.stringValue = "Not connected."
+		statusLabel.stringValue = UIStrings.notConnected
 		mainWindow.setShell(subtitle: nil, statusBar: UIStrings.barCertificate, marker: .failed, for: record.id)
 		let wasLive = chainReachedLive
 		chainHost = nil

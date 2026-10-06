@@ -22,11 +22,12 @@ import Testing
 //     `AppDelegateSessionEndPinTests` holds; three of the call sites are held here, beside the
 //     other claims about those three paths, and the End-session action's next door, beside that
 //     button's own pins.
-//  4. The connect-error branch keeps its "Connect failed: ..." line and its literal `true`, and
-//     then ends the session through that same function. Lane D froze the branch's five statements
-//     byte-for-byte and appended one call; the session-end lane lifted that freeze to repair the
-//     button it left refusing every press (lane D impl-report §8 #1), keeping the two statements
-//     a human actually sees.
+//  4. The connect-error branch keeps its failure line and its literal `true`, and then ends the
+//     session through that same function. Lane D froze the branch's five statements byte-for-byte
+//     and appended one call; the session-end lane lifted that freeze to repair the button it left
+//     refusing every press (lane D impl-report §8 #1), keeping the two statements a human actually
+//     sees. UI slice ④ re-worded the line to the catalog's `st_err` and moved the error itself to
+//     a `[connect]` log line in front of it.
 //  5. The button is enabled by a literal `true` only where no reconnect state is involved: the two
 //     places that predate this lane, and the three adr/0020 lane S added (the End-session action,
 //     and the two host.env failures D-8 moved behind the button's disable -- since UI slice ①,
@@ -94,7 +95,9 @@ struct AppDelegateReconnectWiringPinTests {
     func theCommentStripperDidNotEatTheCode() throws {
         let stripped = try sourceWithoutComments(Self.appDelegate)
         #expect(stripped.contains("newSession.start()"))
-        #expect(stripped.contains("statusLabel.stringValue = \"Connecting...\""))
+        // UI slice ④ re-froze the literal this probe looked for ("Connecting...") to its
+        // catalog accessor; the probe still needs a statement that sits on a line of its own.
+        #expect(stripped.contains("statusLabel.stringValue = UIStrings.connecting"))
         #expect(!stripped.contains("adr/0019 §2 lane D"), "a line comment survived the strip")
         // The `//` in this file's own paths and URLs lives in comments only; a `//` appearing
         // inside a string literal would silently truncate that line and this is the alarm.
@@ -224,19 +227,29 @@ struct AppDelegateReconnectWiringPinTests {
     /// driver never sees the `.disconnected` a bridge refusal produces on this path), and it runs to
     /// the branch's `return }`, so nothing can be inserted between the call and the return.
     ///
+    /// RE-FROZEN by UI slice ④ (UI-1 spec §4.1; old needle's line was
+    /// `statusLabel.stringValue = "Connect failed: \(error.localizedDescription)"`): the status line
+    /// is the catalog's `st_err` (`UIStrings.connectionFailed`), and the error leaves the screen --
+    /// it is logged as one `[connect]` line by domain and code (never its description, which can
+    /// carry the address), the first statement of the branch. The order is otherwise lane S's.
+    ///
     /// MUST-RED for: reverting to the hand-written statements, dropping or moving the literal
-    /// `true`, re-wording the failure line, and returning without the teardown.
-    @Test("the connect-error branch writes the failure, enables the button, and ends the session")
+    /// `true`, re-wording the failure line, putting the error's description back on screen, and
+    /// returning without the teardown.
+    @Test("the connect-error branch logs the error, writes st_err, enables the button, and ends the session")
     func theConnectErrorBranchEndsTheSession() throws {
         let stripped = try sourceWithoutComments(Self.appDelegate)
         #expect(occurrences(
             of: "private func drainTick() { guard let session else { return } "
                 + "if let error = session.lastConnectError { "
-                + "statusLabel.stringValue = \"Connect failed: \\(error.localizedDescription)\" "
+                + "ConnectChain.log.notice(\"[connect] failed: domain=\\((error as NSError).domain, privacy: .public) "
+                + "code=\\((error as NSError).code, privacy: .public)\") "
+                + "statusLabel.stringValue = UIStrings.connectionFailed "
                 + "connectButton.isEnabled = true "
                 + "tearDownSession() "
                 + "return }",
             in: stripped) == 1)
+        #expect(occurrences(of: "localizedDescription", in: stripped) == 0, "the error's text is not shown or logged")
     }
 
     /// D-7b. The literal `true` stays in the two places that predate this lane -- the boundary
@@ -253,6 +266,10 @@ struct AppDelegateReconnectWiringPinTests {
     /// Password sheet's Cancel -- both arms that end a press without a session, after the button
     /// was disabled. Still five literal trues and eight writes.
     ///
+    /// Re-counted, not changed, by UI slice ④: its banner buttons press the Hosts window's own
+    /// buttons (`MainWindowController.connect(to:)` / `disconnectSession()`), so this file gains no
+    /// `isEnabled` write. Still five literal trues and eight writes.
+    ///
     /// Read from the comment-stripped text so that a `true` written in prose cannot be counted.
     @Test("connectButton.isEnabled = true survives in exactly five places, none of them a reconnect state")
     func theButtonIsEnabledByALiteralInFivePlacesOnly() throws {
@@ -267,7 +284,8 @@ struct AppDelegateReconnectWiringPinTests {
     // MARK: - the status line has one writer, and the give-up teardown is complete
 
     /// D-3, App side. The "Connected" wording left this file; the label now receives the
-    /// presenter's answer, and the button receives it in the same breath.
+    /// presenter's answer, and the button receives it in the same breath (and, since UI slice ④,
+    /// the status bar right after them).
     ///
     /// MUST-RED for: re-introducing a hard-coded connected status here (which is what made a
     /// dropped session go on being announced as connected once a second), and for writing one half
@@ -280,9 +298,11 @@ struct AppDelegateReconnectWiringPinTests {
         #expect(occurrences(of: "remote window(s) live", in: stripped) == 0)
         #expect(occurrences(of: "ShellReconnectPresenter.shell(", in: stripped) == 1)
         #expect(occurrences(
-            of: "statusLabel.stringValue = shell.statusLine connectButton.isEnabled = shell.connectEnabled",
+            of: "statusLabel.stringValue = shell.statusLine connectButton.isEnabled = shell.connectEnabled "
+                + "mainWindow.setStatusBarText(shell.statusBar)",
             in: stripped) == 1,
-            "both halves of the shell, from the same value, adjacent")
+            "all three parts of the shell, from the same value, adjacent")
+        #expect(occurrences(of: "setStatusBarText(", in: stripped) == 1, "the per-tick bar write, in one place")
     }
 
     /// GATE r1 I-1. THE ARGUMENT LIST, and not just the call.
@@ -303,31 +323,62 @@ struct AppDelegateReconnectWiringPinTests {
     /// to be pinned here.
     ///
     /// One needle over the whole function body, comment-stripped, same technique as the other
-    /// order pins in this file. MUST-RED for: replacing any of the four arguments with a literal,
-    /// swapping `events:` and `windows:` (both are `Int`, so the compiler would not object),
-    /// reading the generation from somewhere other than the current session, and dropping either
-    /// assignment.
-    @Test("the presenter is fed the live session's numbers, not constants")
+    /// order pins in this file.
+    ///
+    /// RE-FROZEN by UI slice ④: the presenter no longer shows the event count or the generation
+    /// (UI-1 spec §4.1 replaced lane D's "N event(s) so far (generation G)" line), so the summary is
+    /// the live-window count and the handshake moment of the current leg (`liveSince`), built by
+    /// ONE helper, `connectedSummary()`, which the Hosts window's state write calls too. The old
+    /// needle's `events: eventCount` and `generation: session?.currentGeneration ?? 0` are gone
+    /// (`session?.currentGeneration` 1 -> 0 here); `eventCount`'s bookkeeping and its two resets are
+    /// kept (the drain tick's gate reads it; `theDisplayNoteIsClearedByTheReconnect` holds them).
+    ///
+    /// MUST-RED for: replacing any argument with a literal, reading the window count or the moment
+    /// from somewhere other than the current registry / the App's one record, dropping an
+    /// assignment, and a second summary builder.
+    @Test("the presenter is fed the live session's values, not constants")
     func theShellIsBuiltFromTheLiveSessionsValues() throws {
         let stripped = try sourceWithoutComments(Self.appDelegate)
         #expect(occurrences(
             of: "private func applyShell(for state: ReconnectDriver.State) { "
                 + "let shell = ShellReconnectPresenter.shell( "
                 + "for: state, "
-                + "connected: .init( "
-                + "events: eventCount, "
-                + "generation: session?.currentGeneration ?? 0, "
-                + "windows: registry?.windowSnapshots().count ?? 0 "
-                + "), "
+                + "connected: connectedSummary(), "
                 + "displayNote: lastDisplayChangeNote "
                 + ") "
                 + "statusLabel.stringValue = shell.statusLine "
-                + "connectButton.isEnabled = shell.connectEnabled }",
+                + "connectButton.isEnabled = shell.connectEnabled "
+                + "mainWindow.setStatusBarText(shell.statusBar) }",
             in: stripped) == 1)
-        // The two reads that cannot be spelled anywhere else in this file: a second call site for
-        // either would mean a second, possibly disagreeing, description of the same session.
-        #expect(occurrences(of: "session?.currentGeneration", in: stripped) == 1)
+        #expect(occurrences(
+            of: "private func connectedSummary() -> ShellReconnectPresenter.ConnectedSummary { "
+                + ".init(windows: registry?.windowSnapshots().count ?? 0, liveSince: liveSince) }",
+            in: stripped) == 1)
+        #expect(occurrences(of: "connectedSummary()", in: stripped) == 3,
+                "the declaration, applyShell, and the Hosts window's presentation")
+        // The read that cannot be spelled anywhere else in this file: a second call site would mean
+        // a second, possibly disagreeing, description of the same session.
         #expect(occurrences(of: "registry?.windowSnapshots().count", in: stripped) == 1)
+        #expect(occurrences(of: "session?.currentGeneration", in: stripped) == 0)
+    }
+
+    /// UI slice ④ (UI-1 spec §4.1 "since 12:03"): the handshake moment has ONE record in the App,
+    /// `liveSince`, set on a leg's first `.live` in the driver's state handler before the shell is
+    /// written, cleared by every other state and at the chain's end, and read by the two places
+    /// that show it -- the summary (status bar) and the status item's reading.
+    ///
+    /// MUST-RED for: a second writer of the moment, the record taken after the shell is written,
+    /// and a reader that takes its own clock.
+    @Test("the handshake moment has one record, set before the shell is written, read by the bar and the status item")
+    func theHandshakeMomentHasOneRecord() throws {
+        let stripped = try sourceWithoutComments(Self.appDelegate)
+        #expect(occurrences(
+            of: "if case .live = state { if liveSince == nil { liveSince = Date() } } else { liveSince = nil } applyShell(for: state)",
+            in: stripped) == 1)
+        #expect(occurrences(of: "liveSince = ", in: stripped) == 3, "set, cleared on other states, cleared at the chain's end")
+        #expect(occurrences(of: "liveSince = nil", in: stripped) == 2)
+        #expect(occurrences(of: "liveSince: liveSince", in: stripped) == 2, "the summary and the status item's reading")
+        #expect(occurrences(of: "Date()", in: stripped) == 1, "the App takes the clock in one place")
     }
 
     /// The give-up branch ends the session through the shared teardown.

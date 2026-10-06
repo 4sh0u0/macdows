@@ -73,19 +73,30 @@ enum ConnectChain {
         let statusBar: String
     }
 
-    static func presentation(hasSession: Bool, state: ReconnectDriver.State?, hostTitle: String) -> Presentation {
+    /// UI-1 spec §4.1, one row per state. The status bar's text for a session state is
+    /// `ShellReconnectPresenter.statusBar(for:connected:)` -- the same function the App's per-tick
+    /// shell update writes the bar with -- so the two writers of the bar can never disagree.
+    /// A `nil` subtitle means "the host count" (`hosts3`).
+    static func presentation(hasSession: Bool, state: ReconnectDriver.State?, hostTitle: String,
+                             connected: ShellReconnectPresenter.ConnectedSummary,
+                             text: ShellText = .main) -> Presentation {
         guard hasSession else {
             return Presentation(marker: .idle, subtitle: nil, statusBar: UIStrings.notConnected)
         }
-        switch state {
-        case .live?:
-            return Presentation(marker: .live, subtitle: UIStrings.connectedTo(hostTitle), statusBar: UIStrings.connected)
-        case .waiting?, .reconnecting?:
-            return Presentation(marker: .reconnecting, subtitle: UIStrings.connectionLostTo(hostTitle), statusBar: UIStrings.reconnecting)
-        case .gaveUp?:
-            return Presentation(marker: .failed, subtitle: nil, statusBar: UIStrings.connectionFailed)
-        case .idle?, nil:
+        guard let state else {
+            // The live-host boundary check: no session object yet.
             return Presentation(marker: .connecting, subtitle: UIStrings.connectingTo(hostTitle), statusBar: UIStrings.connecting)
+        }
+        let statusBar = ShellReconnectPresenter.statusBar(for: state, connected: connected, text: text)
+        switch state {
+        case .live:
+            return Presentation(marker: .live, subtitle: UIStrings.connectedTo(hostTitle), statusBar: statusBar)
+        case .waiting, .reconnecting:
+            return Presentation(marker: .reconnecting, subtitle: UIStrings.connectionLostTo(hostTitle), statusBar: statusBar)
+        case .gaveUp:
+            return Presentation(marker: .failed, subtitle: UIStrings.notConnected, statusBar: statusBar)
+        case .idle:
+            return Presentation(marker: .connecting, subtitle: UIStrings.connectingTo(hostTitle), statusBar: statusBar)
         }
     }
 }

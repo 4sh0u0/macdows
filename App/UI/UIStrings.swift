@@ -13,9 +13,11 @@ enum UIStrings {
     static var removeHost: String { String(localized: "sb_remove", defaultValue: "Remove Host", comment: "Sidebar: remove the selected host (accessibility)") }
     static var settings: String { String(localized: "tb_settings", defaultValue: "Settings", comment: "Toolbar: Settings button") }
     /// `hosts3` has plural variations in English ("1 host", "2 hosts"; gate r1 m-10), which only
-    /// `localizedStringWithFormat` resolves.
+    /// a localized format resolves -- with the resolved localization's locale, not the region's
+    /// (`ShellText.formattingLocale`, UI slice ④ gate r1 m-1).
     static func hostCount(_ count: Int) -> String {
-        String.localizedStringWithFormat(Bundle.main.localizedString(forKey: "hosts3", value: "%d hosts", table: nil), Int32(clamping: count))
+        String(format: Bundle.main.localizedString(forKey: "hosts3", value: "%d hosts", table: nil),
+               locale: ShellText.formattingLocale(preferredLocalizations: Bundle.main.preferredLocalizations), Int32(clamping: count))
     }
     static var hostDetails: String { String(localized: "details", defaultValue: "Host details", comment: "Main window: the detail pane (accessibility)") }
 
@@ -25,6 +27,11 @@ enum UIStrings {
     static var connectionFailed: String { String(localized: "st_err", defaultValue: "Connection failed", comment: "State: the last connect failed") }
     static var reconnecting: String { String(localized: "st_warn", defaultValue: "Reconnecting", comment: "State: reconnecting") }
     static var connecting: String { String(localized: "st_connecting", defaultValue: "Connecting…", comment: "Status menu: a session that has not reached live yet") }
+    /// UI slice ④ (UI-1 spec §4.1): the status line after the user pressed Disconnect.
+    static var sessionEnded: String { String(localized: "st_ended", defaultValue: "Session ended.", comment: "Status line: the user pressed Disconnect (UI slice 4)") }
+    /// UI slice ④: a Connect press while a session or its preflight already exists (the button is
+    /// disabled then, so only an unattended press reaches it) -- the status menu's own wording.
+    static var oneSessionAtATime: String { String(localized: "si_one", defaultValue: "One session at a time. Disconnect first.", comment: "Status menu: why Connect to is unavailable during a session") }
     static func connectingTo(_ host: String) -> String {
         String(format: Bundle.main.localizedString(forKey: "tb_connecting", value: "Connecting to %@…", table: nil), host)
     }

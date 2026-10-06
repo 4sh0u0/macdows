@@ -96,6 +96,19 @@ struct StatusItemControllerTests {
         #expect(controller.liveSince == nil)
     }
 
+    @Test("UI slice ④: the App's recorded live-since wins over a moment this controller latched itself")
+    func appLiveSinceWinsOverTheLatch() throws {
+        let controller = StatusItemController()
+        var reading = StatusItemController.SessionReading(hasSession: true, state: .live, host: "host.example")
+        controller.reading = { reading }
+        controller.refresh()
+        let latched = try #require(controller.liveSince, "no App record: the controller latches its own moment")
+        let recorded = latched.addingTimeInterval(-3600)
+        reading.liveSince = recorded
+        controller.refresh()
+        #expect(controller.liveSince == recorded, "the App's handshake moment replaces the latched one")
+    }
+
     @Test(
         "status rows for each driver state (v1: live / reconnecting / not connected, plus connecting)",
         arguments: [
@@ -103,8 +116,8 @@ struct StatusItemControllerTests {
             (.init(hasSession: true, state: nil, host: "h"), .reconnecting, "Connecting…", nil),
             (.init(hasSession: true, state: .idle, host: "h"), .reconnecting, "Connecting…", nil),
             (.init(hasSession: true, state: .live, host: "h"), .live, "Connected to h", "3 windows · since "),
-            (.init(hasSession: true, state: .waiting(attempt: 1, delay: .seconds(2)), host: "h"), .reconnecting, "Reconnecting to h", "Reconnect attempt 2 of 5"),
-            (.init(hasSession: true, state: .reconnecting(attempt: 0), host: "h"), .reconnecting, "Reconnecting to h", "Reconnect attempt 1 of 5"),
+            (.init(hasSession: true, state: .waiting(attempt: 1, delay: .seconds(2)), host: "h"), .reconnecting, "Reconnecting to h", "Reconnect attempt 2 of 4"),
+            (.init(hasSession: true, state: .reconnecting(attempt: 0), host: "h"), .reconnecting, "Reconnecting to h", "Reconnect attempt 1 of 4"),
             (.init(hasSession: true, state: .gaveUp(.policy(.attemptsExhausted)), host: "h"), .notConnected, "Not connected", nil),
             (.init(hasSession: false, state: .live, host: "h"), .notConnected, "Not connected", nil),
         ] as [(StatusItemController.SessionReading, StatusItemController.Marker, String, String?)]
@@ -118,7 +131,7 @@ struct StatusItemControllerTests {
         } else {
             #expect(rows.detail == nil)
         }
-        #expect(ReconnectPolicy.maxAttempts == 5, "the table's 'of 5'")
+        #expect(ShellReconnectPresenter.reconnectCount == 4, "the table's 'of 4'")
     }
 
     // MARK: - adr/0023 D-8 ⑥: one status item in the App, none in the tray controller

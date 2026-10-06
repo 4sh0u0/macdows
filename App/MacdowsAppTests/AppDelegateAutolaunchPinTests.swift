@@ -383,6 +383,15 @@ struct AppDelegateAutolaunchPinTests {
     /// `endSessionTapped`, `drainTick` and `applicationWillTerminate` are unchanged. It now folds to
     /// 45012 characters, +1177.
     ///
+    /// RE-FROZEN by UI slice ④ commit 1 (UI-1 spec §4.1, the shell in three languages): every English
+    /// status-line literal after `connectTapped` became its catalog accessor (`UIStrings.*`); the
+    /// connect-error branch logs the error as a `[connect]` line instead of showing its description;
+    /// the driver's state handler records the handshake moment (`liveSince`); `applyShell` reads one
+    /// summary builder, `connectedSummary()`, and also writes the status bar; the status item's
+    /// reading carries `liveSince`; `chainEnded` keeps a give-up's row; the Hosts window's
+    /// presentation gets the summary. `tearDownSession` and `applicationWillTerminate` are
+    /// unchanged. It now folds to 46458 characters, +1446.
+    ///
     /// The "net folded edit" above is the folded-length delta for each re-freeze, which is what the
     /// length chain below already checks; it is not a token-by-token added/removed count -- those
     /// depend on the diff algorithm and separator convention used to produce them, so this pin does
@@ -398,9 +407,9 @@ struct AppDelegateAutolaunchPinTests {
     /// expected to re-freeze this constant in the same commit that makes the edit, and the length
     /// below is here so that such a re-freeze can be sanity-checked (a length that MOVED by the size
     /// of the edit is a re-freeze; a length that moved by 22638 is a needle that stopped matching).
-    private static let foldedTailLength = 45012
+    private static let foldedTailLength = 46458
     private static let foldedTailSHA256 =
-        "a7bb17029424113495c4ead1960582b0cb8b16270d18d16209bb43a20f0161d6"
+        "bb18491bad840bee4f496313fe1e6a7fd500f1b8eeb2db124a5405fb0886cc2c"
 
     @Test("connectTapped to end-of-file is byte-identical to its last deliberate freeze")
     func theRestOfTheFileIsUnchanged() throws {

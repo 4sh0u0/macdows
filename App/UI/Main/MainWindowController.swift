@@ -140,6 +140,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         if let host { list.setMarker(marker, for: host) }
     }
 
+    /// UI slice ④: the status bar's text alone -- the App's per-tick shell write (the live text
+    /// carries the window count). The marker follows state changes through `setShell`.
+    func setStatusBarText(_ text: String) {
+        detail.setStatusBarText(text)
+    }
+
     // MARK: - Banners
 
     func showBanner(_ model: BannerView.Model) {

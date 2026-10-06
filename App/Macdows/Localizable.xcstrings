@@ -1405,6 +1405,42 @@
         }
       }
     },
+    "dg_bar" : {
+      "comment" : "Status bar while connected without Unicode input; %1$lld is the remote window count, %2$@ the time the connection went live (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "Connected · %1$lld window · since %2$@ · some features unavailable"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "Connected · %1$lld windows · since %2$@ · some features unavailable"
+                }
+              }
+            }
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "接続済み · ウインドウ %1$lld 個 · %2$@ から · 一部の機能は利用できません"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已连接 · %1$lld 个窗口 · 自 %2$@ 起 · 部分功能不可用"
+          }
+        }
+      }
+    },
     "disconnect" : {
       "comment" : "File menu and status menu: end the current session",
       "extractionState" : "manual",
@@ -4436,6 +4472,138 @@
         }
       }
     },
+    "s_gr" : {
+      "comment" : "Status line and bar after the host refused a reconnect (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Not connected · the host refused the connection"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未接続 · ホストが接続を拒否しました"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未连接 · 主机拒绝了连接"
+          }
+        }
+      }
+    },
+    "s_gx" : {
+      "comment" : "Status line and bar after the reconnects ran out; %lld is the number of reconnects (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Not connected · couldn’t reconnect after %lld attempts"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未接続 · %lld 回再接続できませんでした"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未连接 · %lld 次重连均未成功"
+          }
+        }
+      }
+    },
+    "s_live_bar" : {
+      "comment" : "Status bar while connected; %1$lld is the remote window count, %2$@ the time the connection went live (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "Connected · %1$lld window · since %2$@"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "Connected · %1$lld windows · since %2$@"
+                }
+              }
+            }
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "接続済み · ウインドウ %1$lld 個 · %2$@ から"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已连接 · %1$lld 个窗口 · 自 %2$@ 起"
+          }
+        }
+      }
+    },
+    "s_re" : {
+      "comment" : "Status line and bar while reconnecting; %1$lld is the attempt, %2$lld the number of reconnects (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connection lost · Reconnecting (attempt %1$lld of %2$lld)…"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "接続が切れました · 再接続中（%2$lld 回中 %1$lld 回目）…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "连接中断 · 正在第 %1$lld 次重连（共 %2$lld 次）…"
+          }
+        }
+      }
+    },
+    "s_wait" : {
+      "comment" : "Status line and bar while a reconnect is scheduled; %1$lld is the attempt, %2$lld the number of reconnects, %3$@ the wait in seconds (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connection lost · Reconnecting (attempt %1$lld of %2$lld) in %3$@ s"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "接続が切れました · %3$@ 秒後に再接続（%2$lld 回中 %1$lld 回目）"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "连接中断 · %3$@ 秒后第 %1$lld 次重连（共 %2$lld 次）"
+          }
+        }
+      }
+    },
     "save" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -4927,6 +5095,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "正在连接…"
+          }
+        }
+      }
+    },
+    "st_ended" : {
+      "comment" : "Status line: the user pressed Disconnect (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Session ended."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "セッションを終了しました。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "会话已结束。"
           }
         }
       }
