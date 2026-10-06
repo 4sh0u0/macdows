@@ -8,7 +8,7 @@ import MacdowsCore
 ///     <detail>                          disabled, second line; hidden when there is none
 ///     [Remote tray section]             adr/0023, `StatusItemTraySection` (hidden or shown)
 ///     ---------------------------      shown only while the section is hidden
-///     Connect to                        disabled until slice ① brings the host list
+///     Connect to ▸ <hosts>              slice ①: the host records (ADR-0024 §3 adr/0023 row)
 ///     One session at a time. ...        disabled, shown while a session exists
 ///     Disconnect                        the File menu's Disconnect item (adr/0022 D-11)
 ///     ---------------------------
@@ -30,6 +30,10 @@ import MacdowsCore
 ///  - The Remote tray section (adr/0023) mirrors the bound registry's tray entries and follows the
 ///    session's state, also while the menu is open: entries through the tray's own change stream
 ///    (D-3 M-a), presentation through `refresh()` on every driver state change.
+///  - Connect to (UI slice ①) lists the host records the App supplies through `hostEntries` and is
+///    enabled only while there is no session and at least one host; choosing a host hands its id to
+///    `onConnectTo`, which presses the App's own Connect button for it. The submenu's items are
+///    written here too, by replacing its `items` in `apply`, so this type stays the one writer.
 ///  - The session is READ, never driven: `reading` is a closure over the App's own state, called
 ///    whenever this menu is about to open and whenever the App says the session changed
 ///    (`bind(_:)`, `refresh()`).
@@ -71,6 +75,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// section brings its own separators when shown).
     let sectionGapSeparator = NSMenuItem.separator()
     let connectToItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    /// Connect to's submenu: one item per host record (UI slice ①).
+    let connectToMenu = NSMenu(title: "")
     let oneSessionItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let disconnectItem = MainMenu.disconnectItem()
     let openItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -82,6 +88,20 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     /// The App's state, read on demand. Returns `.noSession` until the App sets it.
     var reading: () -> SessionReading = { .noSession }
+
+    /// One Connect to entry (UI slice ①).
+    struct HostEntry: Equatable {
+        let id: HostID
+        let title: String
+    }
+
+    /// The host records, read on demand; empty until the App sets it.
+    var hostEntries: () -> [HostEntry] = { [] }
+    /// Called with the chosen host; the App presses its Connect button for it.
+    var onConnectTo: ((HostID) -> Void)?
+    /// Gate r1 I-2: Open Macdows also brings the Hosts window back (the App points this at the
+    /// Hosts window controller's `showHosts`), so a closed Hosts window is always one click away.
+    var onOpenMacdows: (() -> Void)?
 
     private(set) var statusItem: NSStatusItem?
     /// The registry of the current session, nil without one. Weak: the App owns it.
@@ -97,6 +117,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         detailRow.isEnabled = false
         detailRow.isHidden = true
         connectToItem.title = String(localized: "si_connect_to", defaultValue: "Connect to", comment: "Status menu: Connect to (the host list arrives with UI slice 1)")
+        connectToItem.submenu = connectToMenu
+        connectToMenu.autoenablesItems = false
         oneSessionItem.title = String(localized: "si_one", defaultValue: "One session at a time. Disconnect first.", comment: "Status menu: why Connect to is unavailable during a session")
         oneSessionItem.isHidden = true
         openItem.title = String(localized: "si_open", defaultValue: "Open Macdows", comment: "Status menu: bring Macdows to the front")
@@ -187,6 +209,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         detailRow.title = rows.detail ?? ""
         detailRow.isHidden = rows.detail == nil
         oneSessionItem.isHidden = !reading.hasSession
+        let entries = hostEntries()
+        connectToMenu.items = entries.map { entry in
+            let item = NSMenuItem(title: entry.title, action: #selector(connectToHost(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = entry.id.keychainAccount
+            item.isEnabled = !reading.hasSession
+            return item
+        }
+        connectToItem.isEnabled = !reading.hasSession && !entries.isEmpty
         traySection.setPresentation(registry == nil ? .hidden : Self.trayPresentation(for: reading))
         sectionGapSeparator.isHidden = traySection.isShown
     }
@@ -269,5 +300,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// key, which releases its modifiers -- the correct outcome).
     @objc private func openMacdows(_ sender: Any?) {
         NSApp.activate(ignoringOtherApps: true)
+        onOpenMacdows?()
+    }
+
+    /// UI slice ①: Connect to ▸ <host>. Only while there is no session (one session at a time).
+    @objc func connectToHost(_ sender: NSMenuItem) {
+        guard !reading().hasSession, let account = sender.representedObject as? String,
+              let host = HostID(keychainAccount: account) else { return }
+        onConnectTo?(host)
     }
 }

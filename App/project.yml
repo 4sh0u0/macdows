@@ -70,6 +70,9 @@ targets:
       # ADR-0024 D-11: the security base of UI slice ①  -- the keychain credential and pin
       # stores and the chain's password bytes. Compiled into this target and MacdowsAppTests.
       - path: Security
+      # UI-1 spec §8 ① (UI slice ①): the Hosts window, the Host Editor, Password and Certificate
+      # sheets, banners, host records. Compiled into this target and MacdowsAppTests.
+      - path: UI
       # adr/0006 §2/§3 fix (2026-09-23): the seven embedded FreeRDP/FFmpeg dylibs used to
       # live here as `sources:` entries with `buildPhase.copyFiles.codeSignOnCopy: true`.
       # XcodeGen 2.46.0 never lowers that per-TargetSource `codeSignOnCopy` flag into the
@@ -481,6 +484,9 @@ targets:
       # ADR-0024 D-10 ⑤ / ⑧: the security stores, driven through test doubles and, for the
       # real keychain, a `.test` service that never touches the App's own items.
       - path: Security
+      # UI slice ①: the views are built offline here (sheet gating, editor validation, the
+      # Connect to list); the host-record and connect-flow logic is driven with the store doubles.
+      - path: UI
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.haru.macdows.dev.apptests

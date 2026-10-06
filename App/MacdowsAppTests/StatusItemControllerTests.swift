@@ -60,7 +60,10 @@ struct StatusItemControllerTests {
         #expect(controller.settingsItem.action == nil)
         #expect(controller.quitItem.action == #selector(NSApplication.terminate(_:)))
         #expect(controller.quitItem.target == nil)
-        #expect(controller.connectToItem.action == nil, "Connect to waits for slice ①'s host list")
+        // UI slice ①: Connect to opens the host-record submenu (StatusItemConnectToTests) and has no
+        // action of its own.
+        #expect(controller.connectToItem.submenu === controller.connectToMenu)
+        #expect(controller.connectToItem.target == nil || controller.connectToItem.target === controller.connectToMenu)
         #expect(controller.statusRow.action == nil && controller.detailRow.action == nil)
     }
 
@@ -186,6 +189,15 @@ struct StatusItemControllerTests {
             inInit += inside
         }
         #expect(inInit > 0, "init builds the menu")
+    }
+
+    @Test("gate r1 I-2: Open Macdows activates the App and then hands over to onOpenMacdows (source pin)")
+    func openMacdowsShowsTheHostsWindow() throws {
+        let code = statusCodeOnly(try String(contentsOf: statusRepoRoot().appendingPathComponent("App/Macdows/StatusMenu/StatusItemController.swift"), encoding: .utf8))
+        #expect(statusOccurrences(
+            of: "@objc private func openMacdows(_ sender: Any?) { NSApp.activate(ignoringOtherApps: true) onOpenMacdows?() }",
+            in: code) == 1)
+        #expect(statusOccurrences(of: "var onOpenMacdows: (() -> Void)?", in: code) == 1)
     }
 
     @Test("the App creates the controller once and installs it once, at launch (source pin)")
