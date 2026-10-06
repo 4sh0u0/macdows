@@ -53,7 +53,7 @@ everything the licences require.
 
 ## FreeRDP
 
-- **Version**: 3.31.1 (tag `3.31.1`, commit `63b948ca5cb94307fd5444ee6e73927a41ccdab4`) —
+- **Version**: 3.32.1 (tag `3.32.1`, commit `bf217a504e54cc719880c228e82353382cd7d4fa`) —
   synced with `deps/freerdp.lock`'s `.tag`; `Scripts/gen-notices.sh` reads that field and
   dies if this file doesn't mention it, so the two can't silently drift apart.
 - **Upstream**: https://github.com/FreeRDP/FreeRDP
@@ -77,10 +77,10 @@ everything the licences require.
   `sbom/macdows.cdx.json`'s `pedigree.patches` for this component is therefore empty; the
   SBOM generator reads the queue directory, not this text.
   The Apache-2.0 obligations are met as before: the licence text and every upstream copyright
-  header ship unaltered. §4(d) adds nothing here: FreeRDP 3.31.1 has no top-level `NOTICE`
+  header ship unaltered. §4(d) adds nothing here: FreeRDP 3.32.1 has no top-level `NOTICE`
   file, only `LICENSE`. (The one `NOTICE` anywhere in its tree,
   `winpr/libwinpr/sysinfo/cpufeatures/NOTICE`, belongs to a vendored third-party component
-  that this configuration does not compile.)
+  that this configuration does not compile: it is added only `if(ANDROID)`.)
 - **Includes**: WinPR (WinPR is part of the FreeRDP repository/release and shares the
   same license and copyright).
 - **How it's packaged**: built as dynamic libraries and embedded into the app bundle's
