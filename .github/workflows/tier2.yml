@@ -64,13 +64,32 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Pinned, not "whatever macos-15 defaults to today": the FreeRDP config hash folds
+  # Pinned, not "whatever the image defaults to today": the FreeRDP config hash folds
   # `xcodebuild -version` in (Scripts/build-freerdp.sh), so an image rotation that moves the
   # default Xcode silently invalidates every cache and turns a warm 6-minute job into a cold
   # 30-minute one. Pinning also keeps App/project.yml's SWIFT_VERSION: "6.0" compiled by a
-  # known toolchain. 16.4 is the macos-15 image's current default; bump this deliberately
-  # (the next run after a bump is a cold one, by design).
-  XCODE_APP: /Applications/Xcode_16.4.app
+  # known toolchain. Bump this deliberately (the next run after a bump is a cold one, by
+  # design).
+  #
+  # Why an Xcode 27 BETA and not the macos-26 image's release Xcode 26.x (owner ruling of
+  # 2026-10-06, docs STATUS, "build chain B"; adr/0023 D-9): the planned UI work references
+  # SDK symbols the old pin cannot compile -- the Liquid Glass views (NSGlassEffectView and
+  # friends, macOS 26 SDK); `if #available` is a runtime guard, not a compile-time one -- and
+  # the maintainer's local toolchain is Xcode 27.2 beta, so CI compiles with the SDK
+  # generation the code is written against. (adr/0023 D-1 reaches NSMenuItem's
+  # preferredImageVisibility, a macOS 27 SDK property, through runtime KVC, so that one is
+  # not a compile-time dependency.) The deployment target does NOT move: it stays 14.0
+  # (deps/freerdp.lock .deployment_target, App/project.yml), so the 14-25 standard-material
+  # fallback paths keep compiling. The path is the `xcode-27` preview image's exact
+  # install path for 27.2 beta (actions/runner-images, images/macos/xcode-27-arm64-Readme.md),
+  # deliberately not one of its version symlinks (/Applications/Xcode_27.2.app etc.), which
+  # GitHub can repoint at a later build without the path changing. Beta caveats, unverified
+  # as of this pin: the preview image's software (Xcode included) may be rotated by GitHub at
+  # any time -- the "Pin the Xcode toolchain" step below then fails red and lists what is
+  # installed, which is the intended signal -- and a newer beta may add Swift 6 /
+  # strict-concurrency diagnostics. Rolling back is this line plus `runs-on` below
+  # (/Applications/Xcode_16.4.app on macos-15).
+  XCODE_APP: /Applications/Xcode_27.2_beta.app
   # Scripts/bootstrap.sh installs whatever brew formula is missing (xcodegen, on this image).
   # Let it do that without spending a minute or two on an auto-update of the whole tap first.
   HOMEBREW_NO_AUTO_UPDATE: "1"
@@ -82,7 +101,10 @@ jobs:
     # arm64 standard runner. The whole build is pinned to arm64 anyway
     # (CMAKE_OSX_ARCHITECTURES=arm64, ffmpeg's --arch=arm64, ARCHS=arm64), so an x86_64
     # runner could not produce the artifacts this repo targets in the first place.
-    runs-on: macos-15
+    # `xcode-27` is GitHub's PREVIEW label for the image that carries Xcode 27 (arm64, macOS 27
+    # base OS since 2026-09-16 per actions/runner-images issue 14404); "preview" means queueing
+    # delays and image churn are possible, see the XCODE_APP comment above.
+    runs-on: xcode-27
     # Measured on this lane's first runs (2026-09-21, cold caches): bootstrap 4m13s (brew
     # xcodegen + OpenSSL + FFmpeg + FreeRDP + xcodegen generate), app build 42s, MacdowsAppTests
     # 33s. So a cold run is ~10 minutes, a warm one far less, and 30 is generous rather than
@@ -143,10 +165,15 @@ jobs:
           # OpenSSL and FFmpeg have no such seam: their idempotence is a stamp file INSIDE the
           # prefix, i.e. inside the thing being cached. So their keys are assembled here from
           # the same inputs their scripts actually read -- the lock's record (version, sha256,
-          # configure flags) plus the script's own text -- with the pinned Xcode folded in for
-          # the same reason build-freerdp.sh folds it.
-          OPENSSL="$( { jq -c '.openssl' deps/freerdp.lock; cat Scripts/build-openssl.sh; printf 'xcode=%s\n' "$XCODE_APP"; } | shasum -a 256 | cut -c1-16)"
-          FFMPEG="$( { jq -c '.ffmpeg' deps/freerdp.lock; cat Scripts/build-ffmpeg.sh; printf 'xcode=%s\n' "$XCODE_APP"; } | shasum -a 256 | cut -c1-16)"
+          # configure flags) plus the script's own text -- with the pinned Xcode folded in
+          # twice, as its path AND its `xcodebuild -version` output, for the same reason
+          # build-freerdp.sh folds the version: GitHub can rotate the preview image's beta
+          # build in place (same path, new Xcode), and only the version line makes these two
+          # keys rotate together with the FreeRDP hash instead of reusing prefixes built by
+          # the previous toolchain. The Pin step above has already xcode-select'ed XCODE_APP.
+          XCODE_VER="$(xcodebuild -version | tr '\n' ' ')"
+          OPENSSL="$( { jq -c '.openssl' deps/freerdp.lock; cat Scripts/build-openssl.sh; printf 'xcode=%s\nxcodever=%s\n' "$XCODE_APP" "$XCODE_VER"; } | shasum -a 256 | cut -c1-16)"
+          FFMPEG="$( { jq -c '.ffmpeg' deps/freerdp.lock; cat Scripts/build-ffmpeg.sh; printf 'xcode=%s\nxcodever=%s\n' "$XCODE_APP" "$XCODE_VER"; } | shasum -a 256 | cut -c1-16)"
 
           {
             printf 'freerdp=%s\n' "$FREERDP"
