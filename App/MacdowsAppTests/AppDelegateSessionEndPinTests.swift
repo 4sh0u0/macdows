@@ -40,7 +40,9 @@ import Testing
 //  adr/0020 S-3', S-4, S-5, S-6. The End-session button: its action is UI first and teardown
 //      second; it is enabled by one statement, in `session`'s `didSet`; there is one action and one
 //      binding, named clear of the substrings the other pins count; and nothing about it adds a
-//      menu, a stdout line or a reconnect route.
+//      stdout line or a reconnect route. S-6's original "no menu" clause was retired by adr/0022
+//      D-7: the main menu is installed once, from `App/Macdows/MainMenu.swift`, and reaches no
+//      session control (see the S-6 pin below).
 //
 // REGISTERED GAP, stated rather than papered over: these pins check that the teardown is WRITTEN,
 // not that it RUNS. Whether the re-enabled button really starts a new connection cannot be observed
@@ -115,6 +117,7 @@ struct AppDelegateSessionEndPinTests {
 
     private static let appDelegate = "App/Macdows/AppDelegate.swift"
     private static let bridge = "App/CRBridge/CRSession.mm"
+    private static let mainMenu = "App/Macdows/MainMenu.swift"
 
     private static func code() throws -> String {
         try sessionEndCodeOnly(sessionEndRawSource(appDelegate))
@@ -367,28 +370,52 @@ struct AppDelegateSessionEndPinTests {
         }
     }
 
-    // MARK: - adr/0020 S-6: no menu, no stdout, no reconnect route
+    // MARK: - adr/0020 S-6 (rewritten by adr/0022 D-7): one menu install, no stdout, no reconnect route
 
-    /// adr/0020 S-6, a guard: green before lane S and after it, red on three mutant classes. No
-    /// `mainMenu` anywhere in `App/Macdows` (a menu item for Disconnect would bring key equivalents
-    /// that take Cmd+W and friends before a RAIL window's `keyDown` sees them); no `print(` there
-    /// (the product's Disconnect path adds no stdout line, D-10, and the App's only reachable
-    /// stdout writer stays the reconnect driver's); and no `performClose` or `prepareForReconnect`
-    /// anywhere in `AppDelegate` (an SC_CLOSE, the registry's reconnect seam). The same three
-    /// routes, plus `connectTapped(`, are checked inside the action's own body by S-3' above,
-    /// which can only be green once the action exists.
+    /// adr/0020 S-6 as rewritten by adr/0022 D-7 (P1: adr/0020's text keeps its history in
+    /// footnotes, this pin changes). The old first clause, "no `mainMenu` anywhere in
+    /// `App/Macdows`", is retired: adr/0022 builds a main menu and keeps Cmd+W and friends going to
+    /// a key RAIL window by having the window's view claim them first (D-2 B), which
+    /// `RemoteWindowKeyEquivalentTests` (D-8 T-2′) and MacdowsCore's `CommandKeyMapperTests` (T-3)
+    /// pin directly instead of through "there is no menu". In its place, three clauses:
+    ///
+    ///  (i)   the main menu is assigned exactly once in `App/Macdows`, counted by CALL SHAPE
+    ///        (`.mainMenu = `, so a doc comment or the builder's own names do not count), and that
+    ///        one assignment is in `App/Macdows/MainMenu.swift` (adr/0022 D-9);
+    ///  (ii)  the menu file reaches none of the session controls: `connectTapped`,
+    ///        `prepareForReconnect` and `endSessionTapped` each appear 0 times. The
+    ///        `endSessionTapped` half is limited to slice ⓪: slice ② adds a Disconnect item under
+    ///        adr/0022 D-11 and changes it to "exactly once, on that item";
+    ///  (iii) key routing is pinned positively elsewhere (above).
+    ///
+    /// Kept from the original S-6: no `print(` anywhere in `App/Macdows` (the product's Disconnect
+    /// path adds no stdout line, adr/0020 D-10, and the App's only reachable stdout writer stays the
+    /// reconnect driver's), and no `performClose` or `prepareForReconnect` anywhere in
+    /// `AppDelegate` (an SC_CLOSE, the registry's reconnect seam). The same routes, plus
+    /// `connectTapped(`, are checked inside the action's own body by S-3' above.
     ///
     /// A knob lane that prints an anchor line from `App/Macdows` collides with this pin and has to
     /// change it in the same commit.
-    @Test("no mainMenu and no print( in App/Macdows, and no SC_CLOSE or reconnect seam in AppDelegate")
-    func theEndSessionPathAddsNoMenuNoStdoutAndNoReconnect() throws {
+    @Test("one main-menu install in MainMenu.swift, no session controls in it, no print( in App/Macdows, no SC_CLOSE or reconnect seam in AppDelegate")
+    func theEndSessionPathAddsNoStdoutAndNoReconnectAndTheMenuIsInstalledOnce() throws {
         let files = try sessionEndSwiftFiles(under: "App/Macdows")
-        #expect(files.contains(Self.appDelegate) && files.contains("App/Macdows/main.swift"),
+        #expect(files.contains(Self.appDelegate) && files.contains("App/Macdows/main.swift")
+                    && files.contains(Self.mainMenu),
                 "the walk found \(files) -- this pin would pass vacuously")
+        var assignments: [String: Int] = [:]
         for file in files {
             let code = sessionEndCodeOnly(try sessionEndRawSource(file))
-            #expect(sessionEndOccurrences(of: "mainMenu", in: code) == 0, "\(file)")
+            assignments[file] = sessionEndOccurrences(of: ".mainMenu = ", in: code)
             #expect(sessionEndOccurrences(of: "print(", in: code) == 0, "\(file)")
+        }
+        // (i)
+        #expect(assignments.values.reduce(0, +) == 1, "\(assignments)")
+        #expect(assignments[Self.mainMenu] == 1, "\(assignments)")
+
+        // (ii)
+        let menu = sessionEndCodeOnly(try sessionEndRawSource(Self.mainMenu))
+        for route in ["connectTapped", "prepareForReconnect", "endSessionTapped"] {
+            #expect(sessionEndOccurrences(of: route, in: menu) == 0, "\(route)")
         }
 
         let code = try Self.code()

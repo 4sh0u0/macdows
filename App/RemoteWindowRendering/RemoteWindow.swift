@@ -54,18 +54,31 @@ private final class RemoteWindowBackingWindow: NSWindow {
     /// 2026-08-23, adr/0010 §6): `applyChromeNow` never applies `.titled` (hence never
     /// `.closable`/`.miniaturizable` either) any more, so AppKit never renders a
     /// traffic-light button and never registers the title-bar double-click that would call
-    /// `-zoom:` -- none of these three overrides has a live AppKit-side trigger left. Kept,
-    /// not deleted: still correct if the policy ever flips back to native chrome, and
-    /// costs nothing while dormant. Cmd+W does NOT depend on this path either way -- this
-    /// app builds no `NSApp.mainMenu` at all (see `App/Macdows/main.swift`/`AppDelegate`),
-    /// so there is no menu key-equivalent to intercept Cmd+W before it reaches
-    /// `RemoteWindowContentView.keyDown`; it flows to `CommandKeyMapper`, which reports
-    /// `.closeRequest` and routes to `RemoteWindowRegistry.handleChromeAction(.close)` ->
-    /// `SC_CLOSE`, entirely independent of `performClose` above (verified by reading both
-    /// paths, not assumed).
+    /// `-zoom:` -- none of these three overrides has a live window-chrome trigger left (the
+    /// Window menu is a separate, menu-side trigger, below). Kept, not deleted: still correct
+    /// if the policy ever flips back to native chrome, and costs nothing while dormant.
+    ///
+    /// Cmd+W does NOT depend on this path either way. Since adr/0022 the App has a main menu
+    /// (`App/Macdows/MainMenu.swift`), but it has no Close item, and while a remote window is
+    /// key `RemoteWindowContentView.performKeyEquivalent` claims Cmd+W before the menu bar is
+    /// asked at all (adr/0022 D-2 B); the claim runs the same body `keyDown` runs, so Cmd+W
+    /// still flows to `CommandKeyMapper`, which reports `.closeRequest` and routes to
+    /// `RemoteWindowRegistry.handleChromeAction(.close)` -> `SC_CLOSE`, entirely independent of
+    /// `performClose` above.
+    ///
+    /// LIVE since adr/0022 D-10 for two of them: the Window menu's Minimize and Zoom items
+    /// (nil-target `performMiniaturize:` / `performZoom:`) reach this window through the
+    /// responder chain whenever a remote window is key, chosen with the pointer. `performZoom:`
+    /// is overridden below for exactly that -- the stock one would beep on a window with no zoom
+    /// box -- and both items validate as enabled while `isChromeActionWired` says the owning
+    /// `RemoteWindow` has a consumer for them. Neither sends a key (adr/0022 I-3): they are the
+    /// same `onChromeAction` route the traffic lights used, server-authoritative.
     var onPerformClose: (() -> Void)?
     var onPerformMiniaturize: (() -> Void)?
     var onZoom: (() -> Void)?
+    /// Whether the owning `RemoteWindow` has an `onChromeAction` consumer (adr/0022 D-10's menu
+    /// validation). Nil means no: a window nobody routes for keeps the two items disabled.
+    var isChromeActionWired: (() -> Bool)?
 
     override func performClose(_ sender: Any?) {
         onPerformClose?()
@@ -77,6 +90,25 @@ private final class RemoteWindowBackingWindow: NSWindow {
 
     override func zoom(_ sender: Any?) {
         onZoom?()
+    }
+
+    /// adr/0022 D-10: the Window menu's Zoom item sends `performZoom:`, not `zoom:`.
+    override func performZoom(_ sender: Any?) {
+        onZoom?()
+    }
+
+    /// Default-deny (gate r1 I-1): only D-10's two items are ever enabled, and only while wired.
+    /// Everything else answers NO -- including the Window-menu items AppKit injects on its own
+    /// (Full Screen, Center, Move & Resize), whose stock validation would otherwise enable them for
+    /// a key borderless remote window and move its frame locally, outside D-10's server-authoritative
+    /// route. `undo:` / `redo:` were already disabled by the stock answer (adr/0022 U-5) and stay so.
+    override func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(performMiniaturize(_:)), #selector(performZoom(_:)):
+            return isChromeActionWired?() ?? false
+        default:
+            return false
+        }
     }
 }
 
@@ -499,6 +531,7 @@ final class RemoteWindow {
         win.onPerformClose = { [weak self] in self?.onChromeAction?(.close) }
         win.onPerformMiniaturize = { [weak self] in self?.onChromeAction?(.minimize) }
         win.onZoom = { [weak self] in self?.onChromeAction?(.zoom) }
+        win.isChromeActionWired = { [weak self] in self?.onChromeAction != nil }
 
         // W4c review H1: this window losing key status is the primary signal that this
         // client can no longer reliably observe the physical keyboard's modifier state
