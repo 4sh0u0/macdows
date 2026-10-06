@@ -52,12 +52,13 @@ struct StatusItemControllerTests {
         #expect(controller.disconnectItem.keyEquivalent == file.keyEquivalent)
     }
 
-    @Test("Open Macdows activates the App through this controller; Settings… has no action; Quit is terminate:")
+    @Test("Open Macdows activates the App through this controller; Settings… performs the main menu's Settings… (UI slice ③); Quit is terminate:")
     func otherItems() {
         let controller = StatusItemController()
         #expect(controller.openItem.target === controller)
         #expect(controller.openItem.action == NSSelectorFromString("openMacdows:"))
-        #expect(controller.settingsItem.action == nil)
+        #expect(controller.settingsItem.action == NSSelectorFromString("openSettings:"))
+        #expect(controller.settingsItem.target === controller)
         #expect(controller.quitItem.action == #selector(NSApplication.terminate(_:)))
         #expect(controller.quitItem.target == nil)
         // UI slice ①: Connect to opens the host-record submenu (StatusItemConnectToTests) and has no

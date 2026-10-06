@@ -20,9 +20,9 @@ import AppKit
 ///    row) gives New Host…, Edit Host…, Connect and View ▸ Show Hosts their actions -- nil-target
 ///    selectors the Hosts window's controller implements (`newHostAction` …); Connect presses the
 ///    App's own Connect button from there, so there is still one connect path. The menu structure
-///    and every key equivalent are unchanged. The three Help items still have no action (slice
-///    ③), so AppKit keeps them disabled. Nothing here reaches `connectTapped` or the registry's
-///    reconnect seam.
+///    and every key equivalent are unchanged. The three Help items have no action (their
+///    content belongs to Phase 4, UI-1 §9), so AppKit keeps them disabled. Nothing here reaches
+///    `connectTapped` or the registry's reconnect seam.
 ///  - The key equivalents of the four Mac-reserved items come from `LocalKeyEquivalent`, the
 ///    same constant `RemoteWindowContentView` decides its claims with (adr/0022 D-3). Every other
 ///    key equivalent here -- slice ②'s ⌘N, ⌘↩, ⇧⌘D, ⌘1 and ⌃⌘F included -- is claimed by a
@@ -36,8 +36,10 @@ import AppKit
 ///    never injects its tab items (Show Previous / Next Tab ⌃⇧⇥ / ⌃⇥, Show Tab Bar, …) into Window
 ///    / View. A matching item swallows its key even while disabled, so with them a key remote
 ///    window would never see Ctrl+Tab (adr/0022 R-11). The Mac side has no tabbed windows.
-///  - Settings… has no action yet (there is no settings window), so AppKit keeps it disabled; ⌘,
-///    still stays on the Mac.
+///  - Settings… (⌘,, still one of the four keys the Mac keeps) opens the Settings window (UI slice
+///    ③): `showSettings:`, which the Hosts window's controller implements and which `bindShowHosts`
+///    binds to it explicitly, for the same reason as Show Hosts -- it has to work while no Macdows
+///    window is key. The status item's Settings… performs this same item (`performSettings`).
 ///  - Titles come from `Localizable.xcstrings` (en, zh-Hans, ja), keyed by the UI-1 string table's
 ///    keys; the default value is the English text.
 @MainActor
@@ -62,7 +64,7 @@ enum MainMenu {
         appMenu.addItem(.separator())
         appMenu.addItem(item(
             String(localized: "m_settings", defaultValue: "Settings…", comment: "Application menu: Settings item"),
-            action: nil, reserved: .settings
+            action: settingsAction, reserved: .settings
         ))
         appMenu.addItem(.separator())
         let servicesTitle = String(localized: "m_services", defaultValue: "Services", comment: "Application menu: Services submenu")
@@ -211,18 +213,39 @@ enum MainMenu {
     static let connectAction = NSSelectorFromString("connectSelectedHost:")
     /// View ▸ Show Hosts (⌘1).
     static let showHostsAction = NSSelectorFromString("showHosts:")
+    /// Macdows ▸ Settings… (⌘,; UI slice ③): the Hosts window's controller opens the Settings window.
+    static let settingsAction = NSSelectorFromString("showSettings:")
 
     /// Gate r1 I-2: View ▸ Show Hosts must reach the Hosts window while that window is closed, and
     /// a closed window's controller is not in the responder chain -- a nil-target item would grey
     /// out exactly when it is needed. So this one item gets an explicit target, the Hosts window's
     /// controller, once that controller exists (the App calls this after `install(on:)`). The
     /// other slice ① items stay nil-target. Returns false when the menu has no Show Hosts item.
+    ///
+    /// UI slice ③: Settings… needs the same thing (⌘, must open Settings while a remote window or
+    /// no window is key), and it opens through the same controller, so this binds it too. The
+    /// App's single call site is unchanged.
     @discardableResult
     static func bindShowHosts(in mainMenu: NSMenu?, to target: AnyObject) -> Bool {
-        let viewItems = mainMenu?.items.compactMap(\.submenu).flatMap(\.items) ?? []
-        guard let showHosts = viewItems.first(where: { $0.action == showHostsAction }) else { return false }
+        let items = mainMenu?.items.compactMap(\.submenu).flatMap(\.items) ?? []
+        guard let showHosts = items.first(where: { $0.action == showHostsAction }) else { return false }
         showHosts.target = target
+        settingsItem(in: mainMenu)?.target = target
         return true
+    }
+
+    /// Macdows ▸ Settings…, if `mainMenu` has it.
+    static func settingsItem(in mainMenu: NSMenu?) -> NSMenuItem? {
+        mainMenu?.items.compactMap(\.submenu).flatMap(\.items).first { $0.action == settingsAction }
+    }
+
+    /// UI slice ③: the status item's Settings… performs the main menu's Settings… item -- its
+    /// action, sent to its target (the Hosts window's controller once bound; the responder chain
+    /// before that). Returns false when nothing handled it.
+    @discardableResult
+    static func performSettings(in mainMenu: NSMenu?, from sender: Any?) -> Bool {
+        guard let item = settingsItem(in: mainMenu), let action = item.action else { return false }
+        return NSApp.sendAction(action, to: item.target, from: sender)
     }
 
     // MARK: - Disconnect (adr/0022 D-11 K3-R)

@@ -157,8 +157,10 @@ final class HostRecordStore {
 
     /// ADR-0024 D-6: after Reset All Pins every record is unpinned (otherwise every host would
     /// read as pin lost) and each one that was pinned gets an "All pins reset" row.
-    func noteAllPinsReset(at date: Date = Date()) {
-        for index in records.indices {
+    /// `hosts` limits it to the hosts whose pin was really cleared (a Reset that stopped part-way);
+    /// nil = every record.
+    func noteAllPinsReset(hosts: Set<HostID>? = nil, at date: Date = Date()) {
+        for index in records.indices where hosts?.contains(records[index].id) ?? true {
             let wasPinned = records[index].pinned
             records[index].pinned = false
             if wasPinned {

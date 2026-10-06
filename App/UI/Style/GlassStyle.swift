@@ -1,11 +1,15 @@
 import AppKit
+import SwiftUI
 
 /// UI-1 spec §3 / §8 (deployment-target ruling B): the ONE file in `App/UI` that names a Liquid
 /// Glass API. Every such call sits inside an `if #available(macOS 26, *)` branch whose `else` gives
 /// §3's "14–25 fallback" -- a standard material or the standard control style, with the same view
 /// hierarchy and the same sizes. The deployment target stays 14.0. Components the system dresses
 /// in glass by itself on 26 (the standard toolbar, the sidebar, menus, sheets) are not branched at
-/// all (§8 general rule). `GlassStyleTests` pins both halves of this as source.
+/// all (§8 general rule). `GlassStyleTests` pins both halves of this as source. UI slice ③ adds the
+/// one SwiftUI glass call of the Settings window (`settingsSecondaryButtonStyle()`, at the end of
+/// this file); its tab bar is the system toolbar and its form body is content, so neither is
+/// branched.
 @MainActor
 enum GlassStyle {
     /// Banner tint (UI-1 spec §3: warning / error tinted, information untinted).
@@ -97,6 +101,19 @@ enum GlassStyle {
                 content.bottomAnchor.constraint(equalTo: material.bottomAnchor),
             ])
             return material
+        }
+    }
+}
+
+extension View {
+    /// UI slice ③: the Settings window's buttons (Export Diagnostics…, Reset All Pins… -- a plain
+    /// glass button, UI-1 spec §5.3): `.glass` on 26; the standard bordered button on 14–25.
+    @ViewBuilder
+    func settingsSecondaryButtonStyle() -> some View {
+        if #available(macOS 26, *) {
+            buttonStyle(.glass)
+        } else {
+            buttonStyle(.bordered)
         }
     }
 }

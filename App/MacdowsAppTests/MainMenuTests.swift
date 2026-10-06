@@ -88,7 +88,7 @@ struct MainMenuTests {
         #expect(Self.rows(appMenu) == [
             "About Macdows|orderFrontStandardAboutPanel:||0|nil-target",
             "---",
-            "Settings…|nil|,|\(command)|nil-target",
+            "Settings…|showSettings:|,|\(command)|nil-target",
             "---",
             "Services|submenu||0|own-submenu",
             "---",

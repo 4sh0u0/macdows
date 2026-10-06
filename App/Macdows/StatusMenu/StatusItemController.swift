@@ -13,7 +13,7 @@ import MacdowsCore
 ///     Disconnect                        the File menu's Disconnect item (adr/0022 D-11)
 ///     ---------------------------
 ///     Open Macdows                      activates the App
-///     Settings…                         no action yet, so AppKit keeps it disabled
+///     Settings…                         the main menu's Settings… (UI slice ③)
 ///     ---------------------------
 ///     Quit Macdows                      `terminate:`
 ///
@@ -125,6 +125,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         openItem.action = #selector(openMacdows(_:))
         openItem.target = self
         settingsItem.title = String(localized: "m_settings", defaultValue: "Settings…", comment: "Application menu: Settings item")
+        settingsItem.action = #selector(openSettings(_:))
+        settingsItem.target = self
         quitItem.title = String(localized: "m_quit", defaultValue: "Quit Macdows", comment: "Application menu: Quit item")
 
         menu.addItem(statusRow)
@@ -301,6 +303,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func openMacdows(_ sender: Any?) {
         NSApp.activate(ignoringOtherApps: true)
         onOpenMacdows?()
+    }
+
+    /// UI slice ③: Settings… activates the App (as Open Macdows does) and performs the main menu's
+    /// Settings… item, so both entries are one action with one target.
+    @objc private func openSettings(_ sender: Any?) {
+        NSApp.activate(ignoringOtherApps: true)
+        MainMenu.performSettings(in: NSApp.mainMenu, from: sender)
     }
 
     /// UI slice ①: Connect to ▸ <host>. Only while there is no session (one session at a time).

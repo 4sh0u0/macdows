@@ -89,9 +89,11 @@ struct HostActions: Sendable {
     }
 
     /// Reset All Pins, keychain half (ADR-0024 D-6, E-a: presets are kept). The caller then calls
-    /// `HostRecordStore.noteAllPinsReset()`.
-    nonisolated func resetAllPins(displayNames: [HostID: String]) throws -> [HostID] {
-        try pins.resetAllPins(displayName: { displayNames[$0] ?? "" })
+    /// `HostRecordStore.noteAllPinsReset(hosts:)` with the hosts this returns; a failure part-way
+    /// keeps the hosts already cleared (gate r1 m-3).
+    nonisolated func resetAllPins(displayNames: [HostID: String]) -> PinResetOutcome {
+        let outcome = pins.resetAllPinsKeepingProgress(displayName: { displayNames[$0] ?? "" })
+        return PinResetOutcome(cleared: outcome.cleared, failed: outcome.error != nil)
     }
 
     /// Gate r1 m-11: the record's Remember bit after an editor Save -- what the detail then shows
@@ -111,6 +113,12 @@ struct HostActions: Sendable {
     }
 }
 
+/// What Reset All Pins did: the hosts whose pin was cleared, and whether the walk stopped early.
+struct PinResetOutcome: Sendable, Equatable {
+    var cleared: [HostID]
+    var failed: Bool
+}
+
 /// The main-actor halves.
 @MainActor
 enum HostOperations {
@@ -126,11 +134,14 @@ enum HostOperations {
         }
     }
 
-    /// Reset All Pins: keychain off the main thread, then every record unpinned with a log row.
-    static func resetAllPins(actions: HostActions, store: HostRecordStore) async throws -> [HostID] {
+    /// Reset All Pins: keychain off the main thread, then the records unpinned with a log row. On
+    /// success every record is unpinned (a record whose item was already gone must not read as
+    /// pin lost); after a failure part-way only the hosts actually cleared are, so the records
+    /// still match the keychain.
+    static func resetAllPins(actions: HostActions, store: HostRecordStore) async -> PinResetOutcome {
         let names = Dictionary(uniqueKeysWithValues: store.records.map { ($0.id, $0.title) })
-        let cleared = try await KeychainQueue.runThrowing { try actions.resetAllPins(displayNames: names) }
-        store.noteAllPinsReset()
-        return cleared
+        let outcome = await KeychainQueue.run { actions.resetAllPins(displayNames: names) }
+        store.noteAllPinsReset(hosts: outcome.failed ? Set(outcome.cleared) : nil)
+        return outcome
     }
 }
