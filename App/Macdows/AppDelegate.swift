@@ -10,7 +10,32 @@ import MacdowsCore
 // nonisolated context" warning under Swift 6's mandatory strict concurrency checking.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-	private var window: NSWindow!
+	/// UI slice ① (UI-1 spec §1): the Hosts window, which replaced the scaffold window. It hosts the
+	/// session controls built below (title, status line, Connect, Disconnect) and owns host editing.
+	private var mainWindow: MainWindowController!
+	/// ADR-0024 D-9 (M-a): the host records -- the only source of WHICH host a Connect press dials.
+	private let hostStore = HostRecordStore(fileURL: HostRecordStore.defaultFileURL())
+	/// ADR-0024 D-1 / D-3: the keychain stores (file-based login keychain, S-b). Every call is made
+	/// off the main thread.
+	private let credentialStore: any CredentialStore = KeychainCredentialStore()
+	private let pinStore: any PinStore = KeychainPinStore()
+	/// The chain the current session belongs to (ADR-0024 D-2): its host, the trust context its
+	/// certificate callback judges by, and whether it has reached live.
+	private var chainHost: HostID?
+	private var chainContext: CertificateDecision.Context?
+	private var chainReachedLive = false
+	/// ADR-0024 D-2′: a certificate the callback rejected, waiting for the user's answer. Holds the
+	/// rejected chain's `CRSession` (and so its password) until Trust / Replace re-starts it or
+	/// Cancel drops it.
+	private var pendingReview: PendingCertificateReview?
+	/// True while a drain is running, so a session end seen from inside it is reviewed after it.
+	private var isDraining = false
+	/// True from a give-up until the chain's end is recorded: the reconnect driver can give up from
+	/// its retry clock, outside any drain, and that end is a lost connection, not a Disconnect press.
+	private var endingByGiveUp = false
+	/// UI-1 spec §4.3: "Enter Password…" on the sign-in banner asks for the password once even when
+	/// the keychain has one.
+	private var askPasswordOnNextPress = false
 	private var statusLabel: NSTextField!
 	private var connectButton: NSButton!
 	/// adr/0020 D-4 (K1): the scaffold's second button, which ends the current session. A button of
@@ -83,30 +108,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// FreeRDP dylibs — check Console.app / stderr for the logged version string.
 		CRSession.logFreeRDPVersion()
 
-		let contentRect = NSRect(x: 0, y: 0, width: 640, height: 400)
-		let newWindow = NSWindow(
-			contentRect: contentRect,
-			styleMask: [.titled, .closable, .miniaturizable, .resizable],
-			backing: .buffered,
-			defer: false
-		)
-		newWindow.title = "Macdows"
-		newWindow.center()
-
-		let label = NSTextField(labelWithString: "Macdows scaffold")
-		label.font = .systemFont(ofSize: 20, weight: .medium)
-		label.alignment = .center
+		// UI slice ① (UI-1 spec §1): the session controls -- the selected host's title, the status
+		// line, Connect and Disconnect -- are built here, as before, and handed to the Hosts window,
+		// which lays them out at the top of the host detail. The scaffold window is gone.
+		let label = NSTextField(labelWithString: "")
 		label.translatesAutoresizingMaskIntoConstraints = false
 
-		let status = NSTextField(labelWithString: "Not connected. Reads ~/.config/macdows/host.env.")
+		let status = NSTextField(labelWithString: "Not connected.")
 		status.font = .systemFont(ofSize: 13)
 		status.textColor = .secondaryLabelColor
-		status.alignment = .center
 		status.maximumNumberOfLines = 0 // now shows a second line (remote window count)
 		status.translatesAutoresizingMaskIntoConstraints = false
 		statusLabel = status
 
-		let button = NSButton(title: "Connect (manual, real host)", target: self, action: #selector(connectTapped))
+		let button = NSButton(title: "Connect", target: self, action: #selector(connectTapped))
 		button.translatesAutoresizingMaskIntoConstraints = false
 		connectButton = button
 
@@ -121,21 +136,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 		let stack = NSStackView(views: [label, status, button, endButton])
 		stack.orientation = .vertical
-		stack.spacing = 16
-		stack.alignment = .centerX
+		stack.spacing = 8
+		stack.alignment = .leading
 		stack.translatesAutoresizingMaskIntoConstraints = false
 
-		let contentView = NSView(frame: contentRect)
-		contentView.addSubview(stack)
-		NSLayoutConstraint.activate([
-			stack.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
-			stack.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
-		])
-		newWindow.contentView = contentView
-
-		window = newWindow
-		window.makeKeyAndOrderFront(nil)
+		mainWindow = MainWindowController(
+			store: hostStore, actions: HostActions(credentials: credentialStore, pins: pinStore)
+		)
+		mainWindow.installSessionControls(stack, title: label, status: status, connect: button, disconnect: endButton)
+		mainWindow.onHostsChanged = { [weak self] in
+			self?.statusItemController.refresh()
+		}
+		mainWindow.onSessionPresenceChange = { [weak self] present in
+			self?.sessionPresenceChanged(present)
+		}
+		mainWindow.showWindow(nil)
 		NSApp.activate(ignoringOtherApps: true)
+		// Gate r1 I-2 (UI slice ①): the Hosts window can be closed, and closing it only orders it
+		// out. View ▸ Show Hosts gets the controller as its explicit target (a closed window's
+		// controller is not in the responder chain), and the status item's Open Macdows shows it
+		// too; a Dock-icon reopen is `applicationShouldHandleReopen` below.
+		MainMenu.bindShowHosts(in: NSApp.mainMenu, to: mainWindow)
+		statusItemController.onOpenMacdows = { [weak self] in
+			self?.mainWindow.showHosts(nil)
+		}
+
+		// UI slice ① (ADR-0024 §3 adr/0023 row): the status item's Connect to lists the host
+		// records and presses Connect for the chosen one, through the Hosts window.
+		statusItemController.hostEntries = { [weak self] in
+			self?.hostStore.records.map { StatusItemController.HostEntry(id: $0.id, title: $0.title) } ?? []
+		}
+		statusItemController.onConnectTo = { [weak self] host in
+			self?.mainWindow.connect(to: host)
+		}
 
 		// adr/0022 D-6 (UI slice ②): the status item, once, at launch.
 		statusItemController.reading = { [weak self] in
@@ -197,9 +230,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			CRSession.keyWitnessEnabled = true
 		}
 		if autolaunch.autoconnect {
-			// `connectTapped()` itself, never a copy of any step inside it: the host.env read, the
-			// live-host boundary gate and the button/`isCheckingBoundary` interlock all have to run
-			// exactly as they do for a human press, and the only way to guarantee that is to make
+			// `connectTapped()` itself, never a copy of any step inside it: the selected record's
+			// preflight (the live-host boundary gate, the pin item, the keychain password) and the
+			// button/`isCheckingBoundary` interlock all have to run exactly as they do for a human press, and the only way to guarantee that is to make
 			// the press. `@objc private` is callable from inside this file, so no visibility changes.
 			connectTapped()
 		}
@@ -288,138 +321,147 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	}
 
 	@objc private func connectTapped() {
-		// `isCheckingBoundary` as well as `session`: the boundary check below is asynchronous,
-		// and during its window `session` is still nil, so this guard alone would let a second
-		// press start a second check. The button is disabled synchronously before the Task for
-		// the same reason (AppKit delivers actions serially on the main actor, so a disable that
-		// happens before this method returns cannot be raced).
+		// `isCheckingBoundary` as well as `session`: the preflight below is asynchronous, and during
+		// its window `session` is still nil, so this guard alone would let a second press start a
+		// second one. The button is disabled synchronously before the Task for the same reason
+		// (AppKit delivers actions serially on the main actor, so a disable that happens before this
+		// method returns cannot be raced).
 		guard session == nil, !isCheckingBoundary else {
 			statusLabel.stringValue = "Already connecting/connected."
 			return
 		}
+		// ADR-0024 D-9 (M-a): the host is the record selected in the Hosts window -- the one place a
+		// human can see which host this press dials -- and nothing else. No file and no environment
+		// variable names a host, an account or a password any more. With no selection (no records,
+		// or several and none chosen, which is also how M-a-1 keeps an unattended
+		// `MACDOWS_AUTOCONNECT` press from guessing) the press does nothing but say so, in one line
+		// that names no address.
+		guard let record = mainWindow.selectedRecord else {
+			ConnectChain.log.notice("[connect] refused: no host selected (host records: \(self.hostStore.records.count, privacy: .public))")
+			statusLabel.stringValue = "Select a host, then press Connect."
+			return
+		}
+		// A new press abandons a certificate question still open from the last chain: dropping the
+		// review drops that chain's session, which overwrites its password (ADR-0024 D-2).
+		pendingReview = nil
+		mainWindow.clearBanners()
+		let forcePassword = askPasswordOnNextPress
+		askPasswordOnNextPress = false
 
 		// Live-host testing boundary gate (owner rule, 2026-08-31), the in-process mirror of
-		// Scripts/lib.sh's crdp_assert_lab_boundary. Pressing Connect used to build a CRSession
-		// straight from host.env with nothing between the button and the socket -- the shell
-		// gate can only guard steps that go through a shell, and this one never did.
+		// Scripts/lib.sh's crdp_assert_lab_boundary. Unconditional, NOT #if DEBUG: a shipped Macdows
+		// obviously must connect to hosts that are not the maintainer's own lab, so the gate belongs
+		// to the harness, not to the product, and removing it is a deliberate act -- registered by
+		// ADR-0024 D-9 as a Phase 4 item, not done here. The refusal line names the host (the address
+		// of the record the human selected) and a reason category, never a boundary segment.
 		//
-		// Unconditional, NOT #if DEBUG. This app is a developer harness today, and gating only
-		// Debug builds would mean the one configuration a stray Release build runs in is the
-		// ungated one. When the product shell replaces this scaffold it will have to revisit
-		// this: a shipped Macdows obviously must connect to hosts that are not the maintainer's
-		// own lab, so the gate belongs to the harness, not to the product, and removing it is a
-		// deliberate act at that point rather than an omission now.
-		//
-		// The refusal line names the host (the operator typed it into host.env and is looking
-		// at the label) and a reason category. It can never contain a boundary segment -- see
-		// LabBoundary's doc comment, and the no-leak test that sweeps the whole refusal
-		// vocabulary.
-		//
-		// Off the main actor, because the gate can block: a WIN_HOST that is a *name* rather
-		// than a numeric literal sends LabBoundary into getaddrinfo, which is synchronous and
-		// can take seconds (much longer for a dead .local). Running that on the main actor
-		// would beachball the UI on the one press that is supposed to feel instant --
-		// CRSession.start explicitly "returns immediately" and connects on its own thread, so
-		// before this gate existed nothing on this path blocked at all, and it must stay that
-		// way. A literal host short-circuits inside LabBoundary without touching the resolver,
-		// so the maintainer's own host.env pays only a Task hop.
-		//
-		// Task.detached rather than a plain `nonisolated async` helper: whether a nonisolated
-		// async function actually leaves the caller's actor is exactly what the
-		// NonisolatedNonsendingByDefault upcoming feature changes, and this has to be off the
-		// main actor under every language mode and feature set. The enclosing `Task {}` inherits
-		// MainActor isolation, so everything after the await is back on the main actor and may
-		// touch AppKit directly.
-		//
-		// adr/0020 D-8 (#6): the host.env read and its three-key check run in that same detached
-		// task, ahead of the gate, instead of on the main actor before it. The file is local and
-		// small, but a HOME on a network mount can stall a read, and a stalled read on the main
-		// actor is the beachball the paragraph above rules out. The price is that the two host.env
-		// failures now arrive after the button has been disabled, so each of them -- like the
-		// gate's refusal -- has to hand the button back: `isCheckingBoundary` is reset once, before
-		// the verdict is read, whatever it is, and every failure arm re-enables Connect with a
-		// literal `true`. Without that, one bad host.env would lock Connect for the life of the
-		// process. The two failure lines are unchanged; the "Checking" line now also covers the
-		// read, which is part of the same check.
+		// Off the main actor, in ONE `KeychainQueue.run` body, for the reasons adr/0020 D-8 gave for
+		// the host.env read this replaced: the gate can block (a host NAME goes through getaddrinfo),
+		// and so can the keychain -- the file-based keychain shows an authorisation prompt and blocks
+		// the calling thread until it is answered (ADR-0024 probe K). On that serial queue a blocked
+		// call holds the queue's own thread, never one of the cooperative pool's (gate r1 m-5). `ConnectFlow.preflight` runs
+		// the gate first (nothing is read from the keychain for an address that may not be dialled),
+		// then the pin item (a pin that cannot be read stops before the password is touched, D-3′),
+		// then the password -- once per press, which is the chain's one credential read (D-2).
+		// `isCheckingBoundary` is reset once, before the result is read, whatever it is, and every
+		// arm that does not start a session hands the button back with a literal `true`.
 		isCheckingBoundary = true
 		connectButton.isEnabled = false
 		statusLabel.stringValue = "Checking the live-host boundary..."
+		mainWindow.activeHostID = record.id
+		applyHostsWindow(state: nil, host: record.id)
+		let credentials = credentialStore
+		let pins = pinStore
+		let host = record.id
+		let address = record.address
+		let recordSaysPinned = record.pinned
+		let readsKeychain = record.remembersPassword && !forcePassword
 		Task { [weak self] in
-			let preflight = await Task.detached(priority: .userInitiated) { () -> ConnectPreflight in
-				// MacdowsCore.EnvFile, not the inline loop this method used to carry. That loop keyed
-				// each line on everything left of the first `=`, so the ordinary line
-				// `export WIN_HOST=x` was filed under the key "export WIN_HOST" and was invisible to
-				// the lookup right below it -- and it stripped no quotes, so `WIN_HOST="x"` dialled a
-				// host whose name included the quote characters. Both defects were duplicated verbatim
-				// in Tools/window-smoke, and both disagreed with the rules
-				// Scripts/run-window-smoke.command applies to the same file; EnvFile's own doc comment
-				// records how that disagreement was measured fail-open. One parser now, in the package
-				// whose tests run in every replay-gate pass (the app-side bundle, MacdowsAppTests,
-				// arrived later -- D7, 2026-09-02 -- and does not change where a parser belongs).
-				//
-				// MacdowsPaths.hostEnvPath() rather than a local `NSHomeDirectory()` concatenation, for
-				// the same reason: LabBoundary locates its own boundary file through $HOME, so the two
-				// halves of the gate a few lines below -- the host, and the segments it is judged
-				// against -- used to be able to come out of two different homes when HOME is redirected.
-				// One resolver now decides both (see MacdowsPaths for the reconciled order and why).
-				// In the default environment the path is byte-identical to the one this line built
-				// before, so nothing about a normal launch changes.
-				//
-				// This method deliberately does NOT take the WIN_HOST/WIN_USER/WIN_PASS environment
-				// variables into account, unlike the two command-line harnesses (which get them from
-				// Scripts/run-window-smoke.command, the whole point of the precedence there). This is a
-				// GUI app: it is launched by Finder, by Xcode's Run button or by `open`, none of which
-				// is a place a maintainer sets a variable on purpose, and honouring one would add a way
-				// to change which host a button press dials that is invisible in the window the human
-				// is looking at. host.env is the app's single source, the status label says so, and
-				// EnvFile.value(forKey:in:environment:) is deliberately not called here.
-				let values: [String: String]
-				do {
-					values = try EnvFile.parse(path: MacdowsPaths.hostEnvPath())
-				} catch {
-					return .unreadable
-				}
-				guard let host = values["WIN_HOST"], let user = values["WIN_USER"], let pass = values["WIN_PASS"],
-					!host.isEmpty, !user.isEmpty, !pass.isEmpty
-				else {
-					return .missingKeys
-				}
-				return .checked(host: host, user: user, password: pass, verdict: LabBoundary.check(host: host))
-			}.value
+			let preflight = await KeychainQueue.run { () -> ConnectFlow.Preflight in
+				ConnectFlow.preflight(
+					host: host, address: address, recordSaysPinned: recordSaysPinned, remembersPassword: readsKeychain,
+					credentials: credentials, pins: pins, boundary: { LabBoundary.check(host: $0) }
+				)
+			}
 			guard let self else { return }
 			self.isCheckingBoundary = false
 			switch preflight {
-			case .unreadable:
-				self.statusLabel.stringValue = "Could not read ~/.config/macdows/host.env"
+			case .refusedByBoundary(let refusal):
+				self.statusLabel.stringValue = LabBoundary.refusalLine(host: address, refusal: refusal)
 				self.connectButton.isEnabled = true
-			case .missingKeys:
-				self.statusLabel.stringValue = "host.env missing WIN_HOST/WIN_USER/WIN_PASS"
+				self.chainEnded()
+			case .pinUnavailable(let status):
+				self.showPinUnavailable(record, status: status)
 				self.connectButton.isEnabled = true
-			case .checked(let host, let user, let pass, .allowed):
-				self.beginSession(host: host, user: user, password: pass)
-			case .checked(let host, _, _, .refused(let refusal)):
-				self.statusLabel.stringValue = LabBoundary.refusalLine(host: host, refusal: refusal)
-				self.connectButton.isEnabled = true
+				self.chainEnded()
+			case .ready(let context, let secret?, _):
+				self.beginChain(record, context: context, secret: secret)
+			case .ready(let context, nil, let keychainStatus):
+				if let keychainStatus {
+					ConnectChain.log.notice("[connect] keychain read failed status=\(keychainStatus, privacy: .public); asking for the password")
+				}
+				self.askForPassword(record, context: context)
 			}
 		}
 	}
 
-	/// adr/0020 D-8 (#6): everything the off-main half of a Connect press can come back with --
-	/// host.env unreadable, host.env without all three keys, or the three values together with
-	/// the live-host gate's verdict on the host. One value, so the main-actor half reads the
-	/// whole outcome in one `switch` and cannot act on credentials without the verdict that goes
-	/// with them.
-	private enum ConnectPreflight: Sendable {
-		case unreadable
-		case missingKeys
-		case checked(host: String, user: String, password: String, verdict: LabBoundary.Verdict)
+	/// ADR-0024 D-1: the password was not saved, the keychain did not hand it over, or the user
+	/// asked to type it again -- the Password sheet asks, and nothing else is tried.
+	private func askForPassword(_ record: HostRecord, context: CertificateDecision.Context) {
+		mainWindow.presentPasswordSheet(for: record) { [weak self] result in
+			guard let self else { return }
+			guard let result else {
+				self.statusLabel.stringValue = "Not connected."
+				self.connectButton.isEnabled = true
+				self.chainEnded()
+				return
+			}
+			guard result.remember else {
+				self.beginChain(record, context: context, secret: result.secret)
+				return
+			}
+			let credentials = self.credentialStore
+			Task { [weak self] in
+				let saved = await ConnectChain.savePassword(result.secret, for: record.id, displayName: record.title, credentials: credentials)
+				guard let self else { return }
+				// Gate r1 m-11: the record says "Saved in Keychain" only when the save succeeded;
+				// otherwise it keeps its bit and the detail keeps saying "Asked for on each connection".
+				var current = record
+				if saved {
+					current.remembersPassword = true
+					self.hostStore.upsert(current)
+				} else {
+					ConnectChain.log.notice("[connect] the password could not be saved; it is asked for again next time")
+				}
+				self.beginChain(current, context: context, secret: result.secret)
+			}
+		}
+	}
+
+	/// The start of a chain (ADR-0024 D-2): its `CRSession` copies the password bytes, which are then
+	/// overwritten here; every later `-start` of the chain -- reconnects, and the re-start after a
+	/// certificate confirmation -- reuses that session and never reads the keychain again.
+	private func beginChain(_ record: HostRecord, context: CertificateDecision.Context, secret: SessionSecret) {
+		let chainSession = secret.withUnsafeData { bytes in
+			CRSession(host: record.address, user: record.userName, passwordBytes: bytes, program: "C:\\Windows\\System32\\winver.exe")
+		}
+		secret.wipe()
+		chainSession.port = record.port
+		chainReachedLive = false
+		beginSession(chainSession, record: record, context: context)
 	}
 
 	/// Everything `connectTapped` used to do inline once the credentials were in hand. Split out
-	/// only so the boundary gate above can be awaited without nesting the whole method inside a
-	/// closure; the body is unchanged, and it is only ever reached on an `.allowed` verdict.
-	private func beginSession(host: String, user: String, password pass: String) {
-		let newSession = CRSession(host: host, user: user, passwordBytes: Data(pass.utf8), program: "C:\\Windows\\System32\\winver.exe")
+	/// only so the preflight above can be awaited without nesting the whole method inside a
+	/// closure. Reached with a new chain's session, or -- after Trust / Replace (ADR-0024 D-2′) --
+	/// with the SAME session the certificate callback rejected, and the context the sheet produced.
+	private func beginSession(_ newSession: CRSession, record: HostRecord, context: CertificateDecision.Context) {
+		// ADR-0024 D-4 (Y-b): the trust snapshot the certificate callback reads on T_rdp -- the one
+		// fingerprint this connection may accept, or none (first use, pin lost).
+		newSession.acceptedCertificateFingerprint = ConnectFlow.trustSnapshot(for: context)
+		chainHost = record.id
+		chainContext = context
+		mainWindow.activeHostID = record.id
 		// Size the remote desktop to the UNION of the local screens, in remote pixels -- adr/0015
 		// §3 rule 3's `desktopSizePx`, the only value allowed to reach desktopWidth/Height.
 		// Without a desktop size at all the server clamps remote windows to FreeRDP's 1024x768
@@ -474,7 +516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// is exactly the divergence §5.A.4 forbids. Without any provider the registry cannot learn
 		// about screens at all (its NSScreen read was removed in M1) and would decline to position
 		// any window, warning once -- loud, but still broken.
-		statusItemHost = host
+		statusItemHost = record.title
 		let newRegistry = RemoteWindowRegistry(
 			session: newSession,
 			topologyProvider: StaticDisplayTopologyProvider(displayTopology.sessionSnapshot)
@@ -522,7 +564,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// instead of waiting out whatever fraction of the poll interval remained.
 		newSession.onEventsAvailable = { [weak self] in
 			MainActor.assumeIsolated {
-				self?.drainTick()
+				self?.drainThenReview()
 			}
 		}
 		newSession.start()
@@ -537,7 +579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// assumeIsolated reasoning (below) still applies unchanged.
 		drainTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
 			MainActor.assumeIsolated {
-				self?.drainTick()
+				self?.drainThenReview()
 			}
 		}
 	}
@@ -629,6 +671,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			eventCount = 0
 		}
 		applyShell(for: state)
+		// UI slice ①: the Hosts window's marker, subtitle and status bar follow the same state, and
+		// the chain's first live state is recorded (and a matching preset pinned, ADR-0024 D-5).
+		applyHostsWindow(state: state, host: chainHost)
+		if case .live = state {
+			noteChainLive()
+		}
+		if case .gaveUp = state {
+			endingByGiveUp = true
+		}
 		// adr/0022 D-6 / adr/0023 D-4: the status item's rows and Remote tray section follow the
 		// driver's state, including while its menu is open.
 		statusItemController.refresh()
@@ -774,12 +825,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// after the shutdown and before the references are dropped, like every other caller's.
 	/// On the common exit path (a quit ceiling or an explicit `NSApp.terminate`) closing the last
 	/// windows here never makes AppKit ask `applicationShouldTerminateAfterLastWindowClosed` at
-	/// all -- that ask never fires during termination on that path. On the other shape, where
-	/// closing the last RAIL window outside this function is itself what starts termination, the
-	/// ask happens exactly once, as the trigger, before this function ever runs; closing the
-	/// remaining (already-hidden) window from inside here does not provoke a second ask. Either
-	/// way this step does not re-enter `terminate:` (adr/0020 D-3's offline exit probe, run for
-	/// lane S, and gate r1's G6 arm, which drove termination from that very check).
+	/// all -- that ask never fires during termination on that path. Since UI slice ① that ask
+	/// answers false (the status item keeps the App reachable, gate r1 I-2), so closing the last
+	/// RAIL window no longer starts termination at all; before it, where that close was the
+	/// trigger, the ask happened exactly once, before this function ever ran. Either way this step
+	/// does not re-enter `terminate:` (adr/0020 D-3's offline exit probe, run for lane S, and gate
+	/// r1's G6 arm, which drove termination from that very check).
 	private func tearDownSession() {
 		drainTimer?.invalidate()
 		drainTimer = nil
@@ -799,8 +850,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// what keeps `ShellReconnectPresenter`'s offline tests worth anything: this app contributes
 	/// the binding and nothing else. The button's five literal `isEnabled = true` sites -- the
 	/// boundary refusal and the connect-error branch, which predate the driver, the End-session
-	/// action (adr/0020 D-5) and the two host.env failures that moved behind the button's disable
-	/// (adr/0020 D-8) -- keep their literal: none of them is a reconnect state.
+	/// action (adr/0020 D-5), the unreadable pin item (ADR-0024 D-3′) and the Password sheet's
+	/// Cancel (ADR-0024 D-1) -- keep their literal: none of them is a reconnect state.
 	private func applyShell(for state: ReconnectDriver.State) {
 		let shell = ShellReconnectPresenter.shell(
 			for: state,
@@ -824,8 +875,235 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		)
 	}
 
+	// MARK: - UI slice ①: the chain around the session (ADR-0024 D-2 / D-2′ / D-3′ / D-5)
+
+	/// The push hook's and the backstop timer's body: the drain, then -- if that drain ended the
+	/// session -- the review of how it ended. `ended` is a strong local, so the session the drain
+	/// tore down (the connect-error branch and the give-up branch both drop `session`) stays alive
+	/// for the review: a certificate rejection keeps it, and its password, for the sheet
+	/// (D-2′); every other end lets it go when this returns, which overwrites the password (D-2).
+	private func drainThenReview() {
+		let ended = session
+		isDraining = true
+		drainTick()
+		isDraining = false
+		if let ended, session == nil {
+			reviewSessionEnd(of: ended)
+		}
+	}
+
+	/// A session ended inside a drain: a certificate rejection opens the certificate question;
+	/// a first connect that failed otherwise gets its failure banner (UI-1 spec §4.3).
+	private func reviewSessionEnd(of ended: CRSession) {
+		guard let host = chainHost, let record = hostStore.record(host) else {
+			chainEnded()
+			return
+		}
+		if let rejection = ended.lastCertificateRejection, let context = chainContext {
+			let presented = rejection.sha256Fingerprint.flatMap(CertificateFingerprint.init(canonical:))
+			let verdict = CertificateDecision.verdict(for: context, presented: presented, unsupportedRoute: rejection.unsupportedRoute)
+			presentCertificateQuestion(record, verdict: verdict, session: ended, rejection: rejection)
+			return
+		}
+		if !chainReachedLive, let error = ended.lastConnectError {
+			hostStore.note(.connectFailed, for: host)
+			showConnectFailure(record, kind: ConnectFlow.failureKind(errorCode: (error as NSError).code, certificateRejected: false))
+		} else if chainReachedLive {
+			hostStore.note(.connectionLost, for: host)
+		}
+		chainEnded()
+	}
+
+	/// The Disconnect button turned on or off -- `session`'s didSet is its one writer, so this is a
+	/// session beginning or ending, by any path. An end outside a drain is the End-session press or
+	/// termination; one inside a drain is reviewed after it (`drainThenReview`).
+	private func sessionPresenceChanged(_ present: Bool) {
+		guard !present, !isDraining else { return }
+		if let host = chainHost, chainReachedLive {
+			hostStore.note(endingByGiveUp ? .connectionLost : .disconnectedByUser, for: host)
+		}
+		chainEnded()
+	}
+
+	/// The chain is over (or never began): forget it and put the Hosts window back to "no session".
+	/// A pending certificate question keeps its own session; it is not touched here.
+	private func chainEnded() {
+		let host = chainHost
+		chainHost = nil
+		chainContext = nil
+		chainReachedLive = false
+		endingByGiveUp = false
+		if pendingReview == nil {
+			mainWindow.activeHostID = nil
+		}
+		if let host, mainWindow.bannerIDs.isEmpty {
+			applyHostsWindow(state: nil, host: host, ended: true)
+		}
+	}
+
+	/// The first live state of a chain: a recent-connections row, and -- when the certificate
+	/// matched an unpinned host's preset -- that preset written as the pin (ADR-0024 D-5).
+	private func noteChainLive() {
+		guard !chainReachedLive, let host = chainHost, let record = hostStore.record(host) else { return }
+		chainReachedLive = true
+		hostStore.note(.connected, for: host)
+		guard case .preset(let expected)? = chainContext else { return }
+		chainContext = .pinned(expected)
+		let pins = pinStore
+		Task { [weak self] in
+			guard await ConnectChain.writePresetPin(expected, for: host, displayName: record.title, pins: pins) else {
+				ConnectChain.log.notice("[connect] preset matched but the pin could not be written; the preset is compared again next time")
+				return
+			}
+			self?.hostStore.setPinned(true, for: host)
+			self?.hostStore.note(.certificatePinnedFromPreset, for: host)
+		}
+	}
+
+	/// UI-1 spec §4.1: the Hosts window's marker, subtitle and status bar for the current state.
+	private func applyHostsWindow(state: ReconnectDriver.State?, host: HostID?, ended: Bool = false) {
+		let title = host.flatMap(hostStore.record)?.title ?? ""
+		let presentation = ConnectChain.presentation(hasSession: !ended, state: state, hostTitle: title)
+		mainWindow.setShell(subtitle: presentation.subtitle, statusBar: presentation.statusBar, marker: presentation.marker, for: host)
+	}
+
+	/// ADR-0024 D-3′: the pin item could not be read -- no connection, no first-use sheet, no retry.
+	private func showPinUnavailable(_ record: HostRecord, status: Int32) {
+		ConnectChain.log.notice("[connect] pin item unreadable status=\(status, privacy: .public); not connecting")
+		statusLabel.stringValue = "Not connected."
+		mainWindow.showBanner(.init(
+			id: "pin-unavailable", title: UIStrings.pinUnavailableTitle(record.title), body: UIStrings.pinUnavailableBody,
+			tone: .error, actions: [.init(title: UIStrings.dismiss) { [weak self] in self?.mainWindow.removeBanner(id: "pin-unavailable") }]
+		))
+		mainWindow.setShell(subtitle: nil, statusBar: UIStrings.connectionFailed, marker: .failed, for: record.id)
+	}
+
+	/// UI-1 spec §4.3: the three first-connect failure banners.
+	private func showConnectFailure(_ record: HostRecord, kind: ConnectFlow.FailureKind) {
+		let model: BannerView.Model
+		let bar: String
+		switch kind {
+		case .unreachable:
+			bar = UIStrings.barUnreachable
+			model = .init(id: "connect-failed", title: UIStrings.unreachableTitle(record.title),
+						  body: UIStrings.unreachableBody(address: record.address, port: Int(record.port)), tone: .error,
+						  actions: [.init(title: UIStrings.editHostAction) { [weak self] in
+							  self?.mainWindow.select(record.id)
+							  self?.mainWindow.editHost(nil)
+						  }])
+		case .signIn:
+			bar = UIStrings.barSignIn
+			model = .init(id: "connect-failed", title: UIStrings.signInTitle(record.title), body: UIStrings.signInBody, tone: .error,
+						  actions: [.init(title: UIStrings.enterPassword) { [weak self] in
+							  self?.askPasswordOnNextPress = true
+							  self?.mainWindow.connect(to: record.id)
+						  }])
+		case .certificate, .other:
+			mainWindow.setShell(subtitle: nil, statusBar: UIStrings.connectionFailed, marker: .failed, for: record.id)
+			return
+		}
+		mainWindow.showBanner(model)
+		mainWindow.setShell(subtitle: nil, statusBar: bar, marker: .failed, for: record.id)
+	}
+
+	/// ADR-0024 D-5: a rejected certificate. First use and a change open their sheet (a change on a
+	/// reconnect leg first shows the banner with Review Certificate…); a redirect / gateway route or
+	/// an unreadable certificate gets the banner only. The rejected session is kept in
+	/// `pendingReview` only while a sheet can still confirm it.
+	private func presentCertificateQuestion(_ record: HostRecord, verdict: CertificateDecision.Verdict,
+											session ended: CRSession, rejection: CRCertificateRejection) {
+		statusLabel.stringValue = "Not connected."
+		mainWindow.setShell(subtitle: nil, statusBar: UIStrings.barCertificate, marker: .failed, for: record.id)
+		let wasLive = chainReachedLive
+		chainHost = nil
+		chainContext = nil
+		chainReachedLive = false
+		// Gate r1 m-13: this chain ends here, so a give-up flag it raised must not be read as the
+		// end of the next one (it would log that user's Disconnect as "Connection lost").
+		endingByGiveUp = false
+		let variant: CertificateSheet.Variant
+		switch verdict {
+		case .firstUse(let presented):
+			variant = .firstUse(presented: presented, subject: rejection.subject, issuer: rejection.issuer)
+		case .changed(let old, let oldSource, let presented):
+			variant = .changed(old: old, oldSource: oldSource, presented: presented, subject: rejection.subject, issuer: rejection.issuer)
+		case .unsupportedRoute, .unreadableCertificate, .accept:
+			let body = verdict == .unsupportedRoute ? UIStrings.unsupportedRouteBody : UIStrings.certificateRejectedBody
+			mainWindow.showBanner(.init(id: "certificate", title: UIStrings.certificateRejectedTitle(record.title), body: body, tone: .error,
+										actions: [.init(title: UIStrings.dismiss) { [weak self] in self?.mainWindow.removeBanner(id: "certificate") }]))
+			mainWindow.activeHostID = nil
+			return
+		}
+		let review = PendingCertificateReview(session: ended, host: record.id, verdict: verdict,
+											  subject: rejection.subject, issuer: rejection.issuer)
+		pendingReview = review
+		let openSheet: () -> Void = { [weak self] in
+			self?.mainWindow.presentCertificateSheet(variant, for: record) { confirmed in
+				self?.answerCertificateQuestion(review, record: record, confirmed: confirmed)
+			}
+		}
+		if case .changed = verdict {
+			mainWindow.showBanner(.init(id: "certificate", title: UIStrings.certificateRejectedTitle(record.title),
+										body: UIStrings.certificateRejectedBody, tone: .error,
+										actions: [.init(title: UIStrings.reviewCertificate, handler: openSheet)]))
+		}
+		if !wasLive {
+			openSheet()
+		}
+	}
+
+	/// The sheet's answer. Cancel ends the chain (its session -- and password -- go with the
+	/// review). Trust / Replace write the pin and re-start the SAME session with the new trust
+	/// context: no second credential read, no Password sheet (ADR-0024 D-2′).
+	private func answerCertificateQuestion(_ review: PendingCertificateReview, record: HostRecord, confirmed: Bool) {
+		guard let pending = pendingReview, pending.session === review.session else { return }
+		guard confirmed else {
+			pendingReview = nil
+			mainWindow.activeHostID = nil
+			return
+		}
+		let pins = pinStore
+		Task { [weak self] in
+			let result = await ConnectChain.confirm(review, displayName: record.title, pins: pins)
+			guard let self, let pending = self.pendingReview, pending.session === review.session else { return }
+			self.pendingReview = nil
+			switch result {
+			case .success(let (context, confirmation)):
+				self.hostStore.setPinned(true, for: record.id)
+				switch confirmation {
+				case .trusted:
+					self.hostStore.note(.certificateTrusted, for: record.id)
+				case .replaced(let old, let new):
+					self.hostStore.note(.certificatePinReplaced, detail: "\(old?.shortDisplay ?? "—") → \(new.shortDisplay)", for: record.id)
+				}
+				self.mainWindow.removeBanner(id: "certificate")
+				guard self.session == nil, !self.isCheckingBoundary, let current = self.hostStore.record(record.id) else {
+					self.mainWindow.activeHostID = nil
+					return
+				}
+				self.chainReachedLive = false
+				self.beginSession(review.session, record: current, context: context)
+			case .failure:
+				ConnectChain.log.notice("[connect] the pin could not be written; not connecting")
+				self.mainWindow.activeHostID = nil
+			}
+		}
+	}
+
+	/// Gate r1 I-2 (UI slice ①): the App stays running when its last window closes -- the status
+	/// item is always there (adr/0022 D-6), the Hosts window comes back through View ▸ Show Hosts,
+	/// Open Macdows or a Dock-icon reopen, and a session that ends while the Hosts window is closed
+	/// no longer takes the App down with its last remote window.
 	func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-		true
+		false
+	}
+
+	/// A Dock-icon click (or `open`) with no window on screen brings the Hosts window back.
+	func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+		if !flag {
+			mainWindow.showHosts(nil)
+		}
+		return true
 	}
 
 	func applicationWillTerminate(_ notification: Notification) {

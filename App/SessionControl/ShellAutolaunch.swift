@@ -21,8 +21,13 @@ import os
 // button or by `open`, and honouring those variables would add a way to change WHICH HOST A BUTTON
 // PRESS DIALS that is invisible in the window the human is looking at. That reasoning is about the
 // TARGET of a connection, and it is untouched here -- none of the six knobs below introduces
-// any host, account or credential source, and `host.env` remains the app's single source for all
-// three.
+// any host, account or credential source. Since UI slice ① (ADR-0024 D-9, M-a) the App reads no
+// `host.env` at all: the host is the record selected in the Hosts window, the account is that
+// record's user name and the password comes from the keychain or the Password sheet. Until the
+// lab target-knob lane lands (ADR-0024 D-9 F-4), a host is pre-selected at launch ONLY when exactly
+// one host record exists (M-a-1), so `MACDOWS_AUTOCONNECT`'s press dials that one record and, with
+// zero or several records, finds no selection and refuses with one `[connect]` line that names no
+// address. The knob still only presses the button that is already there.
 //
 // These knobs decide only whether somebody has to be present to press a button that is already
 // there -- Connect (twice over: once via `MACDOWS_AUTOCONNECT`, a second time via
@@ -86,7 +91,7 @@ import os
 // present to press a button. It still does not touch what `connectTapped`'s refusal is about.
 // It names no host and no account, carries no credential, and cannot change WHICH HOST is dialled
 // or WITH WHAT IDENTITY -- the connection it rides on is the one the autoconnect press made, through
-// `host.env` and the live-host boundary gate, exactly as before. It is OFF by default (both
+// the selected host record (ADR-0024 D-9) and the live-host boundary gate. It is OFF by default (both
 // variables have to be set, and `plan(environment:)` drops the pair unless `MACDOWS_AUTOCONNECT=1`
 // and a `MACDOWS_QUIT_AFTER_SECONDS` ceiling are set too, i.e. only in the unattended shape an
 // orchestrator exports deliberately). The program string comes from the environment only and never

@@ -125,6 +125,12 @@ private final class FakeSession: CRSession {
 
     override var lastConnectError: (any Error)? { stubConnectError }
 
+    /// What `-lastCertificateRejection` answers (ADR-0024 D-5 step 0). The real one is published by
+    /// the certificate callback inside the TLS handshake and cleared at the top of every `-start`.
+    var stubCertificateRejection: CRCertificateRejection?
+
+    override var lastCertificateRejection: CRCertificateRejection? { stubCertificateRejection }
+
     override func start() {
         startCount += 1
         calls.append("start")
@@ -663,5 +669,66 @@ struct ReconnectDriverLogLineTests {
         }
         #expect(printed == [1_000, 2_000, 4_000, 8_000])
         #expect(ReconnectDriver.milliseconds(ReconnectPolicy.maxDelay) == 16_000)
+    }
+}
+
+// MARK: - ADR-0024 D-5 (R-a) / D-10 ⑥: step 0, the certificate rejection
+
+/// A real rejection record, made by the bridge's own verdict function (its initializer is private
+/// to the bridge): an unparsable certificate, with or without a route flag.
+@MainActor
+private func rejection(route: Bool) throws -> CRCertificateRejection {
+    var record: CRCertificateRejection?
+    _ = CRSession.certificateVerdict(forPEM: Data("not a certificate".utf8), flags: route ? 0x10 : 0,
+                                     acceptedFingerprint: nil, rejection: &record)
+    return try #require(record)
+}
+
+@MainActor
+@Suite("ReconnectDriver: step 0 -- a certificate rejection gives up without a retry (ADR-0024 D-5)")
+struct ReconnectDriverCertificateTests {
+
+    /// The mutant this exists for: step 0 moved after step 1. A rejection always comes with a TLS
+    /// `lastConnectError` too, so with the order swapped the cause reads `refusedByBridge` and the
+    /// App never offers the changed-certificate sheet.
+    @Test("a rejection outranks the connect error that comes with it, and schedules nothing")
+    func stepZeroBeforeStepOne() throws {
+        let fixture = try Fixture.make()
+        fixture.session.stubCertificateRejection = try rejection(route: false)
+        fixture.session.stubConnectError = NSError(domain: "Macdows.CRSession", code: 0x0002_0008)
+
+        fixture.disconnect()
+
+        #expect(fixture.driver.state == .gaveUp(.certificateRejected(unsupportedRoute: false)))
+        #expect(fixture.clock.requested.isEmpty)
+        #expect(fixture.clock.pendingCount == 0)
+        #expect(fixture.session.restartCount == 0)
+    }
+
+    @Test("a redirect / gateway route is its own flavour of the cause")
+    func routeFlavour() throws {
+        let fixture = try Fixture.make()
+        fixture.session.stubCertificateRejection = try rejection(route: true)
+        fixture.disconnect()
+        #expect(fixture.driver.state == .gaveUp(.certificateRejected(unsupportedRoute: true)))
+    }
+
+    @Test("the restart-failed branch checks step 0 first as well")
+    func restartBranch() throws {
+        let fixture = try Fixture.make()
+        fixture.disconnect()
+        fixture.session.restartResult = false
+        fixture.session.stubCertificateRejection = try rejection(route: false)
+        fixture.session.stubConnectError = NSError(domain: "Macdows.CRSession", code: -2)
+        fixture.clock.fireNext()
+        #expect(fixture.driver.state == .gaveUp(.certificateRejected(unsupportedRoute: false)))
+    }
+
+    @Test("the frozen [reconnect] line carries the new cause as one token")
+    func token() {
+        #expect(ReconnectDriver.token(for: .certificateRejected(unsupportedRoute: false)) == "certificate-rejected")
+        #expect(ReconnectDriver.token(for: .certificateRejected(unsupportedRoute: true)) == "certificate-rejected:route")
+        #expect(ReconnectDriver.logLine(for: .gaveUp(.certificateRejected(unsupportedRoute: false)), failedAttempts: 0)
+                == "[reconnect] attempt=0 delay-ms= state=gaveup cause=certificate-rejected")
     }
 }

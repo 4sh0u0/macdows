@@ -18,8 +18,11 @@ import os
 /// There is no "connected" event to react to. `crdpq`'s event enum has no such member, and
 /// `CRDPQ_EVENT_DISCONNECTED` carries no payload and no reason at all — the same sentinel is
 /// posted for a server-side drop, for a connect that never completed, and for a shutdown this
-/// side asked for. So the driver reads three signals and never guesses:
+/// side asked for. So the driver reads four signals, in this order, and never guesses:
 ///
+///  0. `CRSession.lastCertificateRejection` (ADR-0024 D-5, R-a) — the bridge's certificate callback
+///     rejected the certificate. It comes with a TLS `lastConnectError`, so it is read first; the
+///     cause is `.certificateRejected` and nothing is retried (the App asks the user instead).
 ///  1. `CRSession.lastConnectError` — non-nil means the bridge itself refused this connection
 ///     (DNS/TCP/TLS/NLA, or the RDPGFX decode-path refusal of ADR-0017 §4 A2). Retrying a refusal
 ///     on a back-off is how a client spends five minutes failing at something that failed for a
@@ -89,6 +92,13 @@ final class ReconnectDriver {
         /// Reported honestly rather than folded into `.policy(.attemptsExhausted)`, which would be
         /// a diagnostic that lies about what happened.
         case policyRefused(attemptIndex: Int)
+        /// ADR-0024 D-5 (R-a): the bridge's certificate callback rejected the certificate this
+        /// connection presented (`CRSession.lastCertificateRejection`). Never retried: the same
+        /// certificate would be rejected the same way, and a changed certificate is a question for
+        /// the user (the changed-certificate sheet), not for a back-off. Distinct from
+        /// `refusedByBridge`, whose TLS code a certificate rejection shares with every other TLS
+        /// failure. `unsupportedRoute` is the REDIRECT / GATEWAY case, which has no sheet.
+        case certificateRejected(unsupportedRoute: Bool)
     }
 
     // MARK: - Dependencies
@@ -211,9 +221,21 @@ final class ReconnectDriver {
         // ORDER IS THE CONTRACT here; each branch is a different question and they are not
         // interchangeable.
 
+        // 0. Did the bridge's certificate callback reject this connection (ADR-0024 D-5, R-a)?
+        //    Checked BEFORE step 1: a certificate rejection also sets `lastConnectError` (a TLS
+        //    failure, the same code as every other one), so step 1 would swallow it as an
+        //    ordinary refusal and the user would never be shown the changed-certificate sheet. The
+        //    callback publishes the rejection inside the TLS handshake, before the error and before
+        //    the sentinel, so it is visible whenever the error is.
+        if let rejection = session.lastCertificateRejection {
+            giveUp(.certificateRejected(unsupportedRoute: rejection.unsupportedRoute))
+            return
+        }
+
         // 1. Did the bridge refuse this connection? Then there is nothing to back off from: the
-        //    same attempt will be refused the same way. Checked FIRST because a refusal also
-        //    produces a disconnect sentinel (`crb_rdp_thread_main`'s epilogue publishes the error
+        //    same attempt will be refused the same way. Checked right after step 0 (which owns the
+        //    one refusal that needs a different answer) and before every later step, because a
+        //    refusal also produces a disconnect sentinel (`crb_rdp_thread_main`'s epilogue publishes the error
         //    just before posting it), so any later branch would swallow it.
         if let error = session.lastConnectError {
             giveUp(.refusedByBridge(code: (error as NSError).code))
@@ -321,6 +343,12 @@ final class ReconnectDriver {
         // failure could have set again by now) is what distinguishes them. An unclean shutdown
         // with a started thread is NOT a failure to react to: the connection is in progress, and
         // tearing it down again to retry would be the driver fighting itself.
+        // ADR-0024 D-5: step 0 here too, ahead of the refusal, for the same reason as in
+        // `noteDisconnect`.
+        if !restarted, let rejection = session.lastCertificateRejection {
+            giveUp(.certificateRejected(unsupportedRoute: rejection.unsupportedRoute))
+            return
+        }
         if !restarted, let error = session.lastConnectError {
             giveUp(.refusedByBridge(code: (error as NSError).code))
             return
@@ -444,6 +472,8 @@ final class ReconnectDriver {
             return "refused-by-bridge:\(code)"
         case .policyRefused(let index):
             return "policy-refused-index:\(index)"
+        case .certificateRejected(let unsupportedRoute):
+            return unsupportedRoute ? "certificate-rejected:route" : "certificate-rejected"
         }
     }
 }
