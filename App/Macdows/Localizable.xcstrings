@@ -1244,6 +1244,102 @@
         }
       }
     },
+    "d_gr_b" : {
+      "comment" : "Banner body after the host refused a reconnect; %@ is the host (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ refused the reconnect, so Macdows stopped without trying again. The Windows session should still be running on the host; Reconnect tries once more."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ が再接続を拒否したため、Macdows は再試行せずに停止しました。Windows のセッションはホスト上でまだ実行中のはずです。「再接続」でもう一度試します。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 拒绝了重连，因此 Macdows 未再重试就停止了。Windows 会话应仍在主机上运行；“重新连接”会再试一次。"
+          }
+        }
+      }
+    },
+    "d_gr_t" : {
+      "comment" : "Banner title after the host refused a reconnect (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The host refused the connection"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ホストが接続を拒否しました"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "主机拒绝了连接"
+          }
+        }
+      }
+    },
+    "d_gx_b" : {
+      "comment" : "Banner body after the reconnects ran out; %1$@ is the host, %2$lld the number of reconnects (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ didn’t answer %2$lld reconnect attempts. The Windows session should still be running on the host; Reconnect starts a new connection to it."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ は %2$lld 回の再接続に応答しませんでした。Windows のセッションはホスト上でまだ実行中のはずです。「再接続」で新しく接続します。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ 没有响应 %2$lld 次重连。Windows 会话应仍在主机上运行；“重新连接”会新建一个到它的连接。"
+          }
+        }
+      }
+    },
+    "d_gx_t" : {
+      "comment" : "Banner title after the reconnects ran out; %lld is the number of reconnects (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Couldn’t reconnect after %lld attempts"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld 回再接続できませんでした"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld 次重连均未成功"
+          }
+        }
+      }
+    },
     "d_match" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1332,6 +1428,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "目前，窗口会出现在主机放置的位置。"
+          }
+        }
+      }
+    },
+    "d_retry_b" : {
+      "comment" : "Connection-lost banner body while reconnecting (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote windows come back when the connection does. Your Windows session should still be running on the host."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "接続が戻るとリモートウインドウも戻ります。Windows のセッションはホスト上でまだ実行中のはずです。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "连接恢复后，远程窗口也会回来。你的 Windows 会话应仍在主机上运行。"
           }
         }
       }
@@ -1437,6 +1557,78 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "已连接 · %1$lld 个窗口 · 自 %2$@ 起 · 部分功能不可用"
+          }
+        }
+      }
+    },
+    "dg_u_b" : {
+      "comment" : "Input-method banner body; %@ is the host (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ didn’t accept Unicode input, so text from input methods (for example Chinese or Japanese) and the Character Viewer is not sent. Typing with your keyboard layout still works."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ が Unicode 入力を受け付けなかったため、入力メソッド（中国語や日本語など）と文字ビューアのテキストは送信されません。キーボード配列での入力は引き続き使えます。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 未接受 Unicode 输入，因此输入法（例如中文或日文）与字符检视器中的文本不会发送。按键盘布局直接键入仍然可用。"
+          }
+        }
+      }
+    },
+    "dg_u_t" : {
+      "comment" : "Input-method banner title (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Input method text can’t be sent to this host"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このホストには入力メソッドのテキストを送信できません"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法向此主机发送输入法文本"
+          }
+        }
+      }
+    },
+    "dg_u_x" : {
+      "comment" : "Input-method banner: accessibility name of its Dismiss button (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dismiss input method notice"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "入力メソッドの通知を閉じる"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭输入法提示"
           }
         }
       }
@@ -3180,6 +3372,30 @@
         }
       }
     },
+    "learn_more" : {
+      "comment" : "Input-method banner: opens Settings > Keyboard (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Learn More"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "詳しい情報"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "了解更多"
+          }
+        }
+      }
+    },
     "m_ack" : {
       "comment" : "Help menu: Acknowledgements item",
       "extractionState" : "manual",
@@ -4288,6 +4504,30 @@
         }
       }
     },
+    "reconnect" : {
+      "comment" : "Connection-lost banner, after giving up: start a new connection (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reconnect"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "再接続"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重新连接"
+          }
+        }
+      }
+    },
     "remove" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -4468,6 +4708,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "移除“%@”？"
+          }
+        }
+      }
+    },
+    "rw_h" : {
+      "comment" : "Main window: card title (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote windows"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "リモートウインドウ"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "远程窗口"
           }
         }
       }
@@ -5420,6 +5684,78 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "信任并固定"
+          }
+        }
+      }
+    },
+    "wn_gr" : {
+      "comment" : "Remote windows card after the host refused a reconnect (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No remote windows. The host refused the connection, so Macdows did not retry. Connect tries again once."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "リモートウインドウはありません。ホストが接続を拒否したため、Macdows は再試行していません。「接続」でもう一度試します。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "没有远程窗口。主机拒绝了连接，因此 Macdows 没有重试。“连接”会再试一次。"
+          }
+        }
+      }
+    },
+    "wn_gx" : {
+      "comment" : "Remote windows card after the reconnects ran out (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No remote windows. The Windows session should still be running on the host; Connect starts a new connection to it."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "リモートウインドウはありません。Windows のセッションはホスト上でまだ実行中のはずです。「接続」で新しく接続します。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "没有远程窗口。Windows 会话应仍在主机上运行；“连接”会新建一个到它的连接。"
+          }
+        }
+      }
+    },
+    "wn_retry" : {
+      "comment" : "Remote windows card while reconnecting (UI slice 4)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote windows close while the connection is down and reappear when the host sends them again after reconnecting."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "接続が切れている間はリモートウインドウが閉じ、再接続後にホストが再送すると再び表示されます。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "连接中断期间远程窗口会关闭；重新连接后，主机再次发送时它们会重新出现。"
           }
         }
       }

@@ -390,7 +390,15 @@ struct AppDelegateAutolaunchPinTests {
     /// summary builder, `connectedSummary()`, and also writes the status bar; the status item's
     /// reading carries `liveSince`; `chainEnded` keeps a give-up's row; the Hosts window's
     /// presentation gets the summary. `tearDownSession` and `applicationWillTerminate` are
-    /// unchanged. It now folds to 46458 characters, +1446.
+    /// unchanged. It folded to 46458 characters, +1446.
+    ///
+    /// RE-FROZEN by UI slice ④ commit 2 (UI-1 spec §4.2 / §4.3, the session banners): the driver's
+    /// state handler reads the leg's input capability once (`inputNotice`) and calls the one banner
+    /// writer, `applySessionBanners`, after the Hosts window; the summary builder carries the
+    /// capability (`dg_bar`); `chainEnded` clears the connection's banners; the Hosts window's state
+    /// write sets the Remote windows note; `sessionBannerModel` wires the banner buttons to existing
+    /// paths (gate r1 fold: Learn More to Settings > Keyboard). `tearDownSession`, `endSessionTapped`
+    /// and `applicationWillTerminate` are unchanged. It now folds to 49205 characters, +2747.
     ///
     /// The "net folded edit" above is the folded-length delta for each re-freeze, which is what the
     /// length chain below already checks; it is not a token-by-token added/removed count -- those
@@ -407,9 +415,9 @@ struct AppDelegateAutolaunchPinTests {
     /// expected to re-freeze this constant in the same commit that makes the edit, and the length
     /// below is here so that such a re-freeze can be sanity-checked (a length that MOVED by the size
     /// of the edit is a re-freeze; a length that moved by 22638 is a needle that stopped matching).
-    private static let foldedTailLength = 46458
+    private static let foldedTailLength = 49205
     private static let foldedTailSHA256 =
-        "bb18491bad840bee4f496313fe1e6a7fd500f1b8eeb2db124a5405fb0886cc2c"
+        "b1c10f3fcc7869341649f0955d8d113b9c7a01a83dba049a2199e259a00333cb"
 
     @Test("connectTapped to end-of-file is byte-identical to its last deliberate freeze")
     func theRestOfTheFileIsUnchanged() throws {

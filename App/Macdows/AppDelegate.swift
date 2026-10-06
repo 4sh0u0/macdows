@@ -90,6 +90,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// (`connectedSummary()`) and the status item (`statusItemReading()`) both read it. Set on the
 	/// first `.live` of a leg, cleared by every other state and when the chain ends.
 	private var liveSince: Date?
+	/// UI slice ④ (adr/0011 §2, UI-1 spec §4.3): this leg's input-method notice -- the session's
+	/// `unicodeInputSupported`, read once on the leg's first `.live`; the status bar's `dg_bar`
+	/// follows `degraded`.
+	private var inputNotice = InputCapabilityNotice()
 	/// True between the Connect press and the boundary gate's verdict. `session` is still nil
 	/// across that window, so it cannot serve as the "already busy" flag on its own.
 	private var isCheckingBoundary = false
@@ -680,6 +684,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			// depend on the tick: `applyShell` below writes it on this very call.
 			eventCount = 0
 		}
+		// UI slice ④: the input capability, read once per leg (only READ: the registry's own gate
+		// keeps its log line and its counters).
+		let showInputBanner = inputNotice.observe(state) { session?.unicodeInputSupported ?? true }
 		// UI slice ④: the handshake moment of this leg, recorded before anything below reads it.
 		if case .live = state {
 			if liveSince == nil { liveSince = Date() }
@@ -690,6 +697,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// UI slice ①: the Hosts window's marker, subtitle and status bar follow the same state, and
 		// the chain's first live state is recorded (and a matching preset pinned, ADR-0024 D-5).
 		applyHostsWindow(state: state, host: chainHost)
+		applySessionBanners(for: state, showInputBanner: showInputBanner)
 		if case .live = state {
 			noteChainLive()
 		}
@@ -888,7 +896,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// of its current leg (`liveSince`). One builder, so the status line's writer and the Hosts
 	/// window's cannot describe two different sessions.
 	private func connectedSummary() -> ShellReconnectPresenter.ConnectedSummary {
-		.init(windows: registry?.windowSnapshots().count ?? 0, liveSince: liveSince)
+		.init(windows: registry?.windowSnapshots().count ?? 0, liveSince: liveSince, inputDegraded: inputNotice.degraded)
 	}
 
 	/// What the status item shows, read from this delegate's own state (adr/0022 D-6): whether a
@@ -962,6 +970,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		chainReachedLive = false
 		endingByGiveUp = false
 		liveSince = nil
+		// UI slice ④: the input-method notice belongs to the connection that just ended, and so
+		// does a connection banner that was still saying "reconnecting" (the user pressed
+		// Disconnect); a give-up's banner stays until it is dismissed or the next press.
+		inputNotice.reset()
+		mainWindow.removeBanner(id: ShellReconnectPresenter.inputBannerID)
+		if !gaveUp {
+			mainWindow.removeBanner(id: ShellReconnectPresenter.connectionBannerID)
+		}
 		if pendingReview == nil {
 			mainWindow.activeHostID = nil
 		}
@@ -994,6 +1010,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		let title = host.flatMap(hostStore.record)?.title ?? ""
 		let presentation = ConnectChain.presentation(hasSession: !ended, state: state, hostTitle: title, connected: connectedSummary())
 		mainWindow.setShell(subtitle: presentation.subtitle, statusBar: presentation.statusBar, marker: presentation.marker, for: host)
+		mainWindow.setRemoteWindowsNote(ShellReconnectPresenter.remoteWindowsNote(for: ended ? nil : state))
+	}
+
+	/// UI slice ④ (UI-1 spec §4.2 / §4.3): the session banners, written from the driver's state in
+	/// this one place. The connection banner is one id, replaced as the state moves on and removed
+	/// by `.live` (and by a certificate give-up, whose banner is the certificate path's); the
+	/// input-method banner shows at most once per connection leg and leaves with the leg. No
+	/// button ends or starts a session by itself: Disconnect presses the Hosts window's Disconnect
+	/// button (the End-session action), Reconnect presses its Connect button for the chain's host
+	/// (the same route as the status item's Connect to), Dismiss removes the banner, Learn More
+	/// opens Settings on its Keyboard page.
+	private func applySessionBanners(for state: ReconnectDriver.State, showInputBanner: Bool) {
+		let host = chainHost
+		let title = host.flatMap(hostStore.record)?.title ?? ""
+		if let banner = ShellReconnectPresenter.connectionBanner(for: state, hostTitle: title) {
+			mainWindow.showBanner(sessionBannerModel(banner, host: host))
+		} else {
+			mainWindow.removeBanner(id: ShellReconnectPresenter.connectionBannerID)
+		}
+		if showInputBanner {
+			mainWindow.showBanner(sessionBannerModel(ShellReconnectPresenter.inputBanner(hostTitle: title), host: host))
+		} else if state != .live {
+			mainWindow.removeBanner(id: ShellReconnectPresenter.inputBannerID)
+		}
+	}
+
+	/// A presenter banner with its buttons wired to the existing paths (see `applySessionBanners`).
+	private func sessionBannerModel(_ banner: ShellReconnectPresenter.SessionBanner, host: HostID?) -> BannerView.Model {
+		let id = banner.id
+		return .session(
+			banner,
+			disconnect: { [weak self] in self?.mainWindow.disconnectSession() },
+			dismiss: { [weak self] in self?.mainWindow.removeBanner(id: id) },
+			reconnect: { [weak self] in
+				guard let host else { return }
+				self?.mainWindow.connect(to: host)
+			},
+			learnMore: { [weak self] in self?.mainWindow.showKeyboardPage() }
+		)
 	}
 
 	/// ADR-0024 D-3′: the pin item could not be read -- no connection, no first-use sheet, no retry.

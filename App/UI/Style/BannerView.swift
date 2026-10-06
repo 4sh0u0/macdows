@@ -7,6 +7,8 @@ final class BannerView: NSView {
     struct Action {
         let title: String
         let handler: () -> Void
+        /// The button's accessibility name when it differs from its title (UI slice ④: `dg_u_x`).
+        var accessibilityLabel: String? = nil
     }
 
     struct Model {
@@ -50,6 +52,7 @@ final class BannerView: NSView {
         for (index, action) in model.actions.enumerated() {
             let button = NSButton(title: action.title, target: self, action: #selector(buttonPressed(_:)))
             button.tag = index
+            if let label = action.accessibilityLabel { button.setAccessibilityLabel(label) }
             GlassStyle.styleSecondary(button)
             buttons.append(button)
             handlers.append(action.handler)
@@ -83,5 +86,44 @@ final class BannerView: NSView {
     @objc private func buttonPressed(_ sender: NSButton) {
         guard handlers.indices.contains(sender.tag) else { return }
         handlers[sender.tag]()
+    }
+
+    /// The buttons, in order (for the offline tests).
+    var buttons: [NSButton] {
+        var found: [NSButton] = []
+        func walk(_ view: NSView) {
+            if let button = view as? NSButton, button.target === self { found.append(button) }
+            view.subviews.forEach(walk)
+        }
+        walk(self)
+        return found.sorted { $0.tag < $1.tag }
+    }
+}
+
+extension BannerView.Model {
+    /// UI slice ④: a session banner from `ShellReconnectPresenter`, its tone mapped onto the
+    /// banner tints and each action onto its button title and the handler the App hands in. The
+    /// handlers are the App's existing paths (the Hosts window's Disconnect and Connect buttons,
+    /// the banner's own removal, Settings > Keyboard); nothing here ends or starts a session itself.
+    static func session(_ banner: ShellReconnectPresenter.SessionBanner,
+                        disconnect: @escaping () -> Void,
+                        dismiss: @escaping () -> Void,
+                        reconnect: @escaping () -> Void,
+                        learnMore: @escaping () -> Void) -> BannerView.Model {
+        let actions = banner.actions.map { action -> BannerView.Action in
+            switch action {
+            case .disconnect: return .init(title: UIStrings.disconnect, handler: disconnect)
+            case .dismiss: return .init(title: UIStrings.dismiss, handler: dismiss, accessibilityLabel: banner.dismissAccessibilityLabel)
+            case .reconnect: return .init(title: UIStrings.reconnect, handler: reconnect)
+            case .learnMore: return .init(title: UIStrings.learnMore, handler: learnMore)
+            }
+        }
+        let tone: GlassStyle.Tone
+        switch banner.tone {
+        case .information: tone = .information
+        case .warning: tone = .warning
+        case .error: tone = .error
+        }
+        return .init(id: banner.id, title: banner.title, body: banner.body, tone: tone, actions: actions)
     }
 }

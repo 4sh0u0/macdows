@@ -271,3 +271,118 @@ struct ShellText {
         Locale(identifier: preferredLocalizations.first ?? "en")
     }
 }
+
+// MARK: - UI slice ④: the session banners and the remote-windows note (UI-1 spec §4.2 / §4.3)
+
+extension ShellReconnectPresenter {
+    /// One session banner as data: what the App builds a `BannerView.Model` from, minus the
+    /// handlers -- the App wires each `Action` to a path that already exists.
+    struct SessionBanner: Equatable {
+        enum Tone: Equatable {
+            /// Untinted (UI-1 spec §3: information is not tinted), the input-method banner.
+            case information
+            case warning
+            case error
+        }
+
+        /// The banner's buttons. Disconnect only while the session still exists (waiting /
+        /// reconnecting); after a give-up the session is gone, so Dismiss / Reconnect (UI-1 §4.2).
+        /// Learn More opens Settings > Keyboard (the input-method banner, UI-1 §4.3).
+        enum Action: Equatable {
+            case disconnect
+            case dismiss
+            case reconnect
+            case learnMore
+        }
+
+        let id: String
+        let title: String
+        let body: String
+        let tone: Tone
+        let actions: [Action]
+        /// The Dismiss button's accessibility name when it needs its own (`dg_u_x`); `nil` keeps
+        /// the button's title.
+        var dismissAccessibilityLabel: String? = nil
+    }
+
+    /// The connection banner's id: ONE banner, replaced as the state moves on (waiting ->
+    /// reconnecting -> gave up), never stacked, and removed when the connection is live again.
+    static let connectionBannerID = "session-connection"
+    /// The input-method banner's id (UI-1 spec §4.3).
+    static let inputBannerID = "session-input"
+
+    /// The connection banner for `state`, or `nil` when there is none (`.idle`, `.live`, and a
+    /// certificate give-up, whose banner and sheets belong to the certificate path, ADR-0024 D-5).
+    ///
+    /// Titles and bodies follow the Session-Disconnected artboard: while retrying, the title is
+    /// the state's own status text (`s_wait` / `s_re`) over `d_retry_b`; after giving up, `d_gx_*`
+    /// or `d_gr_*`. Warning tint while retrying, error tint after giving up.
+    static func connectionBanner(
+        for state: ReconnectDriver.State,
+        hostTitle: String,
+        text: ShellText = .main
+    ) -> SessionBanner? {
+        switch state {
+        case .idle, .live, .gaveUp(.certificateRejected):
+            return nil
+        case .waiting, .reconnecting:
+            return SessionBanner(
+                id: connectionBannerID, title: lostOrEndedText(for: state, text: text),
+                body: text.string("d_retry_b", "Remote windows come back when the connection does. Your Windows session should still be running on the host."),
+                tone: .warning, actions: [.disconnect]
+            )
+        case .gaveUp(.policy(.attemptsExhausted)):
+            return SessionBanner(
+                id: connectionBannerID,
+                title: text.format("d_gx_t", "Couldn’t reconnect after %lld attempts", [Int64(reconnectCount)]),
+                body: text.format(
+                    "d_gx_b", "%1$@ didn’t answer %2$lld reconnect attempts. The Windows session should still be running on the host; Reconnect starts a new connection to it.",
+                    [hostTitle, Int64(reconnectCount)]
+                ),
+                tone: .error, actions: [.dismiss, .reconnect]
+            )
+        case .gaveUp(.refusedByBridge), .gaveUp(.policyRefused):
+            return SessionBanner(
+                id: connectionBannerID,
+                title: text.string("d_gr_t", "The host refused the connection"),
+                body: text.format(
+                    "d_gr_b", "%@ refused the reconnect, so Macdows stopped without trying again. The Windows session should still be running on the host; Reconnect tries once more.",
+                    [hostTitle]
+                ),
+                tone: .error, actions: [.dismiss, .reconnect]
+            )
+        }
+    }
+
+    /// The Remote windows card's note while there are no remote windows because the connection
+    /// dropped (UI-1 spec §4.2 `wn_*`, Main-Connected artboard: the detail area, not the banner).
+    /// `nil` hides the card: no state, a connection coming up, a live one, a certificate give-up.
+    static func remoteWindowsNote(for state: ReconnectDriver.State?, text: ShellText = .main) -> String? {
+        switch state {
+        case .waiting?, .reconnecting?:
+            return text.string("wn_retry", "Remote windows close while the connection is down and reappear when the host sends them again after reconnecting.")
+        case .gaveUp(.policy(.attemptsExhausted))?:
+            return text.string("wn_gx", "No remote windows. The Windows session should still be running on the host; Connect starts a new connection to it.")
+        case .gaveUp(.refusedByBridge)?, .gaveUp(.policyRefused)?:
+            return text.string("wn_gr", "No remote windows. The host refused the connection, so Macdows did not retry. Connect tries again once.")
+        case nil, .idle?, .live?, .gaveUp(.certificateRejected)?:
+            return nil
+        }
+    }
+
+    /// adr/0011 §2's "visible to the user" half (UI-1 spec §4.3): the connection did not accept
+    /// Unicode input, so input-method text is not sent. Information tone (the artboard's `info-b`),
+    /// Learn More and Dismiss, the latter named `dg_u_x` for accessibility.
+    static func inputBanner(hostTitle: String, text: ShellText = .main) -> SessionBanner {
+        SessionBanner(
+            id: inputBannerID,
+            title: text.string("dg_u_t", "Input method text can’t be sent to this host"),
+            body: text.format(
+                "dg_u_b", "%@ didn’t accept Unicode input, so text from input methods (for example Chinese or Japanese) and the Character Viewer is not sent. Typing with your keyboard layout still works.",
+                [hostTitle]
+            ),
+            tone: .information, actions: [.learnMore, .dismiss],
+            dismissAccessibilityLabel: text.string("dg_u_x", "Dismiss input method notice")
+        )
+    }
+}

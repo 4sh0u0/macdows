@@ -350,9 +350,10 @@ struct AppDelegateReconnectWiringPinTests {
                 + "connectButton.isEnabled = shell.connectEnabled "
                 + "mainWindow.setStatusBarText(shell.statusBar) }",
             in: stripped) == 1)
+        // UI slice ④ commit 2 adds the input capability (`dg_bar`) to the same builder.
         #expect(occurrences(
             of: "private func connectedSummary() -> ShellReconnectPresenter.ConnectedSummary { "
-                + ".init(windows: registry?.windowSnapshots().count ?? 0, liveSince: liveSince) }",
+                + ".init(windows: registry?.windowSnapshots().count ?? 0, liveSince: liveSince, inputDegraded: inputNotice.degraded) }",
             in: stripped) == 1)
         #expect(occurrences(of: "connectedSummary()", in: stripped) == 3,
                 "the declaration, applyShell, and the Hosts window's presentation")

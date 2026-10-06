@@ -58,6 +58,10 @@ enum UIStrings {
     static var dismiss: String { String(localized: "dismiss", defaultValue: "Dismiss", comment: "Banner: close") }
     static var connect: String { String(localized: "connect", defaultValue: "Connect", comment: "File menu: Connect item (UI slice 1)") }
     static var disconnect: String { String(localized: "disconnect", defaultValue: "Disconnect", comment: "File menu and status menu: end the current session") }
+    /// UI slice ④: the connection banner's button after a give-up.
+    static var reconnect: String { String(localized: "reconnect", defaultValue: "Reconnect", comment: "Connection-lost banner, after giving up: start a new connection (UI slice 4)") }
+    /// UI slice ④: the input-method banner's button to Settings > Keyboard.
+    static var learnMore: String { String(localized: "learn_more", defaultValue: "Learn More", comment: "Input-method banner: opens Settings > Keyboard (UI slice 4)") }
 
     // MARK: Main window detail
     static var connectionHeader: String { String(localized: "conn_h", defaultValue: "Connection", comment: "Main window: card title") }
@@ -72,6 +76,8 @@ enum UIStrings {
     static var pinnedSHA256: String { String(localized: "pinned_sha", defaultValue: "Pinned · SHA-256", comment: "Main window: the host is pinned") }
     static var notPinned: String { String(localized: "not_pinned", defaultValue: "Not pinned yet. You confirm the fingerprint on first connect.", comment: "Main window: not pinned") }
     static var nlaRequired: String { String(localized: "nla_req", defaultValue: "Network Level Authentication required", comment: "Main window: security row") }
+    /// UI slice ④: the Remote windows card, shown with the `wn_*` note while the connection is down.
+    static var remoteWindowsHeader: String { String(localized: "rw_h", defaultValue: "Remote windows", comment: "Main window: card title (UI slice 4)") }
     static var recentHeader: String { String(localized: "recent_h", defaultValue: "Recent connections", comment: "Main window: card title") }
     static var recentNone: String { String(localized: "recent_none", defaultValue: "No connections yet", comment: "Main window: empty recent list (slice 1)") }
 

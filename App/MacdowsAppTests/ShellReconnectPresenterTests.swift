@@ -222,7 +222,10 @@ struct ShellReconnectPresenterTests {
             keys.insert(String(key))
             #expect(shellCatalogValue(strings, String(key), "en") == String(fallback), "\(key)")
         }
-        #expect(keys == ["st_connecting", "st_conn", "st_off", "dg_bar", "s_live_bar", "s_wait", "s_re", "s_gx", "s_gr", "cf_bar_c"])
+        #expect(keys == ["st_connecting", "st_conn", "st_off", "dg_bar", "s_live_bar", "s_wait", "s_re", "s_gx", "s_gr", "cf_bar_c",
+                         // UI slice ④ commit 2: the banners and the Remote windows note.
+                         "d_retry_b", "d_gx_t", "d_gx_b", "d_gr_t", "d_gr_b", "wn_retry", "wn_gx", "wn_gr", "dg_u_t", "dg_u_b",
+                         "dg_u_x"])
         let specifier = try Regex(#"%(?:\d\$)?(?:lld|d|@)"#)
         for key in keys {
             let en = shellCatalogValue(strings, key, "en") ?? ""
