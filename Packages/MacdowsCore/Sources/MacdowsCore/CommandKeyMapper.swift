@@ -86,7 +86,12 @@ public final class CommandKeyMapper {
     /// `Character.init(_:String)` traps on anything but exactly one grapheme cluster; a
     /// plain `String` comparison degrades an empty/multi-char input to "no match" instead
     /// of crashing.
-    private static let suppressedNoWireKeys: Set<String> = ["q", " ", "\t"]
+    ///
+    /// adr/0022 D-3 does NOT extend this set: the Mac-reserved ⌘H / ⌥⌘H / ⌘, never reach
+    /// `key(down:...)` while a Macdows menu can take them -- the view reports them through
+    /// `localKeyEquivalent()` instead. `internal` (not `private`) only so the test target can
+    /// pin that the set is still exactly these three (adr/0022 D-8 T-3).
+    static let suppressedNoWireKeys: Set<String> = ["q", " ", "\t"]
 
     public private(set) var state: State = .idle
 
@@ -188,6 +193,28 @@ public final class CommandKeyMapper {
             // too -- otherwise it's a stray RELEASE for a key the wire never saw DOWN.
             return wasConsumed ? .wire([]) : .wire([.modifierKey(.shift, down: false)])
         }
+    }
+
+    // MARK: - A key the Mac consumed locally (adr/0022 D-3, the adr/0011 §3 addendum)
+
+    /// The view handed a Command key equivalent to the Mac instead of the wire: one of the
+    /// local-reserved (character, exact modifier mask) pairs ⌘Q / ⌘H / ⌥⌘H / ⌘, (adr/0022 D-3),
+    /// which the Macdows menu performs locally. Never puts anything on the wire, in any state.
+    ///
+    /// `.withheld`: the gesture now counts as "had a key", so Cmd's own release afterwards is
+    /// just closing that gesture out and does NOT fire the bare-tap LWIN pair (adr/0022 I-2 --
+    /// without this, ⌘H followed by Cmd-up would open the Start menu on Windows). `.mapped` /
+    /// `.passthrough`: nothing changes -- a chord or a live LWIN is already on the wire and
+    /// Cmd's own release closes it out exactly as before. `.idle`: defensive, nothing to do.
+    ///
+    /// Idempotent: when there is no menu or no matching item, AppKit re-delivers the same key as
+    /// `keyDown`, which reports this a second time (a matching disabled item consumes the key
+    /// instead); the second call changes nothing the first did not.
+    public func localKeyEquivalent() -> CommandKeyMapperOutput {
+        if state == .withheld {
+            gestureHadKey = true
+        }
+        return .wire([])
     }
 
     // MARK: - Regular keys (only while a Cmd gesture is active -- see `isActive`)

@@ -1974,6 +1974,13 @@ final class RemoteWindowRegistry {
             // wireHeldModifiers, independent of whatever CommandKeyMapper still thinks.
             commandKeyMapper.reset()
 
+        case .localKeyEquivalent:
+            // adr/0022 D-3: the view handed a reserved Command key (⌘Q / ⌘H / ⌥⌘H / ⌘,) to the
+            // Mac's menu. The modifier alignment that precedes it already ran through the
+            // `.flagsChanged` case above; this only marks the Cmd gesture as having had a key,
+            // so Cmd's release sends no bare LWIN tap. Always `.wire([])` -- zero wire events.
+            execute(commandKeyMapperOutput: commandKeyMapper.localKeyEquivalent(), windowId: windowId)
+
         case .unicodeText(let text):
             // adr/0011 §2's degradation gate, evaluated BEFORE the lane: on a server whose
             // Input Capability Set never set INPUT_FLAG_UNICODE, FreeRDP's own

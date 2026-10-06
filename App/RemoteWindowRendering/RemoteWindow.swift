@@ -438,6 +438,12 @@ final class RemoteWindow {
 
         let win = RemoteWindowBackingWindow(contentRect: contentRect, styleMask: [.borderless], backing: .buffered, defer: false)
         win.isReleasedWhenClosed = false // this class, not AppKit, owns the window's lifetime
+        // adr/0022 D-5 W2: never listed in the Window menu. Choosing a listed window there is a
+        // local makeKeyAndOrderFront that bypasses `FocusAuthority.localActivate`, so keys would
+        // go to the server's current active window instead (adr/0012 §2); "Bring All to Front"
+        // also orders only the windows the menu lists, leaving the server-owned Z order alone.
+        // Set before the title: AppKit adds a Window-menu item when a title is set.
+        win.isExcludedFromWindowsMenu = true
         win.title = title
         win.hasShadow = true
         win.isOpaque = true

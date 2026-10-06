@@ -56,6 +56,52 @@ enum RemoteWindowInputEvent {
     /// dispatched only when the current input source is non-ASCII-capable (see
     /// `RemoteWindowContentView.keyDown(with:)`'s own routing).
     case unicodeText(String)
+    /// adr/0022 D-3: one of the local-reserved key equivalents (`LocalKeyEquivalent.reserved`)
+    /// was handed to the Mac's menu instead of the wire. Carries nothing: the registry only tells
+    /// `CommandKeyMapper` that the current Cmd gesture had a key (`localKeyEquivalent()`), so
+    /// Cmd's release does not send a bare LWIN tap. Never puts anything on the wire.
+    case localKeyEquivalent
+}
+
+/// adr/0022 D-3: a key equivalent the Mac keeps for itself even while a remote window is key --
+/// matched on (`charactersIgnoringModifiers.lowercased()`, the event's modifier flags restricted
+/// to ⌘ ⌥ ⌃ ⇧ and compared for EXACT equality). Caps Lock, Fn and the other bits take no part.
+/// ⇧⌘H, ⌃⌘H, ⌃⌘, and every other near miss are not reserved and go to Windows as before.
+///
+/// `reserved` is the one copy of the set: the content view's claim decision reads it, and the
+/// main menu takes the key equivalents of its four local items from it (adr/0022 D-8 T-1).
+struct LocalKeyEquivalent: Hashable {
+    let character: String
+    let modifiers: NSEvent.ModifierFlags
+
+    /// The only modifier bits the match looks at.
+    static let comparedModifiers: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
+
+    static let quit = LocalKeyEquivalent(character: "q", modifiers: [.command])
+    static let hide = LocalKeyEquivalent(character: "h", modifiers: [.command])
+    static let hideOthers = LocalKeyEquivalent(character: "h", modifiers: [.command, .option])
+    static let settings = LocalKeyEquivalent(character: ",", modifiers: [.command])
+
+    /// adr/0022 D-3's R4, owner-ruled (STATUS ㋍): ⌘Q, ⌘H, ⌥⌘H, ⌘,.
+    static let reserved: [LocalKeyEquivalent] = [quit, hide, hideOthers, settings]
+
+    static func == (lhs: LocalKeyEquivalent, rhs: LocalKeyEquivalent) -> Bool {
+        lhs.character == rhs.character && lhs.modifiers.rawValue == rhs.modifiers.rawValue
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(character)
+        hasher.combine(modifiers.rawValue)
+    }
+
+    /// Whether `event` is one of `reserved`, by exact pair.
+    static func isReserved(_ event: NSEvent) -> Bool {
+        let candidate = LocalKeyEquivalent(
+            character: (event.charactersIgnoringModifiers ?? "").lowercased(),
+            modifiers: event.modifierFlags.intersection(comparedModifiers)
+        )
+        return reserved.contains(candidate)
+    }
 }
 
 /// W4c: `RemoteWindow`'s content view. Captures the full range of mouse/keyboard/scroll
@@ -189,7 +235,64 @@ final class RemoteWindowContentView: NSView {
 
     // MARK: - Keyboard
 
+    /// adr/0022 D-2 B: once a main menu exists, AppKit offers every modifier key event to the
+    /// KEY window's view hierarchy through this method BEFORE the menu bar sees it, and only then
+    /// delivers it as `keyDown` (Cocoa Event Handling Guide, "Handling Key Equivalents"). Claiming
+    /// a Command key here is what keeps ⌘W, ⌘C, ⌘M and the rest going to Windows exactly as they
+    /// did when the App had no menu, whatever the menu contains.
+    ///
+    /// In order:
+    ///  1. adr/0022 I-4: claim nothing unless this view's window is key AND this view is its first
+    ///     responder -- a Mac panel that is key while a remote window is main keeps its ⌘C.
+    ///  2. No Command (a bare Control key equivalent included): not ours, `super` (returns NO). The
+    ///     main menu then decides: a matching item, enabled or disabled, consumes the key (gate r1
+    ///     I-1 -- AppKit's injected fn / Globe items included); only when no item matches does
+    ///     AppKit re-deliver it as `keyDown`.
+    ///  3. Command, not reserved: the same body `keyDown` runs (modifier alignment first, then the
+    ///     input-source fork), and YES, so the menu never sees it.
+    ///  4. Command, reserved (`LocalKeyEquivalent.reserved`): align modifiers exactly as `keyDown`
+    ///     does -- so a Cmd press this view never observed puts `CommandKeyMapper` into its
+    ///     withheld state first and the bare letter cannot leak through the ordinary lane -- then
+    ///     report `.localKeyEquivalent` (no input-source fork), and NO, so the menu performs it.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.type == .keyDown,
+              let window, window.isKeyWindow, window.firstResponder === self else {
+            return super.performKeyEquivalent(with: event)
+        }
+        guard event.modifierFlags.contains(.command) else {
+            return super.performKeyEquivalent(with: event)
+        }
+        if LocalKeyEquivalent.isReserved(event) {
+            reportModifierAlignment(for: event)
+            onEvent?(.localKeyEquivalent)
+            return false
+        }
+        handleKeyDown(event)
+        return true
+    }
+
     override func keyDown(with event: NSEvent) {
+        // adr/0022 D-2 B: a reserved pair arriving here was already reported by
+        // `performKeyEquivalent`. AppKit re-delivers a key equivalent as keyDown only when there is
+        // no menu or no matching item; a matching disabled item consumes it (gate r1 m-2).
+        // Report it again -- `CommandKeyMapper.localKeyEquivalent()` is idempotent -- and never
+        // hand it to the mapper's character table, where a disabled ⌘, would become LWIN+,.
+        if LocalKeyEquivalent.isReserved(event) {
+            onEvent?(.localKeyEquivalent)
+            return
+        }
+        handleKeyDown(event)
+    }
+
+    /// W4c review H1's reconciliation `.flagsChanged`, shared by `keyDown` and the claim path.
+    private func reportModifierAlignment(for event: NSEvent) {
+        onEvent?(.flagsChanged(modifierFlags: event.modifierFlags.intersection(.deviceIndependentFlagsMask)))
+    }
+
+    /// The one keyDown body: `keyDown(with:)` and `performKeyEquivalent(with:)`'s claim branch
+    /// both run exactly this, so a claimed Command key reaches the registry in the same shape a
+    /// menu-less `keyDown` delivered it in (adr/0022 I-1).
+    private func handleKeyDown(_ event: NSEvent) {
         // W4c review H1: MRDPView.m:513's own keyDown: calls [self flagsChanged:event] as
         // its literal first line, before handling the key itself -- a defensive
         // reconciliation against modifier state that might have drifted out of sync with
@@ -197,7 +300,7 @@ final class RemoteWindowContentView: NSView {
         // just regaining focus). Reporting .flagsChanged here is a no-op downstream if
         // nothing actually changed (RemoteWindowRegistry's diff against session-level state
         // produces zero transitions), so this is always safe to send.
-        onEvent?(.flagsChanged(modifierFlags: event.modifierFlags.intersection(.deviceIndependentFlagsMask)))
+        reportModifierAlignment(for: event)
 
         // adr/0011 §1's mixing rule: modifier/function/arrow/Enter/Tab/Esc keys always go
         // scancode regardless of input source; everything else defers to whether the
