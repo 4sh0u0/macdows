@@ -222,6 +222,20 @@ int main(int argc, char *argv[])
         }
         printf("bridge-smoke: %s\n", [BridgeSmokeGate allowedLine].UTF8String);
 
+        /* ADR-0024 D-4 (W-b): the certificate this run accepts, resolved before any CRSession
+         * exists (GateShim.swift). Missing or not a SHA-256 fingerprint => refuse with its own
+         * exit code (77: distinct from 1 / 2 / 78), value-free line, no trust-on-first-use
+         * fallback, nothing contacted. */
+        NSString *acceptedFingerprint = [BridgeSmokeGate resolveLabAcceptedFingerprint];
+        if (acceptedFingerprint.length == 0)
+        {
+            fprintf(stderr, "bridge-smoke: lab certificate pin REFUSED this run -- MACDOWS_LAB_PIN_SHA256 is "
+                            "missing or not a SHA-256 fingerprint (environment variable, then host.env). "
+                            "Nothing was connected; no trust-on-first-use fallback exists (ADR-0024 D-4).\n");
+            return 77;
+        }
+        printf("bridge-smoke: lab certificate pin resolved (preset snapshot, 64 hex digits; never written back)\n");
+
         NSString *program = @"C:\\Windows\\System32\\winver.exe";
 
         __block Tally tally;
@@ -242,7 +256,12 @@ int main(int argc, char *argv[])
         for (int attempt = 1; attempt <= maxAttempts && !connected; attempt++)
         {
             printf("=== connect attempt %d/%d ===\n", attempt, maxAttempts);
-            session = [[CRSession alloc] initWithHost:host user:user password:pass program:program];
+            session = [[CRSession alloc] initWithHost:host
+                                                   user:user
+                                          passwordBytes:[pass dataUsingEncoding:NSUTF8StringEncoding]
+                                                program:program];
+            /* The trust snapshot, before -start; the reconnect test's later -start reuses it. */
+            session.acceptedCertificateFingerprint = acceptedFingerprint;
             [session start];
 
             NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:connectTimeoutSeconds];

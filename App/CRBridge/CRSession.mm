@@ -1,3 +1,7 @@
+/* ADR-0024 D-2: memset_s (C11 Annex K, which macOS ships) for the password wipes below; must
+ * precede the first <string.h>. */
+#define __STDC_WANT_LIB_EXT1__ 1
+#include <string.h>
 #import "CRSession.h"
 
 #include <freerdp/config.h>
@@ -18,6 +22,9 @@
 #include <freerdp/log.h>
 #include <freerdp/utils/signal.h>
 #include <freerdp/client/rail.h>
+/* ADR-0024 D-4: the certificate callback parses the presented PEM and fingerprints it with
+ * FreeRDP's own functions. */
+#include <freerdp/crypto/certificate.h>
 #include <freerdp/client/rdpgfx.h>
 #include <freerdp/channels/channels.h>
 #include <freerdp/rail.h>
@@ -528,7 +535,9 @@ typedef NS_ENUM(NSInteger, CRSessionState) {
 }
 @property (nonatomic, copy) NSString *host;
 @property (nonatomic, copy) NSString *user;
-@property (nonatomic, copy) NSString *password;
+/* ADR-0024 D-2: the chain's password bytes, this instance's own copy (see -initWithHost:...'s
+ * header doc). Mutable so -dealloc can overwrite it in place. Never exposed. */
+@property (nonatomic, strong) NSMutableData *passwordBytes;
 @property (nonatomic, copy) NSString *program;
 /* Deliberately NOT nonatomic (W4a review M5): written from T_rdp
  * (crb_rdp_thread_main's connect-failure path, and -- ADR-0017 §4 A2 -- its epilogue,
@@ -546,6 +555,35 @@ typedef NS_ENUM(NSInteger, CRSessionState) {
  * written once from T_rdp (crb_rdp_thread_main, immediately after a successful
  * freerdp_connect) and read from T_main. Deliberately NOT nonatomic for the same reason. */
 @property BOOL unicodeInputSupported;
+/* ADR-0024 D-4 (Y-b): written from T_rdp inside the TLS handshake (the certificate callback),
+ * read from T_main; atomic for the same cross-thread publish reason as -lastConnectError. */
+@property (nullable) CRCertificateRejection *lastCertificateRejection;
+@end
+
+@interface CRCertificateRejection ()
+- (instancetype)initWithFingerprint:(nullable NSString *)fingerprint
+                            subject:(NSString *)subject
+                             issuer:(NSString *)issuer
+                              flags:(uint32_t)flags NS_DESIGNATED_INITIALIZER;
+@end
+
+@implementation CRCertificateRejection
+- (instancetype)initWithFingerprint:(nullable NSString *)fingerprint
+                            subject:(NSString *)subject
+                             issuer:(NSString *)issuer
+                              flags:(uint32_t)flags
+{
+    self = [super init];
+    if (self)
+    {
+        _sha256Fingerprint = [fingerprint copy];
+        _subject = [subject copy];
+        _issuer = [issuer copy];
+        _flags = flags;
+        _unsupportedRoute = (flags & (VERIFY_CERT_FLAG_REDIRECT | VERIFY_CERT_FLAG_GATEWAY)) != 0;
+    }
+    return self;
+}
 @end
 
 /* ------------------------------------------------------------------------------------ */
@@ -1780,38 +1818,124 @@ static void crb_on_channel_disconnected(void *context, const ChannelDisconnected
  * Certificate / logon callbacks
  * ==================================================================================== */
 
-/* W4a review H3: real certificate-pin UX (a Phase 1 follow-on ADR) doesn't exist yet.
- * Accepting every certificate unconditionally in the meantime is a real security hole if
- * it ever leaked into a non-Debug build, so it's gated on CRB_ALLOW_INSECURE_CERT --
- * defined only for the Debug configuration (App/project.yml's CRBridge target). Without
- * it (Release, or any config that doesn't define it), every certificate is rejected
- * outright: a loud, immediate connection failure instead of a silent insecure accept. */
+/* ADR-0024 D-4 (W-b + Y-b). The certificate is judged by the App's pin, and by nothing else.
+ *
+ * crb_pre_connect turns FreeRDP_ExternalCertificateManagement on, which makes
+ * tls_verify_certificate ask ONLY VerifyX509Certificate below: known-hosts, the system
+ * certificates.json and OpenSSL chain + host-name validation (whose CA directory, under the
+ * user-writable FreeRDP config path, is a trust anchor any same-user process can add to) are never
+ * consulted, and nothing is ever written to the known-hosts store. The two other callbacks are
+ * constant-reject stubs, unreachable under W-b and kept as defence in depth.
+ *
+ * The callback is a pure function of the presented certificate and the trust snapshot the App set
+ * before -start (-acceptedCertificateFingerprint): it never blocks and never waits for UI (Y-a
+ * would deadlock against -shutdownAndWait's unbounded join). A rejection is published through
+ * -lastCertificateRejection and the App asks the user afterwards; confirming re-starts the same
+ * CRSession. It returns 2 or 0 and never a negative value (tls.c logs the whole PEM at ERROR level
+ * for a negative one). Under W-b 1 and 2 are equivalent -- any positive value only marks the
+ * certificate accepted for this session -- 2 is chosen because it says so. */
+static int crb_certificate_verdict(const BYTE *data, size_t length, DWORD flags, NSString *accepted,
+                                   CRCertificateRejection *__autoreleasing *outRejection)
+{
+    char *fingerprint = NULL;
+    char *subject = NULL;
+    char *issuer = NULL;
+    if (data && length > 0)
+    {
+        /* freerdp_certificate_new_from_pem reads a NUL-terminated string and parses only its
+         * first block -- the leaf certificate, which tls.c puts first (ADR-0024 §0(d)). The
+         * callback's buffer is not guaranteed to be terminated, so copy it into one that is. */
+        char *pem = (char *)calloc(length + 1, 1);
+        if (pem)
+        {
+            memcpy(pem, data, length);
+            rdpCertificate *cert = freerdp_certificate_new_from_pem(pem);
+            if (cert)
+            {
+                fingerprint = freerdp_certificate_get_fingerprint_by_hash_ex(cert, "sha256", FALSE);
+                subject = freerdp_certificate_get_subject(cert);
+                issuer = freerdp_certificate_get_issuer(cert);
+                freerdp_certificate_free(cert);
+            }
+            free(pem);
+        }
+    }
+    const BOOL unsupportedRoute = (flags & (VERIFY_CERT_FLAG_REDIRECT | VERIFY_CERT_FLAG_GATEWAY)) != 0;
+    const char *acceptedC = accepted.UTF8String;
+    const BOOL match = !unsupportedRoute && fingerprint && acceptedC && strlen(acceptedC) == 64 &&
+                       strlen(fingerprint) == 64 && strcasecmp(fingerprint, acceptedC) == 0;
+    if (!match && outRejection)
+    {
+        *outRejection = [[CRCertificateRejection alloc]
+            initWithFingerprint:fingerprint ? [[NSString stringWithUTF8String:fingerprint] lowercaseString] : nil
+                        subject:subject ? @(subject) : @""
+                         issuer:issuer ? @(issuer) : @""
+                          flags:(uint32_t)flags];
+    }
+    free(fingerprint);
+    free(subject);
+    free(issuer);
+    return match ? 2 : 0;
+}
+
+static int crb_verify_x509_certificate(freerdp *instance, const BYTE *data, size_t length,
+                                       const char *hostname, UINT16 port, DWORD flags)
+{
+    (void)hostname;
+    (void)port;
+    CRSession *session = crb_session((CRBridgeContext *)instance->context);
+    CRCertificateRejection *rejection = nil;
+    const int verdict = crb_certificate_verdict(data, length, flags, session.acceptedCertificateFingerprint, &rejection);
+    if (rejection)
+    {
+        /* Published before freerdp_connect returns, so before -lastConnectError and before the
+         * DISCONNECTED sentinel: a drain that sees the error sees this too. The line carries the
+         * fingerprint and flags only -- never the PEM, the host or an account. */
+        session.lastCertificateRejection = rejection;
+        WLog_WARN(TAG, "[cert] rejected sha256=%s flags=0x%08" PRIx32 " route=%d",
+                  rejection.sha256Fingerprint ? rejection.sha256Fingerprint.UTF8String : "unreadable",
+                  (uint32_t)flags, rejection.unsupportedRoute ? 1 : 0);
+    }
+    return verdict;
+}
+
+/* Unreachable with ExternalCertificateManagement on (tls.c only asks VerifyX509Certificate);
+ * constant-reject stubs so that an upstream change to that branch order fails closed. */
 static DWORD crb_verify_certificate_ex(freerdp *instance, const char *host, UINT16 port,
                                         const char *common_name, const char *subject,
                                         const char *issuer, const char *fingerprint, DWORD flags)
 {
     (void)instance;
-    (void)flags;
-#if CRB_ALLOW_INSECURE_CERT
-    WLog_WARN(TAG,
-              "VerifyCertificateEx: INSECURE ACCEPT (CRB_ALLOW_INSECURE_CERT) host=%s:%u "
-              "commonName=%s subject=%s issuer=%s fingerprint=%s",
-              host, (unsigned)port, common_name ? common_name : "", subject ? subject : "",
-              issuer ? issuer : "", fingerprint ? fingerprint : "");
-    /* Accept unconditionally, for this session only -- never touches an on-disk
-     * known-hosts store. */
-    return 2;
-#else
     (void)host;
     (void)port;
     (void)common_name;
     (void)subject;
     (void)issuer;
     (void)fingerprint;
-    WLog_ERR(TAG, "VerifyCertificateEx: REJECTED -- certificate pin UX not implemented yet "
-                  "(CRB_ALLOW_INSECURE_CERT not defined in this build configuration)");
+    (void)flags;
+    WLog_ERR(TAG, "[cert] VerifyCertificateEx reached (ExternalCertificateManagement bypassed?) -- rejected");
     return 0;
-#endif
+}
+
+static DWORD crb_verify_changed_certificate_ex(freerdp *instance, const char *host, UINT16 port,
+                                                const char *common_name, const char *subject,
+                                                const char *issuer, const char *new_fingerprint,
+                                                const char *old_subject, const char *old_issuer,
+                                                const char *old_fingerprint, DWORD flags)
+{
+    (void)instance;
+    (void)host;
+    (void)port;
+    (void)common_name;
+    (void)subject;
+    (void)issuer;
+    (void)new_fingerprint;
+    (void)old_subject;
+    (void)old_issuer;
+    (void)old_fingerprint;
+    (void)flags;
+    WLog_ERR(TAG, "[cert] VerifyChangedCertificateEx reached (ExternalCertificateManagement bypassed?) -- rejected");
+    return 0;
 }
 
 static int crb_logon_error_info(freerdp *instance, UINT32 data, UINT32 type)
@@ -1940,7 +2064,28 @@ static BOOL crb_pre_connect(freerdp *instance)
      * invariant is self-documenting rather than relying on an unstated default). */
     if (!freerdp_settings_set_bool(settings, FreeRDP_DeactivateClientDecoding, FALSE))
         return FALSE;
+    /* ADR-0024 D-7 (L-c): NLA only. RDP standard security and TLS-only are both off, so a server
+     * (or a man in the middle) that answers with PROTOCOL_RDP or PROTOCOL_SSL -- or with no
+     * negotiation data at all -- is refused instead of being followed below the TLS certificate
+     * check; the request still advertises SSL (nego.c writes it unconditionally) and the response
+     * side rejects it. Ext security follows upstream; AAD and RDSTLS stay off, written out the
+     * self-documenting way DeactivateClientDecoding is above. */
     if (!freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, TRUE))
+        return FALSE;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, FALSE))
+        return FALSE;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, FALSE))
+        return FALSE;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_AadSecurity, FALSE))
+        return FALSE;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_RdstlsSecurity, FALSE))
+        return FALSE;
+    /* ADR-0024 D-4 (W-b): the App's pin is the only judge -- see crb_verify_x509_certificate.
+     * The accepted-fingerprints list is emptied explicitly so nothing can pre-accept a
+     * certificate ahead of the callback. */
+    if (!freerdp_settings_set_bool(settings, FreeRDP_ExternalCertificateManagement, TRUE))
+        return FALSE;
+    if (!freerdp_settings_set_string(settings, FreeRDP_CertificateAcceptedFingerprints, NULL))
         return FALSE;
 
     if (PubSub_SubscribeChannelConnected(instance->context->pubSub, crb_on_channel_connected) < 0)
@@ -2006,6 +2151,8 @@ static BOOL crb_client_new(freerdp *instance, rdpContext *context)
     instance->PostFinalDisconnect = crb_post_final_disconnect;
     instance->LogonErrorInfo = crb_logon_error_info;
     instance->VerifyCertificateEx = crb_verify_certificate_ex;
+    instance->VerifyChangedCertificateEx = crb_verify_changed_certificate_ex;
+    instance->VerifyX509Certificate = crb_verify_x509_certificate;
     return TRUE;
 }
 
@@ -2428,6 +2575,68 @@ static BOOL crb_openssl_legacy_provider_available(void)
     NSLog(@"Macdows: linked against FreeRDP %s", version ? version : "(null)");
 }
 
++ (BOOL)pinProcessLogConfiguration
+{
+    /* ADR-0024 D-8 (F-3). WinPR's root logger reads these when it is first created
+     * (wlog.c WLog_InitializeRoot / WLog_New / WLog_ParseFilters and the file / UDP / journald
+     * appenders); removing them first means that creation sees the defaults. The values are
+     * never read here. */
+    static const char *const ignored[] = {
+        "WLOG_APPENDER", "WLOG_LEVEL", "WLOG_FILTER", "WLOG_PREFIX",
+        "WLOG_FILEAPPENDER_OUTPUT_FILE_PATH", "WLOG_FILEAPPENDER_OUTPUT_FILE_NAME",
+        "WLOG_UDP_TARGET", "WLOG_JOURNALD_ID",
+    };
+    for (size_t i = 0; i < sizeof(ignored) / sizeof(ignored[0]); i++)
+        unsetenv(ignored[i]);
+    wLog *root = WLog_GetRoot();
+    if (!root)
+        return NO;
+    /* Then the API, so the configuration does not rest on the environment being clean: the
+     * CONSOLE appender and INFO level are WinPR's own defaults, i.e. the stdout channel the
+     * bridge's INFO judgement lines use stays exactly as it was. */
+    if (!WLog_SetLogAppenderType(root, WLOG_APPENDER_CONSOLE))
+        return NO;
+    if (!WLog_SetLogLevel(root, WLOG_INFO))
+        return NO;
+    return YES;
+}
+
++ (nullable NSString *)sha256FingerprintOfCertificatePEM:(NSData *)pem
+{
+    CRCertificateRejection *rejection = nil;
+    (void)crb_certificate_verdict((const BYTE *)pem.bytes, pem.length, 0, nil, &rejection);
+    return rejection.sha256Fingerprint;
+}
+
++ (int)certificateVerdictForPEM:(NSData *)pem
+                          flags:(uint32_t)flags
+            acceptedFingerprint:(nullable NSString *)accepted
+                      rejection:(CRCertificateRejection *_Nullable *_Nullable)rejection
+{
+    CRCertificateRejection *found = nil;
+    const int verdict = crb_certificate_verdict((const BYTE *)pem.bytes, pem.length, flags, accepted, &found);
+    if (rejection)
+        *rejection = found;
+    return verdict;
+}
+
+/* ADR-0024 D-2: FreeRDP takes the password as a NUL-terminated string and keeps its own copy
+ * (zeroed by winpr_zfree when the settings are freed). The terminated scratch copy made here is
+ * overwritten before it is freed, so the chain's bytes stay in exactly one buffer of this class. */
+static BOOL crb_apply_password(rdpSettings *settings, NSData *bytes)
+{
+    const size_t length = bytes.length;
+    char *scratch = (char *)calloc(length + 1, 1);
+    if (!scratch)
+        return FALSE;
+    if (length > 0)
+        memcpy(scratch, bytes.bytes, length);
+    const BOOL ok = freerdp_settings_set_string(settings, FreeRDP_Password, scratch);
+    memset_s(scratch, length + 1, 0, length + 1);
+    free(scratch);
+    return ok;
+}
+
 /* W4c review: push-style drain notification -- passed as crdpq_control_t's own
  * schedule_drain callback below, so it fires (coalesced, "at most once per drain cycle")
  * whenever a new control-lane event is posted, from whatever thread posted it (T_rdp, for
@@ -2451,7 +2660,7 @@ static void crb_schedule_drain(void *ctx)
 
 - (instancetype)initWithHost:(NSString *)host
                          user:(NSString *)user
-                     password:(NSString *)password
+                passwordBytes:(NSData *)passwordBytes
                       program:(NSString *)program
 {
     self = [super init];
@@ -2459,7 +2668,7 @@ static void crb_schedule_drain(void *ctx)
     {
         _host = [host copy];
         _user = [user copy];
-        _password = [password copy];
+        _passwordBytes = [NSMutableData dataWithData:passwordBytes];
         _program = [program copy];
         _state = CRSessionStateIdle;
         atomic_init(&_staleEventsDiscardedCount, 0ULL);
@@ -2517,6 +2726,10 @@ static void crb_schedule_drain(void *ctx)
         [self shutdownAndWait];
         NSAssert(_state == CRSessionStateIdle, @"shutdownAndWait must always leave _state == Idle");
     }
+    /* ADR-0024 D-2: the chain's password ends with this instance. */
+    if (_passwordBytes.length > 0)
+        memset_s(_passwordBytes.mutableBytes, _passwordBytes.length, 0, _passwordBytes.length);
+    _passwordBytes = nil;
     if (_controlQueue)
     {
         crdpq_control_destroy(_controlQueue);
@@ -2564,6 +2777,8 @@ static void crb_schedule_drain(void *ctx)
         return;
     }
     self.lastConnectError = nil;
+    /* ADR-0024 D-4: per attempt, exactly like -lastConnectError. */
+    self.lastCertificateRejection = nil;
     /* adr/0011 §2: reset before every fresh attempt, same reasoning as -lastConnectError
      * above -- a caller must never see a prior connection generation's answer. */
     self.unicodeInputSupported = NO;
@@ -2593,16 +2808,6 @@ static void crb_schedule_drain(void *ctx)
         _state = CRSessionStateIdle;
         return; /* nothing allocated yet at this point -- nothing to clean up */
     }
-
-#if CRB_ALLOW_INSECURE_CERT
-    /* H3: an explicit, unmissable startup warning every time a session starts with this
-     * Debug-only escape hatch enabled -- not just the per-connection log line inside
-     * crb_verify_certificate_ex itself, which someone scanning startup logs for "is this
-     * build secure" could plausibly miss among everything else FreeRDP logs. */
-    WLog_WARN(TAG, "CRB_ALLOW_INSECURE_CERT is defined -- this build accepts ANY TLS "
-                   "certificate unconditionally. Debug-only; must never be defined for a "
-                   "Release/distributed build (see App/project.yml's CRBridge target).");
-#endif
 
     /* M1: every early-return below this point goes through `cleanup` so the outbound
      * queue/wakeup event (already created) and the FreeRDP context (once it exists)
@@ -2656,7 +2861,8 @@ static void crb_schedule_drain(void *ctx)
      * Tools/rail-probe/rail-probe.c's main(), the wiring reference for this file. */
     if (!freerdp_settings_set_string(context->settings, FreeRDP_ServerHostname, self.host.UTF8String) ||
         !freerdp_settings_set_string(context->settings, FreeRDP_Username, self.user.UTF8String) ||
-        !freerdp_settings_set_string(context->settings, FreeRDP_Password, self.password.UTF8String))
+        !crb_apply_password(context->settings, _passwordBytes) ||
+        (_port > 0 && !freerdp_settings_set_uint32(context->settings, FreeRDP_ServerPort, _port)))
     {
         self.lastConnectError = [NSError errorWithDomain:@"Macdows.CRSession"
                                                       code:-3

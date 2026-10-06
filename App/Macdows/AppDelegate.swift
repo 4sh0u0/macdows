@@ -419,7 +419,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// only so the boundary gate above can be awaited without nesting the whole method inside a
 	/// closure; the body is unchanged, and it is only ever reached on an `.allowed` verdict.
 	private func beginSession(host: String, user: String, password pass: String) {
-		let newSession = CRSession(host: host, user: user, password: pass, program: "C:\\Windows\\System32\\winver.exe")
+		let newSession = CRSession(host: host, user: user, passwordBytes: Data(pass.utf8), program: "C:\\Windows\\System32\\winver.exe")
 		// Size the remote desktop to the UNION of the local screens, in remote pixels -- adr/0015
 		// §3 rule 3's `desktopSizePx`, the only value allowed to reach desktopWidth/Height.
 		// Without a desktop size at all the server clamps remote windows to FreeRDP's 1024x768

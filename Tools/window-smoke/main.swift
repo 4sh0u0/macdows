@@ -1208,6 +1208,59 @@ enum SizeBand {
 /// seam this tool has no owned file to build.
 ///
 /// Exit code 0/1, matching every other assertion path in this harness.
+/// ADR-0024 D-4 (W-b) applies to this harness too: the bridge accepts exactly the certificate
+/// whose SHA-256 is in `acceptedCertificateFingerprint` and rejects every other one, so a run
+/// needs the lab host's fingerprint BEFORE it dials. It comes from `MACDOWS_LAB_PIN_SHA256`,
+/// looked up exactly like WIN_HOST (environment variable first, then host.env), and goes through
+/// the App's own two rules: `CertificateFingerprint.parse` and the "preset" trust snapshot
+/// (`CertificateDecision.acceptedFingerprint(for: .preset(_))`). The harness never writes a pin
+/// and has no keychain. A missing or unparsable value refuses the run before any session exists
+/// (exit `refusalExitCode`); there is no trust-on-first-use fallback and no "accept anything".
+/// The value is never printed (it is public, but the refusal line stays value-free so that a
+/// mistyped secret pasted into the wrong key cannot reach the evidence log).
+enum LabCertificatePin {
+    static let key = "MACDOWS_LAB_PIN_SHA256"
+    /// Distinct from 2 (missing credentials), 3 / 4 (knob parse errors) and 78 (boundary refusal).
+    static let refusalExitCode: Int32 = 77
+
+    enum Resolution: Equatable {
+        /// The canonical 64-hex fingerprint for the bridge's trust snapshot.
+        case accepted(String)
+        /// One line, value-free: why the run is refused.
+        case refused(String)
+    }
+
+    static func resolve(_ raw: String?) -> Resolution {
+        guard let raw, !raw.isEmpty else {
+            return .refused("\(key) is not set (environment variable or host.env)")
+        }
+        switch CertificateFingerprint.parse(raw) {
+        case .failure(let error):
+            return .refused("\(key) is not a SHA-256 fingerprint (\(reason(error)))")
+        case .success(let fingerprint):
+            guard let accepted = CertificateDecision.acceptedFingerprint(for: .preset(fingerprint)) else {
+                return .refused("\(key) produced no trust snapshot")
+            }
+            return .accepted(accepted.canonical)
+        }
+    }
+
+    private static func reason(_ error: CertificateFingerprint.ParseError) -> String {
+        switch error {
+        case .empty: return "empty"
+        case .invalidCharacter: return "invalid character"
+        case .oddDigitCount: return "odd digit count"
+        case .sha1Length: return "20 bytes: a SHA-1 thumbprint"
+        case .wrongLength(let bytes): return "\(bytes) bytes"
+        }
+    }
+
+    static func refusalLine(_ reason: String) -> String {
+        "window-smoke: lab certificate pin REFUSED this run -- \(reason). Nothing was connected; "
+            + "no trust-on-first-use fallback exists (ADR-0024 D-4)."
+    }
+}
+
 enum WindowSmokeGateSelfTest {
     static func run() -> Bool {
         var ok = true
@@ -2784,6 +2837,39 @@ enum WindowSmokeGateSelfTest {
             "baselineLineTakesTheLastSizeBearingOrder: across a sequence the recorded size is the LAST order that actually carried the SIZE bit -- an OFFSET-only order in between neither overwrites it with its own (meaningless, unflagged) windowWidth/windowHeight nor erases it, which is the same delta-order invariant WindowState.merge enforces; the final size-bearing order then replaces it"
         )
 
+        // --- ADR-0024 D-4 W-b: the lab certificate pin (MACDOWS_LAB_PIN_SHA256) ----------------
+        let labPinCanonical = String(repeating: "ab", count: 32)
+        let labPinDisplay = stride(from: 0, to: 32, by: 1).map { _ in "AB" }.joined(separator: ":")
+        expect(
+            LabCertificatePin.resolve(labPinCanonical) == .accepted(labPinCanonical)
+                && LabCertificatePin.resolve(labPinDisplay) == .accepted(labPinCanonical)
+                && LabCertificatePin.resolve(" \(labPinCanonical.uppercased())\n") == .accepted(labPinCanonical),
+            "labPinAcceptsTheCanonicalAndDisplayForms: a 32-byte SHA-256 in canonical, upper-case colon or padded form resolves to the one canonical 64-hex value the bridge's snapshot compares against"
+        )
+        let missingNil = LabCertificatePin.resolve(nil)
+        let missingEmpty = LabCertificatePin.resolve("")
+        expect(
+            { if case .refused = missingNil { return true }; return false }()
+                && { if case .refused = missingEmpty { return true }; return false }(),
+            "labPinMissingRefuses: no value (unset or empty) refuses the run -- never a trust-on-first-use fallback"
+        )
+        let sha1 = String(repeating: "cd", count: 20)
+        let refusedForms = [sha1, String(repeating: "ab", count: 31), "zz" + String(repeating: "ab", count: 31), labPinCanonical + "a"]
+        expect(
+            refusedForms.allSatisfy { form in
+                if case .refused(let line) = LabCertificatePin.resolve(form) { return !line.contains(form) }
+                return false
+            },
+            "labPinInvalidRefuses: a SHA-1 thumbprint, a short value, a non-hex character and an odd digit count each refuse, and no refusal line repeats the value"
+        )
+        expect(
+            LabCertificatePin.refusalExitCode != 0 && LabCertificatePin.refusalExitCode != 1
+                && LabCertificatePin.refusalExitCode != 2 && LabCertificatePin.refusalExitCode != 78
+                && !LabCertificatePin.refusalLine("x").contains(LabCertificatePin.key + "=")
+                && LabCertificatePin.refusalLine("x").hasPrefix("window-smoke: lab certificate pin REFUSED"),
+            "labPinRefusalHasItsOwnExitCode: the refusal exit code is distinct from pass / fail / missing credentials / boundary refusal, and the refusal line carries no key=value"
+        )
+
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
         // rev-L9 M-4: `Scripts/run-window-smoke.command:192-193` records `DONE exit=<rc>` via `launcher_done` and its callers
         // read that line as the whole verdict. A `WINDOW_SMOKE_SELFTEST=1` leaked into the
@@ -3102,6 +3188,18 @@ case .refused(let refusal):
             + "Nothing was connected; the host value is not printed (red line)."
     )
     exit(78)
+}
+
+// ADR-0024 D-4 (W-b): the certificate this run accepts, resolved before any session exists.
+// Same lookup order as WIN_HOST (environment first, then host.env); see `LabCertificatePin`.
+let labAcceptedFingerprint: String
+switch LabCertificatePin.resolve(EnvFile.value(forKey: LabCertificatePin.key, in: fileEnv)) {
+case .accepted(let canonical):
+    labAcceptedFingerprint = canonical
+    print("window-smoke: lab certificate pin resolved (preset snapshot, 64 hex digits; never written back)")
+case .refused(let reason):
+    print(LabCertificatePin.refusalLine(reason))
+    exit(LabCertificatePin.refusalExitCode)
 }
 
 // H2/L4 (W4b review): the evidence path is now a parameter, not a hardcoded absolute path,
@@ -4237,6 +4335,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private let host: String
     private let user: String
     private let pass: String
+    /// ADR-0024 D-4: the canonical SHA-256 the bridge's trust snapshot accepts (`LabCertificatePin`).
+    private let acceptedFingerprint: String
     private let screenshotPath: String
     private let launchedProgram: String
     private let launchedAppKind: LaunchedAppKind
@@ -4969,12 +5069,13 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     private var activatePost = ActivateExperimentCheckpoint(threshold: 20)
     private var didSendActivate = false
 
-    init(host: String, user: String, pass: String, screenshotPath: String, launchedProgram: String,
-         launchedAppKind: LaunchedAppKind, inputTestMode: InputTestMode?)
+    init(host: String, user: String, pass: String, acceptedFingerprint: String, screenshotPath: String,
+         launchedProgram: String, launchedAppKind: LaunchedAppKind, inputTestMode: InputTestMode?)
     {
         self.host = host
         self.user = user
         self.pass = pass
+        self.acceptedFingerprint = acceptedFingerprint
         self.screenshotPath = screenshotPath
         self.launchedProgram = launchedProgram
         self.launchedAppKind = launchedAppKind
@@ -5026,7 +5127,13 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         // canBecomeKey bug ship unnoticed in the first place.
         NSApp.activate(ignoringOtherApps: true)
 
-        let newSession = CRSession(host: host, user: user, password: pass, program: launchedProgram)
+        // ADR-0024 D-2: the bridge takes the password as bytes; this harness still reads it from
+        // host.env / the environment as before (tools are not the product, ADR-0024 D-9 M-a).
+        let newSession = CRSession(host: host, user: user, passwordBytes: Data(pass.utf8), program: launchedProgram)
+        // ADR-0024 D-4 (W-b): the trust snapshot, set once before the first `-start`; every later
+        // `-start` of this session (the cycle restarts) reuses it. Never nil here: a missing or
+        // invalid lab pin already ended the process before the delegate existed.
+        newSession.acceptedCertificateFingerprint = acceptedFingerprint
         // adr/0011 §5 items 5/6 (WINDOW_SMOKE_APP_ARGS): RemoteApp launch arguments, so a run
         // can open a SPECIFIC seeded file (e.g. `notepad.exe C:\rdp-lab\cmdmap-seed.txt`) for
         // the input round-trip batteries instead of the argument-less winver every other
@@ -9865,7 +9972,8 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
 // read would be the one lying.
 let app = NSApplication.shared
 let delegate = WindowSmokeDelegate(
-    host: host, user: user, pass: pass, screenshotPath: screenshotPath, launchedProgram: launchedProgram,
+    host: host, user: user, pass: pass, acceptedFingerprint: labAcceptedFingerprint,
+    screenshotPath: screenshotPath, launchedProgram: launchedProgram,
     launchedAppKind: launchedAppKind, inputTestMode: inputTestMode
 )
 // .accessory: no Dock icon/menu bar needed for a CLI verification harness, but this still

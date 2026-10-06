@@ -359,6 +359,10 @@ struct AppDelegateAutolaunchPinTests {
     /// End-session button's predicate (adr/0022 D-11). The actions themselves are untouched. The
     /// region now folds to 34853 characters, a net folded edit of +1290.
     ///
+    /// RE-FROZEN by ADR-0024 UI slice ① commit 1 (the bridge takes the password as bytes, D-2):
+    /// `beginSession`'s `CRSession(...)` call passes `passwordBytes: Data(pass.utf8)` instead of the
+    /// string. Nothing else in the region moved. It now folds to 34869 characters, +16.
+    ///
     /// The "net folded edit" above is the folded-length delta for each re-freeze, which is what the
     /// length chain below already checks; it is not a token-by-token added/removed count -- those
     /// depend on the diff algorithm and separator convention used to produce them, so this pin does
@@ -374,9 +378,9 @@ struct AppDelegateAutolaunchPinTests {
     /// expected to re-freeze this constant in the same commit that makes the edit, and the length
     /// below is here so that such a re-freeze can be sanity-checked (a length that MOVED by the size
     /// of the edit is a re-freeze; a length that moved by 22638 is a needle that stopped matching).
-    private static let foldedTailLength = 34853
+    private static let foldedTailLength = 34869
     private static let foldedTailSHA256 =
-        "9ef8defe4ed129c6f99d7aaf0941edb3b4050d1d3c55cad70fd904a80fa4e269"
+        "340218e928579fcb4e01947a299a85b7bea3adccb45f0e58a996dadd0b2e3252"
 
     @Test("connectTapped to end-of-file is byte-identical to its last deliberate freeze")
     func theRestOfTheFileIsUnchanged() throws {

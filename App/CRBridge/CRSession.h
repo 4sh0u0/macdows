@@ -321,6 +321,20 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 
 @end
 
+/// ADR-0024 D-4: one certificate the bridge's callback rejected. Built on T_rdp, immutable.
+@interface CRCertificateRejection : NSObject
+/// The presented leaf certificate's SHA-256 (canonical, 64 lower-case hex digits), or nil when
+/// FreeRDP could not parse the certificate.
+@property (nonatomic, readonly, copy, nullable) NSString *sha256Fingerprint;
+@property (nonatomic, readonly, copy) NSString *subject;
+@property (nonatomic, readonly, copy) NSString *issuer;
+/// FreeRDP's VERIFY_CERT_FLAG_* bits.
+@property (nonatomic, readonly) uint32_t flags;
+/// REDIRECT or GATEWAY was set: a route v1 does not support, refused whatever the fingerprint.
+@property (nonatomic, readonly) BOOL unsupportedRoute;
+- (instancetype)init NS_UNAVAILABLE;
+@end
+
 /// One RDP/RAIL/RDPGFX session bridging a remote Windows host into this process, per
 /// adr/0005. `CRSession.mm`'s implementation links FreeRDP and CRDPQueue's C API
 /// directly; none of that leaks across this header — it stays pure Objective-C so Swift
@@ -339,15 +353,68 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// session instance.
 + (void)logFreeRDPVersion;
 
-/// `host`/`user`/`password` are supplied by the caller — this class never reads
+/// `host`/`user`/`passwordBytes` are supplied by the caller — this class never reads
 /// environment variables or credential files itself (red line: no credential-handling
 /// logic embedded in library code). `program` is the RemoteApp executable path on the
 /// Windows host, e.g. `C:\Windows\System32\winver.exe`.
+///
+/// ADR-0024 D-2 (P-b): the password arrives as BYTES (UTF-8, no terminator), never as a string
+/// this class keeps. They are copied into a buffer this instance owns for its whole life -- one
+/// connection CHAIN: every `-start`, every reconnect through `-restartForReconnectPreparing:` and
+/// the re-`-start` after a certificate confirmation all reuse it, so the password is fetched
+/// once per chain -- and that buffer is overwritten in `-dealloc`. Each `-start` copies it into a
+/// NUL-terminated scratch buffer, hands that to FreeRDP's settings (which keep their own copy and
+/// zero it when the context is freed) and overwrites the scratch buffer at once. The caller should
+/// overwrite its own copy as soon as this initializer returns.
 - (instancetype)initWithHost:(NSString *)host
                          user:(NSString *)user
-                     password:(NSString *)password
+                passwordBytes:(NSData *)passwordBytes
                       program:(NSString *)program NS_DESIGNATED_INITIALIZER;
 - (instancetype)init NS_UNAVAILABLE;
+
+/// ADR-0024 D-8 (F-3): pins the process-wide WinPR log configuration and ignores every `WLOG_*`
+/// environment variable. Removes the eight variables WinPR's root logger reads at its first use
+/// (appender type, level, filter, prefix, file path / name, UDP target, journald id), then sets the
+/// root logger's appender to CONSOLE and its level to INFO through the API -- the same output the
+/// default configuration produces, so the stdout channel the bridge's judgement lines use
+/// (`[key-witness]` and the other INFO lines) is unchanged, while a `WLOG_APPENDER=FILE` / `UDP` or
+/// a `WLOG_FILTER` that raises a tag to DEBUG (where FreeRDP prints account names) has no effect.
+/// Call it once, as the App's very first statement, before anything can create the root logger
+/// (WinPR reads the variables only then). Returns NO if the root logger or either setter failed.
++ (BOOL)pinProcessLogConfiguration;
+
+/// ADR-0024 D-10 ③: the SHA-256 fingerprint FreeRDP computes for the FIRST certificate in `pem`
+/// (`freerdp_certificate_new_from_pem` + `freerdp_certificate_get_fingerprint_by_hash_ex(cert,
+/// "sha256", FALSE)`: 64 lower-case hex digits, the leaf certificate's DER digest), or nil when
+/// FreeRDP cannot parse it. The certificate callback uses exactly this function.
++ (nullable NSString *)sha256FingerprintOfCertificatePEM:(NSData *)pem;
+
+/// ADR-0024 D-10 ③: the certificate callback's whole decision, callable offline: 2 when the
+/// first certificate in `pem` has the fingerprint `accepted` (compared ignoring case) and `flags`
+/// carry neither REDIRECT (0x10) nor GATEWAY (0x20); 0 otherwise, with `*rejection` set. Never
+/// negative (a negative answer would make FreeRDP log the whole PEM at ERROR level).
++ (int)certificateVerdictForPEM:(NSData *)pem
+                          flags:(uint32_t)flags
+            acceptedFingerprint:(nullable NSString *)accepted
+                      rejection:(CRCertificateRejection *_Nullable *_Nullable)rejection;
+
+/// ADR-0024 D-4 (Y-b): the trust snapshot the certificate callback judges against -- the ONE
+/// SHA-256 fingerprint (canonical, 64 hex digits) this connection may accept, or nil to accept
+/// none. Set on T_main before `-start` (the callback reads it on T_rdp, after the thread was
+/// spawned) and again before the re-`-start` that follows a Trust / Replace. With
+/// `ExternalCertificateManagement` on, FreeRDP asks nothing else: known-hosts, the system
+/// `certificates.json` and OpenSSL chain + host-name validation are never consulted.
+@property (copy, nullable) NSString *acceptedCertificateFingerprint;
+
+/// ADR-0024 D-4 (Y-b): what the certificate callback rejected on the most recent `-start`, or nil.
+/// Published from T_rdp inside the TLS handshake, i.e. BEFORE `-lastConnectError` and before the
+/// DISCONNECTED sentinel; cleared at the start of each `-start`, like `-lastConnectError`. When
+/// both this and a decode-path refusal could be set, this one is the cause (a certificate is
+/// rejected before any channel exists).
+@property (readonly, nullable) CRCertificateRejection *lastCertificateRejection;
+
+/// The RDP port (`FreeRDP_ServerPort`); 0 leaves FreeRDP's default, 3389. Set before `-start`.
+@property (nonatomic) uint16_t port;
 
 /// Remote session desktop size. Set BOTH before `-start` (read once by the connect path on
 /// T_rdp; unsynchronized afterwards) or leave at 0/0 for FreeRDP's default (1024x768). The

@@ -110,7 +110,7 @@ struct ReconnectDriverTopologyHookTests {
     @Test func theHookIsEvaluatedInsidePrepareAndBeforeTheTeardown() throws {
         let old = CountingProvider(try hookFixtureTopology(width: 1920))
         let fresh = CountingProvider(try hookFixtureTopology(width: 2560))
-        let session = HookTestSession(host: "", user: "", password: "", program: "")
+        let session = HookTestSession(host: "", user: "", passwordBytes: Data(), program: "")
         let registry = RemoteWindowRegistry(session: session, topologyProvider: old)
         let clock = HookTestClock()
         let driver = ReconnectDriver(session: session, registry: registry, clock: clock)
@@ -146,7 +146,7 @@ struct ReconnectDriverTopologyHookTests {
     /// inventing a provider of its own when the hook is nil.
     @Test func withNoHookTheRegistryKeepsItsSeamAndStillPrepares() throws {
         let seam = CountingProvider(try hookFixtureTopology(width: 1920))
-        let session = HookTestSession(host: "", user: "", password: "", program: "")
+        let session = HookTestSession(host: "", user: "", passwordBytes: Data(), program: "")
         let registry = RemoteWindowRegistry(session: session, topologyProvider: seam)
         let clock = HookTestClock()
         let driver = ReconnectDriver(session: session, registry: registry, clock: clock)
@@ -165,7 +165,7 @@ struct ReconnectDriverTopologyHookTests {
     /// side, while still having been called.
     @Test func aHookThatReturnsNilStillRunsAndKeepsTheSeam() throws {
         let seam = CountingProvider(try hookFixtureTopology(width: 1920))
-        let session = HookTestSession(host: "", user: "", password: "", program: "")
+        let session = HookTestSession(host: "", user: "", passwordBytes: Data(), program: "")
         let registry = RemoteWindowRegistry(session: session, topologyProvider: seam)
         let clock = HookTestClock()
         let driver = ReconnectDriver(session: session, registry: registry, clock: clock)

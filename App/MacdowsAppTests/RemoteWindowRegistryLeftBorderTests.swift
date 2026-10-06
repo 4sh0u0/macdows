@@ -164,7 +164,7 @@ struct RemoteWindowRegistryLeftBorderTests {
     private static func makeRegistry(
         advertisedDesktopScaleFactor: UInt32, topology: DisplayTopology
     ) throws -> (RemoteWindowRegistry, SentBox) {
-        let session = CRSession(host: "", user: "", password: "", program: "")
+        let session = CRSession(host: "", user: "", passwordBytes: Data(), program: "")
         session.advertisedDesktopScaleFactor = advertisedDesktopScaleFactor
         let registry = RemoteWindowRegistry(
             session: session, topologyProvider: StaticDisplayTopologyProvider(topology)
