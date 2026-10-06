@@ -34,7 +34,7 @@ done
 # CRDP_WITH_FFMPEG: Phase 2 W0(2) AVC caps flip (adr/0007, docs/plans/phase2.md W0 item 2).
 # Default ON as of this flip -- deps/freerdp.lock's committed flags already say WITH_FFMPEG/
 # WITH_VIDEO_FFMPEG=ON, so CRDP_WITH_FFMPEG=1 is a no-op pass-through of the lock. Set
-# CRDP_WITH_FFMPEG=0 to force those (plus the WITH_VIDEOTOOLBOX hwaccel flag that depends on
+# CRDP_WITH_FFMPEG=0 to force those (plus the WITH_FFMPEG_HWACCEL hwaccel flag that depends on
 # WITH_VIDEO_FFMPEG) back to OFF at configure time -- the pre-flip config -- without editing
 # the lock. See "--- ffmpeg (H264 decode) ---" below for why this has to fold into the config
 # hash rather than being a silent flag substitution like CMAKE_INSTALL_PREFIX/OPENSSL_ROOT_DIR.
@@ -287,7 +287,7 @@ while IFS= read -r flag; do
 	# discovery block when FFMPEG_LIBRARIES is already set. Seeding exactly the four
 	# components we build (avcodec, avutil, swresample, and -- since the 3.31.1 pin --
 	# swscale, whose header h264_ffmpeg.c includes unconditionally from 3.31.0 on and whose
-	# sws_* symbols it calls under WITH_VIDEOTOOLBOX, which this build enables) is what keeps
+	# sws_* symbols it calls under WITH_FFMPEG_HWACCEL, which this build enables) is what keeps
 	# libavformat/libavfilter/libavdevice out of libfreerdp3's link line no matter what
 	# happens to be installed on the machine.
 	-DFFMPEG_INCLUDE_DIRS=*) flag="-DFFMPEG_INCLUDE_DIRS=$CRDP_FFMPEG_PREFIX/include" ;;
@@ -303,7 +303,7 @@ while IFS= read -r flag; do
 	# never force them ON, that's what the lock's own committed values already do.
 	-DWITH_FFMPEG=*) [ "$CRDP_WITH_FFMPEG" = "1" ] || flag="-DWITH_FFMPEG=OFF" ;;
 	-DWITH_VIDEO_FFMPEG=*) [ "$CRDP_WITH_FFMPEG" = "1" ] || flag="-DWITH_VIDEO_FFMPEG=OFF" ;;
-	-DWITH_VIDEOTOOLBOX=*) [ "$CRDP_WITH_FFMPEG" = "1" ] || flag="-DWITH_VIDEOTOOLBOX=OFF" ;;
+	-DWITH_FFMPEG_HWACCEL=*) [ "$CRDP_WITH_FFMPEG" = "1" ] || flag="-DWITH_FFMPEG_HWACCEL=OFF" ;;
 	esac
 	FLAGS+=("$flag")
 done <<<"$FLAGS_RAW"
@@ -342,7 +342,7 @@ CACHE_FILE="$BUILD_DIR/CMakeCache.txt"
 # invariant this flip retires (adr/0004/adr/0007).
 CACHE_KEYS=(
 	CMAKE_BUILD_TYPE CMAKE_OSX_ARCHITECTURES CMAKE_OSX_DEPLOYMENT_TARGET
-	CHANNEL_URBDRC WITH_VIDEOTOOLBOX WITH_FFMPEG WITH_VIDEO_FFMPEG WITH_SWSCALE WITH_DSP_FFMPEG
+	CHANNEL_URBDRC WITH_FFMPEG_HWACCEL WITH_FFMPEG WITH_VIDEO_FFMPEG WITH_SWSCALE WITH_DSP_FFMPEG
 	WITH_OPENH264 WITH_URIPARSER WITH_JSON_DISABLED
 	OPENSSL_ROOT_DIR OPENSSL_USE_STATIC_LIBS
 )

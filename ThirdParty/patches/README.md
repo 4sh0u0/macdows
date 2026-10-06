@@ -84,7 +84,7 @@ policy).
 
 ## Current state
 
-**No patches** against FreeRDP 3.31.1 (`63b948ca5cb94307fd5444ee6e73927a41ccdab4`). The queue is
+**No patches** against FreeRDP 3.32.1 (`bf217a504e54cc719880c228e82353382cd7d4fa`). The queue is
 empty on purpose: both patches this project ever carried are retired -- `0001` absorbed upstream on
 the 3.31.1 pin bump (2026-09-02), `0002` retired by design when its lab experiment closed
 (2026-09-07). The rules above, including the lab-only exception, stay set with the directory empty.
