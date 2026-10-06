@@ -6324,7 +6324,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         cycleRenderedAt = nil
         // adr/0014 §6: the tray-click scenario's per-connection state dies with the
         // connection. `registry.prepareForReconnect()` above tore down every live
-        // `NSStatusItem`, so every key in `liveNotifyIconKeys` now names an icon that no
+        // tray entry, so every key in `liveNotifyIconKeys` now names an icon that no
         // longer exists -- and notify-icon ids are per-session, so the next cycle's server may
         // legitimately reuse the same numbers for different icons, which is how a stale key
         // turns into a click addressed at the wrong icon (or at nothing, failing
@@ -7369,7 +7369,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// AND `liveCount >= 1` -- plus a live key in this harness's own `liveNotifyIconKeys`.
     /// Read these precisely: `realIconMaxObserved` is a SESSION-WIDE latch ("at least one icon
     /// in this session held a real remote bitmap at some point", possibly a different icon,
-    /// possibly already deleted), and `liveCount` says a status item exists right now. Neither
+    /// possibly already deleted), and `liveCount` says a tray entry exists right now. Neither
     /// says the icon actually clicked below is currently showing a real bitmap, and this
     /// scenario does not need it to: what it asserts is the SEND path (message sequence, key
     /// fidelity, queue admission), none of which depends on the clicked icon's pixels. The
@@ -7378,11 +7378,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// this one's.
     ///
     /// The click goes through `RemoteWindowRegistry.debugSimulateTrayClick`, which enters
-    /// `TrayStatusController.handleLeftClick(tag:)` with the same packed tag the live
-    /// `NSStatusBarButton` carries -- the real path, with AppKit's own event delivery as the
-    /// ONLY thing skipped (there is no supported way to synthesize a menu-bar click for
-    /// another process's status item). The liveness re-check, the counters, and the registry's
-    /// two-PDU send all run exactly as they would for a user's click.
+    /// `TrayStatusController.handleLeftClick(tag:)` with the same packed tag the Remote tray
+    /// section's menu item carries (adr/0023) -- the real path, with AppKit's own menu
+    /// selection as the ONLY thing skipped (this harness has no status item, and there is no
+    /// supported way to synthesize a menu-bar click). The liveness re-check, the counters, and
+    /// the registry's two-PDU send all run exactly as they would for a user's click.
     private func runTrayClickScenario(session: CRSession, registry: RemoteWindowRegistry) {
         guard trayClickScenarioEnabled, !trayClickDone else { return }
         let diag = registry.trayDiagnostics()
@@ -8747,12 +8747,17 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         check(monitoredDesktopEventCount >= 1, "received >=1 MonitoredDesktop event this session (adr/0008 §0: ~25/session observed) (got \(monitoredDesktopEventCount))")
         check(zOrderSyncEventCount >= 1, "received >=1 ZOrderSync event this session (adr/0008 §0: exactly 1/session observed) (got \(zOrderSyncEventCount))")
 
-        // Phase 2 W6 (docs/plans/phase2.md §2 W6 / §4 W6 acceptance: "NSStatusItem 数量 ==
-        // create−delete"): printed unconditionally, like [flow]/[zorder] above, regardless of
-        // pass/fail. Unlike `finishCycle` (which explicitly calls `registry.prepareForReconnect()`
+        // Phase 2 W6 acceptance as adr/0023 D-3 rewrites it (W6-1: the tray side's live entry
+        // count == create−delete; it used to read "NSStatusItem 数量 == create−delete" before the
+        // per-icon status items were retired into the Macdows status item's Remote tray section):
+        // printed unconditionally, like [flow]/[zorder] above, regardless of pass/fail. This
+        // harness has no status item and no menu; `liveCount` is the tray side's own entry
+        // count, which is the same number a mirroring menu shows (adr/0023 D-6 P-a; the menu
+        // side is pinned offline as W6-2). The `[tray]` line's field names and order are
+        // unchanged, so earlier records read the same way. Unlike `finishCycle` (which explicitly calls `registry.prepareForReconnect()`
         // right after its own `shutdownAndWait()`), this single-run `finish()` never resets the
         // registry -- `session.shutdownAndWait()` above tears down the CONNECTION but leaves
-        // `registry`'s own bookkeeping (including `trayStatusController`'s live items) exactly
+        // `registry`'s own bookkeeping (including `trayStatusController`'s live entries) exactly
         // as this session's drain loop last left it, so `liveCount` below is real, undisturbed
         // evidence of this session's create/delete balance, not a trivially-zeroed post-teardown
         // read.
@@ -8792,7 +8797,7 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
         if trayDiag.createsSeen > 0 || trayDiag.updatesSeen > 0 || trayDiag.deletesSeen > 0 {
             check(
                 trayDiag.liveCount == trayDiag.createsSeen - trayDiag.deletesSeen,
-                "NSStatusItem count == create−delete (phase2.md §4 W6 acceptance) (got liveCount=\(trayDiag.liveCount) creates=\(trayDiag.createsSeen) deletes=\(trayDiag.deletesSeen))"
+                "Remote tray item count == create−delete (phase2.md §4 W6 acceptance) (got liveCount=\(trayDiag.liveCount) creates=\(trayDiag.createsSeen) deletes=\(trayDiag.deletesSeen))"
             )
         }
         // adr/0013 acceptance (WINDOW_SMOKE_TRAY=1): the run was pointed at a tray-icon-

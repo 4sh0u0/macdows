@@ -59,7 +59,9 @@ private final class RemoteWindowBackingWindow: NSWindow {
     /// if the policy ever flips back to native chrome, and costs nothing while dormant.
     ///
     /// Cmd+W does NOT depend on this path either way. Since adr/0022 the App has a main menu
-    /// (`App/Macdows/MainMenu.swift`), but it has no Close item, and while a remote window is
+    /// (`App/Macdows/MainMenu.swift`), but it has no Close item (slice ②'s File menu deliberately
+    /// leaves Close Window out until slice ① owns the main window's lifetime -- on the scaffold
+    /// window ⌘W would close the last window and terminate the app), and while a remote window is
     /// key `RemoteWindowContentView.performKeyEquivalent` claims Cmd+W before the menu bar is
     /// asked at all (adr/0022 D-2 B); the claim runs the same body `keyDown` runs, so Cmd+W
     /// still flows to `CommandKeyMapper`, which reports `.closeRequest` and routes to
@@ -97,11 +99,24 @@ private final class RemoteWindowBackingWindow: NSWindow {
         onZoom?()
     }
 
+    /// adr/0022 slice ②: Window ▸ Bring All to Front is greyed while a remote window is key.
+    /// `arrangeInFront:` is an `NSApplication` action, so without this method the responder chain
+    /// would pass this window by and NSApp would validate the item itself; answering it here makes
+    /// this window the item's target, and `validateMenuItem` below denies it. Never reached
+    /// through the menu for that reason, and deliberately does nothing if called directly.
+    /// The greying is cosmetic: the real guarantee is adr/0022 D-5 W2 (remote windows exclude
+    /// themselves from the Window menu's window list, so NSApp's arranging never touches them).
+    /// The ⌥ alternate AppKit injects next to this item, Arrange in Front
+    /// (`alternateArrangeInFront:`, targeted at NSApp), stays enabled for the same reason and
+    /// likewise leaves remote windows alone; their order is the server's.
+    @objc func arrangeInFront(_ sender: Any?) {}
+
     /// Default-deny (gate r1 I-1): only D-10's two items are ever enabled, and only while wired.
     /// Everything else answers NO -- including the Window-menu items AppKit injects on its own
     /// (Full Screen, Center, Move & Resize), whose stock validation would otherwise enable them for
     /// a key borderless remote window and move its frame locally, outside D-10's server-authoritative
-    /// route. `undo:` / `redo:` were already disabled by the stock answer (adr/0022 U-5) and stay so.
+    /// route, and slice ②'s View ▸ Enter Full Screen and Window ▸ Bring All to Front (adr/0022
+    /// R-11, UI-1 spec §6.1). `undo:` / `redo:` were already disabled by the stock answer (adr/0022 U-5) and stay so.
     override func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
         case #selector(performMiniaturize(_:)), #selector(performZoom(_:)):
