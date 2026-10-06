@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import Testing
 
 // The session-end lane (a follow-up to adr/0019 §2 lane D). Lane D's implementation report
@@ -382,10 +382,10 @@ struct AppDelegateSessionEndPinTests {
     ///  (i)   the main menu is assigned exactly once in `App/Macdows`, counted by CALL SHAPE
     ///        (`.mainMenu = `, so a doc comment or the builder's own names do not count), and that
     ///        one assignment is in `App/Macdows/MainMenu.swift` (adr/0022 D-9);
-    ///  (ii)  the menu file reaches none of the session controls: `connectTapped`,
-    ///        `prepareForReconnect` and `endSessionTapped` each appear 0 times. The
-    ///        `endSessionTapped` half is limited to slice ⓪: slice ② adds a Disconnect item under
-    ///        adr/0022 D-11 and changes it to "exactly once, on that item";
+    ///  (ii)  the menu file reaches no session control but one: `connectTapped` and
+    ///        `prepareForReconnect` appear 0 times, and `endSessionTapped` -- 0 in slice ⓪ --
+    ///        appears exactly once since slice ② (adr/0022 D-11 K3-R), as the action of the
+    ///        Disconnect item and of nothing else in the built menu;
     ///  (iii) key routing is pinned positively elsewhere (above).
     ///
     /// Kept from the original S-6: no `print(` anywhere in `App/Macdows` (the product's Disconnect
@@ -397,6 +397,7 @@ struct AppDelegateSessionEndPinTests {
     /// A knob lane that prints an anchor line from `App/Macdows` collides with this pin and has to
     /// change it in the same commit.
     @Test("one main-menu install in MainMenu.swift, no session controls in it, no print( in App/Macdows, no SC_CLOSE or reconnect seam in AppDelegate")
+    @MainActor
     func theEndSessionPathAddsNoStdoutAndNoReconnectAndTheMenuIsInstalledOnce() throws {
         let files = try sessionEndSwiftFiles(under: "App/Macdows")
         #expect(files.contains(Self.appDelegate) && files.contains("App/Macdows/main.swift")
@@ -414,9 +415,22 @@ struct AppDelegateSessionEndPinTests {
 
         // (ii)
         let menu = sessionEndCodeOnly(try sessionEndRawSource(Self.mainMenu))
-        for route in ["connectTapped", "prepareForReconnect", "endSessionTapped"] {
+        for route in ["connectTapped", "prepareForReconnect"] {
             #expect(sessionEndOccurrences(of: route, in: menu) == 0, "\(route)")
         }
+        #expect(sessionEndOccurrences(of: "endSessionTapped", in: menu) == 1)
+        #expect(sessionEndOccurrences(of: "static let disconnectAction = NSSelectorFromString(\"endSessionTapped\")", in: menu) == 1)
+        var carriers: [String] = []
+        func walk(_ menu: NSMenu) {
+            for item in menu.items {
+                if item.action == MainMenu.disconnectAction { carriers.append(item.title) }
+                if let sub = item.submenu { walk(sub) }
+            }
+        }
+        walk(MainMenu.build().mainMenu)
+        #expect(carriers == ["Disconnect"], "only File ▸ Disconnect carries the End-session action")
+        #expect(MainMenu.disconnectItem().action == MainMenu.disconnectAction)
+        #expect(MainMenu.disconnectItem().target == nil)
 
         let code = try Self.code()
         #expect(sessionEndOccurrences(of: "performClose", in: code) == 0)
@@ -453,5 +467,27 @@ struct AppDelegateSessionEndPinTests {
             in: bridge) == 1)
         #expect(sessionEndOccurrences(of: "onEventsAvailable()", in: bridge) == 1,
                 "the hook is invoked from one place in the bridge")
+    }
+
+    // MARK: - adr/0022 D-11 (K3-R): the Disconnect items' enablement is the button's predicate
+
+    /// adr/0022 D-11: File ▸ Disconnect and the status item's Disconnect reach `AppDelegate` through
+    /// the responder chain, and the delegate validates them with the End-session button's own
+    /// predicate, `session != nil` -- the whole body, so a validation that enabled them some other
+    /// way, or validated every item by the session, is red. S-5 above still holds: the conformance
+    /// adds no `@objc` and no `#selector`.
+    ///
+    /// MUST-RED for: a different predicate, a missing guard on the action, and a validation that
+    /// moves out of the delegate.
+    @Test("the Disconnect menu items are validated by the button's own predicate, in AppDelegate")
+    func disconnectItemsAreValidatedLikeTheButton() throws {
+        let code = try Self.code()
+        #expect(sessionEndOccurrences(
+            of: "extension AppDelegate: NSMenuItemValidation { "
+                + "func validateMenuItem(_ menuItem: NSMenuItem) -> Bool { "
+                + "guard menuItem.action == MainMenu.disconnectAction else { return true } "
+                + "return session != nil } }",
+            in: code) == 1)
+        #expect(sessionEndOccurrences(of: "func validateMenuItem(", in: code) == 1)
     }
 }

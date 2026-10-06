@@ -37,7 +37,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// built the button.
 		didSet { endSessionButton.isEnabled = session != nil }
 	}
-	private var registry: RemoteWindowRegistry?
+	private var registry: RemoteWindowRegistry? {
+		// adr/0022 D-6 / adr/0023 D-6 (P-a): the status item is handed the current session's
+		// registry -- the source of its Remote tray section -- and nil when there is none (an
+		// empty source: the section hides). A `didSet` covers both of this property's assignments,
+		// the connect's and the teardown's, without adding a statement to either.
+		didSet { statusItemController.bind(registry) }
+	}
+	/// adr/0022 D-6 (T1, UI slice ②): the Macdows status item and its menu. App-resident -- created
+	/// with this delegate, put in the menu bar at launch, taken out when the App terminates -- and
+	/// never per session; it reads the session through `statusItemReading()` and is handed the
+	/// registry by `registry`'s `didSet`.
+	private let statusItemController = StatusItemController()
+	/// The address the current session was opened to, for the status item's rows and the Remote
+	/// tray section's header (adr/0023 D-4). Read only while `session` is set.
+	private var statusItemHost: String?
 	/// adr/0019 §2 lane D: the reconnect driver for the session above, armed in `beginSession` and
 	/// dropped when this app stops having a session to reconnect. Per-connection, exactly like
 	/// `session` and `registry`, and deliberately NOT app-resident: it holds the very `CRSession`
@@ -122,6 +136,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		window = newWindow
 		window.makeKeyAndOrderFront(nil)
 		NSApp.activate(ignoringOtherApps: true)
+
+		// adr/0022 D-6 (UI slice ②): the status item, once, at launch.
+		statusItemController.reading = { [weak self] in
+			self?.statusItemReading() ?? .noSession
+		}
+		statusItemController.install()
 
 		// M1/W1 deliverable 2: the screen-parameter observer's *observable* half. The provider
 		// already logs every change (Console.app, category "DisplayTopology"); this puts the same
@@ -454,6 +474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// is exactly the divergence §5.A.4 forbids. Without any provider the registry cannot learn
 		// about screens at all (its NSScreen read was removed in M1) and would decline to position
 		// any window, warning once -- loud, but still broken.
+		statusItemHost = host
 		let newRegistry = RemoteWindowRegistry(
 			session: newSession,
 			topologyProvider: StaticDisplayTopologyProvider(displayTopology.sessionSnapshot)
@@ -608,6 +629,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			eventCount = 0
 		}
 		applyShell(for: state)
+		// adr/0022 D-6 / adr/0023 D-4: the status item's rows and Remote tray section follow the
+		// driver's state, including while its menu is open.
+		statusItemController.refresh()
 		if case .gaveUp = state {
 			// This app's half of "the driver has stopped trying": end the session for real, so the
 			// button `ShellReconnectPresenter` has just enabled can actually start a new one.
@@ -791,6 +815,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		connectButton.isEnabled = shell.connectEnabled
 	}
 
+	/// What the status item shows, read from this delegate's own state (adr/0022 D-6): whether a
+	/// session exists -- the End-session button's predicate --, the reconnect driver's state, and the
+	/// address. Read, never written.
+	private func statusItemReading() -> StatusItemController.SessionReading {
+		StatusItemController.SessionReading(
+			hasSession: session != nil, state: reconnectDriver?.state, host: statusItemHost
+		)
+	}
+
 	func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
 		true
 	}
@@ -802,5 +835,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// is an edge `teardownInitiated` does not close), and everything it drops, it drops after
 		// the shutdown. See the exit precondition on `tearDownSession()`.
 		tearDownSession()
+	}
+}
+
+/// adr/0022 D-11 (K3-R): File ▸ Disconnect and the status item's Disconnect are nil-target items
+/// whose action is the End-session button's own method (`MainMenu.disconnectAction`); no window
+/// implements it, so the responder chain brings them here. They are enabled by the button's own
+/// predicate, a session to end, so the two menu items and the button are never in disagreement.
+/// Every other item this delegate is asked about keeps AppKit's answer (enabled).
+extension AppDelegate: NSMenuItemValidation {
+	func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+		guard menuItem.action == MainMenu.disconnectAction else { return true }
+		return session != nil
 	}
 }

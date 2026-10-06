@@ -41,8 +41,13 @@ private func mainMenuOccurrences(of needle: String, in haystack: String) -> Int 
     haystack.components(separatedBy: needle).count - 1
 }
 
+/// A window whose key state the test decides (the xctest host cannot make a window key).
+private final class MainMenuKeyStateWindow: NSWindow {
+    override var isKeyWindow: Bool { true }
+}
+
 @MainActor
-@Suite("MainMenu (adr/0022 UI slice ⓪)")
+@Suite("MainMenu (adr/0022 UI slices ⓪ and ②)")
 struct MainMenuTests {
     private static let command = NSEvent.ModifierFlags.command.rawValue
 
@@ -64,13 +69,14 @@ struct MainMenuTests {
 
     // MARK: - T-1: structure
 
-    @Test("T-1: three top-level menus -- Macdows, Edit, Window -- and nothing else")
+    @Test("T-1: six top-level menus -- Macdows, File, Edit, View, Window, Help -- and nothing else (adr/0022 slice ②)")
     func topLevelMenus() {
         let menus = MainMenu.build()
         #expect(Self.rows(menus.mainMenu) == [
-            "Macdows|submenu||0|own-submenu", "Edit|submenu||0|own-submenu", "Window|submenu||0|own-submenu",
+            "Macdows|submenu||0|own-submenu", "File|submenu||0|own-submenu", "Edit|submenu||0|own-submenu",
+            "View|submenu||0|own-submenu", "Window|submenu||0|own-submenu", "Help|submenu||0|own-submenu",
         ])
-        #expect(menus.mainMenu.items[2].submenu === menus.windowsMenu)
+        #expect(menus.mainMenu.items[4].submenu === menus.windowsMenu)
     }
 
     @Test("T-1: the Macdows menu, item by item")
@@ -97,7 +103,7 @@ struct MainMenuTests {
 
     @Test("T-1: the Edit menu -- nil target, the six standard selectors (adr/0022 D-4 E1)")
     func editMenu() throws {
-        let editMenu = try #require(MainMenu.build().mainMenu.items[1].submenu)
+        let editMenu = try #require(MainMenu.build().mainMenu.items[2].submenu)
         let command = Self.command
         let shiftCommand = NSEvent.ModifierFlags([.command, .shift]).rawValue
         #expect(editMenu.title == "Edit")
@@ -122,6 +128,101 @@ struct MainMenuTests {
             "---",
             "Bring All to Front|arrangeInFront:||0|nil-target",
         ])
+    }
+
+    /// No Close Window (UI-1 spec §6.1 footnote, gate r1 I-2): it waits for slice ①'s main-window
+    /// lifetime, and with it AppKit's injected ⌥⌘W Close All goes too.
+    @Test("T-1: the File menu (adr/0022 slice ②) -- only Disconnect carries an action, and there is no Close Window")
+    func fileMenu() throws {
+        let fileMenu = try #require(MainMenu.build().mainMenu.items[1].submenu)
+        let command = Self.command
+        let shiftCommand = NSEvent.ModifierFlags([.command, .shift]).rawValue
+        #expect(fileMenu.title == "File")
+        #expect(Self.rows(fileMenu) == [
+            "New Host…|nil|n|\(command)|nil-target",
+            "Edit Host…|nil||0|nil-target",
+            "---",
+            "Connect|nil|\r|\(command)|nil-target",
+            "Disconnect|endSessionTapped|d|\(shiftCommand)|nil-target",
+        ])
+    }
+
+    @Test("T-1: the View menu (adr/0022 slice ②) -- Show Hosts waits for slice ①, Enter Full Screen is the standard item")
+    func viewMenu() throws {
+        let viewMenu = try #require(MainMenu.build().mainMenu.items[3].submenu)
+        let controlCommand = NSEvent.ModifierFlags([.control, .command]).rawValue
+        #expect(viewMenu.title == "View")
+        #expect(Self.rows(viewMenu) == [
+            "Show Hosts|nil|1|\(Self.command)|nil-target",
+            "---",
+            "Enter Full Screen|toggleFullScreen:|f|\(controlCommand)|nil-target",
+        ])
+    }
+
+    @Test("T-1: the Help menu (adr/0022 slice ②) -- three items, none wired yet")
+    func helpMenu() throws {
+        let helpMenu = try #require(MainMenu.build().mainMenu.items[5].submenu)
+        #expect(helpMenu.title == "Help")
+        #expect(Self.rows(helpMenu) == [
+            "Macdows Help|nil||0|nil-target",
+            "Keyboard Shortcuts|nil||0|nil-target",
+            "Acknowledgements|nil||0|nil-target",
+        ])
+    }
+
+    /// adr/0022 §4: every key equivalent slice ② adds is registered as remote or local, here, as a
+    /// claim decision of a key remote window's content view: local = the four reserved pairs (the
+    /// view answers NO, the menu acts), remote = everything else (the view claims it and the menu
+    /// never sees it). The table must cover every key equivalent the built menu carries, so a new
+    /// shortcut without a registration is red.
+    @Test("T-1: every key equivalent in the menu is registered remote or local, and a key remote view claims exactly the remote ones")
+    func everyKeyEquivalentIsRegistered() throws {
+        let registered: [String: Bool] = [ // "key/modifiers" -> claimed by a key remote view (remote)
+            "q/⌘": false, "h/⌘": false, "h/⌥⌘": false, ",/⌘": false,
+            "n/⌘": true, "\r/⌘": true, "d/⇧⌘": true,
+            "z/⌘": true, "z/⇧⌘": true, "x/⌘": true, "c/⌘": true, "v/⌘": true, "a/⌘": true,
+            "1/⌘": true, "f/⌃⌘": true, "m/⌘": true,
+        ]
+        func name(_ item: NSMenuItem) -> String {
+            let m = item.keyEquivalentModifierMask
+            let mods = (m.contains(.control) ? "⌃" : "") + (m.contains(.option) ? "⌥" : "")
+                + (m.contains(.shift) ? "⇧" : "") + (m.contains(.command) ? "⌘" : "")
+            return "\(item.keyEquivalent)/\(mods)"
+        }
+        var seen: [String] = []
+        func walk(_ menu: NSMenu) {
+            for item in menu.items {
+                if !item.keyEquivalent.isEmpty { seen.append(name(item)) }
+                if let sub = item.submenu { walk(sub) }
+            }
+        }
+        walk(MainMenu.build().mainMenu)
+        #expect(Set(seen) == Set(registered.keys), "every shortcut registered, nothing registered that the menu lacks")
+        #expect(seen.count == Set(seen).count, "no two items share a key equivalent")
+
+        let keyCodes: [String: UInt16] = ["q": 12, "h": 4, ",": 43, "n": 45, "\r": 36, "d": 2, "z": 6, "x": 7, "c": 8, "v": 9, "a": 0, "1": 18, "f": 3, "m": 46]
+        for (pair, remote) in registered {
+            let parts = pair.split(separator: "/", maxSplits: 1).map(String.init)
+            var flags: NSEvent.ModifierFlags = []
+            if parts[1].contains("⌃") { flags.insert(.control) }
+            if parts[1].contains("⌥") { flags.insert(.option) }
+            if parts[1].contains("⇧") { flags.insert(.shift) }
+            if parts[1].contains("⌘") { flags.insert(.command) }
+            let window = MainMenuKeyStateWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 100, height: 100), styleMask: [.borderless], backing: .buffered, defer: false
+            )
+            window.isReleasedWhenClosed = false
+            defer { window.close() }
+            let view = RemoteWindowContentView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+            window.contentView = view
+            view.onEvent = { _ in }
+            _ = window.makeFirstResponder(view)
+            let event = try #require(NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: 0, context: nil,
+                characters: parts[0], charactersIgnoringModifiers: parts[0], isARepeat: false, keyCode: keyCodes[parts[0]] ?? 0
+            ))
+            #expect(view.performKeyEquivalent(with: event) == remote, "\(pair) should be \(remote ? "remote (claimed)" : "local")")
+        }
     }
 
     @Test("T-1: the menu's local items take their keys from the view's reserved set, and no other item collides with it")
@@ -176,6 +277,45 @@ struct MainMenuTests {
         let installCall = try #require(main.range(of: "MainMenu.install(on: app)"))
         let run = try #require(main.range(of: "app.run()"))
         #expect(installCall.lowerBound < run.lowerBound)
+    }
+
+    /// Gate r1 I-1 (UI-4 fold F-1): with automatic window tabbing on, AppKit injects its tab items
+    /// (Show Previous / Next Tab ⌃⇧⇥ / ⌃⇥, Show Tab Bar, Show All Tabs, …) into Window / View, and a
+    /// matching menu item swallows its key even while disabled -- so a key remote window never saw
+    /// Ctrl+Tab. `install(on:)` turns tabbing off exactly once, before any of the three menu
+    /// assignments, and nowhere else in the file.
+    @Test("F-1: install(on:) turns automatic window tabbing off once, before the three menu assignments")
+    func installTurnsWindowTabbingOffFirst() throws {
+        let code = mainMenuCodeOnly(try mainMenuSource("App/Macdows/MainMenu.swift"))
+        let statement = "NSWindow.allowsAutomaticWindowTabbing = false"
+        #expect(mainMenuOccurrences(of: "allowsAutomaticWindowTabbing", in: code) == 1)
+        let installStart = try #require(code.range(of: "static func install(on app: NSApplication) {"))
+        let installEnd = try #require(code.range(of: "static let disconnectAction", range: installStart.upperBound..<code.endIndex))
+        let install = String(code[installStart.upperBound..<installEnd.lowerBound])
+        #expect(mainMenuOccurrences(of: statement, in: install) == 1)
+        let tabbing = try #require(install.range(of: statement))
+        for assignment in [".mainMenu = ", ".servicesMenu = ", ".windowsMenu = "] {
+            let at = try #require(install.range(of: assignment), "\(assignment)")
+            #expect(tabbing.lowerBound < at.lowerBound, "tabbing off before \(assignment)")
+        }
+    }
+
+    /// The offline half of F-1: `install(on:)` run for real on the test process's application
+    /// leaves automatic window tabbing off. The suite is `@MainActor` and this test never
+    /// suspends, so no other test observes the swapped menus; they are put back before it returns.
+    @Test("F-1: after install(on:), NSWindow.allowsAutomaticWindowTabbing is false")
+    func installLeavesWindowTabbingOff() {
+        let app = NSApplication.shared
+        let before = (app.mainMenu, app.servicesMenu, app.windowsMenu, NSWindow.allowsAutomaticWindowTabbing)
+        defer {
+            app.mainMenu = before.0
+            app.servicesMenu = before.1
+            app.windowsMenu = before.2
+            NSWindow.allowsAutomaticWindowTabbing = before.3
+        }
+        NSWindow.allowsAutomaticWindowTabbing = true
+        MainMenu.install(on: app)
+        #expect(NSWindow.allowsAutomaticWindowTabbing == false)
     }
 
     // MARK: - The String Catalog (three languages)
@@ -273,7 +413,7 @@ struct MainMenuTests {
         window.contentView?.addSubview(field)
         try #require(window.makeFirstResponder(field))
         let editor = try #require(field.currentEditor() as? NSTextView)
-        let editMenu = try #require(MainMenu.build().mainMenu.items[1].submenu)
+        let editMenu = try #require(MainMenu.build().mainMenu.items[2].submenu)
         for item in editMenu.items where !item.isSeparatorItem {
             let action = try #require(item.action)
             #expect(Self.chainImplements(action, from: window.firstResponder, window: window), "\(item.title)")
@@ -308,7 +448,7 @@ struct MainMenuTests {
             key: RemoteWindowKey(windowId: 5, generation: 0),
             contentRect: NSRect(x: 0, y: 0, width: 120, height: 80), title: "undo-probe"
         )
-        let editMenu = try #require(MainMenu.build().mainMenu.items[1].submenu)
+        let editMenu = try #require(MainMenu.build().mainMenu.items[2].submenu)
         for item in editMenu.items.prefix(2) {
             let action = try #require(item.action)
             #expect(Self.chainImplements(action, from: remote.window.firstResponder, window: remote.window), "\(item.title)")
@@ -409,5 +549,63 @@ struct MainMenuTests {
         let item = NSMenuItem(title: "Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
         item.keyEquivalentModifierMask = [.control, .command]
         #expect(remote.window.validateMenuItem(item) == false)
+    }
+
+    // MARK: - adr/0022 slice ②: what a key remote window greys, and what it leaves to AppKit
+
+    /// The first object on a remote window's nil-target search that implements `selector`: the
+    /// responder chain from its first responder, then the window's delegate, then the application.
+    private static func firstImplementer(_ selector: Selector, in remote: RemoteWindow) -> AnyObject? {
+        var responder: NSResponder? = remote.window.firstResponder
+        while let current = responder {
+            if current.responds(to: selector) { return current }
+            responder = current.nextResponder
+        }
+        if let delegate = remote.window.delegate, delegate.responds(to: selector) { return delegate }
+        return NSApplication.shared.responds(to: selector) ? NSApplication.shared : nil
+    }
+
+    /// UI-1 spec §6.1 / adr/0022 §4 and R-11: View ▸ Enter Full Screen and Window ▸ Bring All to
+    /// Front, chosen with the pointer while a remote window is key, reach the
+    /// remote window's backing window (the first implementer of their action on its chain) and are
+    /// greyed by its default-deny validation, wired or not. `arrangeInFront:` is an NSApplication
+    /// action; the backing window answers it only so that it is the one asked.
+    @Test("slice ②: Enter Full Screen and Bring All to Front are decided by a remote window, and greyed")
+    func remoteWindowGreysTheWindowItems() throws {
+        let remote = RemoteWindow(
+            key: RemoteWindowKey(windowId: 11, generation: 0),
+            contentRect: NSRect(x: 0, y: 0, width: 120, height: 80), title: "slice-2-probe"
+        )
+        let menus = MainMenu.build()
+        let fullScreen = try #require(menus.mainMenu.items[3].submenu?.items.last)
+        let front = try #require(menus.windowsMenu.items.last)
+        #expect(fullScreen.action == #selector(NSWindow.toggleFullScreen(_:)))
+        #expect(front.action == #selector(NSApplication.arrangeInFront(_:)))
+        for wired in [false, true] {
+            remote.onChromeAction = wired ? { _ in } : nil
+            for item in [fullScreen, front] {
+                let action = try #require(item.action)
+                #expect(Self.firstImplementer(action, in: remote) === remote.window, "\(item.title) is decided by the remote window")
+                #expect(remote.window.validateMenuItem(item) == false, "\(item.title) greyed (wired: \(wired))")
+            }
+        }
+        // The backing window's arrangeInFront: does nothing to the window when called directly.
+        let frame = remote.window.frame
+        _ = remote.window.tryToPerform(#selector(NSApplication.arrangeInFront(_:)), with: nil)
+        #expect(remote.window.frame == frame)
+    }
+
+    /// adr/0022 D-11: Disconnect is not decided by a remote window -- nothing on its chain
+    /// implements the End-session action -- so a pointer choice still reaches the App delegate and
+    /// its `session != nil` validation (AppDelegateSessionEndPinTests pins that half as source).
+    @Test("slice ②: File ▸ Disconnect is not decided by a remote window; the App delegate is asked")
+    func disconnectPassesARemoteWindowBy() throws {
+        let remote = RemoteWindow(
+            key: RemoteWindowKey(windowId: 12, generation: 0),
+            contentRect: NSRect(x: 0, y: 0, width: 120, height: 80), title: "disconnect-probe"
+        )
+        let disconnect = try #require(MainMenu.build().mainMenu.items[1].submenu?.items[4])
+        #expect(disconnect.action == MainMenu.disconnectAction)
+        #expect(Self.firstImplementer(MainMenu.disconnectAction, in: remote) == nil)
     }
 }
