@@ -325,8 +325,10 @@ final class RemoteWindowRegistry {
     /// adr/0012 §4's "纯状态机进MacdowsCore，RemoteWindowRegistry只做消费与副作用" split.
     private let focusAuthority = FocusAuthority()
 
-    /// Phase 2 W6 (docs/plans/phase2.md §2 W6 / §4 W6): owns every `NSStatusItem` this
-    /// session's RAIL notify icons map to. Session-scoped, same lifetime discipline
+    /// Phase 2 W6 (docs/plans/phase2.md §2 W6 / §4 W6), as adr/0023 reshapes it: owns the entry
+    /// table this session's RAIL notify icons map to, which the Macdows status item's Remote tray
+    /// section mirrors (`trayMenuSource` below; the per-icon `NSStatusItem`s are retired, D-5
+    /// R1). Session-scoped, same lifetime discipline
     /// `focusAuthority` above already establishes -- `closeAllWindows()` tears it down via
     /// `removeAll()`, same as every other per-connection resource this registry owns. Both of
     /// the wire-contract gaps that type's doc comment used to flag are now closed (icon
@@ -335,6 +337,12 @@ final class RemoteWindowRegistry {
     /// controller) performs the `sendNotifyEvent` calls a click turns into, via
     /// `handleTrayIconClick` below.
     private let trayStatusController = TrayStatusController()
+
+    /// adr/0023 D-6 P-a: the tray entry table, for the status item's Remote tray section to mirror
+    /// and to forward clicks into (`handleLeftClick(tag:)`, which ends in `handleTrayIconClick`
+    /// below). The App hands it over through `AppDelegate`'s `registry` hand-off; nil registry,
+    /// empty source. The registry stays the only one feeding RAIL orders into it.
+    var trayMenuSource: TrayStatusController { trayStatusController }
 
     /// W4c review H1: *session-level* modifier state — one physical keyboard, one tracked
     /// set, not per-window. The original per-window `[UInt32: NSEvent.ModifierFlags]`
@@ -912,13 +920,10 @@ final class RemoteWindowRegistry {
         execute(focusAuthority.serverDesktopUpdate(rawActiveWindowId: event.windowId, at: CFAbsoluteTimeGetCurrent()))
     }
 
-    /// Phase 2 W6 (docs/plans/phase2.md §2 W6): the tray degradation form's only source of a
-    /// human-readable label -- see `TrayStatusController`'s own doc comment (gap 1) for why
-    /// this is the OWNER WINDOW's title, not a notify-icon-specific tooltip (nothing beyond
-    /// `windowId`/`notifyIconId` crosses the CRBridge boundary for a notify icon order today).
-    /// `nil` (not `""`) when the owner window is unknown or its title is empty, matching
-    /// `NSStatusItem.button.toolTip`'s own "no tooltip" convention -- an empty-string tooltip
-    /// would still show a (blank) tooltip bubble on hover, which isn't the same thing.
+    /// Phase 2 W6 (docs/plans/phase2.md §2 W6): the owner window's title, the tray entry's
+    /// FALLBACK label when the notify-icon order itself carried no usable tooltip (adr/0013 §3;
+    /// adr/0023 D-1 N-a puts a numbered "Tray app %d" after it). `nil` (not `""`) when the owner
+    /// window is unknown or its title is empty, so the next fallback applies.
     private func ownerWindowTitle(for windowId: UInt32) -> String? {
         guard let title = geometry[windowId]?.title, !title.isEmpty else { return nil }
         return title
@@ -1287,11 +1292,11 @@ final class RemoteWindowRegistry {
 
     /// Diagnostics only (`Tools/window-smoke`'s `WINDOW_SMOKE_TRAY_CLICK` scenario, adr/0014
     /// §6): drives a tray left click for `(windowId, notifyIconId)` through the REAL path --
-    /// `TrayStatusController.handleLeftClick(tag:)`, entered with the same packed tag
-    /// `upsertStatusItem` writes into the live `NSStatusBarButton`, so the liveness re-check,
-    /// the counters, and this registry's own two-PDU send all execute exactly as they do for a
-    /// user's click. The ONLY thing skipped is AppKit's own event delivery (there is no
-    /// supported way to synthesize a real menu-bar click for another process's status item),
+    /// `TrayStatusController.handleLeftClick(tag:)`, entered with the same packed tag the Remote
+    /// tray section writes into the entry's menu item (adr/0023), so the liveness re-check, the
+    /// counters, and this registry's own two-PDU send all execute exactly as they do for a
+    /// user's click. The ONLY thing skipped is AppKit's own menu selection (a harness has no
+    /// status item, and there is no supported way to synthesize a menu-bar click),
     /// which is also why this is deliberately not a shortcut straight to `handleTrayIconClick`:
     /// a harness bypassing the controller would stop covering the drop-if-gone branch that
     /// makes `clicksDroppedIconGone == 0` a meaningful assertion.
@@ -3359,13 +3364,13 @@ final class RemoteWindowRegistry {
         // bookkeeping.
         attachedChildOwner.removeAll()
         warnedUnresolvedOwner.removeAll()
-        // Phase 2 W6 (docs/plans/phase2.md §4 W6 acceptance: "delete 清零"): every live
-        // NSStatusItem this session created is session-scoped, same as every RemoteWindow
-        // above -- torn down unconditionally on all four of this method's callers (the
+        // Phase 2 W6 (docs/plans/phase2.md §4 W6 acceptance: "delete 清零", W6-1 since
+        // adr/0023): every live tray entry this session created is session-scoped, same as every
+        // RemoteWindow above -- and the Remote tray section mirroring it empties with it -- torn down unconditionally on all four of this method's callers (the
         // generation-rollover branch in `handle(_:)`, the `.disconnected` case, the explicit
         // `prepareForReconnect()` driver, and the session-end entry,
         // `closeWindowsForSessionEnd()`). createsSeen/updatesSeen/deletesSeen are
-        // NOT reset by this (see TrayStatusController.statusItems' own doc comment).
+        // NOT reset by this (see TrayStatusController.entries' own doc comment).
         trayStatusController.removeAll()
         desktopState = ServerDesktopState()
         // adr/0012 §2 reconnect discipline: reset to `.unmonitored` -- the gate can only

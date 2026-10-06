@@ -27,6 +27,9 @@ import MacdowsCore
 ///    same nil-target action -- the scaffold button's `endSessionTapped` -- validated by the same
 ///    `session != nil` predicate in `AppDelegate` (adr/0022 D-11 K3-R). Nothing here ends a session
 ///    itself, and no item sends a key to Windows (adr/0022 I-3).
+///  - The Remote tray section (adr/0023) mirrors the bound registry's tray entries and follows the
+///    session's state, also while the menu is open: entries through the tray's own change stream
+///    (D-3 M-a), presentation through `refresh()` on every driver state change.
 ///  - The session is READ, never driven: `reading` is a closure over the App's own state, called
 ///    whenever this menu is about to open and whenever the App says the session changed
 ///    (`bind(_:)`, `refresh()`).
@@ -154,9 +157,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     // MARK: - Session hand-off
 
     /// The App hands over the current session's registry, or nil when there is none (adr/0023
-    /// D-6: an empty source, so the Remote tray section hides).
+    /// D-6: an empty source, so the Remote tray section hides). The section mirrors that
+    /// registry's tray entries from now on.
     func bind(_ registry: RemoteWindowRegistry?) {
         self.registry = registry
+        traySection.bind(registry?.trayMenuSource)
         refresh()
     }
 
@@ -182,6 +187,24 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         detailRow.title = rows.detail ?? ""
         detailRow.isHidden = rows.detail == nil
         oneSessionItem.isHidden = !reading.hasSession
+        traySection.setPresentation(registry == nil ? .hidden : Self.trayPresentation(for: reading))
+        sectionGapSeparator.isHidden = traySection.isShown
+    }
+
+    /// adr/0023 D-4: live -> entries (or "no tray icons"); waiting / reconnecting -> "come back
+    /// after reconnecting" (the entries were torn down with the connection); first connect not yet
+    /// live, given up, no session -> no section at all. The header names the session's address.
+    static func trayPresentation(for reading: SessionReading) -> StatusItemTraySection.Presentation {
+        guard reading.hasSession else { return .hidden }
+        let host = reading.host ?? ""
+        switch reading.state {
+        case .live:
+            return .live(host: host)
+        case .waiting, .reconnecting:
+            return .reconnecting(host: host)
+        case .idle, .gaveUp, nil:
+            return .hidden
+        }
     }
 
     // MARK: - Pure presentation (offline-testable)
