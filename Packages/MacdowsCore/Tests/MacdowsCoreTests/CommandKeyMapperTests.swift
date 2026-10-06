@@ -264,4 +264,91 @@ struct CommandKeyMapperTests {
             #expect(mapper.commandChanged(down: true) == .wire([]))
         }
     }
+
+    // MARK: - adr/0022 D-3 / D-8 T-3: the "consumed locally" input
+
+    @Test("localKeyEquivalent while withheld: zero wire events, and Cmd's release then sends no LWIN pair")
+    func localKeyEquivalentWhileWithheldSuppressesTheBareTap() {
+        let mapper = CommandKeyMapper()
+        #expect(mapper.commandChanged(down: true) == .wire([]))
+        #expect(mapper.localKeyEquivalent() == .wire([]))
+        #expect(mapper.state == .withheld)
+        // adr/0022 I-2: ⌘H / ⌥⌘H / ⌘, / ⌘Q taken by the menu must not leave a bare Cmd tap behind.
+        #expect(mapper.commandChanged(down: false) == .wire([]))
+        #expect(mapper.state == .idle)
+    }
+
+    @Test("localKeyEquivalent is idempotent: a re-delivered keyDown reporting it twice changes nothing more")
+    func localKeyEquivalentTwiceIsTheSameAsOnce() {
+        let mapper = CommandKeyMapper()
+        _ = mapper.commandChanged(down: true)
+        #expect(mapper.localKeyEquivalent() == .wire([]))
+        #expect(mapper.localKeyEquivalent() == .wire([]))
+        #expect(mapper.state == .withheld)
+        #expect(mapper.commandChanged(down: false) == .wire([]))
+    }
+
+    @Test("localKeyEquivalent while idle: zero wire events, state stays idle, a later bare tap still opens Start")
+    func localKeyEquivalentWhileIdleIsInert() {
+        let mapper = CommandKeyMapper()
+        #expect(mapper.localKeyEquivalent() == .wire([]))
+        #expect(mapper.state == .idle)
+        #expect(mapper.isActive == false)
+        // It must not leak a "had a key" mark into the NEXT gesture.
+        #expect(mapper.commandChanged(down: true) == .wire([]))
+        #expect(mapper.commandChanged(down: false) == .wire([
+            .modifierKey(.command, down: true), .modifierKey(.command, down: false),
+        ]))
+    }
+
+    @Test("localKeyEquivalent while a chord is open: zero wire events, the chord still closes normally")
+    func localKeyEquivalentWhileMappedChangesNothing() {
+        let mapper = CommandKeyMapper()
+        _ = mapper.commandChanged(down: true)
+        _ = mapper.key(down: true, macKeyCode: 8, charactersIgnoringModifiers: "c")
+        #expect(mapper.state == .mapped(fixedVK: 0x08))
+        #expect(mapper.localKeyEquivalent() == .wire([]))
+        #expect(mapper.state == .mapped(fixedVK: 0x08))
+        #expect(mapper.key(down: false, macKeyCode: 8, charactersIgnoringModifiers: "c")
+            == .wire([.keyUp(macKeyCode: 0x08), .modifierKey(.control, down: false)]))
+        #expect(mapper.commandChanged(down: false) == .wire([]))
+    }
+
+    @Test("localKeyEquivalent in passthrough: zero wire events, LWIN still closes on Cmd's release")
+    func localKeyEquivalentWhilePassthroughChangesNothing() {
+        let mapper = CommandKeyMapper()
+        _ = mapper.commandChanged(down: true)
+        _ = mapper.key(down: true, macKeyCode: 38, charactersIgnoringModifiers: "j")
+        #expect(mapper.state == .passthrough)
+        #expect(mapper.localKeyEquivalent() == .wire([]))
+        #expect(mapper.state == .passthrough)
+        #expect(mapper.commandChanged(down: false) == .wire([.modifierKey(.command, down: false)]))
+    }
+
+    @Test("Cmd+Q, then Cmd up via the local route: no LWIN pair (the menu Quit path)")
+    func cmdQConsumedLocallyThenCmdUpSendsNoLWIN() {
+        let mapper = CommandKeyMapper()
+        _ = mapper.commandChanged(down: true)
+        #expect(mapper.localKeyEquivalent() == .wire([]))
+        // A Quit item that is disabled lets the keyDown through too; the table answer is still zero.
+        #expect(mapper.key(down: true, macKeyCode: 12, charactersIgnoringModifiers: "q") == .wire([]))
+        #expect(mapper.commandChanged(down: false) == .wire([]))
+    }
+
+    @Test("the suppressed set is not extended: still exactly q, space and tab")
+    func suppressedSetIsUnchanged() {
+        #expect(CommandKeyMapper.suppressedNoWireKeys == ["q", " ", "\t"])
+    }
+
+    @Test(
+        "h and , still pass through as LWIN when they DO reach the table (no table extension)",
+        arguments: [("h", UInt16(4)), (",", UInt16(43))]
+    )
+    func reservedCharactersAreStillPassthroughInTheTable(char: String, keyCode: UInt16) {
+        let mapper = CommandKeyMapper()
+        _ = mapper.commandChanged(down: true)
+        #expect(mapper.key(down: true, macKeyCode: keyCode, charactersIgnoringModifiers: char)
+            == .wire([.modifierKey(.command, down: true), .keyDown(macKeyCode: keyCode)]))
+        #expect(mapper.state == .passthrough)
+    }
 }

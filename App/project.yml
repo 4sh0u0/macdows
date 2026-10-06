@@ -485,6 +485,9 @@ targets:
       # compiled INTO this bundle, so ReconnectDriverTests reaches its `internal` API with no
       # @testable and no framework target.
       - path: SessionControl
+      # adr/0022 D-8 T-1: the main-menu constructor, one file of `Macdows` -- the rest of that
+      # directory (AppDelegate, main.swift) stays out of this bundle, as above.
+      - path: Macdows/MainMenu.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.haru.macdows.dev.apptests
