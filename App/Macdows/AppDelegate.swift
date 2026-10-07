@@ -1079,31 +1079,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		mainWindow.setShell(subtitle: nil, statusBar: UIStrings.connectionFailed, marker: .failed, for: record.id)
 	}
 
-	/// UI-1 spec §4.3: the three first-connect failure banners.
+	/// UI-1 spec §4.3: the first-connect failure banners (`BannerView.Model.connectFailure`, where
+	/// the offline tests drive them) with their buttons wired to existing paths, and the status bar.
+	/// F-1: Reconnect presses the Hosts window's Connect button for this host, the give-up banner's
+	/// route -- whose press `connectTapped` answers by clearing that banner first.
 	private func showConnectFailure(_ record: HostRecord, kind: ConnectFlow.FailureKind) {
-		let model: BannerView.Model
 		let bar: String
 		switch kind {
-		case .unreachable:
-			bar = UIStrings.barUnreachable
-			model = .init(id: "connect-failed", title: UIStrings.unreachableTitle(record.title),
-						  body: UIStrings.unreachableBody(address: record.address, port: Int(record.port)), tone: .error,
-						  actions: [.init(title: UIStrings.editHostAction) { [weak self] in
-							  self?.mainWindow.select(record.id)
-							  self?.mainWindow.editHost(nil)
-						  }])
-		case .signIn:
-			bar = UIStrings.barSignIn
-			model = .init(id: "connect-failed", title: UIStrings.signInTitle(record.title), body: UIStrings.signInBody, tone: .error,
-						  actions: [.init(title: UIStrings.enterPassword) { [weak self] in
-							  self?.askPasswordOnNextPress = true
-							  self?.mainWindow.connect(to: record.id)
-						  }])
-		case .certificate, .other:
-			mainWindow.setShell(subtitle: nil, statusBar: UIStrings.connectionFailed, marker: .failed, for: record.id)
-			return
+		case .unreachable: bar = UIStrings.barUnreachable
+		case .signIn: bar = UIStrings.barSignIn
+		case .certificate, .other: bar = UIStrings.connectionFailed
 		}
-		mainWindow.showBanner(model)
+		let model = BannerView.Model.connectFailure(
+			kind, hostTitle: record.title, address: record.address, port: Int(record.port),
+			editHost: { [weak self] in
+				self?.mainWindow.select(record.id)
+				self?.mainWindow.editHost(nil)
+			},
+			enterPassword: { [weak self] in
+				self?.askPasswordOnNextPress = true
+				self?.mainWindow.connect(to: record.id)
+			},
+			reconnect: { [weak self] in self?.mainWindow.connect(to: record.id) }
+		)
+		if let model {
+			mainWindow.showBanner(model)
+		}
 		mainWindow.setShell(subtitle: nil, statusBar: bar, marker: .failed, for: record.id)
 	}
 

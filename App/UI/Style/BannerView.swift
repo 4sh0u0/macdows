@@ -166,4 +166,32 @@ extension BannerView.Model {
         }
         return .init(id: banner.id, title: banner.title, body: banner.body, tone: tone, actions: actions)
     }
+
+    /// UI-1 spec §4.3: the id the first-connect failure banners share (one at a time).
+    static let connectFailureID = "connect-failed"
+
+    /// UI-1 spec §4.3: the first-connect failure banner for `kind`, or nil for the kinds that show
+    /// none here (a certificate rejection has the certificate path's banner and sheet; any other
+    /// failure writes the status bar only). The handlers are the App's existing paths.
+    ///
+    /// F-1 (owner in-person batch 2026-10-07): the unreachable banner carries Reconnect after Edit
+    /// Host…. A give-up banner's Reconnect press clears that banner (`connectTapped`), and when the
+    /// network is still down the new chain's first connect fails into THIS banner -- which, with
+    /// Edit Host… alone, left no button that connects again until the toolbar's Connect.
+    static func connectFailure(_ kind: ConnectFlow.FailureKind, hostTitle: String, address: String, port: Int,
+                               editHost: @escaping () -> Void, enterPassword: @escaping () -> Void,
+                               reconnect: @escaping () -> Void) -> BannerView.Model? {
+        switch kind {
+        case .unreachable:
+            return .init(id: connectFailureID, title: UIStrings.unreachableTitle(hostTitle),
+                         body: UIStrings.unreachableBody(address: address, port: port), tone: .error,
+                         actions: [.init(title: UIStrings.editHostAction, handler: editHost),
+                                   .init(title: UIStrings.reconnect, handler: reconnect)])
+        case .signIn:
+            return .init(id: connectFailureID, title: UIStrings.signInTitle(hostTitle), body: UIStrings.signInBody, tone: .error,
+                         actions: [.init(title: UIStrings.enterPassword, handler: enterPassword)])
+        case .certificate, .other:
+            return nil
+        }
+    }
 }
