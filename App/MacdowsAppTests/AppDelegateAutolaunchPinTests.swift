@@ -412,7 +412,14 @@ struct AppDelegateAutolaunchPinTests {
     /// the reconnect driver's give-up (`if !endingByGiveUp { ... }` inside the branch, plus a
     /// two-line comment); the `.connectFailed` record and every other statement stay as they were.
     /// `tearDownSession`, `endSessionTapped`, `drainTick` and `applicationWillTerminate` are
-    /// unchanged. It now folds to 50570 characters, +190.
+    /// unchanged. It folded to 50570 characters, +190.
+    ///
+    /// RE-FROZEN by F-1 (owner in-person batch 2026-10-07): `showConnectFailure` builds its banner
+    /// through `BannerView.Model.connectFailure` (UI, where the offline tests drive it) and hands it
+    /// one more handler, Reconnect, which presses Connect for the host -- the unreachable banner's
+    /// new second button; the status bar per kind and every other statement are as they were.
+    /// `connectTapped`, `drainTick`, `tearDownSession`, `endSessionTapped` and
+    /// `applicationWillTerminate` are unchanged. It now folds to 50608 characters, +38.
     ///
     /// The "net folded edit" above is the folded-length delta for each re-freeze, which is what the
     /// length chain below already checks; it is not a token-by-token added/removed count -- those
@@ -429,9 +436,9 @@ struct AppDelegateAutolaunchPinTests {
     /// expected to re-freeze this constant in the same commit that makes the edit, and the length
     /// below is here so that such a re-freeze can be sanity-checked (a length that MOVED by the size
     /// of the edit is a re-freeze; a length that moved by 22638 is a needle that stopped matching).
-    private static let foldedTailLength = 50570
+    private static let foldedTailLength = 50608
     private static let foldedTailSHA256 =
-        "87878764f29879fae8e446e89b82bff5a881992a1585d859b9e945b33704ab22"
+        "62e37a8e73ce3817c583d7b8a6cd12dbe29608e7aa303a8edf06f0c9a4f5a6f6"
 
     @Test("connectTapped to end-of-file is byte-identical to its last deliberate freeze")
     func theRestOfTheFileIsUnchanged() throws {

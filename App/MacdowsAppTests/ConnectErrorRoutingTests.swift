@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import MacdowsCore
 import Testing
@@ -374,6 +375,20 @@ struct ConnectErrorRoutingSourcePinTests {
         #expect(Self.occurrences(of: "showConnectFailure(", in: code) == 2, "one declaration, one call")
     }
 
+    /// F-1 (owner in-person batch 2026-10-07): `showConnectFailure` builds its banner through the
+    /// UI builder the offline F-1 tests drive, and wires Reconnect to the Hosts window's Connect for
+    /// the failed host -- the give-up banner's route. The handler is App-side, so it is pinned here.
+    @Test("F-1: the failure banner comes from the tested builder, and its Reconnect presses Connect for the host")
+    func failureBannerReconnectIsWired() throws {
+        let code = try routingCodeOnly(Self.appDelegate)
+        let show = try routingBody(of: "private func showConnectFailure(", endingAt: "private func presentCertificateQuestion(", in: code)
+        #expect(Self.occurrences(of: "BannerView.Model.connectFailure(", in: show) == 1)
+        #expect(Self.occurrences(of: "reconnect: { [weak self] in self?.mainWindow.connect(to: record.id) }", in: show) == 1)
+        #expect(Self.occurrences(of: "if let model { mainWindow.showBanner(model) }", in: show) == 1)
+        #expect(Self.occurrences(of: "BannerView.Model.connectFailure(", in: code) == 1, "one caller")
+        #expect(Self.occurrences(of: "\"connect-failed\"", in: code) == 0, "the id lives with the builder")
+    }
+
     @Test("F-3: the driver writes the leg-failed line once, between step 0's return and the final give-up")
     func legFailedLineIsWrittenFromStepOneOnly() throws {
         let code = try routingCodeOnly(Self.reconnectDriver)
@@ -395,5 +410,151 @@ struct ConnectErrorRoutingSourcePinTests {
         let tick = try routingBody(of: "func tick(_ events: [CRDPEvent]) {", endingAt: "func failConnect(code: Int) {", in: code)
         #expect(Self.occurrences(of: "!ReconnectDriver.connectErrorBelongsToDriver(in: driver.state)", in: tick) == 1)
         #expect(Self.occurrences(of: "connectErrorBelongsToDriver(", in: tick) == 1)
+    }
+}
+
+// MARK: - F-1: a Reconnect press that fails again leaves a button that connects again
+
+/// The Connect button's target in the F-1 test: `connectTapped`'s banner-relevant steps and the
+/// first connect of the chain that press starts, re-stated over production pieces. A press clears
+/// every banner and disables the button (`connectTapped`); the chain's first connect fails on a
+/// fresh driver (`.idle`), so the App's connect-error branch takes it (`AppTick`, the routing
+/// copy pinned by F-4) and hands the button back with a literal `true` before the teardown; the
+/// session-end review then shows the first-connect failure banner for the code's kind, wired the
+/// way `showConnectFailure` wires it (Reconnect presses Connect for the host).
+@MainActor
+private final class FailingChain: NSObject {
+    let controller: MainWindowController
+    let connect: NSButton
+    let host: HostID
+    let code: Int
+    private(set) var presses = 0
+
+    init(controller: MainWindowController, connect: NSButton, host: HostID, code: Int) {
+        self.controller = controller
+        self.connect = connect
+        self.host = host
+        self.code = code
+    }
+
+    @objc func connectTapped(_ sender: Any?) {
+        presses += 1
+        controller.clearBanners()
+        connect.isEnabled = false
+        guard let leg = try? AppTick() else {
+            Issue.record("the routing fixture did not build")
+            return
+        }
+        leg.failConnect(code: code)
+        #expect(leg.appTookTheError, "a first connect's error is the App's")
+        connect.isEnabled = true
+        let kind = ConnectFlow.failureKind(errorCode: code, certificateRejected: false)
+        let host = self.host
+        if let model = BannerView.Model.connectFailure(
+            kind, hostTitle: "Lab", address: "lab.example", port: 3389,
+            editHost: {}, enterPassword: {},
+            reconnect: { [weak self] in self?.controller.connect(to: host) }
+        ) {
+            controller.showBanner(model)
+        }
+    }
+}
+
+@MainActor
+@Suite("F-1 (owner in-person batch 2026-10-07): a failed Reconnect press never leaves a dead end")
+struct GiveUpReconnectRetryTests {
+
+    private static func banner(_ id: String, in controller: MainWindowController) throws -> BannerView {
+        let views = controller.detail.bannerStack.arrangedSubviews.compactMap { $0 as? BannerView }
+        return try #require(views.first { $0.model.id == id }, "no banner \(id); shown: \(controller.bannerIDs)")
+    }
+
+    private static func press(_ title: String, on banner: BannerView) throws {
+        let button = try #require(banner.buttons.first { $0.title == title },
+                                  "\(banner.model.id) has no \(title); buttons: \(banner.buttons.map(\.title))")
+        button.performClick(nil)
+    }
+
+    @Test("attempts exhausted, Reconnect while the host is still unreachable, then Reconnect again: every press dials")
+    func reconnectAfterAFailedReconnectDialsAgain() throws {
+        _ = NSApplication.shared
+        // The give-up: transient failures on every driver leg (the attempts-exhausted fixture above).
+        let lost = try AppTick()
+        lost.tick([Handshake()])
+        lost.tick([Sentinel()])
+        for _ in 0..<(ReconnectPolicy.maxAttempts - 1) {
+            lost.clock.fireNext()
+            lost.failConnect(code: 131_078)
+        }
+        let gaveUp = lost.driver.state
+        #expect(gaveUp == .gaveUp(.policy(.attemptsExhausted)))
+        #expect(!lost.appTookTheError)
+
+        // The Hosts window as the App wires it: one host, the App's Connect / Disconnect buttons.
+        let record = HostRecord(displayName: "Lab", address: "lab.example", userName: "u")
+        let controller = MainWindowControllerTests.controller(records: [record])
+        defer { controller.window?.orderOut(nil) }
+        let connect = NSButton(title: "Connect", target: nil, action: nil)
+        let disconnect = NSButton(title: "Disconnect", target: nil, action: nil)
+        disconnect.isEnabled = false
+        let title = NSTextField(labelWithString: ""), status = NSTextField(labelWithString: "")
+        controller.installSessionControls(NSStackView(views: [title, status, connect, disconnect]), title: title, status: status,
+                                          connect: connect, disconnect: disconnect)
+        let chain = FailingChain(controller: controller, connect: connect, host: record.id, code: 131_078)
+        connect.target = chain
+        connect.action = #selector(FailingChain.connectTapped(_:))
+
+        // `applyShell` + `applySessionBanners` on the give-up, `sessionBannerModel`'s Reconnect.
+        connect.isEnabled = ShellReconnectPresenter.shell(for: gaveUp, connected: .init(windows: 0, liveSince: nil, inputDegraded: false),
+                                                          displayNote: nil).connectEnabled
+        #expect(connect.isEnabled, "a give-up hands Connect back")
+        let host = record.id
+        controller.showBanner(.session(try #require(ShellReconnectPresenter.connectionBanner(for: gaveUp, hostTitle: "Lab")),
+                                       disconnect: {}, dismiss: {}, reconnect: { controller.connect(to: host) }, learnMore: {}))
+        #expect(controller.bannerIDs == [ShellReconnectPresenter.connectionBannerID])
+
+        // (1) The give-up banner's Reconnect, with the network still down: one dial, which fails.
+        try Self.press(UIStrings.reconnect, on: Self.banner(ShellReconnectPresenter.connectionBannerID, in: controller))
+        #expect(chain.presses == 1)
+        #expect(connect.isEnabled, "the connect-error branch hands Connect back")
+        #expect(controller.bannerIDs == [BannerView.Model.connectFailureID], "the press cleared the give-up banner")
+        let failed = try Self.banner(BannerView.Model.connectFailureID, in: controller)
+        #expect(failed.buttons.map(\.title) == [UIStrings.editHostAction, UIStrings.reconnect])
+
+        // (2) Reconnect again from the failure banner: a second dial (it fails again, same banner).
+        try Self.press(UIStrings.reconnect, on: failed)
+        #expect(chain.presses == 2, "the second press must dial again")
+        #expect(controller.bannerIDs == [BannerView.Model.connectFailureID])
+
+        // (3) And again: the banner it fails into keeps the button.
+        try Self.press(UIStrings.reconnect, on: Self.banner(BannerView.Model.connectFailureID, in: controller))
+        #expect(chain.presses == 3)
+    }
+
+    @Test("the failure banners' buttons: unreachable Edit Host… then Reconnect, sign-in Enter Password…, none for the others")
+    func failureBannerButtons() throws {
+        var calls: [String] = []
+        func model(_ kind: ConnectFlow.FailureKind) -> BannerView.Model? {
+            .connectFailure(kind, hostTitle: "H", address: "h.example", port: 3389,
+                            editHost: { calls.append("edit") }, enterPassword: { calls.append("password") },
+                            reconnect: { calls.append("reconnect") })
+        }
+        let unreachable = BannerView(try #require(model(.unreachable)))
+        #expect(unreachable.model.id == "connect-failed")
+        #expect(unreachable.model.tone == .error)
+        #expect(unreachable.buttons.map(\.title) == [UIStrings.editHostAction, UIStrings.reconnect])
+        unreachable.buttons.forEach { $0.performClick(nil) }
+        #expect(calls == ["edit", "reconnect"])
+
+        calls = []
+        let signIn = BannerView(try #require(model(.signIn)))
+        #expect(signIn.model.id == "connect-failed")
+        #expect(signIn.buttons.map(\.title) == [UIStrings.enterPassword])
+        signIn.buttons.forEach { $0.performClick(nil) }
+        #expect(calls == ["password"])
+
+        #expect(model(.certificate) == nil)
+        #expect(model(.other) == nil)
+        #expect(calls == ["password"])
     }
 }
