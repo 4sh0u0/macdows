@@ -289,14 +289,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
 
     @objc func removeHost(_ sender: Any?) {
         guard let record = selectedRecord, record.id != activeHostID, let window else { return }
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = UIStrings.removeTitle(record.title)
-        alert.informativeText = UIStrings.removeBody
-        let remove = alert.addButton(withTitle: UIStrings.removeConfirm)
-        remove.hasDestructiveAction = true
-        alert.addButton(withTitle: UIStrings.cancel)
+        let alert = Self.makeRemoveAlert(for: record)
+        let escape = AlertKeys.cancelOnEscape(alert, cancel: alert.buttons[1])
         alert.beginSheetModal(for: window) { [weak self] response in
+            if let escape { NSEvent.removeMonitor(escape) }
             guard response == .alertFirstButtonReturn, let self else { return }
             let actions = self.actions
             let store = self.store
@@ -308,6 +304,26 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
                 }
             }
         }
+    }
+
+    /// The Remove warning, not yet shown. Remove stays the first button (the response the sheet
+    /// checks) but never has a key; Cancel, second, is the default button (Return) -- finding F-6.
+    static func makeRemoveAlert(for record: HostRecord) -> NSAlert {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = UIStrings.removeTitle(record.title)
+        alert.informativeText = UIStrings.removeBody
+        // AppKit gives the first button Return at addButton time and the Cancel-titled button
+        // Escape; macOS 27's layout then takes Return back from a destructive button, so left alone
+        // Return only beeps there (earlier systems are not verified -- there it could remove the
+        // host). Remove loses Return by hand and Cancel takes it, which replaces Cancel's derived
+        // Escape; `AlertKeys.cancelOnEscape` restores Escape while the alert is shown.
+        let remove = alert.addButton(withTitle: UIStrings.removeConfirm)
+        remove.hasDestructiveAction = true
+        remove.keyEquivalent = ""
+        let cancel = alert.addButton(withTitle: UIStrings.cancel)
+        cancel.keyEquivalent = "\r"
+        return alert
     }
 
     @objc func showPinnedCertificate(_ sender: Any?) {

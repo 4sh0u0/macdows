@@ -415,7 +415,10 @@ struct SettingsWindowTests {
         let code = settingsCodeOnly(try settingsSource("\(settingsDirectory)/SettingsWindowController.swift"))
         #expect(settingsOccurrences(of: "keyEquivalent", in: code) == 1, "the only key equivalent set by hand")
         #expect(code.contains("cancel.keyEquivalent = \"\\r\""), "and it is Cancel's Return")
-        #expect(code.contains("let escape = cancelOnEscape(alert)"), "the sheet path installs the Escape monitor")
+        #expect(code.contains("let escape = AlertKeys.cancelOnEscape(alert, cancel: alert.buttons[0])"),
+                "the sheet path installs the Escape monitor on Cancel, the first button (F-6 moved the helper to AlertKeys)")
+        #expect(settingsOccurrences(of: "cancelOnEscape(", in: code) == 1)
+        #expect(!code.contains("addLocalMonitorForEvents") && !code.contains("func isEscape"), "no copy of AlertKeys left here")
         #expect(code.contains("if let escape { NSEvent.removeMonitor(escape) }"), "and removes it when the alert ends")
         #expect(code.contains("completion(response == .alertSecondButtonReturn)"))
         #expect(!code.contains(".alertFirstButtonReturn"), "the first button is Cancel")
@@ -426,7 +429,7 @@ struct SettingsWindowTests {
         }
     }
 
-    @Test("the Reset alert's Escape filter: plain Escape in the alert window only (F-2)")
+    @Test("the Reset alert's Escape filter: plain Escape in the alert window only (F-2; AlertKeys since F-6)")
     func resetAlertEscapeFilter() throws {
         // Offline the alert's own window has no window number until shown (an event cannot name it),
         // so two undeferred stand-ins play the alert window and another window.
@@ -439,15 +442,16 @@ struct SettingsWindowTests {
                              context: nil, characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code)!
         }
         #expect(window.windowNumber > 0 && other.windowNumber > 0 && window.windowNumber != other.windowNumber)
-        #expect(SettingsWindowController.isEscape(key("\u{1b}", 0x35, in: window), in: window))
-        #expect(!SettingsWindowController.isEscape(key("\u{1b}", 0x35, in: window, .keyUp), in: window), "key-up")
-        #expect(!SettingsWindowController.isEscape(key("\r", 0x24, in: window), in: window), "Return is Cancel's own key equivalent")
-        #expect(!SettingsWindowController.isEscape(key("\u{1b}", 0x35, .command, in: window), in: window), "Command-Escape")
-        #expect(!SettingsWindowController.isEscape(key("\u{1b}", 0x35, .shift, in: window), in: window), "Shift-Escape")
-        #expect(!SettingsWindowController.isEscape(key("\u{1b}", 0x35, .control, in: window), in: window), "Control-Escape")
-        #expect(!SettingsWindowController.isEscape(key("\u{1b}", 0x35, .option, in: window), in: window), "Option-Escape")
-        #expect(!SettingsWindowController.isEscape(key("\u{1b}", 0x35, in: other), in: window), "another window")
-        let monitor = try #require(SettingsWindowController.cancelOnEscape(SettingsWindowController.makeResetAlert()))
+        #expect(AlertKeys.isEscape(key("\u{1b}", 0x35, in: window), in: window))
+        #expect(!AlertKeys.isEscape(key("\u{1b}", 0x35, in: window, .keyUp), in: window), "key-up")
+        #expect(!AlertKeys.isEscape(key("\r", 0x24, in: window), in: window), "Return is Cancel's own key equivalent")
+        #expect(!AlertKeys.isEscape(key("\u{1b}", 0x35, .command, in: window), in: window), "Command-Escape")
+        #expect(!AlertKeys.isEscape(key("\u{1b}", 0x35, .shift, in: window), in: window), "Shift-Escape")
+        #expect(!AlertKeys.isEscape(key("\u{1b}", 0x35, .control, in: window), in: window), "Control-Escape")
+        #expect(!AlertKeys.isEscape(key("\u{1b}", 0x35, .option, in: window), in: window), "Option-Escape")
+        #expect(!AlertKeys.isEscape(key("\u{1b}", 0x35, in: other), in: window), "another window")
+        let alert = SettingsWindowController.makeResetAlert()
+        let monitor = try #require(AlertKeys.cancelOnEscape(alert, cancel: alert.buttons[0]))
         NSEvent.removeMonitor(monitor)
     }
 
