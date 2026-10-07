@@ -531,7 +531,7 @@ struct GiveUpReconnectRetryTests {
         #expect(chain.presses == 3)
     }
 
-    @Test("the failure banners' buttons: unreachable Edit Host… then Reconnect, sign-in Enter Password…, none for the others")
+    @Test("the failure banners' buttons: unreachable Edit Host… then Reconnect, sign-in Enter Password…, none for a certificate rejection")
     func failureBannerButtons() throws {
         var calls: [String] = []
         func model(_ kind: ConnectFlow.FailureKind) -> BannerView.Model? {
@@ -554,7 +554,183 @@ struct GiveUpReconnectRetryTests {
         #expect(calls == ["password"])
 
         #expect(model(.certificate) == nil)
-        #expect(model(.other) == nil)
+        // F-7: `.other` has a banner now; `OtherFailureBannerTests` pins it.
         #expect(calls == ["password"])
+    }
+}
+
+// MARK: - F-7: a first connect that fails as "other" leaves a banner with Reconnect
+
+/// F-7 (owner in-person batch 2026-10-07, ruled 23:3x): the F-1 dead end had a second door. A give-up
+/// banner's Reconnect press clears every banner (`connectTapped`); when the new chain's first connect
+/// ended in a code `ConnectFlow.failureKind` calls `.other` -- the in-person batch saw ERRINFO 65537,
+/// the remote PC ending the connection -- `connectFailure` returned nil, the status bar said
+/// Connection failed, and no banner offered to connect again. `.other` now gets the unreachable
+/// banner's two buttons, in the same order, under its own title and body (`cf_o_t` / `cf_o_b`); a
+/// certificate rejection still gets none here (the certificate path owns its banner and sheet).
+@MainActor
+@Suite("F-7 (owner in-person batch 2026-10-07): an other-kind first-connect failure shows a banner with Reconnect")
+struct OtherFailureBannerTests {
+
+    /// The ERRINFO code the in-person batch saw: ERRINFO_RPC_INITIATED_DISCONNECT, class 1.
+    private static let errinfoCode = 65_537
+
+    private static func banner(_ id: String, in controller: MainWindowController) throws -> BannerView {
+        let views = controller.detail.bannerStack.arrangedSubviews.compactMap { $0 as? BannerView }
+        return try #require(views.first { $0.model.id == id }, "no banner \(id); shown: \(controller.bannerIDs)")
+    }
+
+    private static func press(_ title: String, on banner: BannerView) throws {
+        let button = try #require(banner.buttons.first { $0.title == title },
+                                  "\(banner.model.id) has no \(title); buttons: \(banner.buttons.map(\.title))")
+        button.performClick(nil)
+    }
+
+    @Test("(a) attempts exhausted, Reconnect, the first connect ends with ERRINFO 65537: the banner offers Edit Host… and Reconnect, and Reconnect dials again")
+    func reconnectAfterAnOtherFailureDialsAgain() throws {
+        _ = NSApplication.shared
+        #expect(ConnectFlow.failureKind(errorCode: Self.errinfoCode, certificateRejected: false) == .other,
+                "the in-person batch's code is the other kind")
+
+        // The give-up: transient failures on every driver leg.
+        let lost = try AppTick()
+        lost.tick([Handshake()])
+        lost.tick([Sentinel()])
+        for _ in 0..<(ReconnectPolicy.maxAttempts - 1) {
+            lost.clock.fireNext()
+            lost.failConnect(code: 131_078)
+        }
+        let gaveUp = lost.driver.state
+        #expect(gaveUp == .gaveUp(.policy(.attemptsExhausted)))
+
+        // The Hosts window as the App wires it, with a Connect whose chain ends in the ERRINFO code.
+        let record = HostRecord(displayName: "Lab", address: "lab.example", userName: "u")
+        let controller = MainWindowControllerTests.controller(records: [record])
+        defer { controller.window?.orderOut(nil) }
+        let connect = NSButton(title: "Connect", target: nil, action: nil)
+        let disconnect = NSButton(title: "Disconnect", target: nil, action: nil)
+        disconnect.isEnabled = false
+        let title = NSTextField(labelWithString: ""), status = NSTextField(labelWithString: "")
+        controller.installSessionControls(NSStackView(views: [title, status, connect, disconnect]), title: title, status: status,
+                                          connect: connect, disconnect: disconnect)
+        let chain = FailingChain(controller: controller, connect: connect, host: record.id, code: Self.errinfoCode)
+        connect.target = chain
+        connect.action = #selector(FailingChain.connectTapped(_:))
+
+        connect.isEnabled = ShellReconnectPresenter.shell(for: gaveUp, connected: .init(windows: 0, liveSince: nil, inputDegraded: false),
+                                                          displayNote: nil).connectEnabled
+        #expect(connect.isEnabled, "a give-up hands Connect back")
+        let host = record.id
+        controller.showBanner(.session(try #require(ShellReconnectPresenter.connectionBanner(for: gaveUp, hostTitle: "Lab")),
+                                       disconnect: {}, dismiss: {}, reconnect: { controller.connect(to: host) }, learnMore: {}))
+        #expect(controller.bannerIDs == [ShellReconnectPresenter.connectionBannerID])
+
+        // (1) The give-up banner's Reconnect: one dial, whose first connect the remote PC ends.
+        try Self.press(UIStrings.reconnect, on: Self.banner(ShellReconnectPresenter.connectionBannerID, in: controller))
+        #expect(chain.presses == 1)
+        #expect(connect.isEnabled, "the connect-error branch hands Connect back")
+        #expect(controller.bannerIDs == [BannerView.Model.connectFailureID], "the failure leaves a banner, not none")
+        let failed = try Self.banner(BannerView.Model.connectFailureID, in: controller)
+        #expect(failed.model.title == UIStrings.otherFailureTitle("Lab"))
+        #expect(failed.model.body == UIStrings.otherFailureBody)
+        #expect(failed.model.tone == .error)
+        #expect(failed.buttons.map(\.title) == [UIStrings.editHostAction, UIStrings.reconnect])
+
+        // (2) Reconnect on that banner dials again, and the banner it fails into keeps the button.
+        try Self.press(UIStrings.reconnect, on: failed)
+        #expect(chain.presses == 2, "the banner's Reconnect must dial again")
+        #expect(controller.bannerIDs == [BannerView.Model.connectFailureID])
+        try Self.press(UIStrings.reconnect, on: Self.banner(BannerView.Model.connectFailureID, in: controller))
+        #expect(chain.presses == 3)
+    }
+
+    @Test("(b) the other banner: id, error tone, the unreachable banner's buttons in its order, its own title and body")
+    func otherBannerHasTheUnreachableButtons() throws {
+        var calls: [String] = []
+        func model(_ kind: ConnectFlow.FailureKind) -> BannerView.Model? {
+            .connectFailure(kind, hostTitle: "H", address: "h.example", port: 3389,
+                            editHost: { calls.append("edit") }, enterPassword: { calls.append("password") },
+                            reconnect: { calls.append("reconnect") })
+        }
+        let other = BannerView(try #require(model(.other), "the other kind shows a banner"))
+        let unreachable = BannerView(try #require(model(.unreachable)))
+        #expect(other.model.id == "connect-failed")
+        #expect(other.model.id == BannerView.Model.connectFailureID)
+        #expect(other.model.tone == .error)
+        #expect(other.buttons.map(\.title) == [UIStrings.editHostAction, UIStrings.reconnect])
+        #expect(other.buttons.map(\.title) == unreachable.buttons.map(\.title), "the same buttons as unreachable")
+        other.buttons.forEach { $0.performClick(nil) }
+        #expect(calls == ["edit", "reconnect"], "Edit Host… then Reconnect, wired to their handlers")
+
+        // Its own wording, not the unreachable banner's (whose body names the address and port).
+        #expect(other.model.title == UIStrings.otherFailureTitle("H"))
+        #expect(other.model.title.contains("H"), "the title names the host (r1 m-1: the format call must run)")
+        #expect(other.model.body == UIStrings.otherFailureBody)
+        #expect(other.model.title != unreachable.model.title)
+        #expect(other.model.body != unreachable.model.body)
+        #expect(!other.model.body.contains("h.example") && !other.model.body.contains("3389"))
+    }
+
+    @Test("(c) a certificate rejection still shows no banner here, and calls no handler")
+    func certificateStillHasNoBanner() {
+        var calls = 0
+        let model = BannerView.Model.connectFailure(.certificate, hostTitle: "H", address: "h.example", port: 3389,
+                                                    editHost: { calls += 1 }, enterPassword: { calls += 1 },
+                                                    reconnect: { calls += 1 })
+        #expect(model == nil)
+        #expect(calls == 0)
+    }
+
+    @Test("(d) cf_o_t and cf_o_b are in the catalog in en, zh-Hans and ja: translated, distinct, two sentences at most, no code")
+    func theCatalogHasTheTwoKeys() throws {
+        let strings = try shellCatalogStrings()
+        let title = try #require(shellCatalogValue(strings, "cf_o_t", "en"))
+        let body = try #require(shellCatalogValue(strings, "cf_o_b", "en"))
+        // The code's English fallback is the catalog's en value (the test bundle resolves defaults).
+        #expect(UIStrings.otherFailureTitle("H") == String(format: title, "H"))
+        #expect(UIStrings.otherFailureBody == body)
+        for language in ["en", "zh-Hans", "ja"] {
+            let t = try #require(shellCatalogValue(strings, "cf_o_t", language), "cf_o_t \(language)")
+            let b = try #require(shellCatalogValue(strings, "cf_o_b", language), "cf_o_b \(language)")
+            #expect(!t.isEmpty && !b.isEmpty, "\(language)")
+            #expect(t != b, "\(language)")
+            #expect(t.components(separatedBy: "%@").count == 2, "cf_o_t \(language) keeps one host placeholder")
+            #expect(!b.contains("%"), "cf_o_b \(language) has no placeholder")
+            // Not another first-connect banner's wording in the same language.
+            for other in ["cf_u_t", "cf_n_t", "cf_c_t"] {
+                #expect(t != shellCatalogValue(strings, other, language), "cf_o_t \(language) repeats \(other)")
+            }
+            for other in ["cf_u_b", "cf_n_b", "cf_c_b"] {
+                #expect(b != shellCatalogValue(strings, other, language), "cf_o_b \(language) repeats \(other)")
+            }
+            for text in [t, b] {
+                // No error code, no hex, no token: not a single digit, no 0x; no dash of any width.
+                #expect(!text.unicodeScalars.contains { CharacterSet.decimalDigits.contains($0) }, "\(language): \(text)")
+                #expect(!text.contains("0x") && !text.contains("--") && !text.contains("\u{2014}"), "\(language): \(text)")
+            }
+            // One reason and one next step: exactly two sentences, the title none.
+            let stop = language == "en" ? "." : "。"
+            #expect(b.components(separatedBy: stop).count - 1 == 2 && b.hasSuffix(stop), "cf_o_b \(language): \(b)")
+            #expect(!t.contains(stop), "cf_o_t \(language)")
+            if language != "en" {
+                #expect(t != title && b != body, "\(language) is the English text")
+                #expect(!(t + b).unicodeScalars.contains { $0.isASCII && CharacterSet.letters.contains($0) },
+                        "\(language) still contains English: \(t) / \(b)")
+            }
+        }
+    }
+
+    @Test("(e) source: connectFailure has one certificate case returning nil and one other case building the other banner")
+    func bannerSourceShape() throws {
+        let code = try routingCodeOnly("App/UI/Style/BannerView.swift")
+        func count(_ needle: String) -> Int { code.components(separatedBy: needle).count - 1 }
+        #expect(count("case .certificate:") == 1)
+        #expect(count("case .certificate: return nil") == 1)
+        #expect(count("case .other:") == 1)
+        #expect(count("case .other: return .init(id: connectFailureID, title: UIStrings.otherFailureTitle(hostTitle), "
+                      + "body: UIStrings.otherFailureBody,") == 1)
+        #expect(count(".certificate, .other") == 0 && count(".other, .certificate") == 0, "no shared arm")
+        #expect(count("UIStrings.otherFailureTitle(") == 1)
+        #expect(count("UIStrings.otherFailureBody") == 1)
     }
 }
