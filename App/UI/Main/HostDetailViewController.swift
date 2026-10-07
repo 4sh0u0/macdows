@@ -193,6 +193,15 @@ final class HostDetailViewController: NSViewController {
     /// Fills the Connection and Recent cards for `record`.
     func show(_ record: HostRecord) {
         loadViewIfNeeded()
+        // UI-10: removeRow(at:) drops a row from the grid's layout but leaves its cells' content
+        // views in the grid's view tree, where they keep their last frame and draw under the new
+        // rows. Take each content view out first (the reused Show button leaves with its row stack
+        // and is moved into the new one below).
+        for row in 0..<connectionGrid.numberOfRows {
+            for column in 0..<connectionGrid.numberOfColumns {
+                connectionGrid.cell(atColumnIndex: column, rowIndex: row).contentView?.removeFromSuperview()
+            }
+        }
         while connectionGrid.numberOfRows > 0 { connectionGrid.removeRow(at: 0) }
         func label(_ text: String) -> NSTextField {
             let label = NSTextField(labelWithString: text)
