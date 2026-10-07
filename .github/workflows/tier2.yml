@@ -89,7 +89,11 @@ env:
   # installed, which is the intended signal -- and a newer beta may add Swift 6 /
   # strict-concurrency diagnostics. Rolling back is this line plus `runs-on` below
   # (/Applications/Xcode_16.4.app on macos-15).
-  XCODE_APP: /Applications/Xcode_27.2_beta.app
+  # 2026-10-07 rotation: the preview image dropped Xcode_27.2_beta.app and now ships only
+  # /Applications/Xcode_27.0.0.app (the Pin step's listing on run 37623176101); the pin follows
+  # the install path again, deliberately the full version path and not a symlink. The local
+  # toolchain stays 27.2 beta, so a diagnostic that differs between the two shows up here first.
+  XCODE_APP: /Applications/Xcode_27.0.0.app
   # Scripts/bootstrap.sh installs whatever brew formula is missing (xcodegen, on this image).
   # Let it do that without spending a minute or two on an auto-update of the whole tap first.
   HOMEBREW_NO_AUTO_UPDATE: "1"
