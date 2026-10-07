@@ -595,7 +595,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 	private func drainTick() {
 		guard let session else { return }
-		if let error = session.lastConnectError {
+		if let error = session.lastConnectError, !ReconnectDriver.connectErrorBelongsToDriver(in: reconnectDriver?.state) {
 			// UI slice ④ (UI-1 spec §4.1): the status line says `st_err`; the error itself goes to
 			// the `[connect]` log line only (and with it to the diagnostics export), as its domain
 			// and code -- never its description, which can carry the host's address.
@@ -614,12 +614,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			// kept (the line re-worded to the catalog's `st_err` by UI slice ④); this branch stays
 			// the one place a connect ERROR re-enables the button.
 			//
-			// Still BEFORE the drain below, so the `.disconnected` that accompanies a bridge refusal
-			// never reaches the driver on this path. The teardown disarms and drops the driver,
-			// which is what keeps it from sitting in `.reconnecting` for ever, armed against a
-			// session whose failure the UI has already announced. Why the shutdown the teardown now
-			// performs on this path is short: see the connect-error precondition on
-			// `tearDownSession()`.
+			// adr/0019 supplementary ruling RB-1 (a′): this branch takes a connect error only when the
+			// leg is not the driver's -- a first connect (driver `.idle`), a live leg (`.live`, where
+			// the decode-path refusal stays `st_err`), or no driver at all. A leg the driver started
+			// (`.reconnecting`, or `.waiting` after that leg failed transiently and the error is still
+			// on the session) is skipped: the drain below hands its `.disconnected` to the driver,
+			// whose step 1 reads the same error, classifies it (`ConnectFailureClass`), logs
+			// `[connect] leg-failed:` and either backs off or gives up through the give-up branch.
+			// Before the ruling this branch took every connect error, so a failed reconnect leg ended
+			// here and the driver never saw it.
+			//
+			// When it does take the error it is still BEFORE the drain below, so that
+			// `.disconnected` never reaches the driver on this path. The teardown disarms and drops
+			// the driver, which is what keeps it from sitting armed against a session whose failure
+			// the UI has already announced. Why the shutdown the teardown now performs on this path
+			// is short: see the connect-error precondition on `tearDownSession()`.
 			tearDownSession()
 			return
 		}
@@ -829,7 +838,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// hook. That is safe for the same reason releasing the driver from inside its own callback is:
 	/// the bridge invokes the value its getter returned, which ARC keeps alive for the whole call.
 	///
-	/// FROM THE CONNECT-ERROR BRANCH this runs before that method's own drain, never inside one. A
+	/// FROM THE CONNECT-ERROR BRANCH this runs before that method's own drain, never inside one. The
+	/// branch takes a connect error only when the leg is not the reconnect driver's (adr/0019
+	/// supplementary ruling RB-1 (a′): a first connect or a live leg); a failed leg the driver
+	/// started reaches this function from the give-up branch instead, inside the drain, under that
+	/// branch's precondition above -- the sentinel was posted after the error, so its bit is set. A
 	/// `-start` that failed synchronously left the session idle, and `-shutdownAndWait` returns from
 	/// idle at once. A connect that failed on T_rdp set the error first and posted the sentinel as
 	/// its last act before returning, so step 4 drains for the sentinel itself -- a flat drain, not a
@@ -940,7 +953,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		}
 		if !chainReachedLive, let error = ended.lastConnectError {
 			hostStore.note(.connectFailed, for: host)
-			showConnectFailure(record, kind: ConnectFlow.failureKind(errorCode: (error as NSError).code, certificateRejected: false))
+			// A driver-started leg that gave up before the chain went live already has its banner
+			// (`applyReconnectState(.gaveUp)`); the give-up banner is the one writer then.
+			if !endingByGiveUp {
+				showConnectFailure(record, kind: ConnectFlow.failureKind(errorCode: (error as NSError).code, certificateRejected: false))
+			}
 		} else if chainReachedLive {
 			hostStore.note(.connectionLost, for: host)
 		}

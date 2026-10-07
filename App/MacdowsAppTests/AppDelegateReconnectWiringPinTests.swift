@@ -27,7 +27,8 @@ import Testing
 //     and appended one call; the session-end lane lifted that freeze to repair the button it left
 //     refusing every press (lane D impl-report §8 #1), keeping the two statements a human actually
 //     sees. UI slice ④ re-worded the line to the catalog's `st_err` and moved the error itself to
-//     a `[connect]` log line in front of it.
+//     a `[connect]` log line in front of it. RB-2 (adr/0019 supplementary ruling RB-1 (a′)) gave
+//     the branch one condition: it leaves a leg the reconnect driver started to the driver.
 //  5. The button is enabled by a literal `true` only where no reconnect state is involved: the two
 //     places that predate this lane, and the three adr/0020 lane S added (the End-session action,
 //     and the two host.env failures D-8 moved behind the button's disable -- since UI slice ①,
@@ -223,9 +224,10 @@ struct AppDelegateReconnectWiringPinTests {
     ///
     /// UI first, teardown second: the same order the give-up path has, where the presenter writes
     /// the give-up line before the teardown runs. The needle starts at the method's own first
-    /// statement, so the branch cannot drift below the drain (it must return BEFORE the drain: the
-    /// driver never sees the `.disconnected` a bridge refusal produces on this path), and it runs to
-    /// the branch's `return }`, so nothing can be inserted between the call and the return.
+    /// statement, so the branch cannot drift below the drain (it must return BEFORE the drain: when
+    /// this branch takes an error, the driver never sees the `.disconnected` that comes with it),
+    /// and it runs to the branch's `return }`, so nothing can be inserted between the call and the
+    /// return.
     ///
     /// RE-FROZEN by UI slice ④ (UI-1 spec §4.1; old needle's line was
     /// `statusLabel.stringValue = "Connect failed: \(error.localizedDescription)"`): the status line
@@ -233,15 +235,25 @@ struct AppDelegateReconnectWiringPinTests {
     /// it is logged as one `[connect]` line by domain and code (never its description, which can
     /// carry the address), the first statement of the branch. The order is otherwise lane S's.
     ///
+    /// RE-FROZEN by RB-2 (adr/0019 supplementary ruling RB-1 (a′); old needle's condition was
+    /// `if let error = session.lastConnectError {`): the branch takes the error only when the leg
+    /// is not the reconnect driver's, `!ReconnectDriver.connectErrorBelongsToDriver(in:
+    /// reconnectDriver?.state)`. A leg the driver started (`.reconnecting`, or `.waiting` after a
+    /// transient failure of that leg) is left to the drain, which hands its `.disconnected` to the
+    /// driver's step 1; a first connect and a live leg are taken here exactly as before. The
+    /// branch's statements are unchanged. `ConnectErrorRoutingTests` drives the predicate and the
+    /// driver through both routes.
+    ///
     /// MUST-RED for: reverting to the hand-written statements, dropping or moving the literal
-    /// `true`, re-wording the failure line, putting the error's description back on screen, and
-    /// returning without the teardown.
+    /// `true`, re-wording the failure line, putting the error's description back on screen,
+    /// returning without the teardown, and dropping or inverting the driver-leg condition.
     @Test("the connect-error branch logs the error, writes st_err, enables the button, and ends the session")
     func theConnectErrorBranchEndsTheSession() throws {
         let stripped = try sourceWithoutComments(Self.appDelegate)
         #expect(occurrences(
             of: "private func drainTick() { guard let session else { return } "
-                + "if let error = session.lastConnectError { "
+                + "if let error = session.lastConnectError, "
+                + "!ReconnectDriver.connectErrorBelongsToDriver(in: reconnectDriver?.state) { "
                 + "ConnectChain.log.notice(\"[connect] failed: domain=\\((error as NSError).domain, privacy: .public) "
                 + "code=\\((error as NSError).code, privacy: .public)\") "
                 + "statusLabel.stringValue = UIStrings.connectionFailed "
@@ -250,6 +262,8 @@ struct AppDelegateReconnectWiringPinTests {
                 + "return }",
             in: stripped) == 1)
         #expect(occurrences(of: "localizedDescription", in: stripped) == 0, "the error's text is not shown or logged")
+        #expect(occurrences(of: "connectErrorBelongsToDriver(", in: stripped) == 1,
+                "the gate asks the driver's predicate in one place")
     }
 
     /// D-7b. The literal `true` stays in the two places that predate this lane -- the boundary
