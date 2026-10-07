@@ -328,6 +328,16 @@ final class StatusItemController: NSObject, NSMenuDelegate, NSMenuItemValidation
         onRun?(buttonScreenFrame)
     }
 
+    /// Design note §6: the button stays highlighted while the start panel it opened is open. The App
+    /// forwards the panel's `onStatusItemAnchorChange` here. Applied on the next turn, after the menu
+    /// that sent Run… has finished tracking (which resets the button's highlight itself); both
+    /// directions go through the same queue, so their order is kept.
+    func setPanelHighlight(_ on: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            self?.statusItem?.button?.highlight(on)
+        }
+    }
+
     /// The status item button's frame on screen, the start panel's anchor.
     var buttonScreenFrame: CGRect? {
         guard let button = statusItem?.button, let window = button.window else { return nil }

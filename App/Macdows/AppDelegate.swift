@@ -207,6 +207,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		statusItemController.onRun = { [weak self] buttonFrame in
 			self?.startPanel.showFromStatusItem(buttonFrame: buttonFrame)
 		}
+		startPanel.onStatusItemAnchorChange = { [weak self] highlighted in
+			self?.statusItemController.setPanelHighlight(highlighted)
+		}
 
 		// M1/W1 deliverable 2: the screen-parameter observer's *observable* half. The provider
 		// already logs every change (Console.app, category "DisplayTopology"); this puts the same

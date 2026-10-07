@@ -16,15 +16,34 @@ private final class PanelSender: LaunchSending {
     }
 }
 
+/// Gate r1 m-1: keeps each scheduled body so a test can make the launch timeout happen.
 @MainActor
 private final class PanelClock: ReconnectClock {
     final class Ticket: ReconnectClockTicket {
         var cancelled = false
+        let body: @MainActor () -> Void
+
+        init(_ body: @escaping @MainActor () -> Void) {
+            self.body = body
+        }
+
         func cancel() { cancelled = true }
     }
 
+    var tickets: [Ticket] = []
+
     func schedule(after delay: Duration, _ body: @escaping @MainActor () -> Void) -> any ReconnectClockTicket {
-        Ticket()
+        let ticket = Ticket(body)
+        tickets.append(ticket)
+        return ticket
+    }
+
+    /// Runs every body still pending (each at most once).
+    func fireAll() {
+        for ticket in tickets where !ticket.cancelled {
+            ticket.cancelled = true
+            ticket.body()
+        }
     }
 }
 
@@ -41,8 +60,9 @@ struct StartPanelControllerTests {
     }
 
     fileprivate static func controller(state: ReconnectDriver.State? = .live, hasSession: Bool = true,
-                           store: LaunchItemStore = LaunchItemStore(fileURL: nil)) -> (StartPanelController, PanelSender) {
-        let launcher = AppLauncher(timeout: StartPanelPolicy.execTimeout, clock: PanelClock())
+                                       store: LaunchItemStore = LaunchItemStore(fileURL: nil),
+                                       clock: PanelClock = PanelClock()) -> (StartPanelController, PanelSender) {
+        let launcher = AppLauncher(timeout: StartPanelPolicy.execTimeout, clock: clock)
         let controller = StartPanelController(items: store, launcher: launcher, preferences: preferences())
         let sender = PanelSender()
         controller.reading = { .init(hasSession: hasSession, state: state, host: Self.host, hostTitle: "workstation.example") }
@@ -269,6 +289,151 @@ struct StartPanelControllerTests {
         state = .reconnecting(attempt: 0)
         controller.render()
         #expect(controller.runField.superview === field && controller.openRow.superview === open)
+    }
+
+    // MARK: - Gate r1 folds
+
+    private static func returnKey() throws -> NSEvent {
+        try #require(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
+                                      characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
+    }
+
+    @Test("gate r1 I-2: a row is a VoiceOver button; a VoiceOver press or Return launches it once; a disabled row refuses")
+    func rowAccessibilityAndPress() throws {
+        let store = LaunchItemStore(fileURL: nil)
+        for (offset, name) in ["a.exe", "b.exe"].enumerated() {
+            store.recordLaunch(RunCommand(program: name, arguments: ""), displayName: name, for: Self.host,
+                               at: Date(timeIntervalSince1970: TimeInterval(offset)))
+        }
+        let (controller, sender) = Self.controller(store: store)
+        controller.render()
+        let first = try #require(controller.itemRows.first?.view)
+        #expect(first.isAccessibilityElement())
+        #expect(first.accessibilityRole() == .button)
+        #expect(first.isAccessibilityEnabled())
+        #expect(first.accessibilityLabel() == "b.exe")
+        #expect(first.accessibilityPerformPress())
+        #expect(sender.calls.map(\.program) == ["b.exe"])
+        // The press re-rendered the rows: look the other one up again, then press it with Return.
+        let second = try #require(controller.itemRows.first { $0.row.item.program == "a.exe" }?.view)
+        #expect(controller.handleRowKey(try Self.returnKey(), from: second))
+        #expect(sender.calls.map(\.program) == ["b.exe", "a.exe"])
+
+        let (connecting, idleSender) = Self.controller(state: .idle, store: store)
+        connecting.render()
+        let disabled = try #require(connecting.itemRows.first?.view)
+        #expect(!disabled.isAccessibilityEnabled())
+        #expect(!disabled.accessibilityPerformPress())
+        #expect(idleSender.calls.isEmpty)
+    }
+
+    @Test("gate r1 I-2: the row menus -- Pinned: Unpin; Recent: Pin, separator, Remove from Recent")
+    func rowMenus() throws {
+        let store = LaunchItemStore(fileURL: nil)
+        for name in ["a.exe", "b.exe"] {
+            store.recordLaunch(RunCommand(program: name, arguments: ""), displayName: name, for: Self.host, at: Date(timeIntervalSince1970: 0))
+        }
+        store.pin(try #require(store.items(for: Self.host).recent.first { $0.program == "a.exe" }), for: Self.host, at: Date(timeIntervalSince1970: 0))
+        let (controller, _) = Self.controller(store: store)
+        controller.render()
+        func titles(_ section: LaunchCatalog.Section) throws -> [String] {
+            let view = try #require(controller.itemRows.first { $0.row.section == section }?.view)
+            let menu = try #require(view.menuProvider?())
+            return menu.items.map { $0.isSeparatorItem ? "---" : $0.title }
+        }
+        #expect(try titles(.pinned) == ["Unpin"])
+        #expect(try titles(.recent) == ["Pin", "---", "Remove from Recent"])
+    }
+
+    @Test("gate r1 m-1: a timeout writes nothing; while open it is the row's and the Run field's reason; closed, it waits for the next open")
+    func timeoutsAtThePanel() throws {
+        let store = LaunchItemStore(fileURL: nil)
+        store.recordLaunch(RunCommand(program: "calc.exe", arguments: ""), displayName: "calc.exe", for: Self.host, at: Date(timeIntervalSince1970: 0))
+        let before = store.items(for: Self.host)
+        let clock = PanelClock()
+        let (controller, sender) = Self.controller(store: store, clock: clock)
+        controller.announce = { _, _ in }
+        controller.show(anchor: .fallback)
+        let calc = try #require(controller.itemRows.first?.row)
+        controller.runField.stringValue = "a.exe"
+        controller.submitRunField()
+        controller.launch(calc)
+        #expect(sender.calls.count == 2)
+        clock.fireAll()
+        #expect(store.items(for: Self.host) == before, "a timeout writes no Recent")
+        #expect(controller.runFieldError == "sp_r_timeout")
+        #expect(controller.rowErrors[calc.item.key] == "sp_r_timeout")
+        #expect(controller.lastFailures.isEmpty)
+        controller.close(.dismissed)
+
+        controller.runField.stringValue = "b.exe"
+        controller.submitRunField()
+        clock.fireAll()
+        #expect(store.items(for: Self.host) == before)
+        #expect(controller.lastFailures[Self.host] == .init(reasonKey: "sp_r_timeout", programName: "b.exe"))
+        controller.show(anchor: .fallback)
+        defer { controller.close(.dismissed) }
+        let texts = Self.texts(in: try #require(controller.panel.contentView))
+        #expect(texts.contains("The last launch did not succeed: Windows did not reply. If the program doesn’t open, try again."))
+    }
+
+    @Test("gate r1 m-3 (i): the status-item anchor callback is true on a status-item open and false on its close; Dock opens never call it")
+    func statusItemAnchorCallback() {
+        let (controller, _) = Self.controller()
+        var seen: [Bool] = []
+        controller.onStatusItemAnchorChange = { seen.append($0) }
+        controller.showFromStatusItem(buttonFrame: CGRect(x: 900, y: 875, width: 30, height: 25))
+        #expect(seen == [true] && controller.isAnchoredToStatusItem)
+        controller.close(.lostFocus)
+        #expect(seen == [true, false])
+        controller.show(anchor: .fallback)
+        controller.close(.dismissed)
+        controller.showFromDockMenu(pointer: nil)
+        controller.close(.toggled)
+        #expect(seen == [true, false], "Dock and Dock-menu opens leave the status item alone")
+        controller.showFromStatusItem(buttonFrame: nil)
+        controller.show(anchor: .fallback)
+        #expect(seen == [true, false, true, false], "re-opened from elsewhere: no longer the status item's")
+        controller.close(.dismissed)
+        #expect(seen.count == 4)
+        let (none, _) = Self.controller(hasSession: false)
+        var noneSeen: [Bool] = []
+        none.onStatusItemAnchorChange = { noneSeen.append($0) }
+        none.showFromStatusItem(buttonFrame: nil)
+        #expect(noneSeen.isEmpty, "no panel, no highlight")
+    }
+
+    @Test("gate r1 m-3 (ii): an inline error is announced on its row or the Run field and stays in the row's help; a late one is not announced")
+    func inlineErrorsAreAnnounced() throws {
+        let store = LaunchItemStore(fileURL: nil)
+        store.recordLaunch(RunCommand(program: #"C:\Tools\Example.exe"#, arguments: "/open"), displayName: "Example.exe", for: Self.host,
+                           at: Date(timeIntervalSince1970: 0))
+        let (controller, _) = Self.controller(store: store)
+        var announced: [(element: AnyObject, text: String)] = []
+        controller.announce = { announced.append(($0 as AnyObject, $1)) }
+        controller.show(anchor: .fallback)
+        defer { controller.close(.dismissed) }
+        controller.launch(try #require(controller.itemRows.first?.row))
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: #"c:\tools\example.exe"#)
+        let reason = "The program was not found on the remote PC. Check the path."
+        let row = try #require(controller.itemRows.first?.view)
+        #expect(announced.count == 1)
+        #expect(announced.first?.text == reason && announced.first?.element === row)
+        let help = try #require(row.accessibilityHelp())
+        #expect(help.contains(reason) && help.contains(#"C:\Tools\Example.exe /open"#))
+        #expect(row.toolTip == #"C:\Tools\Example.exe /open"#, "the tooltip stays the command")
+
+        controller.runField.stringValue = "missing.exe"
+        controller.submitRunField()
+        controller.handleExecResult(execResult: 3, rawResult: 0, program: "missing.exe")
+        #expect(announced.count == 2)
+        #expect(announced.last?.element === controller.runField && announced.last?.text == "This program is not allowed on the remote PC.")
+
+        controller.close(.dismissed)
+        controller.runField.stringValue = "late.exe"
+        controller.submitRunField()
+        controller.handleExecResult(execResult: 6, rawResult: 0, program: "late.exe")
+        #expect(announced.count == 2, "a late failure goes to the next open's bar, unannounced")
     }
 
     // MARK: - Ruling R-a1-1 (i)

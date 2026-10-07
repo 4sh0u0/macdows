@@ -280,6 +280,11 @@ extension BridgeExecWitnessPinTests {
         #expect(bridgeOccurrences(of: "WLog_", in: method) == 1)
         #expect(bridgeOccurrences(of: Self.launchProgramWarn, in: method) == 1)
         Self.expectNoProgramInWLog(method, "-launchProgram:arguments:")
+        // Gate r1 I-1 (a): WLog_ is not the only way to print. No other logging or printing call
+        // shape at all in this body (CRSession.mm uses NSLog elsewhere, so the form is real).
+        for shape in ["NSLog(", "printf(", "fprintf(", "os_log(", "syslog("] {
+            #expect(bridgeOccurrences(of: shape, in: method) == 0, "-launchProgram:arguments: calls \(shape)")
+        }
         for call in method.components(separatedBy: "WLog_").dropFirst() {
             let statement = call.prefix { $0 != ";" }
             for banned in ["arguments", "Bytes", ".bytes", "%@", ".UTF8String"] {

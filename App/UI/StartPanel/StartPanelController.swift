@@ -73,6 +73,19 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
     /// Open Macdows (the panel's last row and the Dock menu's): the App shows the Hosts window.
     var onOpenMacdows: (() -> Void)?
 
+    /// Design note §6: the status item's button stays highlighted while the panel it opened is
+    /// open. Called with true when the panel opens from the status item's Run…, and with false when
+    /// that panel closes (by any path) or is re-opened from somewhere else. A Dock or Dock-menu open
+    /// never calls it. The App forwards it to the status item; the panel knows nothing of it.
+    var onStatusItemAnchorChange: ((Bool) -> Void)?
+
+    /// Design note §6: an inline error is read out to VoiceOver. A seam so tests can see what is
+    /// announced on which element; the App keeps the default, the system announcement.
+    var announce: (_ element: Any, _ text: String) -> Void = { element, text in
+        NSAccessibility.post(element: element, notification: .announcementRequested,
+                             userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.high.rawValue])
+    }
+
     let launcher: AppLauncher
     let items: LaunchItemStore
     let preferences: StartPanelPreferences
@@ -107,9 +120,18 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
     private(set) var phase: Phase?
     private var currentHost: HostID?
     private var pendingByKey: [String: Int] = [:]
-    private var rowErrors: [String: String] = [:]
+    /// Inline reasons by command key while the panel is open (read by tests).
+    private(set) var rowErrors: [String: String] = [:]
     private var runFieldPending: Int?
-    private var runFieldError: String?
+    private(set) var runFieldError: String?
+    /// The inline error to announce once the panel has re-rendered (design note §6, VoiceOver).
+    private var inlineAnnouncement: (rowKey: String?, reasonKey: String)?
+    /// True while the panel is open and was opened from the status item's Run…
+    private(set) var isAnchoredToStatusItem = false {
+        didSet {
+            if isAnchoredToStatusItem != oldValue { onStatusItemAnchorChange?(isAnchoredToStatusItem) }
+        }
+    }
     private(set) var lastFailures: [HostID: LastFailure] = [:]
     private(set) var shownLastFailure: LastFailure?
     private var shownAt: Date?
@@ -299,7 +321,7 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
 
     /// The status item's "Run…": under the status item button, the Run field focused.
     func showFromStatusItem(buttonFrame: CGRect?) {
-        show(anchor: buttonFrame.map { .statusItem(buttonFrame: $0) } ?? .fallback)
+        show(anchor: buttonFrame.map { .statusItem(buttonFrame: $0) } ?? .fallback, fromStatusItem: true)
     }
 
     /// The Dock menu's "Run…".
@@ -309,7 +331,7 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
 
     /// Lays the panel out for the current reading and shows it at `anchor`, key, with the Run field
     /// focused when it can take a launch and Open Macdows the default otherwise (design note §6).
-    func show(anchor: PanelAnchor) {
+    func show(anchor: PanelAnchor, fromStatusItem: Bool = false) {
         let current = reading()
         guard Self.phase(for: current) != nil else { return }
         if let host = current.host {
@@ -331,6 +353,7 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
         }
         isShown = true
         shownAt = Date()
+        isAnchoredToStatusItem = fromStatusItem
     }
 
     /// Closes the panel. Activates nothing (S-1).
@@ -347,7 +370,9 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
         shownLastFailure = nil
         rowErrors = [:]
         runFieldError = nil
+        inlineAnnouncement = nil
         panel.orderOut(nil)
+        isAnchoredToStatusItem = false
     }
 
     /// The App's state changed: re-render in place (without taking focus), or close when there is
@@ -521,6 +546,10 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
         for row in rows {
             let detail = [row.qualifier, row.arguments.isEmpty ? nil : row.arguments].compactMap { $0 }.joined(separator: "  ")
             let view = StartPanelRowView(title: row.title, detail: detail, help: row.fullCommand)
+            if let reasonKey = rowErrors[row.item.key] {
+                // VoiceOver keeps the reason in the row's help; the tooltip stays the command.
+                view.setAccessibilityHelp(row.fullCommand + "\n" + UIStrings.startPanelReason(forKey: reasonKey))
+            }
             view.isEnabled = live
             view.isPending = pendingByKey[row.item.key] != nil
             view.onPress = { [weak self] in self?.launch(row) }
@@ -671,6 +700,7 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
             fail(request, reasonKey: AppLauncher.timeoutReasonKey, key: key, programName: programName)
         }
         if isShown { refresh() }
+        announceInlineError()
     }
 
     private func fail(_ request: AppLauncher.Request, reasonKey: String, key: String, programName: String) {
@@ -678,13 +708,24 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
         switch request.origin {
         case .row where here:
             rowErrors[key] = reasonKey
+            inlineAnnouncement = (key, reasonKey)
         case .runField where here:
             runFieldError = reasonKey
+            inlineAnnouncement = (nil, reasonKey)
         default:
             if let host = request.host {
                 lastFailures[host] = LastFailure(reasonKey: reasonKey, programName: programName)
             }
         }
+    }
+
+    /// Reads the inline error just shown to VoiceOver, on its row (rebuilt by the refresh, so looked
+    /// up again) or on the Run field. Only the two inline error branches of `fail` set it.
+    private func announceInlineError() {
+        guard let pending = inlineAnnouncement else { return }
+        inlineAnnouncement = nil
+        let element: Any = pending.rowKey.flatMap { key in itemRows.first { $0.row.item.key == key }?.view } ?? runField
+        announce(element, UIStrings.startPanelReason(forKey: pending.reasonKey))
     }
 
     private func contextMenu(for row: LaunchCatalog.Row) -> NSMenu? {

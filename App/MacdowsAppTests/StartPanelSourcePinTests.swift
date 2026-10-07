@@ -60,6 +60,63 @@ private func braced(_ code: String, from start: String.Index) -> Substring? {
     return nil
 }
 
+/// The `\(…)` bodies of every string literal in the call whose argument list opens at `open` (the
+/// index of its "("), up to the call's own closing parenthesis; nil when the call never closes. A
+/// small scanner with three states -- code, string, interpolation -- that keeps parentheses inside a
+/// string out of the call's count and follows nested parentheses and string literals inside an
+/// interpolation, so `\(f("x)"))` is one body, `f("x)")`.
+private func interpolations(inCallAt open: String.Index, of code: String) -> [String]? {
+    var bodies: [String] = []
+    var index = code.index(after: open)
+    var depth = 1
+    var inString = false
+    var bodyStart: String.Index?
+    var bodyDepth = 0
+    var nestedString = false
+    while index < code.endIndex {
+        let character = code[index]
+        if let start = bodyStart {
+            if nestedString {
+                if character == "\\" {
+                    index = code.index(after: index)
+                } else if character == "\"" {
+                    nestedString = false
+                }
+            } else if character == "\"" {
+                nestedString = true
+            } else if character == "(" {
+                bodyDepth += 1
+            } else if character == ")" {
+                bodyDepth -= 1
+                if bodyDepth == 0 {
+                    bodies.append(String(code[start..<index]))
+                    bodyStart = nil
+                }
+            }
+        } else if inString {
+            if character == "\\" {
+                let next = code.index(after: index)
+                if next < code.endIndex, code[next] == "(" {
+                    bodyStart = code.index(after: next)
+                    bodyDepth = 1
+                }
+                index = next
+            } else if character == "\"" {
+                inString = false
+            }
+        } else if character == "\"" {
+            inString = true
+        } else if character == "(" {
+            depth += 1
+        } else if character == ")" {
+            depth -= 1
+            if depth == 0 { return bodies }
+        }
+        if index < code.endIndex { index = code.index(after: index) }
+    }
+    return nil
+}
+
 @Suite("ADR-0025 §3.2 — the start panel's source pins (S-1…S-5, the Accessibility rule)")
 struct StartPanelSourcePinTests {
 
@@ -71,13 +128,21 @@ struct StartPanelSourcePinTests {
     }
 
     /// S-1 (adr/0014 §3): launching never activates a window; the server activates the one it creates.
-    @Test("S-1: the launch path never calls activateWindow( or localActivate(")
+    /// Gate r1 m-2: also the App-activation shapes (design note §6: closing activates nothing), and
+    /// the one window the launch path may make key is its own panel.
+    @Test("S-1: the launch path never activates a window or the App; it makes only its own panel key")
     func s1NoActivation() throws {
+        var keyed = 0
+        var panelKeyed = 0
         for file in try launchPathSources() {
-            for shape in ["activateWindow(", "localActivate(", "focusAuthority"] {
+            for shape in ["activateWindow(", "localActivate(", "focusAuthority", ".activate(ignoringOtherApps", "NSApp.activate(",
+                          "NSRunningApplication.current.activate", "orderFrontRegardless("] {
                 #expect(pinCount(shape, file.code) == 0, "\(file.path): \(shape)")
             }
+            keyed += pinCount("makeKeyAndOrderFront(", file.code)
+            panelKeyed += pinCount("panel.makeKeyAndOrderFront(nil)", file.code)
         }
+        #expect(keyed == 2 && panelKeyed == 2, "show and the key-loss grace, both the panel itself (\(panelKeyed) of \(keyed))")
     }
 
     /// S-2: the program and the arguments never reach a log. The needle: every interpolation inside a
@@ -103,6 +168,40 @@ struct StartPanelSourcePinTests {
             }
         }
         #expect(logCalls == 4, "the launcher's four lines: sent, result, unmatched, timeout (\(logCalls))")
+    }
+
+    /// Gate r1 I-1 (b): the blacklist above cannot see a whole value (`\(entry.request)`,
+    /// `\(String(describing: pending))`), so every interpolation in a launch-path log call must ALSO be
+    /// one of the scalar fields the four log lines use today, optionally with a privacy argument --
+    /// default deny. Every other logging shape (print, NSLog, os_log, a bare os.Logger) is absent, and
+    /// every `logger.` use is one of the level calls whose bodies are read here.
+    @Test("S-2 grammar: each log interpolation in the launch path is an allowed scalar field; no other logging shape")
+    func s2LogInterpolationsAreAllowListed() throws {
+        let allowed = try Regex(#"^(id|bytes|execResult|rawResult|entry\.request\.id|self\.unmatchedResults)(, privacy: \.(public|private))?$"#)
+        let levels = ["logger.notice(", "logger.info(", "logger.debug(", "logger.error(", "logger.warning(", "logger.fault("]
+        var bodies: [String] = []
+        for file in try launchPathSources() {
+            for shape in ["print(", "NSLog(", "os_log(", " Logger(", "os.Logger(", "dump("] {
+                #expect(pinCount(shape, file.code) == 0, "\(file.path): \(shape)")
+            }
+            let calls = levels.reduce(0) { $0 + pinCount($1, file.code) }
+            #expect(pinCount("logger.", file.code) == calls, "\(file.path): a logger use that is not a level call")
+            for level in levels {
+                var searchFrom = file.code.startIndex
+                while let found = file.code.range(of: level, range: searchFrom..<file.code.endIndex) {
+                    let open = file.code.index(before: found.upperBound)
+                    let inside = try #require(interpolations(inCallAt: open, of: file.code), "\(file.path): an unclosed log call")
+                    bodies += inside
+                    searchFrom = found.upperBound
+                }
+            }
+        }
+        #expect(bodies.count == 8, "id, bytes / code, count / id, code, raw / id (\(bodies))")
+        for body in bodies {
+            #expect(body.wholeMatch(of: allowed) != nil, "a log interpolates \(body)")
+        }
+        let launcher = pinCode(try pinSource("App/SessionControl/AppLauncher.swift"))
+        #expect(pinCount("DiagnosticLogger(subsystem: \"dev.haru.macdows\", category: \"Launch\")", launcher) == 1)
         let registry = pinCode(try pinSource("App/RemoteWindowRendering/RemoteWindowRegistry.swift"))
         let branch = try #require(registry.range(of: "case .execResult:"))
         let next = try #require(registry.range(of: "case .windowIcon, .handshakeFlags:", range: branch.upperBound..<registry.endIndex))
@@ -216,6 +315,43 @@ struct StartPanelSourcePinTests {
         }
         #expect(defaults == ["App/UI/StartPanel/StartPanelPreferences.swift"])
         #expect(screens == ["App/RemoteWindowRendering/DisplayTopologyProvider.swift"], "adr/0015 §5.A.5")
+    }
+
+    /// Gate r1 m-3 (ii): the one VoiceOver announcement is the inline-error path's: the system call is
+    /// the seam's default, the seam is called once, from `announceInlineError`, and only the two
+    /// inline branches of `fail` queue an announcement.
+    @Test("m-3 (ii): .announcementRequested once, reached only from the inline error branches")
+    func announcementOnlyOnInlineErrors() throws {
+        var posts: [String: Int] = [:]
+        for file in try launchPathSources() where pinCount(".announcementRequested", file.code) > 0 {
+            posts[file.path] = pinCount(".announcementRequested", file.code)
+        }
+        #expect(posts == ["App/UI/StartPanel/StartPanelController.swift": 1], "\(posts)")
+        let controller = pinCode(try pinSource("App/UI/StartPanel/StartPanelController.swift"))
+        #expect(controller.contains("var announce: (_ element: Any, _ text: String) -> Void = { element, text in "
+                                    + "NSAccessibility.post(element: element, notification: .announcementRequested,"))
+        #expect(pinCount("announce(element, UIStrings.startPanelReason(forKey: pending.reasonKey))", controller) == 1)
+        #expect(pinCount("announceInlineError()", controller) == 2, "declared once, called once (after the refresh in handle)")
+        let fail = try #require(controller.range(of: "private func fail("))
+        let failBody = try #require(braced(controller, from: fail.lowerBound))
+        #expect(pinCount("inlineAnnouncement = (", controller) == 2)
+        #expect(pinCount("inlineAnnouncement = (", String(failBody)) == 2, "both in fail's inline branches")
+        #expect(failBody.contains("case .row where here: rowErrors[key] = reasonKey inlineAnnouncement = (key, reasonKey)"))
+        #expect(failBody.contains("case .runField where here: runFieldError = reasonKey inlineAnnouncement = (nil, reasonKey)"))
+    }
+
+    /// Gate r1 m-3 (i): the status item's button is highlighted through the panel's own callback.
+    @Test("m-3 (i): the App forwards the panel's status-item anchor to the status item's highlight")
+    func statusItemHighlightWiring() throws {
+        let delegate = pinCode(try pinSource("App/Macdows/AppDelegate.swift"))
+        #expect(pinCount("startPanel.onStatusItemAnchorChange = { [weak self] highlighted in "
+                         + "self?.statusItemController.setPanelHighlight(highlighted) }", delegate) == 1)
+        let status = pinCode(try pinSource("App/Macdows/StatusMenu/StatusItemController.swift"))
+        #expect(pinCount("self?.statusItem?.button?.highlight(on)", status) == 1)
+        #expect(pinCount(".highlight(", status) == 1)
+        for file in try launchPathSources() {
+            #expect(pinCount("StatusItemController", file.code) == 0, "\(file.path): the panel does not reach the status item")
+        }
     }
 
     @Test("the App delegate's session end reaches the panel through the presence hook, and the teardown is untouched")
