@@ -1680,6 +1680,102 @@
         }
       }
     },
+    "dn_none" : {
+      "comment" : "adr/0015 §5.A.3 display-change note: the screen list is empty (§5.A.6)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Display change: no usable display right now."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ディスプレイの変更：現在使用できるディスプレイがありません。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "显示器变化：当前没有可用的显示器。"
+          }
+        }
+      }
+    },
+    "dn_nosess" : {
+      "comment" : "adr/0015 §5.A.3 display-change note: no session, the desktop size is taken at connect",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Display change: no session yet -- the desktop size is taken at connect."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ディスプレイの変更：まだセッションがありません。デスクトップサイズは接続時に決まります。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "显示器变化：尚无会话，桌面尺寸在连接时确定。"
+          }
+        }
+      }
+    },
+    "dn_ok" : {
+      "comment" : "adr/0015 §5.A.3 display-change note: the session desktop size is unaffected",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Display change: this session's desktop size is unaffected."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ディスプレイの変更：このセッションのデスクトップサイズに影響はありません。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "显示器变化：此会话的桌面尺寸不受影响。"
+          }
+        }
+      }
+    },
+    "dn_stale" : {
+      "comment" : "adr/0015 §5.A.3 display-change note: the session desktop size is out of date",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Display change: this session's desktop size is now out of date -- reconnect to re-negotiate."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ディスプレイの変更：このセッションのデスクトップサイズは古くなりました。再接続してデスクトップサイズを設定し直してください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "显示器变化：此会话的桌面尺寸已过时，请重新连接以便再次协商。"
+          }
+        }
+      }
+    },
     "done" : {
       "extractionState" : "manual",
       "localizations" : {
