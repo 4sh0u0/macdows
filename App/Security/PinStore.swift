@@ -192,23 +192,39 @@ extension PinStore {
     /// with nothing in it is deleted. Returns the hosts whose pin was cleared. Stops at the first
     /// item it cannot read or write (nothing is written over an unreadable item).
     func resetAllPins(displayName: (HostID) -> String) throws -> [HostID] {
+        let outcome = resetAllPinsKeepingProgress(displayName: displayName)
+        if let error = outcome.error { throw error }
+        return outcome.cleared
+    }
+
+    /// Same walk as `resetAllPins`, but a failure part-way does not lose the hosts already
+    /// cleared: they come back in `cleared` next to the error that stopped the walk.
+    func resetAllPinsKeepingProgress(displayName: (HostID) -> String) -> (cleared: [HostID], error: Error?) {
         var cleared: [HostID] = []
-        for host in try hostsWithItems() {
-            var record = try currentRecord(for: host)
-            let hadPin = record.sha256 != nil
-            record.sha256 = nil
-            record.previous = nil
-            record.source = nil
-            record.pinnedAt = nil
-            record.subject = nil
-            record.issuer = nil
-            if record.isEmpty {
-                try delete(for: host)
-            } else {
-                try write(record, for: host, displayName: displayName(host))
+        do {
+            for host in try hostsWithItems() {
+                try resetPin(of: host, displayName: displayName, cleared: &cleared)
             }
-            if hadPin { cleared.append(host) }
+        } catch {
+            return (cleared, error)
         }
-        return cleared
+        return (cleared, nil)
+    }
+
+    private func resetPin(of host: HostID, displayName: (HostID) -> String, cleared: inout [HostID]) throws {
+        var record = try currentRecord(for: host)
+        let hadPin = record.sha256 != nil
+        record.sha256 = nil
+        record.previous = nil
+        record.source = nil
+        record.pinnedAt = nil
+        record.subject = nil
+        record.issuer = nil
+        if record.isEmpty {
+            try delete(for: host)
+        } else {
+            try write(record, for: host, displayName: displayName(host))
+        }
+        if hadPin { cleared.append(host) }
     }
 }

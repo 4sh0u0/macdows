@@ -148,8 +148,8 @@ struct HostActionsTests {
         store.upsert(record)
         let pins = InMemoryPinStore()
         pins.seed(PinRecord(sha256: TestFingerprints.a, expected: TestFingerprints.b), for: record.id)
-        let cleared = try await HostOperations.resetAllPins(actions: HostActions(credentials: InMemoryCredentialStore(), pins: pins), store: store)
-        #expect(cleared == [record.id])
+        let outcome = await HostOperations.resetAllPins(actions: HostActions(credentials: InMemoryCredentialStore(), pins: pins), store: store)
+        #expect(outcome == PinResetOutcome(cleared: [record.id], failed: false))
         #expect(pins.records[record.id] == PinRecord(expected: TestFingerprints.b))
         #expect(store.record(record.id)?.pinned == false)
     }

@@ -374,7 +374,10 @@ final class ReconnectDriver {
     // MARK: - State changes and the log line
 
     /// The unified-log half of the line below. See `logLine`'s doc for why there are two halves.
-    private static let logger = Logger(subsystem: "dev.haru.macdows", category: "Reconnect")
+    /// UI slice ③: a `DiagnosticLogger`, which hands the same string to the same `os.Logger`
+    /// (subsystem, category, level and privacy unchanged) and copies it into the diagnostics ring
+    /// buffer, where ADR-0024 D-8 registers the `[reconnect]` shape for the export.
+    private static let logger = DiagnosticLogger(subsystem: "dev.haru.macdows", category: "Reconnect")
 
     private func transition(to next: State) {
         state = next

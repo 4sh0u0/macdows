@@ -263,8 +263,10 @@ enum ShellAutolaunch {
     /// adr/0019 §2 lane D's own logger, extended here rather than duplicated: this file's anchor
     /// line needs the same two channels `ReconnectDriver.transition(to:)` already uses for the
     /// `[reconnect]` line family -- stdout, captured by the same orchestrator, and the unified
-    /// log, timestamped, for a cross-check the stdout line cannot carry on its own.
-    private static let logger = Logger(subsystem: "dev.haru.macdows", category: "Autolaunch")
+    /// log, timestamped, for a cross-check the stdout line cannot carry on its own. UI slice ③: a
+    /// `DiagnosticLogger` (same `os.Logger` underneath; the buffer copy has no registered export
+    /// shape, so an export only counts these lines).
+    private static let logger = DiagnosticLogger(subsystem: "dev.haru.macdows", category: "Autolaunch")
 
     /// The fixed-shape anchor line for `which`, e.g. `[autolaunch] press=disconnect`. Split out
     /// from `notePress(_:)` below so its exact shape can be value-tested, the same reason

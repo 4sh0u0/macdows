@@ -231,6 +231,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         window?.makeKeyAndOrderFront(nil)
     }
 
+    // MARK: - Settings (UI slice ③)
+
+    /// The Settings window, built on first use. It shares this controller's host records and
+    /// keychain actions, so Reset All Pins updates the same records the sidebar shows.
+    private(set) lazy var settings = SettingsWindowController(actions: actions, store: store)
+
+    /// Macdows ▸ Settings… (⌘,), the status item's Settings… and the toolbar's Settings button.
+    @objc func showSettings(_ sender: Any?) {
+        settings.show()
+    }
+
     @objc func removeHost(_ sender: Any?) {
         guard let record = selectedRecord, record.id != activeHostID, let window else { return }
         let alert = NSAlert()
@@ -364,12 +375,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             item.target = self
             item.action = MainMenu.newHostAction
         case Self.settingsItem:
-            // The settings window arrives with slice ③; until then the item has no action and
-            // AppKit keeps it disabled (as Settings… in the menus).
+            // UI slice ③: the same action as Settings… in the menus.
             item.label = UIStrings.settings
             item.toolTip = UIStrings.settings
             item.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: UIStrings.settings)
-            item.action = nil
+            item.target = self
+            item.action = MainMenu.settingsAction
         default:
             return nil
         }

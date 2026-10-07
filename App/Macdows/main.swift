@@ -8,6 +8,10 @@ import AppKit
 if !CRSession.pinProcessLogConfiguration() {
 	fputs("[log] WinPR root logger configuration failed; FreeRDP logging keeps WinPR's defaults\n", stderr)
 }
+// UI slice ③ (ADR-0024 D-8): the root logger's callback copies every FreeRDP / WinPR line into the
+// diagnostics ring buffer the Settings window exports from (after writing it to stdout / stderr
+// as before). Attached right after the configuration and before anything can log a line.
+DiagnosticLogBuffer.shared.attachProcessLog()
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
