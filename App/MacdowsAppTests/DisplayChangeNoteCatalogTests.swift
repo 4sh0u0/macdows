@@ -82,6 +82,16 @@ struct DisplayChangeNoteCatalogTests {
         }
     }
 
+    @Test("the closure's branches map to the keys in order: empty, no session, stale, unaffected")
+    func branchesMapToKeysInOrder() throws {
+        let code = displayNoteCodeOnly(try displayNoteSource("App/Macdows/AppDelegate.swift"))
+        let sequence = "if change.currentTopologyIsEmpty { note = UIStrings.displayNoteNoDisplay } "
+            + "else if change.sessionDesktopSize == nil { note = UIStrings.displayNoteNoSession } "
+            + "else if change.connectedDesktopSizeIsStale { note = UIStrings.displayNoteStale } "
+            + "else { note = UIStrings.displayNoteUnaffected }"
+        #expect(displayNoteOccurrences(of: sequence, in: code) == 1)
+    }
+
     @Test("each key has exactly one resolution point, in UIStrings")
     func eachKeyIsResolvedOnceInUIStrings() throws {
         let code = displayNoteCodeOnly(try displayNoteSource("App/UI/UIStrings.swift"))

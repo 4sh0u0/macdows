@@ -39,23 +39,42 @@ private func englishOnlyBundle() throws -> (bundle: Bundle, root: URL) {
     return (try #require(Bundle(url: root)), root)
 }
 
+/// Builds the en-only bundle, runs `body`, removes the temporary root on every exit path, and
+/// hands the root back so a test can check it is gone (UI-9 gate r1 m-2: dropping the cleanup
+/// used to survive).
+@discardableResult
+private func withEnglishOnlyBundle<T>(_ body: (Bundle) throws -> T) throws -> (value: T, root: URL) {
+    let (bundle, root) = try englishOnlyBundle()
+    defer { try? FileManager.default.removeItem(at: root) }
+    return (try body(bundle), root)
+}
+
 @Suite("Shell plural formats use the resolved localization's locale (UI slice ④, gate r1 m-1)")
 struct ShellFormattingLocaleTests {
     @Test("en catalog in a zh_CN region: 1 window, not 1 windows")
     func englishCatalogInChineseRegion() throws {
-        let (bundle, root) = try englishOnlyBundle()
-        defer { try? FileManager.default.removeItem(at: root) }
-        #expect(bundle.preferredLocalizations.first == "en")
-        let format = bundle.localizedString(forKey: "s_live_bar", value: "missing", table: nil)
-        let arguments: [any CVarArg] = [Int64(1), "12:03"]
-        let locale = ShellText.formattingLocale(preferredLocalizations: bundle.preferredLocalizations)
-        #expect(String(format: format, locale: locale, arguments: arguments) == "Connected · 1 window · since 12:03")
-        #expect(String(format: format, locale: locale, arguments: [Int64(2), "12:03"] as [any CVarArg]) == "Connected · 2 windows · since 12:03")
-        // The defect this replaces: the region's locale picks the plural category.
-        let region = Locale(identifier: "zh_CN")
-        #expect(String(format: format, locale: region, arguments: arguments) == "Connected · 1 windows · since 12:03")
-        #expect(ShellText.formattingLocale(preferredLocalizations: []).identifier == "en")
-        #expect(ShellText.formattingLocale(preferredLocalizations: ["ja", "en"]).identifier == "ja")
+        try withEnglishOnlyBundle { bundle in
+            #expect(bundle.preferredLocalizations.first == "en")
+            let format = bundle.localizedString(forKey: "s_live_bar", value: "missing", table: nil)
+            let arguments: [any CVarArg] = [Int64(1), "12:03"]
+            let locale = ShellText.formattingLocale(preferredLocalizations: bundle.preferredLocalizations)
+            #expect(String(format: format, locale: locale, arguments: arguments) == "Connected · 1 window · since 12:03")
+            #expect(String(format: format, locale: locale, arguments: [Int64(2), "12:03"] as [any CVarArg]) == "Connected · 2 windows · since 12:03")
+            // The defect this replaces: the region's locale picks the plural category.
+            let region = Locale(identifier: "zh_CN")
+            #expect(String(format: format, locale: region, arguments: arguments) == "Connected · 1 windows · since 12:03")
+            #expect(ShellText.formattingLocale(preferredLocalizations: []).identifier == "en")
+            #expect(ShellText.formattingLocale(preferredLocalizations: ["ja", "en"]).identifier == "ja")
+        }
+    }
+
+    @Test("the throwaway en-only bundle's temporary root is removed once the body returns")
+    func temporaryBundleIsCleanedUp() throws {
+        let (existedInside, root) = try withEnglishOnlyBundle { bundle in
+            FileManager.default.fileExists(atPath: bundle.bundlePath)
+        }
+        #expect(existedInside)
+        #expect(!FileManager.default.fileExists(atPath: root.path), "temporary bundle left behind")
     }
 
     @Test("ShellText.main and UIStrings.hostCount format with formattingLocale, never the region")
