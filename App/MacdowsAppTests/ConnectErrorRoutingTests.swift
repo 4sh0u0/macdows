@@ -193,6 +193,39 @@ struct ConnectErrorRoutingTests {
         #expect(app.session.restartCount == 2)
     }
 
+    /// adr/0019 RB-1 D-B(iv) reconsidered (owner 2026-10-07): ERRINFO_RPC_INITIATED_DISCONNECT
+    /// (65537, seen on a host restart) is one failed attempt, not a refusal. The driver's step 1
+    /// only asks `ConnectFailureClass`, so the leg backs off exactly as a CONNECT-class transient
+    /// one does, and the leg-failed line keeps its shape with the new code and class.
+    @Test("an ERRINFO RPC_INITIATED_DISCONNECT (65537) on a driver leg backs off instead of giving up")
+    func errinfoRpcInitiatedDisconnectOnDriverLegBacksOff() throws {
+        let app = try AppTick()
+        app.tick([Handshake()])
+        app.tick([Sentinel()])
+        app.clock.fireNext()
+        #expect(app.driver.state == .reconnecting(attempt: 0))
+
+        app.failConnect(code: 65_537)
+        #expect(!app.appTookTheError)
+        let expected = try ReconnectPolicy.delay(forFailedAttempt: 1)
+        #expect(app.driver.state == .waiting(attempt: 1, delay: expected))
+        #expect(app.driver.lastGiveUpCause == nil)
+
+        app.clock.fireNext()
+        app.tick([Handshake()])
+        #expect(app.driver.state == .live)
+        #expect(app.session.restartCount == 2)
+
+        let buffer = DiagnosticLogBuffer(capacity: 10)
+        let logger = DiagnosticLogger(subsystem: "dev.haru.macdows.tests", category: "Connect", buffer: buffer)
+        let error = NSError(domain: "Macdows.CRSession", code: 65_537)
+        ConnectChain.logLegFailure(error, as: ConnectFailureClass.classify(domain: error.domain, code: error.code),
+                                   to: logger)
+        #expect(buffer.snapshot().map(\.line.message) == [
+            "[connect] leg-failed: domain=Macdows.CRSession code=65537 class=transient",
+        ])
+    }
+
     @Test("a final failure on a driver leg reaches the driver, which gives up with the code")
     func finalDriverLegGivesUp() throws {
         let app = try AppTick()

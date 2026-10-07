@@ -69,12 +69,22 @@ struct ConnectFailureClassTests {
         #expect(ConnectFailureClass.bridgeErrorDomain == Self.domain)
     }
 
+    @Test("the named ERRINFO transient set is exactly {01 RPC_INITIATED_DISCONNECT, 02 RPC_INITIATED_LOGOFF}")
+    func theErrinfoTransientSetIsExact() {
+        #expect(ConnectFailureClass.transientErrinfoCodes == [0x01, 0x02])
+        #expect(ConnectFailureClass.errinfoErrorClass == 0x1_0000)
+    }
+
     @Test("the code seen on 2026-10-07 (131080, TLS_CONNECT_FAILED) and its neighbours by decimal value")
     func decimalSpellings() {
         #expect(ConnectFailureClass.classify(domain: Self.domain, code: 131_080) == .transient)
         #expect(ConnectFailureClass.classify(domain: Self.domain, code: 131_078) == .transient, "CONNECT_FAILED")
         #expect(ConnectFailureClass.classify(domain: Self.domain, code: 131_081) == .final, "AUTHENTICATION_FAILED")
         #expect(ConnectFailureClass.classify(domain: Self.domain, code: 131_083) == .final, "CONNECT_CANCELLED")
+        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 65_537) == .transient,
+                "the host-restart sample, ERRINFO RPC_INITIATED_DISCONNECT")
+        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 65_538) == .transient, "ERRINFO RPC_INITIATED_LOGOFF")
+        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 65_539) == .final, "ERRINFO IDLE_TIMEOUT")
     }
 
     @Test("the bridge's own negative codes -5...-1 are final")
@@ -95,11 +105,39 @@ struct ConnectFailureClassTests {
         #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0xFFFF) == .final)
     }
 
-    @Test("ERRINFO-class codes are final, including ones whose low half is a transient type")
-    func errinfoCodesAreFinal() {
+    @Test("ERRINFO-class codes other than 0x1 and 0x2 are final, including ones whose low half is a transient CONNECT type")
+    func errinfoCodesOutsideTheSetAreFinal() {
         #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0x1_0005) == .final)
         #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0x1_0006) == .final)
-        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0x1_0000) == .final)
+        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0x1_0000) == .final, "ERRINFO_SUCCESS")
+        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0x1_0003) == .final, "IDLE_TIMEOUT")
+        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0x1_0004) == .final, "LOGON_TIMEOUT")
+        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0x1_0007) == .final, "SERVER_DENIED_CONNECTION")
+        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0x1_000B) == .final, "RPC_INITIATED_DISCONNECT_BY_USER")
+        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0x1_000C) == .final, "LOGOFF_BY_USER")
+        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0x1_FFFF) == .final)
+    }
+
+    /// Owner ruling 2026-10-07 (D-B(iv) reconsidered): a host shutdown / restart or an
+    /// administrator's disconnect leaves ERRINFO_RPC_INITIATED_DISCONNECT (0x1) or
+    /// ERRINFO_RPC_INITIATED_LOGOFF (0x2) as the last error; the sample 65537 came from a host
+    /// restart. Only in the ERRINFO class and only in the bridge's domain.
+    @Test("ERRINFO 0x1_0001 / 0x1_0002 are transient; the bare numbers, other classes and other domains are not")
+    func errinfoRpcInitiatedCodesAreTransient() {
+        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0x1_0001) == .transient, "RPC_INITIATED_DISCONNECT")
+        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0x1_0002) == .transient, "RPC_INITIATED_LOGOFF")
+        for bare in [0x01, 0x02] {
+            #expect(ConnectFailureClass.classify(domain: Self.domain, code: bare) == .final,
+                    "a bare \(bare) carries no class bits")
+        }
+        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0x3_0001) == .final, "a different class, same low half")
+        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0x3_0002) == .final, "a different class, same low half")
+        #expect(ConnectFailureClass.classify(domain: Self.domain, code: 0x1_0001_0001) == .final,
+                "beyond 32 bits: no aliasing onto the ERRINFO class")
+        for domain in ["NSPOSIXErrorDomain", "NSURLErrorDomain", "Macdows.CRSession.other", ""] {
+            #expect(ConnectFailureClass.classify(domain: domain, code: 0x1_0001) == .final, "\(domain)")
+            #expect(ConnectFailureClass.classify(domain: domain, code: 0x1_0002) == .final, "\(domain)")
+        }
     }
 
     @Test("CONNECT types outside 0x01...0x1E and other classes are final")
