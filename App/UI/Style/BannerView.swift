@@ -17,9 +17,30 @@ final class BannerView: NSView {
         let body: String
         let tone: GlassStyle.Tone
         let actions: [Action]
+
+        /// Everything a banner shows, without the handlers (closures cannot be compared): two
+        /// models with the same signature draw the same banner (UI-9, gate UI-8 R-2).
+        struct Signature: Equatable {
+            let id: String
+            let title: String
+            let body: String
+            let tone: GlassStyle.Tone
+            let buttons: [ButtonSignature]
+        }
+
+        /// A button's title and its accessibility name.
+        struct ButtonSignature: Equatable {
+            let title: String
+            let accessibilityLabel: String?
+        }
+
+        var signature: Signature {
+            Signature(id: id, title: title, body: body, tone: tone,
+                      buttons: actions.map { ButtonSignature(title: $0.title, accessibilityLabel: $0.accessibilityLabel) })
+        }
     }
 
-    let model: Model
+    private(set) var model: Model
     private var handlers: [() -> Void] = []
 
     init(_ model: Model) {
@@ -82,6 +103,17 @@ final class BannerView: NSView {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    /// Takes `model`'s handlers without rebuilding anything, for a model with this banner's
+    /// signature (UI-9): the view stays where it is and its buttons now call the latest handlers.
+    /// Returns false, changing nothing, when the signature differs.
+    @discardableResult
+    func adoptHandlers(of model: Model) -> Bool {
+        guard model.signature == self.model.signature else { return false }
+        self.model = model
+        handlers = model.actions.map(\.handler)
+        return true
+    }
 
     @objc private func buttonPressed(_ sender: NSButton) {
         guard handlers.indices.contains(sender.tag) else { return }

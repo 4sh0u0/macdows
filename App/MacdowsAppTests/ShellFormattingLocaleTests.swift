@@ -21,8 +21,9 @@ private func formattingCodeOnly(_ path: String) throws -> String {
 }
 
 /// A throwaway bundle with only an en localization whose `s_live_bar` carries the en plural
-/// variants, in the stringsdict form the String Catalog compiles to.
-private func englishOnlyBundle() throws -> Bundle {
+/// variants, in the stringsdict form the String Catalog compiles to. The caller removes `root`
+/// when it is done (UI-8 gate r2 m-2: the directory used to be left in the temporary directory).
+private func englishOnlyBundle() throws -> (bundle: Bundle, root: URL) {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("shell-locale-\(UUID().uuidString).bundle")
     let lproj = root.appendingPathComponent("en.lproj")
     try FileManager.default.createDirectory(at: lproj, withIntermediateDirectories: true)
@@ -35,14 +36,15 @@ private func englishOnlyBundle() throws -> Bundle {
     let table: [String: Any] = ["s_live_bar": ["NSStringLocalizedFormatKey": "%#@n@", "n": plural]]
     let data = try PropertyListSerialization.data(fromPropertyList: table, format: .xml, options: 0)
     try data.write(to: lproj.appendingPathComponent("Localizable.stringsdict"))
-    return try #require(Bundle(url: root))
+    return (try #require(Bundle(url: root)), root)
 }
 
 @Suite("Shell plural formats use the resolved localization's locale (UI slice ④, gate r1 m-1)")
 struct ShellFormattingLocaleTests {
     @Test("en catalog in a zh_CN region: 1 window, not 1 windows")
     func englishCatalogInChineseRegion() throws {
-        let bundle = try englishOnlyBundle()
+        let (bundle, root) = try englishOnlyBundle()
+        defer { try? FileManager.default.removeItem(at: root) }
         #expect(bundle.preferredLocalizations.first == "en")
         let format = bundle.localizedString(forKey: "s_live_bar", value: "missing", table: nil)
         let arguments: [any CVarArg] = [Int64(1), "12:03"]

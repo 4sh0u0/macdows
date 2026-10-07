@@ -252,15 +252,33 @@ final class HostDetailViewController: NSViewController {
 
     // MARK: Banners
 
-    func setBanners(_ banners: [BannerView]) {
+    /// Shows `models`, top to bottom, touching only what changed (UI-9, gate UI-8 R-2): a banner
+    /// whose model has the same signature as the one on screen keeps its view (and takes the new
+    /// handlers); a changed banner gets a new view in the same place; a new id is inserted at its
+    /// model position; a banner no longer listed is removed. Ids are unique (the caller's list).
+    func setBanners(_ models: [BannerView.Model]) {
         loadViewIfNeeded()
-        for view in bannerStack.arrangedSubviews {
+        var onScreen: [String: BannerView] = [:]
+        for case let banner as BannerView in bannerStack.arrangedSubviews { onScreen[banner.model.id] = banner }
+        let banners = models.map { model -> BannerView in
+            if let shown = onScreen[model.id], shown.adoptHandlers(of: model) { return shown }
+            return BannerView(model)
+        }
+        let kept = Set(banners.map(ObjectIdentifier.init))
+        for view in bannerStack.arrangedSubviews where !kept.contains(ObjectIdentifier(view)) {
             bannerStack.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
-        for banner in banners {
-            bannerStack.addArrangedSubview(banner)
-            banner.widthAnchor.constraint(equalTo: bannerStack.widthAnchor).isActive = true
+        for (index, banner) in banners.enumerated() {
+            let arranged = bannerStack.arrangedSubviews
+            if arranged.indices.contains(index), arranged[index] === banner { continue }
+            if banner.superview === bannerStack {
+                bannerStack.removeArrangedSubview(banner)
+                bannerStack.insertArrangedSubview(banner, at: index)
+            } else {
+                bannerStack.insertArrangedSubview(banner, at: index)
+                banner.widthAnchor.constraint(equalTo: bannerStack.widthAnchor).isActive = true
+            }
         }
         // UI slice ④ (UI-1 spec §7.1): a banner that was not on screen before is pushed in over
         // 0.2 s -- the content below slides down while it fades in -- unless Reduce Motion is on.
@@ -268,6 +286,7 @@ final class HostDetailViewController: NSViewController {
         // move.
         let arriving = Self.arrivingBannerIDs(now: banners.map(\.model.id), before: shownBannerIDs)
         shownBannerIDs = banners.map(\.model.id)
+        lastArrivingBannerIDs = arriving
         guard !arriving.isEmpty, view.window != nil,
               !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
         let pushed = banners.filter { arriving.contains($0.model.id) }
@@ -279,6 +298,10 @@ final class HostDetailViewController: NSViewController {
             for banner in pushed { banner.animator().alphaValue = 1 }
         }
     }
+
+    /// The ids the last `setBanners` treated as newly arriving (pushed in unless Reduce Motion is
+    /// on or the view has no window), for the offline tests.
+    private(set) var lastArrivingBannerIDs: [String] = []
 
     /// UI-1 spec §7.1: the banner push-in transition.
     static let bannerPushDuration: TimeInterval = 0.2

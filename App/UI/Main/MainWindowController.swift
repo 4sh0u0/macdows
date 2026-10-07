@@ -165,15 +165,21 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
 
     // MARK: - Banners
 
+    /// Shows `model`: a banner with the same id is replaced where it stands (UI-9, gate UI-8 R-2 --
+    /// waiting -> reconnecting no longer moves the connection banner below the others); a new id
+    /// goes to the bottom. The detail rebuilds only what changed (`setBanners`).
     func showBanner(_ model: BannerView.Model) {
-        banners.removeAll { $0.id == model.id }
-        banners.append(model)
-        detail.setBanners(banners.map(BannerView.init))
+        if let index = banners.firstIndex(where: { $0.id == model.id }) {
+            banners[index] = model
+        } else {
+            banners.append(model)
+        }
+        detail.setBanners(banners)
     }
 
     func removeBanner(id: String) {
         banners.removeAll { $0.id == id }
-        detail.setBanners(banners.map(BannerView.init))
+        detail.setBanners(banners)
     }
 
     func clearBanners() {
