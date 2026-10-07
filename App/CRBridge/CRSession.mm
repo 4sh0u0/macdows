@@ -2240,6 +2240,14 @@ static void crb_outbound_visitor(const CrdpCommand *cmd, void *vctx)
             char programBuf[CRDPQ_TEXT_BUF_SIZE];
             memcpy(programBuf, cmd->payload.execute.program.bytes, sizeof(programBuf));
             exec.RemoteApplicationProgram = programBuf;
+            /* ADR-0025 R-4: an execute payload may carry arguments after the program, split at the
+             * first NUL inside `length` (crdpq.h, crdpq_cmd_execute_t). The offset is read from the
+             * queued command and applied to the stack copy, so both halves point into programBuf and
+             * never into the const CrdpCommand. A program-only payload -- everything
+             * -executeProgram: queues -- has no split and leaves the field NULL, as before. */
+            const size_t argumentsAt = crdpq_execute_arguments_offset(&cmd->payload.execute);
+            if (argumentsAt > 0)
+                exec.RemoteApplicationArguments = programBuf + argumentsAt;
             if (rail->ClientExecute)
             {
                 const UINT rc = rail->ClientExecute(rail, &exec);
@@ -3487,6 +3495,36 @@ cleanup:
     {
         WLog_WARN(TAG, "executeProgram: path exceeds %d bytes and would be truncated -- refusing to send",
                   CRDPQ_TEXT_BUF_SIZE - 1);
+        return;
+    }
+    crdpq_outbound_post(_outboundQueue, &cmd);
+}
+
+- (void)launchProgram:(NSString *)program arguments:(nullable NSString *)arguments
+{
+    if (!_outboundQueue)
+        return;
+    /* ADR-0025 R-4: the program and its arguments share the execute payload's one text buffer
+     * (crdpq.h, crdpq_cmd_execute_t). Converted as NSData rather than UTF8String, so a NUL inside
+     * either string reaches crdpq_execute_set as a byte to refuse instead of quietly ending the
+     * string early. nil or empty arguments pack as the program-only payload. */
+    NSData *programBytes = [program dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *argumentsBytes = [arguments dataUsingEncoding:NSUTF8StringEncoding];
+    CrdpCommand cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = CRDPQ_CMD_EXECUTE;
+    const crdpq_execute_set_result_t packed =
+        crdpq_execute_set(&cmd.payload.execute, (const char *)programBytes.bytes, programBytes.length,
+                          (const char *)argumentsBytes.bytes, argumentsBytes.length);
+    /* Refused, never cut short: a truncated program or argument list launches something other
+     * than what was asked for. ADR-0025 §3.2 S-2: the one WARN carries a byte count and a flag,
+     * never either string. */
+    if (packed != CRDPQ_EXECUTE_SET_OK)
+    {
+        const unsigned long byteCount =
+            (unsigned long)(programBytes.length + (argumentsBytes.length > 0 ? 1 + argumentsBytes.length : 0));
+        WLog_WARN(TAG, "launchProgram: refusing to send -- %lu payload bytes (allowed 1 to %d), embedded NUL=%d",
+                  byteCount, CRDPQ_TEXT_BUF_SIZE - 1, (int)(packed == CRDPQ_EXECUTE_SET_EMBEDDED_NUL));
         return;
     }
     crdpq_outbound_post(_outboundQueue, &cmd);

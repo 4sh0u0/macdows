@@ -67,12 +67,15 @@ typedef uint32_t crdpq_generation_t;
  *  in samples/phase05-rail-events-2026-08-19 (longest real title there is under 20 UTF-8
  *  bytes) with headroom for pathological server input; anything longer is truncated at a
  *  UTF-8 codepoint boundary (never mid-sequence) and `truncated` is set so a consumer can
- *  tell the difference between "short title" and "we cut this off". */
+ *  tell the difference between "short title" and "we cut this off". One payload is the
+ *  exception to the "`length` == strlen(bytes)" rule below: an execute command's buffer
+ *  carries a program AND its arguments, so its `length` counts both -- see
+ *  `crdpq_cmd_execute_t`. */
 #define CRDPQ_TEXT_BUF_SIZE 256
 
 typedef struct {
     char bytes[CRDPQ_TEXT_BUF_SIZE]; /* always NUL-terminated */
-    uint16_t length;                 /* strlen(bytes), i.e. excluding the NUL */
+    uint16_t length;                 /* strlen(bytes), i.e. excluding the NUL (execute: see crdpq_cmd_execute_t) */
     bool truncated;
 } crdpq_text_t;
 
@@ -986,10 +989,120 @@ typedef enum {
     CRDPQ_CMD_NOTIFY_EVENT,
 } crdpq_command_type_t;
 
-/** ClientExecute (launching/re-launching the RemoteApp program). */
+/** ClientExecute (launching/re-launching the RemoteApp program).
+ *
+ *  ADR-0025 R-4 (owner ruling 2026-10-07: `flags` deferred to a-2): the program and its
+ *  arguments SHARE this one text buffer instead of each getting a field of its own.
+ *  `execute` is the largest member of `crdpq_command_payload_t`, so a second `crdpq_text_t`
+ *  would double the size of EVERY outbound command (mouse moves included) and of both
+ *  outbound buffers; sharing keeps this struct, the union and `CrdpCommand` at exactly their
+ *  pinned 260 / 260 / 264 bytes.
+ *
+ *  The shared-buffer rule, which overrides `crdpq_text_t`'s "`length` == strlen(bytes)":
+ *
+ *    bytes  = program (UTF-8) + '\0' + arguments (UTF-8) + '\0'
+ *    length = total byte count INCLUDING the separating NUL, excluding the final one
+ *
+ *  so program + 1 + arguments <= CRDPQ_TEXT_BUF_SIZE - 1 (255) bytes between them. With no
+ *  arguments there is no separator and the payload is byte-for-byte what it has always been
+ *  (`length` == strlen(bytes)), which is why `crdpq_text_set` on `program` -- the shape every
+ *  pre-ADR-0025 sender uses -- still produces a valid program-only payload. Neither part may
+ *  contain a NUL of its own (the separator would become ambiguous), and `truncated` is always
+ *  false: a pair that does not fit is refused by `crdpq_execute_set`, never cut, because a
+ *  truncated program or argument list launches something other than what was asked for.
+ *
+ *  Write with `crdpq_execute_set`; read the arguments' start with
+ *  `crdpq_execute_arguments_offset`. Nothing in the queue itself (crdpq_outbound.c) reads
+ *  `length` -- it copies whole `CrdpCommand`s -- so the rule lives entirely in these two
+ *  helpers and their callers. */
 typedef struct {
     crdpq_text_t program;
 } crdpq_cmd_execute_t;
+
+/** Outcome of `crdpq_execute_set`. Only `CRDPQ_EXECUTE_SET_OK` writes the payload. */
+typedef enum {
+    CRDPQ_EXECUTE_SET_OK = 0,
+    /** `program` is NULL or zero bytes long. */
+    CRDPQ_EXECUTE_SET_EMPTY_PROGRAM,
+    /** `program` or `arguments` contains a NUL byte inside its given length. */
+    CRDPQ_EXECUTE_SET_EMBEDDED_NUL,
+    /** program + 1 + arguments (or program alone, with no arguments) exceeds
+     *  `CRDPQ_TEXT_BUF_SIZE - 1` bytes. */
+    CRDPQ_EXECUTE_SET_TOO_LONG,
+} crdpq_execute_set_result_t;
+
+/** Packs `program[0..program_len)` and `arguments[0..arguments_len)` into `dst` by the
+ *  shared-buffer rule on `crdpq_cmd_execute_t`. `arguments` may be NULL or zero bytes long:
+ *  either means "no arguments" and produces the program-only shape. Byte counts, not C
+ *  strings, so an embedded NUL is seen and refused rather than silently ending a part early.
+ *  Every byte after the final NUL is zeroed, so two calls with the same input produce the same
+ *  256 bytes. On any result other than `CRDPQ_EXECUTE_SET_OK`, `dst` is left untouched. */
+static inline crdpq_execute_set_result_t crdpq_execute_set(crdpq_cmd_execute_t* dst,
+                                                           const char* program, size_t program_len,
+                                                           const char* arguments, size_t arguments_len) {
+    if (program == NULL || program_len == 0) {
+        return CRDPQ_EXECUTE_SET_EMPTY_PROGRAM;
+    }
+    if (arguments == NULL) {
+        arguments_len = 0;
+    }
+    for (size_t i = 0; i < program_len; i++) {
+        if (program[i] == '\0') {
+            return CRDPQ_EXECUTE_SET_EMBEDDED_NUL;
+        }
+    }
+    for (size_t i = 0; i < arguments_len; i++) {
+        if (arguments[i] == '\0') {
+            return CRDPQ_EXECUTE_SET_EMBEDDED_NUL;
+        }
+    }
+    /* Compared part by part before anything is added, so no length can overflow the sum. */
+    const size_t limit = CRDPQ_TEXT_BUF_SIZE - 1;
+    if (program_len > limit) {
+        return CRDPQ_EXECUTE_SET_TOO_LONG;
+    }
+    size_t total = program_len;
+    if (arguments_len > 0) {
+        if (program_len + 1 > limit || arguments_len > limit - program_len - 1) {
+            return CRDPQ_EXECUTE_SET_TOO_LONG;
+        }
+        total = program_len + 1 + arguments_len;
+    }
+    for (size_t i = 0; i < program_len; i++) {
+        dst->program.bytes[i] = program[i];
+    }
+    dst->program.bytes[program_len] = '\0';
+    for (size_t i = 0; i < arguments_len; i++) {
+        dst->program.bytes[program_len + 1 + i] = arguments[i];
+    }
+    for (size_t i = total; i < CRDPQ_TEXT_BUF_SIZE; i++) {
+        dst->program.bytes[i] = '\0';
+    }
+    dst->program.length = (uint16_t)total;
+    dst->program.truncated = false;
+    return CRDPQ_EXECUTE_SET_OK;
+}
+
+/** Where the arguments start inside `e->program.bytes`, or 0 when the payload carries none.
+ *  The split is the first NUL inside `length` (the shared-buffer rule on
+ *  `crdpq_cmd_execute_t`): a program-only payload has none, so it reads as program-only no
+ *  matter who wrote it. A separator with nothing after it, or a `length` that cannot fit the
+ *  buffer, also reads as "no arguments". 0 is never a valid start (the program is at least
+ *  one byte), which is what lets it mean "none". */
+static inline size_t crdpq_execute_arguments_offset(const crdpq_cmd_execute_t* e) {
+    const size_t length = e->program.length;
+    if (length >= CRDPQ_TEXT_BUF_SIZE) {
+        return 0;
+    }
+    size_t program_len = 0;
+    while (program_len < length && e->program.bytes[program_len] != '\0') {
+        program_len++;
+    }
+    if (program_len + 1 < length) {
+        return program_len + 1;
+    }
+    return 0;
+}
 
 /** ClientActivate. */
 typedef struct {

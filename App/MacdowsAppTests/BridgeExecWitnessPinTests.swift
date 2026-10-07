@@ -217,3 +217,114 @@ struct BridgeExecWitnessPinTests {
                 "declaration, reset, increment, log argument")
     }
 }
+
+// MARK: - ADR-0025 a-1: -launchProgram:arguments: and the EXECUTE branch's argument split
+//
+// The Dock start panel launches through a NEW bridge method (ADR-0025 §2: a new name, so no pin
+// anchored on `-executeProgram:` can ever match it), and the old method stays the unattended
+// knob's program-only send. The pins below hold the new method to the old one's discipline -- one
+// WLog call, a refusal that reports a byte count and never the program or the arguments (ADR-0025
+// §3.2 S-2) -- hold the old body to its exact pre-ADR text, and hold the outbound visitor's split
+// to the shared-buffer rule in `crdpq.h` (`crdpq_cmd_execute_t`). The frozen X-S / X-R lines
+// (S-3) stay pinned by `eachFormatStringOnce` and `xSFollowsClientExecute` above, unchanged.
+extension BridgeExecWitnessPinTests {
+
+    private static let launchSignature =
+        "- (void)launchProgram:(NSString *)program arguments:(nullable NSString *)arguments"
+
+    /// The new method's only WLog call, in its exact call shape: a byte count, the limit and a
+    /// flag -- no `%s`, no string argument.
+    private static let launchProgramWarn =
+        "WLog_WARN(TAG, \"launchProgram: refusing to send -- %lu payload bytes (allowed 1 to %d), embedded NUL=%d\", "
+        + "byteCount, CRDPQ_TEXT_BUF_SIZE - 1, (int)(packed == CRDPQ_EXECUTE_SET_EMBEDDED_NUL));"
+
+    /// `-executeProgram:` as it stood at main `3b0bdb2`, comments included, whitespace folded.
+    private static let executeProgramBodyFolded =
+        #"- (void)executeProgram:(NSString *)program { if (!_outboundQueue) return; CrdpCommand cmd; "#
+        + #"memset(&cmd, 0, sizeof(cmd)); cmd.type = CRDPQ_CMD_EXECUTE; const char *utf8 = program.UTF8String; "#
+        + #"if (!utf8 || utf8[0] == '\0') return; crdpq_text_set(&cmd.payload.execute.program, utf8, strlen(utf8)); "#
+        + #"/* A path that doesn't fit crdpq's 255-byte text buffer would exec a TRUNCATED (i.e. * different) "#
+        + #"path on the server, whose failure result nothing may be watching -- * refuse loudly instead of "#
+        + #"silently launching the wrong thing (2026-08-22 review). */ if (cmd.payload.execute.program.truncated) "#
+        + #"{ WLog_WARN(TAG, "executeProgram: path exceeds %d bytes and would be truncated -- refusing to send", "#
+        + #"CRDPQ_TEXT_BUF_SIZE - 1); return; } crdpq_outbound_post(_outboundQueue, &cmd); }"#
+
+    @Test("-executeProgram:'s body is exactly its pre-ADR-0025 text, comments included")
+    func theOldMethodIsUntouched() throws {
+        let body = try bridgeFolded(Self.functionBody("- (void)executeProgram:(NSString *)program", in: Self.raw()))
+        #expect(body == Self.executeProgramBodyFolded)
+    }
+
+    @Test("the header declares both methods once each, the old declaration unchanged and first")
+    func theHeaderDeclaresBoth() throws {
+        let header = try String(contentsOf: bridgeRepoRoot().appendingPathComponent("App/CRBridge/CRSession.h"),
+                                encoding: .utf8)
+        let old = "- (void)executeProgram:(NSString *)program;"
+        let new = Self.launchSignature + ";"
+        #expect(bridgeOccurrences(of: old, in: header) == 1)
+        #expect(bridgeOccurrences(of: new, in: header) == 1)
+        // Nothing else takes the old name as a prefix.
+        #expect(bridgeOccurrences(of: "- (void)executeProgram", in: header) == 1)
+        let oldAt = try Self.index(of: old, in: header)
+        let newAt = try Self.index(of: new, in: header)
+        #expect(oldAt < newAt)
+    }
+
+    /// Mutant P6 (the new method printing the program or the arguments) is killed here: any extra
+    /// WLog call, any change to the one WARN's shape, or a WARN naming either string goes red.
+    @Test("-launchProgram:arguments: has one WLog, the refusal WARN, which never prints the command")
+    func theNewMethodNeverLogsTheCommand() throws {
+        let raw = try Self.raw()
+        #expect(bridgeOccurrences(of: Self.launchSignature, in: raw) == 1)
+        let method = try bridgeCodeOnly(Self.functionBody(Self.launchSignature, in: raw))
+        #expect(bridgeOccurrences(of: "WLog_", in: method) == 1)
+        #expect(bridgeOccurrences(of: Self.launchProgramWarn, in: method) == 1)
+        Self.expectNoProgramInWLog(method, "-launchProgram:arguments:")
+        for call in method.components(separatedBy: "WLog_").dropFirst() {
+            let statement = call.prefix { $0 != ";" }
+            for banned in ["arguments", "Bytes", ".bytes", "%@", ".UTF8String"] {
+                #expect(!statement.contains(banned), "a WLog call in -launchProgram:arguments: contains \(banned)")
+            }
+        }
+    }
+
+    @Test("-launchProgram:arguments: packs with crdpq_execute_set, refuses before posting, posts once")
+    func theNewMethodPacksAndPosts() throws {
+        let method = try bridgeCodeOnly(Self.functionBody(Self.launchSignature, in: Self.raw()))
+        // The shared-buffer packer, from NSData byte counts; never crdpq_text_set, which truncates.
+        #expect(bridgeOccurrences(of: "crdpq_execute_set(&cmd.payload.execute, ", in: method) == 1)
+        #expect(method.contains("NSData *programBytes = [program dataUsingEncoding:NSUTF8StringEncoding];"))
+        #expect(method.contains("NSData *argumentsBytes = [arguments dataUsingEncoding:NSUTF8StringEncoding];"))
+        #expect(bridgeOccurrences(of: "crdpq_text_set(", in: method) == 0)
+        // Matched as the property access: `NSUTF8StringEncoding` contains the bare name.
+        #expect(bridgeOccurrences(of: ".UTF8String", in: method) == 0)
+        #expect(bridgeOccurrences(of: "crdpq_outbound_post(", in: method) == 1)
+        // Any result but OK returns after the WARN; the post is the method's last statement.
+        #expect(method.contains(
+            "if (packed != CRDPQ_EXECUTE_SET_OK) { const unsigned long byteCount = (unsigned long)(programBytes.length "
+                + "+ (argumentsBytes.length > 0 ? 1 + argumentsBytes.length : 0)); "
+                + Self.launchProgramWarn + " return; } crdpq_outbound_post(_outboundQueue, &cmd); }"))
+    }
+
+    @Test("the EXECUTE branch splits the arguments off its stack copy, once, before the send")
+    func theBranchSplitsTheArguments() throws {
+        let code = try Self.code()
+        let branchStart = try Self.index(of: "case CRDPQ_CMD_EXECUTE:", in: code)
+        let branchEnd = try Self.index(of: "case CRDPQ_CMD_ACTIVATE:", in: code)
+        try #require(branchStart < branchEnd)
+        let branch = String(code[branchStart..<branchEnd])
+        // The one place the arguments are wired, in the whole file's code.
+        #expect(bridgeOccurrences(of: "RemoteApplicationArguments", in: code) == 1)
+        #expect(bridgeOccurrences(of: "RemoteApplicationArguments", in: branch) == 1)
+        #expect(bridgeOccurrences(of: "crdpq_execute_arguments_offset(", in: code) == 1)
+        #expect(branch.contains(
+            "memcpy(programBuf, cmd->payload.execute.program.bytes, sizeof(programBuf)); "
+                + "exec.RemoteApplicationProgram = programBuf; "
+                + "const size_t argumentsAt = crdpq_execute_arguments_offset(&cmd->payload.execute); "
+                + "if (argumentsAt > 0) exec.RemoteApplicationArguments = programBuf + argumentsAt; "
+                + "if (rail->ClientExecute) {"))
+        // Both halves point into the stack copy, never into the const command; flags stay 0.
+        #expect(!branch.contains("= cmd->payload.execute.program.bytes"))
+        #expect(!branch.contains("exec.flags"))
+    }
+}
