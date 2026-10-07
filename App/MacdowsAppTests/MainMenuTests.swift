@@ -130,14 +130,17 @@ struct MainMenuTests {
         ])
     }
 
-    /// No Close Window (UI-1 spec §6.1 footnote, gate r1 I-2): it waits for slice ①'s main-window
-    /// lifetime, and with it AppKit's injected ⌥⌘W Close All goes too.
-    ///
     /// RE-FROZEN by UI slice ① (ADR-0024 §3, adr/0022 row): New Host…, Edit Host… and Connect gain
     /// their nil-target actions -- the Hosts window controller's `newHost:`, `editHost:` and
     /// `connectSelectedHost:` -- with titles, key equivalents and order unchanged. Connect is still
     /// not `connectTapped` (S-6 (ii)).
-    @Test("T-1: the File menu (slice ① actions on slice ②'s structure), and there is no Close Window")
+    ///
+    /// RE-FROZEN by UI-9 (UI-1 spec §6.1 File row; adr/0022 §3 ⌘W row): Close Window ⌘W, after a
+    /// separator at the end of File. Slice ②'s deferral (the scaffold window's ⌘W terminated the
+    /// App) was lifted by slice ①. Its action is `closeKeyWindow:`, not `performClose:`, so AppKit
+    /// injects no ⌥⌘W Close All -- an injection happens after `install(on:)` and cannot be seen in
+    /// `build()`; the lane's .app probe shows File's run-time items.
+    @Test("T-1: the File menu (slice ① actions on slice ②'s structure) ends with Close Window ⌘W on closeKeyWindow:")
     func fileMenu() throws {
         let fileMenu = try #require(MainMenu.build().mainMenu.items[1].submenu)
         let command = Self.command
@@ -149,7 +152,10 @@ struct MainMenuTests {
             "---",
             "Connect|connectSelectedHost:|\r|\(command)|nil-target",
             "Disconnect|endSessionTapped|d|\(shiftCommand)|nil-target",
+            "---",
+            "Close Window|closeKeyWindow:|w|\(command)|nil-target",
         ])
+        #expect(!fileMenu.items.contains { $0.action == #selector(NSWindow.performClose(_:)) }, "performClose: would bring AppKit's ⌥⌘W Close All")
     }
 
     @Test("T-1: the View menu -- Show Hosts is slice ①'s showHosts:, Enter Full Screen is the standard item")
@@ -187,6 +193,7 @@ struct MainMenuTests {
             "n/⌘": true, "\r/⌘": true, "d/⇧⌘": true,
             "z/⌘": true, "z/⇧⌘": true, "x/⌘": true, "c/⌘": true, "v/⌘": true, "a/⌘": true,
             "1/⌘": true, "f/⌃⌘": true, "m/⌘": true,
+            "w/⌘": true, // UI-9 Close Window: a key remote view claims it as SC_CLOSE (adr/0022 D-3)
         ]
         func name(_ item: NSMenuItem) -> String {
             let m = item.keyEquivalentModifierMask
@@ -205,7 +212,7 @@ struct MainMenuTests {
         #expect(Set(seen) == Set(registered.keys), "every shortcut registered, nothing registered that the menu lacks")
         #expect(seen.count == Set(seen).count, "no two items share a key equivalent")
 
-        let keyCodes: [String: UInt16] = ["q": 12, "h": 4, ",": 43, "n": 45, "\r": 36, "d": 2, "z": 6, "x": 7, "c": 8, "v": 9, "a": 0, "1": 18, "f": 3, "m": 46]
+        let keyCodes: [String: UInt16] = ["q": 12, "h": 4, ",": 43, "n": 45, "\r": 36, "d": 2, "z": 6, "x": 7, "c": 8, "v": 9, "a": 0, "1": 18, "f": 3, "m": 46, "w": 13]
         for (pair, remote) in registered {
             let parts = pair.split(separator: "/", maxSplits: 1).map(String.init)
             var flags: NSEvent.ModifierFlags = []
@@ -321,6 +328,84 @@ struct MainMenuTests {
         NSWindow.allowsAutomaticWindowTabbing = true
         MainMenu.install(on: app)
         #expect(NSWindow.allowsAutomaticWindowTabbing == false)
+    }
+
+    // MARK: - UI-9: File ▸ Close Window
+
+    @Test("UI-9: closeKeyWindow: is implemented by the two Mac window controllers and by nothing a remote window's chain reaches")
+    func closeWindowImplementers() throws {
+        #expect(MainWindowController.instancesRespond(to: MainMenu.closeWindowAction))
+        #expect(SettingsWindowController.instancesRespond(to: MainMenu.closeWindowAction))
+        let others: [(String, Bool)] = [
+            ("NSWindow", NSWindow.instancesRespond(to: MainMenu.closeWindowAction)),
+            ("NSApplication", NSApplication.instancesRespond(to: MainMenu.closeWindowAction)),
+            ("NSWindowController", NSWindowController.instancesRespond(to: MainMenu.closeWindowAction)),
+            ("NSView", NSView.instancesRespond(to: MainMenu.closeWindowAction)),
+        ]
+        for (name, responds) in others {
+            #expect(!responds, "\(name) must not answer Close Window")
+        }
+        let remote = RemoteWindow(
+            key: RemoteWindowKey(windowId: 13, generation: 0),
+            contentRect: NSRect(x: 0, y: 0, width: 120, height: 80), title: "close-window-probe"
+        )
+        #expect(Self.firstImplementer(MainMenu.closeWindowAction, in: remote) == nil, "a key remote window leaves Close Window grey")
+        let close = try #require(MainMenu.build().mainMenu.items[1].submenu?.items.last)
+        #expect(close.action == MainMenu.closeWindowAction)
+        #expect(remote.window.validateMenuItem(close) == false, "the backing window's default-deny also greys it")
+    }
+
+    @Test("UI-9: Close Window validates only while the controller's own window is key, and closes (orders out) that window")
+    func closeWindowClosesTheKeyMacWindow() throws {
+        let close = try #require(MainMenu.build().mainMenu.items[1].submenu?.items.last)
+        let other = NSMenuItem(title: "other", action: NSSelectorFromString("someUnrelatedAction:"), keyEquivalent: "")
+        func keyStateWindow() -> NSWindow {
+            let window = MainMenuKeyStateWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 200, height: 100), styleMask: [.titled, .closable], backing: .buffered, defer: false
+            )
+            window.isReleasedWhenClosed = false
+            return window
+        }
+
+        let hosts = MainWindowControllerTests.controller(records: [])
+        #expect(hosts.validateMenuItem(close) == false, "not key (the xctest host never makes a window key)")
+        hosts.showWindow(nil)
+        #expect(hosts.window?.isVisible == true)
+        hosts.closeKeyWindow(nil)
+        #expect(hosts.window?.isVisible == false, "performClose ordered the Hosts window out")
+        #expect(hosts.window != nil, "isReleasedWhenClosed = false: the window survives and Show Hosts can bring it back")
+        hosts.showHosts(nil)
+        #expect(hosts.window?.isVisible == true)
+        hosts.window?.orderOut(nil)
+        hosts.window = keyStateWindow()
+        #expect(hosts.validateMenuItem(close) == true, "key: enabled")
+
+        let settings = SettingsWindowTests.controller()
+        #expect(settings.validateMenuItem(close) == false)
+        #expect(settings.validateMenuItem(other) == true, "Settings validates nothing else")
+        settings.show()
+        #expect(settings.window?.isVisible == true)
+        settings.closeKeyWindow(nil)
+        #expect(settings.window?.isVisible == false)
+        settings.show()
+        #expect(settings.window?.isVisible == true, "⌘, brings it back")
+        settings.window?.orderOut(nil)
+        settings.window = keyStateWindow()
+        #expect(settings.validateMenuItem(close) == true)
+    }
+
+    @Test("UI-9: Close Window's selector is named once, in MainMenu, and both controllers call performClose on their own window")
+    func closeWindowSourceShape() throws {
+        let menu = mainMenuCodeOnly(try mainMenuSource("App/Macdows/MainMenu.swift"))
+        #expect(mainMenuOccurrences(of: "\"closeKeyWindow:\"", in: menu) == 1)
+        #expect(mainMenuOccurrences(of: "performClose", in: menu) == 0)
+        for file in ["App/UI/Main/MainWindowController.swift", "App/UI/Settings/SettingsWindowController.swift"] {
+            let code = mainMenuCodeOnly(try mainMenuSource(file))
+            #expect(mainMenuOccurrences(of: "@objc func closeKeyWindow(_ sender: Any?) { window?.performClose(sender) }", in: code) == 1, "\(file)")
+            #expect(mainMenuOccurrences(of: "performClose", in: code) == 1, "\(file)")
+            #expect(code.contains("MainMenu.closeWindowAction"), "\(file) validates it")
+            #expect(!code.contains("\"closeKeyWindow:\""), "\(file) names the selector through MainMenu only")
+        }
     }
 
     // MARK: - The String Catalog (three languages)

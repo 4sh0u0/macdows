@@ -10,7 +10,8 @@ import UniformTypeIdentifiers
 /// Opened by Settings… (⌘,) in the Macdows menu, by the status item's Settings… and by the Hosts
 /// window's toolbar button -- all three reach `MainWindowController.showSettings(_:)`, which owns
 /// this controller (it holds the host records and the keychain actions Reset All Pins needs).
-/// Closing only orders the window out.
+/// Closing only orders the window out; File ▸ Close Window (⌘W, `MainMenu.closeWindowAction`)
+/// closes it while it is key (UI-9), and ⌘, opens it again.
 ///
 /// The window changes no setting (there are none to change today, see `SettingsModel`). Its two
 /// actions use existing capabilities only:
@@ -21,7 +22,7 @@ import UniformTypeIdentifiers
 ///    over the diagnostics ring buffer with this export's `a_include` choice, which is then cleared.
 /// The alert and panel steps are closures so the flows run offline in tests.
 @MainActor
-final class SettingsWindowController: NSWindowController, NSWindowDelegate {
+final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSMenuItemValidation {
     /// UI-1 spec §3: 720 × 520.
     static let windowSize = NSSize(width: 720, height: 520)
 
@@ -105,6 +106,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     func show() {
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// File ▸ Close Window (⌘W; UI-9): the standard close of this window (`performClose`, the red
+    /// button's path). Enabled only while this window is key, so it never closes Settings from
+    /// behind a key remote window or the Reset alert's sheet.
+    @objc func closeKeyWindow(_ sender: Any?) {
+        window?.performClose(sender)
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        guard menuItem.action == MainMenu.closeWindowAction else { return true }
+        return window?.isKeyWindow == true
     }
 
     func select(_ page: Page) {
