@@ -50,6 +50,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         /// The address the session was opened to (adr/0023 D-4: the host's display name arrives
         /// with slice ①'s host list; until then the connection address is the name).
         var host: String?
+        /// UI slice ④: when the connection leg went live, as the App recorded it -- the one record
+        /// the Hosts window's status bar reads too. `nil` lets this controller latch its own (a
+        /// reading built without the App, as in a test).
+        var liveSince: Date? = nil
 
         static let noSession = SessionReading(hasSession: false, state: nil, host: nil)
     }
@@ -107,7 +111,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// The registry of the current session, nil without one. Weak: the App owns it.
     private(set) weak var registry: RemoteWindowRegistry?
     /// When the current connection was first seen live, for "since 12:03"; cleared when it stops
-    /// being live.
+    /// being live. The App's own record (`SessionReading.liveSince`) wins when it supplies one.
     private(set) var liveSince: Date?
     private var terminationObserver: NSObjectProtocol?
 
@@ -201,7 +205,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func apply(_ reading: SessionReading) {
         if case .live = reading.state, reading.hasSession {
-            if liveSince == nil { liveSince = Date() }
+            liveSince = reading.liveSince ?? liveSince ?? Date()
         } else {
             liveSince = nil
         }
@@ -265,7 +269,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 detail: String(
                     format: Bundle.main.localizedString(forKey: "si_retry_d", value: "Reconnect attempt %1$d of %2$d", table: nil),
                     Int32(clamping: ShellReconnectPresenter.humanAttemptNumber(forZeroBasedIndex: attempt)),
-                    Int32(clamping: ReconnectPolicy.maxAttempts)
+                    Int32(clamping: ShellReconnectPresenter.reconnectCount)
                 )
             )
         case .gaveUp:

@@ -41,6 +41,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     private var presenceObservation: NSKeyValueObservation?
     private(set) var selectedHostID: HostID?
     private weak var connectButton: NSButton?
+    /// The App's Disconnect button (UI slice ④: the connection banner's Disconnect presses it).
+    private weak var disconnectButton: NSButton?
     private var titleLabel: NSTextField?
     private var banners: [BannerView.Model] = []
     /// Sheets kept alive until they finish.
@@ -115,6 +117,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     func installSessionControls(_ stack: NSStackView, title: NSTextField, status: NSTextField,
                                 connect: NSButton, disconnect: NSButton) {
         connectButton = connect
+        disconnectButton = disconnect
         titleLabel = title
         detail.installSessionControls(stack, title: title, status: status, connect: connect, disconnect: disconnect)
         presenceObservation = disconnect.observe(\.isEnabled, options: [.new]) { [weak self] button, _ in
@@ -138,6 +141,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         window?.subtitle = subtitle ?? UIStrings.hostCount(store.records.count)
         detail.setStatusBar(statusBar, marker: marker)
         if let host { list.setMarker(marker, for: host) }
+    }
+
+    /// UI slice ④: the Remote windows card's note (`nil` hides the card).
+    func setRemoteWindowsNote(_ text: String?) {
+        detail.setRemoteWindowsNote(text)
+    }
+
+    /// UI slice ④: the connection banner's Disconnect -- presses the App's Disconnect button, so it
+    /// is the End-session action itself (adr/0020 D-5), by the route a mouse takes. Ignored while
+    /// that button is disabled (no session to end).
+    func disconnectSession() {
+        guard let disconnectButton, disconnectButton.isEnabled else { return }
+        disconnectButton.performClick(nil)
+    }
+
+    /// UI slice ④: the status bar's text alone -- the App's per-tick shell write (the live text
+    /// carries the window count). The marker follows state changes through `setShell`.
+    func setStatusBarText(_ text: String) {
+        detail.setStatusBarText(text)
     }
 
     // MARK: - Banners
@@ -240,6 +262,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     /// Macdows ▸ Settings… (⌘,), the status item's Settings… and the toolbar's Settings button.
     @objc func showSettings(_ sender: Any?) {
         settings.show()
+    }
+
+    /// UI slice ④: the input-method banner's Learn More -- the Settings window on its Keyboard page.
+    /// Named without "Settings" so AppDelegate's source still never names it (slice ③'s S-5 pin).
+    func showKeyboardPage() {
+        settings.show()
+        settings.select(.keyboard)
     }
 
     @objc func removeHost(_ sender: Any?) {

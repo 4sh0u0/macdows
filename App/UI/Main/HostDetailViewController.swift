@@ -16,6 +16,12 @@ final class HostDetailViewController: NSViewController {
     let addHostButton: NSButton
     let statusBarLabel = NSTextField(labelWithString: "")
     let statusBarMarker = NSImageView()
+    /// UI slice ④ (UI-1 spec §4.2 `wn_*`): the Remote windows card and its note, shown only while
+    /// the connection is down (the live window table is not part of this slice).
+    let remoteWindowsNote = NSTextField(wrappingLabelWithString: "")
+    private(set) var remoteWindowsCard = NSView()
+    /// The banners on screen, by id, so a newly arriving one -- and only that one -- is pushed in.
+    private var shownBannerIDs: [String] = []
     private let connectionGrid = NSGridView()
     private let recentStack = NSStackView()
     private var sessionControls: NSStackView?
@@ -67,12 +73,17 @@ final class HostDetailViewController: NSViewController {
         recentStack.spacing = 6
         let connectionCard = Self.card(title: UIStrings.connectionHeader, content: connectionGrid)
         let recentCard = Self.card(title: UIStrings.recentHeader, content: recentStack)
-        for view in [manage, connectionCard, recentCard] { detailStack.addArrangedSubview(view) }
+        remoteWindowsNote.textColor = .secondaryLabelColor
+        remoteWindowsNote.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        remoteWindowsCard = Self.card(title: UIStrings.remoteWindowsHeader, content: remoteWindowsNote)
+        remoteWindowsCard.isHidden = true
+        for view in [remoteWindowsCard, manage, connectionCard, recentCard] { detailStack.addArrangedSubview(view) }
         detailStack.orientation = .vertical
         detailStack.alignment = .leading
         detailStack.spacing = 16
         detailStack.translatesAutoresizingMaskIntoConstraints = false
         connectionCard.widthAnchor.constraint(equalTo: detailStack.widthAnchor).isActive = true
+        remoteWindowsCard.widthAnchor.constraint(equalTo: detailStack.widthAnchor).isActive = true
         recentCard.widthAnchor.constraint(equalTo: detailStack.widthAnchor).isActive = true
 
         // Status bar (content layer, 28 pt).
@@ -121,6 +132,9 @@ final class HostDetailViewController: NSViewController {
             root.widthAnchor.constraint(greaterThanOrEqualToConstant: 480),
         ])
         view = root
+        // UI-1 spec §4.1: with no session the status bar reads "Not connected" from the start;
+        // the App overwrites it once a connection chain begins.
+        setStatusBar(UIStrings.notConnected, marker: .idle)
     }
 
     /// The App's session controls -- the host title, the status line and the Connect / Disconnect
@@ -160,6 +174,20 @@ final class HostDetailViewController: NSViewController {
         statusBarLabel.stringValue = text
         statusBarMarker.image = NSImage(systemSymbolName: marker.symbol, accessibilityDescription: nil)
         statusBarMarker.contentTintColor = marker.color
+    }
+
+    /// The status bar's text without touching its marker (UI slice ④). Written only when it
+    /// changed, because the App calls this on every drain tick.
+    func setStatusBarText(_ text: String) {
+        loadViewIfNeeded()
+        if statusBarLabel.stringValue != text { statusBarLabel.stringValue = text }
+    }
+
+    /// The Remote windows card's note; `nil` hides the card (UI slice ④).
+    func setRemoteWindowsNote(_ text: String?) {
+        loadViewIfNeeded()
+        remoteWindowsNote.stringValue = text ?? ""
+        remoteWindowsCard.isHidden = text == nil
     }
 
     /// Fills the Connection and Recent cards for `record`.
@@ -234,6 +262,30 @@ final class HostDetailViewController: NSViewController {
             bannerStack.addArrangedSubview(banner)
             banner.widthAnchor.constraint(equalTo: bannerStack.widthAnchor).isActive = true
         }
+        // UI slice ④ (UI-1 spec §7.1): a banner that was not on screen before is pushed in over
+        // 0.2 s -- the content below slides down while it fades in -- unless Reduce Motion is on.
+        // A banner replaced under the same id (waiting -> reconnecting) is not new and does not
+        // move.
+        let arriving = Self.arrivingBannerIDs(now: banners.map(\.model.id), before: shownBannerIDs)
+        shownBannerIDs = banners.map(\.model.id)
+        guard !arriving.isEmpty, view.window != nil,
+              !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        let pushed = banners.filter { arriving.contains($0.model.id) }
+        for banner in pushed { banner.alphaValue = 0 }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = Self.bannerPushDuration
+            context.allowsImplicitAnimation = true
+            view.layoutSubtreeIfNeeded()
+            for banner in pushed { banner.animator().alphaValue = 1 }
+        }
+    }
+
+    /// UI-1 spec §7.1: the banner push-in transition.
+    static let bannerPushDuration: TimeInterval = 0.2
+
+    /// The ids in `now` that `before` did not have, in order.
+    static func arrivingBannerIDs(now: [String], before: [String]) -> [String] {
+        now.filter { !before.contains($0) }
     }
 
     /// A grouped card (content layer, standard fill, corner radius 12; no glass, §3).

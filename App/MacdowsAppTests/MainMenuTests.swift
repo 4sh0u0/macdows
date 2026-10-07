@@ -326,10 +326,12 @@ struct MainMenuTests {
     // MARK: - The String Catalog (three languages)
 
     /// Every Swift file that can resolve a string from the App's catalog: the App's own sources
-    /// and the shared rendering sources (the tray's numbered fallback title lives there).
+    /// and the shared rendering sources (the tray's numbered fallback title lives there), and --
+    /// since UI slice ④ -- `App/SessionControl`, where `ShellReconnectPresenter` resolves the
+    /// session-state strings through `ShellText`.
     private static func catalogClientSources() throws -> [String] {
         var files: [String] = []
-        for directory in ["App/Macdows", "App/RemoteWindowRendering", "App/UI"] {
+        for directory in ["App/Macdows", "App/RemoteWindowRendering", "App/UI", "App/SessionControl"] {
             let root = mainMenuRepoRoot().appendingPathComponent(directory)
             let walker = try #require(FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil))
             for case let url as URL in walker where url.pathExtension == "swift" {
@@ -341,10 +343,12 @@ struct MainMenuTests {
 
     /// The literal key / default-value pairs a source resolves: `String(localized:defaultValue:)`
     /// for plain titles, `Bundle.localizedString(forKey:value:table:)` for format strings (whose
-    /// catalog value is returned unformatted and filled in with `String(format:)`).
+    /// catalog value is returned unformatted and filled in with `String(format:)`), and the
+    /// session-state presenter's `text.string(_:_:)` / `text.format(_:_:_:)` (UI slice ④).
     private static func catalogKeys(in raw: String) throws -> [(String, String)] {
         var used: [(String, String)] = []
-        for pattern in [#"String\(localized: "(\w+)", defaultValue: "([^"]+)""#, #"localizedString\(forKey: "(\w+)", value: "([^"]+)""#] {
+        for pattern in [#"String\(localized: "(\w+)", defaultValue: "([^"]+)""#, #"localizedString\(forKey: "(\w+)", value: "([^"]+)""#,
+                        #"text\.(?:string|format)\(\s*"(\w+)",\s*"([^"]+)""#] {
             let regex = try NSRegularExpression(pattern: pattern)
             for match in regex.matches(in: raw, range: NSRange(raw.startIndex..., in: raw)) {
                 guard let key = Range(match.range(at: 1), in: raw), let value = Range(match.range(at: 2), in: raw) else { continue }

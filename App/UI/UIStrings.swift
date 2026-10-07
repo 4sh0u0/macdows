@@ -13,9 +13,11 @@ enum UIStrings {
     static var removeHost: String { String(localized: "sb_remove", defaultValue: "Remove Host", comment: "Sidebar: remove the selected host (accessibility)") }
     static var settings: String { String(localized: "tb_settings", defaultValue: "Settings", comment: "Toolbar: Settings button") }
     /// `hosts3` has plural variations in English ("1 host", "2 hosts"; gate r1 m-10), which only
-    /// `localizedStringWithFormat` resolves.
+    /// a localized format resolves -- with the resolved localization's locale, not the region's
+    /// (`ShellText.formattingLocale`, UI slice ④ gate r1 m-1).
     static func hostCount(_ count: Int) -> String {
-        String.localizedStringWithFormat(Bundle.main.localizedString(forKey: "hosts3", value: "%d hosts", table: nil), Int32(clamping: count))
+        String(format: Bundle.main.localizedString(forKey: "hosts3", value: "%d hosts", table: nil),
+               locale: ShellText.formattingLocale(preferredLocalizations: Bundle.main.preferredLocalizations), Int32(clamping: count))
     }
     static var hostDetails: String { String(localized: "details", defaultValue: "Host details", comment: "Main window: the detail pane (accessibility)") }
 
@@ -25,6 +27,11 @@ enum UIStrings {
     static var connectionFailed: String { String(localized: "st_err", defaultValue: "Connection failed", comment: "State: the last connect failed") }
     static var reconnecting: String { String(localized: "st_warn", defaultValue: "Reconnecting", comment: "State: reconnecting") }
     static var connecting: String { String(localized: "st_connecting", defaultValue: "Connecting…", comment: "Status menu: a session that has not reached live yet") }
+    /// UI slice ④ (UI-1 spec §4.1): the status line after the user pressed Disconnect.
+    static var sessionEnded: String { String(localized: "st_ended", defaultValue: "Session ended.", comment: "Status line: the user pressed Disconnect (UI slice 4)") }
+    /// UI slice ④: a Connect press while a session or its preflight already exists (the button is
+    /// disabled then, so only an unattended press reaches it) -- the status menu's own wording.
+    static var oneSessionAtATime: String { String(localized: "si_one", defaultValue: "One session at a time. Disconnect first.", comment: "Status menu: why Connect to is unavailable during a session") }
     static func connectingTo(_ host: String) -> String {
         String(format: Bundle.main.localizedString(forKey: "tb_connecting", value: "Connecting to %@…", table: nil), host)
     }
@@ -51,6 +58,10 @@ enum UIStrings {
     static var dismiss: String { String(localized: "dismiss", defaultValue: "Dismiss", comment: "Banner: close") }
     static var connect: String { String(localized: "connect", defaultValue: "Connect", comment: "File menu: Connect item (UI slice 1)") }
     static var disconnect: String { String(localized: "disconnect", defaultValue: "Disconnect", comment: "File menu and status menu: end the current session") }
+    /// UI slice ④: the connection banner's button after a give-up.
+    static var reconnect: String { String(localized: "reconnect", defaultValue: "Reconnect", comment: "Connection-lost banner, after giving up: start a new connection (UI slice 4)") }
+    /// UI slice ④: the input-method banner's button to Settings > Keyboard.
+    static var learnMore: String { String(localized: "learn_more", defaultValue: "Learn More", comment: "Input-method banner: opens Settings > Keyboard (UI slice 4)") }
 
     // MARK: Main window detail
     static var connectionHeader: String { String(localized: "conn_h", defaultValue: "Connection", comment: "Main window: card title") }
@@ -65,6 +76,8 @@ enum UIStrings {
     static var pinnedSHA256: String { String(localized: "pinned_sha", defaultValue: "Pinned · SHA-256", comment: "Main window: the host is pinned") }
     static var notPinned: String { String(localized: "not_pinned", defaultValue: "Not pinned yet. You confirm the fingerprint on first connect.", comment: "Main window: not pinned") }
     static var nlaRequired: String { String(localized: "nla_req", defaultValue: "Network Level Authentication required", comment: "Main window: security row") }
+    /// UI slice ④: the Remote windows card, shown with the `wn_*` note while the connection is down.
+    static var remoteWindowsHeader: String { String(localized: "rw_h", defaultValue: "Remote windows", comment: "Main window: card title (UI slice 4)") }
     static var recentHeader: String { String(localized: "recent_h", defaultValue: "Recent connections", comment: "Main window: card title") }
     static var recentNone: String { String(localized: "recent_none", defaultValue: "No connections yet", comment: "Main window: empty recent list (slice 1)") }
 

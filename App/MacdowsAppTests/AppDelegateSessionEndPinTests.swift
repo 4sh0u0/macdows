@@ -134,7 +134,8 @@ struct AppDelegateSessionEndPinTests {
         let code = try Self.code()
         #expect(code.contains("private func tearDownSession() {"))
         #expect(code.contains("func applicationWillTerminate(_ notification: Notification) {"))
-        #expect(code.contains("statusLabel.stringValue = \"Connect failed: \\(error.localizedDescription)\""))
+        // UI slice ④ re-froze the connect-error line to its catalog accessor (`st_err`).
+        #expect(code.contains("statusLabel.stringValue = UIStrings.connectionFailed"))
         #expect(!code.contains("adr/0019"), "a line comment survived the strip")
         #expect(!code.contains("// "), "a comment marker survived the strip")
     }
@@ -252,7 +253,11 @@ struct AppDelegateSessionEndPinTests {
         #expect(sessionEndOccurrences(of: "tearDownSession(", in: code) == 5)
     }
 
-    /// adr/0020 S-3'. The End-session action, as one contiguous run over its whole body (D-5 = Q1):
+    /// adr/0020 S-3', re-frozen by UI slice ④: the action's status line is the catalog's
+    /// `st_ended` ("Session ended."; was the literal "Session ended. Press Connect to start a new
+    /// one."), through `UIStrings.sessionEnded`. Order and the rest of the body unchanged.
+    ///
+    /// The End-session action, as one contiguous run over its whole body (D-5 = Q1):
     /// a `session != nil` guard, the action's own status line, Connect enabled by a literal `true`,
     /// and only then the teardown -- the connect-error branch's order, UI first. The status line is
     /// part of the needle so that a re-worded line is a deliberate re-freeze; it carries no `//`
@@ -273,7 +278,7 @@ struct AppDelegateSessionEndPinTests {
         #expect(sessionEndOccurrences(
             of: "@objc private func endSessionTapped() { "
                 + "guard session != nil else { return } "
-                + "statusLabel.stringValue = \"Session ended. Press Connect to start a new one.\" "
+                + "statusLabel.stringValue = UIStrings.sessionEnded "
                 + "connectButton.isEnabled = true "
                 + "tearDownSession() }",
             in: code) == 1)
