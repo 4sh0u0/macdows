@@ -166,8 +166,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSMe
         alert.informativeText = SettingsStrings.resetBody
         // AppKit gives a button titled Cancel the Escape key even when it is the first button, so
         // left alone this alert has no default button and Return only beeps (finding F-2). Cancel
-        // takes Return by hand; that replaces the derived Escape, which `cancelOnEscape` restores
-        // while the alert is shown. Reset never gets a key equivalent.
+        // takes Return by hand; that replaces the derived Escape, which `AlertKeys.cancelOnEscape`
+        // restores while the alert is shown. Reset never gets a key equivalent.
         let cancel = alert.addButton(withTitle: UIStrings.cancel)
         cancel.keyEquivalent = "\r"
         let reset = alert.addButton(withTitle: SettingsStrings.resetConfirm)
@@ -175,28 +175,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSMe
         return alert
     }
 
-    /// Whether `event` is a plain Escape key-down in `window` (the alert's Cancel action).
-    static func isEscape(_ event: NSEvent, in window: NSWindow) -> Bool {
-        event.type == .keyDown && event.keyCode == escapeKeyCode && event.window === window
-            && event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty
-    }
-
-    /// `kVK_Escape`: the physical key, whatever the keyboard layout.
-    private static let escapeKeyCode: UInt16 = 0x35
-
-    /// While `alert` is shown, Escape clicks its first button (Cancel). Remove the returned monitor
-    /// when the alert ends.
-    static func cancelOnEscape(_ alert: NSAlert) -> Any? {
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak alert] event in
-            guard let alert, isEscape(event, in: alert.window) else { return event }
-            alert.buttons.first?.performClick(nil)
-            return nil
-        }
-    }
-
     private static func confirmResetAlert(_ window: NSWindow, _ completion: @escaping (Bool) -> Void) {
         let alert = makeResetAlert()
-        let escape = cancelOnEscape(alert)
+        let escape = AlertKeys.cancelOnEscape(alert, cancel: alert.buttons[0])
         alert.beginSheetModal(for: window) { response in
             if let escape { NSEvent.removeMonitor(escape) }
             completion(response == .alertSecondButtonReturn)
