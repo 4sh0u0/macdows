@@ -15,10 +15,13 @@ import AppKit
 ///    implements cut/copy/paste/selectAll, so those items disable themselves; Enter Full Screen
 ///    and Bring All to Front reach the remote window's backing window, whose default-deny
 ///    validation greys them). No item sends a key to Windows (adr/0022 I-3).
-///  - Slice ② wires only actions that already exist (UI-1 spec §8 ②). File ▸ Disconnect is the
-///    scaffold's End-session action (adr/0022 D-11 K3-R, `disconnectItem()`); New Host…, Edit
-///    Host…, Connect, Show Hosts and the three Help items have no action yet (slices ① / ③), so
-///    AppKit keeps them disabled. Nothing here reaches `connectTapped` or the registry's
+///  - Slice ② wired only actions that already existed (UI-1 spec §8 ②). File ▸ Disconnect is the
+///    End-session action (adr/0022 D-11 K3-R, `disconnectItem()`). Slice ① (ADR-0024 §3 adr/0022
+///    row) gives New Host…, Edit Host…, Connect and View ▸ Show Hosts their actions -- nil-target
+///    selectors the Hosts window's controller implements (`newHostAction` …); Connect presses the
+///    App's own Connect button from there, so there is still one connect path. The menu structure
+///    and every key equivalent are unchanged. The three Help items still have no action (slice
+///    ③), so AppKit keeps them disabled. Nothing here reaches `connectTapped` or the registry's
 ///    reconnect seam.
 ///  - The key equivalents of the four Mac-reserved items come from `LocalKeyEquivalent`, the
 ///    same constant `RemoteWindowContentView` decides its claims with (adr/0022 D-3). Every other
@@ -91,16 +94,16 @@ enum MainMenu {
         let fileMenu = NSMenu(title: String(localized: "m_file", defaultValue: "File", comment: "Main menu: File menu"))
         fileMenu.addItem(item(
             String(localized: "m_new_host", defaultValue: "New Host…", comment: "File menu: New Host item (UI slice 1)"),
-            action: nil, key: "n", modifiers: [.command]
+            action: newHostAction, key: "n", modifiers: [.command]
         ))
         fileMenu.addItem(item(
             String(localized: "edit_host", defaultValue: "Edit Host…", comment: "File menu: Edit Host item (UI slice 1)"),
-            action: nil
+            action: editHostAction
         ))
         fileMenu.addItem(.separator())
         fileMenu.addItem(item(
             String(localized: "connect", defaultValue: "Connect", comment: "File menu: Connect item (UI slice 1)"),
-            action: nil, key: "\r", modifiers: [.command]
+            action: connectAction, key: "\r", modifiers: [.command]
         ))
         fileMenu.addItem(disconnectItem())
         mainMenu.addItem(topLevel(fileMenu.title, submenu: fileMenu))
@@ -142,7 +145,7 @@ enum MainMenu {
         let viewMenu = NSMenu(title: String(localized: "m_view", defaultValue: "View", comment: "Main menu: View menu"))
         viewMenu.addItem(item(
             String(localized: "m_show_hosts", defaultValue: "Show Hosts", comment: "View menu: Show Hosts item (UI slice 1)"),
-            action: nil, key: "1", modifiers: [.command]
+            action: showHostsAction, key: "1", modifiers: [.command]
         ))
         viewMenu.addItem(.separator())
         viewMenu.addItem(item(
@@ -198,6 +201,30 @@ enum MainMenu {
         app.windowsMenu = menus.windowsMenu
     }
 
+    // MARK: - Slice ① actions (ADR-0024 §3, adr/0022 row): the Hosts window controller's
+
+    /// File ▸ New Host… (⌘N).
+    static let newHostAction = NSSelectorFromString("newHost:")
+    /// File ▸ Edit Host….
+    static let editHostAction = NSSelectorFromString("editHost:")
+    /// File ▸ Connect (⌘↩): the controller presses the App's Connect button.
+    static let connectAction = NSSelectorFromString("connectSelectedHost:")
+    /// View ▸ Show Hosts (⌘1).
+    static let showHostsAction = NSSelectorFromString("showHosts:")
+
+    /// Gate r1 I-2: View ▸ Show Hosts must reach the Hosts window while that window is closed, and
+    /// a closed window's controller is not in the responder chain -- a nil-target item would grey
+    /// out exactly when it is needed. So this one item gets an explicit target, the Hosts window's
+    /// controller, once that controller exists (the App calls this after `install(on:)`). The
+    /// other slice ① items stay nil-target. Returns false when the menu has no Show Hosts item.
+    @discardableResult
+    static func bindShowHosts(in mainMenu: NSMenu?, to target: AnyObject) -> Bool {
+        let viewItems = mainMenu?.items.compactMap(\.submenu).flatMap(\.items) ?? []
+        guard let showHosts = viewItems.first(where: { $0.action == showHostsAction }) else { return false }
+        showHosts.target = target
+        return true
+    }
+
     // MARK: - Disconnect (adr/0022 D-11 K3-R)
 
     /// The scaffold's End-session action -- the same method the Disconnect button calls. Named
@@ -216,7 +243,7 @@ enum MainMenu {
         )
     }
 
-    // MARK: - Item helpers (target always nil)
+    // MARK: - Item helpers (target always nil; `bindShowHosts` is the one later exception)
 
     private static func item(
         _ title: String, action: Selector?, key: String = "", modifiers: NSEvent.ModifierFlags = []

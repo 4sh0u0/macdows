@@ -132,28 +132,33 @@ struct MainMenuTests {
 
     /// No Close Window (UI-1 spec §6.1 footnote, gate r1 I-2): it waits for slice ①'s main-window
     /// lifetime, and with it AppKit's injected ⌥⌘W Close All goes too.
-    @Test("T-1: the File menu (adr/0022 slice ②) -- only Disconnect carries an action, and there is no Close Window")
+    ///
+    /// RE-FROZEN by UI slice ① (ADR-0024 §3, adr/0022 row): New Host…, Edit Host… and Connect gain
+    /// their nil-target actions -- the Hosts window controller's `newHost:`, `editHost:` and
+    /// `connectSelectedHost:` -- with titles, key equivalents and order unchanged. Connect is still
+    /// not `connectTapped` (S-6 (ii)).
+    @Test("T-1: the File menu (slice ① actions on slice ②'s structure), and there is no Close Window")
     func fileMenu() throws {
         let fileMenu = try #require(MainMenu.build().mainMenu.items[1].submenu)
         let command = Self.command
         let shiftCommand = NSEvent.ModifierFlags([.command, .shift]).rawValue
         #expect(fileMenu.title == "File")
         #expect(Self.rows(fileMenu) == [
-            "New Host…|nil|n|\(command)|nil-target",
-            "Edit Host…|nil||0|nil-target",
+            "New Host…|newHost:|n|\(command)|nil-target",
+            "Edit Host…|editHost:||0|nil-target",
             "---",
-            "Connect|nil|\r|\(command)|nil-target",
+            "Connect|connectSelectedHost:|\r|\(command)|nil-target",
             "Disconnect|endSessionTapped|d|\(shiftCommand)|nil-target",
         ])
     }
 
-    @Test("T-1: the View menu (adr/0022 slice ②) -- Show Hosts waits for slice ①, Enter Full Screen is the standard item")
+    @Test("T-1: the View menu -- Show Hosts is slice ①'s showHosts:, Enter Full Screen is the standard item")
     func viewMenu() throws {
         let viewMenu = try #require(MainMenu.build().mainMenu.items[3].submenu)
         let controlCommand = NSEvent.ModifierFlags([.control, .command]).rawValue
         #expect(viewMenu.title == "View")
         #expect(Self.rows(viewMenu) == [
-            "Show Hosts|nil|1|\(Self.command)|nil-target",
+            "Show Hosts|showHosts:|1|\(Self.command)|nil-target",
             "---",
             "Enter Full Screen|toggleFullScreen:|f|\(controlCommand)|nil-target",
         ])
@@ -324,7 +329,7 @@ struct MainMenuTests {
     /// and the shared rendering sources (the tray's numbered fallback title lives there).
     private static func catalogClientSources() throws -> [String] {
         var files: [String] = []
-        for directory in ["App/Macdows", "App/RemoteWindowRendering"] {
+        for directory in ["App/Macdows", "App/RemoteWindowRendering", "App/UI"] {
             let root = mainMenuRepoRoot().appendingPathComponent(directory)
             let walker = try #require(FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil))
             for case let url as URL in walker where url.pathExtension == "swift" {
@@ -374,15 +379,29 @@ struct MainMenuTests {
             let localizations = try #require(entry["localizations"] as? [String: Any], "\(key)")
             #expect(Set(localizations.keys) == ["en", "zh-Hans", "ja"], "\(key)")
             for (language, value) in localizations {
-                let unit = (value as? [String: Any])?["stringUnit"] as? [String: Any]
-                #expect(unit?["state"] as? String == "translated", "\(key) \(language)")
-                let text = unit?["value"] as? String ?? ""
-                #expect(text.count > 0, "\(key) \(language)")
-                // A format string keeps its placeholders in every language.
-                #expect(text.components(separatedBy: "%").count == defaultValue.components(separatedBy: "%").count, "\(key) \(language)")
-                if language == "en" {
-                    #expect(unit?["value"] as? String == defaultValue, "\(key)")
+                // A plain string unit, or (gate r1 m-10, `hosts3` in English) plural variations whose
+                // `other` form is the default value.
+                let plural = ((value as? [String: Any])?["variations"] as? [String: Any])?["plural"] as? [String: Any]
+                let units: [(form: String, unit: [String: Any]?)] = plural.map { forms in
+                    forms.map { (form: $0.key, unit: ($0.value as? [String: Any])?["stringUnit"] as? [String: Any]) }
+                } ?? [(form: "other", unit: (value as? [String: Any])?["stringUnit"] as? [String: Any])]
+                if let plural {
+                    #expect(Set(plural.keys).isSuperset(of: ["one", "other"]), "\(key) \(language) plural forms")
                 }
+                for (form, unit) in units {
+                    #expect(unit?["state"] as? String == "translated", "\(key) \(language) \(form)")
+                    let text = unit?["value"] as? String ?? ""
+                    #expect(text.count > 0, "\(key) \(language) \(form)")
+                    // A format string keeps its placeholders in every language and form.
+                    #expect(text.components(separatedBy: "%").count == defaultValue.components(separatedBy: "%").count, "\(key) \(language) \(form)")
+                    if language == "en" && form == "other" {
+                        #expect(unit?["value"] as? String == defaultValue, "\(key)")
+                    }
+                }
+            }
+            if key == "hosts3" {
+                #expect(((localizations["en"] as? [String: Any])?["variations"] as? [String: Any])?["plural"] != nil,
+                        "gate r1 m-10: English has one / other")
             }
         }
     }

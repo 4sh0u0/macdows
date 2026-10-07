@@ -120,7 +120,7 @@ private func fixtureTopology(width: Double = 1920, height: Double = 1080) throws
 /// `provider`. NOTHING IN THIS FILE CONTACTS ANY HOST, and the strings are empty.
 @MainActor
 private func makeRegistry(provider: any DisplayTopologyProviding) -> (CRSession, RemoteWindowRegistry) {
-    let session = CRSession(host: "", user: "", password: "", program: "")
+    let session = CRSession(host: "", user: "", passwordBytes: Data(), program: "")
     let registry = RemoteWindowRegistry(session: session, topologyProvider: provider)
     return (session, registry)
 }
@@ -237,7 +237,7 @@ struct ReconnectTopologyRefreshTests {
     /// instead of the frozen snapshot, and returning the live provider instead of a static
     /// snapshot of it.
     @Test func refreezeAssignsDesktopAndScaleFromOneRead() throws {
-        let session = CRSession(host: "", user: "", password: "", program: "")
+        let session = CRSession(host: "", user: "", passwordBytes: Data(), program: "")
         // Values no layout can produce, so "left alone" and "assigned" are distinguishable.
         session.desktopWidth = 111
         session.desktopHeight = 222
@@ -296,7 +296,7 @@ struct ReconnectTopologyRefreshTests {
     /// "resolved against freeze 1". Only a physical display change mid-run could, which is a
     /// live-host claim.
     @Test func everyRefreezeReassignsFromItsOwnFreeze() throws {
-        let session = CRSession(host: "", user: "", password: "", program: "")
+        let session = CRSession(host: "", user: "", passwordBytes: Data(), program: "")
         let provider = DisplayTopologyProvider(notificationCenter: NotificationCenter())
 
         _ = ReconnectTopologyRefresh.refreeze(session: session, topology: provider)

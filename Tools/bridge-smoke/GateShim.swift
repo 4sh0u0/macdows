@@ -78,7 +78,7 @@ public final class BridgeSmokeBoundaryVerdict: NSObject {
     }
 }
 
-/// The two calls main.mm makes, and nothing else.
+/// The three calls main.mm makes, and nothing else.
 @objc(BridgeSmokeGate)
 public final class BridgeSmokeGate: NSObject {
     /// The host.env this harness reads, exposed because main.mm names the file in its
@@ -129,6 +129,24 @@ public final class BridgeSmokeGate: NSObject {
             user: EnvFile.value(forKey: "WIN_USER", in: fileValues),
             password: EnvFile.value(forKey: "WIN_PASS", in: fileValues)
         )
+    }
+
+    /// ADR-0024 D-4 (W-b): the certificate this run accepts. The bridge accepts exactly the
+    /// certificate whose SHA-256 is its `acceptedCertificateFingerprint` and rejects every other
+    /// one, so the harness needs the lab host's fingerprint before it dials. Read from
+    /// `MACDOWS_LAB_PIN_SHA256` with the same precedence as WIN_HOST (environment variable first,
+    /// then host.env), parsed by `CertificateFingerprint.parse` and turned into the snapshot by
+    /// `CertificateDecision.acceptedFingerprint(for: .preset(_))` -- the App's own two rules.
+    ///
+    /// Returns the canonical 64-hex form, or nil when the key is missing or is not a SHA-256
+    /// fingerprint. nil is a refusal: main.mm exits before any `CRSession` exists; there is no
+    /// trust-on-first-use path and the harness never writes a pin.
+    @objc public static func resolveLabAcceptedFingerprint() -> String? {
+        let fileValues = (try? EnvFile.parse(path: hostEnvPath)) ?? [:]
+        guard let raw = EnvFile.value(forKey: "MACDOWS_LAB_PIN_SHA256", in: fileValues),
+              case .success(let fingerprint) = CertificateFingerprint.parse(raw)
+        else { return nil }
+        return CertificateDecision.acceptedFingerprint(for: .preset(fingerprint))?.canonical
     }
 
     /// The live-host boundary gate (owner rule, 2026-08-31) on the host this run would dial.

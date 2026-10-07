@@ -43,6 +43,7 @@ struct ShellReconnectPresenterTests {
             .policy(.attemptsExhausted),
             .refusedByBridge(code: -3),
             .policyRefused(attemptIndex: 2),
+            .certificateRejected(unsupportedRoute: false),
         ]
     }
 
@@ -109,7 +110,7 @@ struct ShellReconnectPresenterTests {
     /// changing only the label's wording is red.
     @Test("gaveUp: button enabled, and the cause word IS the [reconnect] line's cause token")
     func gaveUpEnablesTheButtonAndSpeaksTheDriversVocabulary() throws {
-        #expect(Self.everyGiveUpCause().count == 3, "one row per GiveUpCause case")
+        #expect(Self.everyGiveUpCause().count == 4, "one row per GiveUpCause case (ADR-0024 D-5 added certificateRejected)")
         for cause in Self.everyGiveUpCause() {
             let shell = Self.shell(.gaveUp(cause))
             #expect(shell.connectEnabled == true, "cause: \(cause)")

@@ -48,7 +48,7 @@ private func wiringRegistry() throws -> (CRSession, RemoteWindowRegistry) {
         scale: DisplayScale(remotePixelsPerPoint: 1, backingPixelsPerPoint: 1), isPrimary: true
     )
     let topology = try #require(DisplayTopology(displays: [display]))
-    let session = CRSession(host: "", user: "", password: "", program: "")
+    let session = CRSession(host: "", user: "", passwordBytes: Data(), program: "")
     let registry = RemoteWindowRegistry(session: session, topologyProvider: StaticDisplayTopologyProvider(topology))
     return (session, registry)
 }

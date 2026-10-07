@@ -67,6 +67,12 @@ targets:
       # MacdowsAppTests/ReconnectSemanticsPinTests.swift for the pin that holds all three
       # sides of that here rather than in a comment.
       - path: SessionControl
+      # ADR-0024 D-11: the security base of UI slice ①  -- the keychain credential and pin
+      # stores and the chain's password bytes. Compiled into this target and MacdowsAppTests.
+      - path: Security
+      # UI-1 spec §8 ① (UI slice ①): the Hosts window, the Host Editor, Password and Certificate
+      # sheets, banners, host records. Compiled into this target and MacdowsAppTests.
+      - path: UI
       # adr/0006 §2/§3 fix (2026-09-23): the seven embedded FreeRDP/FFmpeg dylibs used to
       # live here as `sources:` entries with `buildPhase.copyFiles.codeSignOnCopy: true`.
       # XcodeGen 2.46.0 never lowers that per-TargetSource `codeSignOnCopy` flag into the
@@ -158,8 +164,7 @@ targets:
           #
           # NOTE: this must live under `settings.configs`, not a target-level `configs:`
           # key. The latter is silently ignored by XcodeGen for targets (verified with
-          # `xcodebuild -showBuildSettings`) — see the CRBridge target's own configs block,
-          # which does not take effect today.
+          # `xcodebuild -showBuildSettings`).
           CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
     # Build FreeRDP (and its OpenSSL dependency) before compiling/linking. Both scripts
     # are idempotent — this is a fast no-op once .build/freerdp/current is populated for
@@ -306,22 +311,6 @@ targets:
           # trailing slash, which is a literal prefix of those paths — unlike
           # "$(SRCROOT)/../", which is not. Result: "Packages/MacdowsCore/...".
           - -fmacro-prefix-map=$(SRCROOT:dir)=
-    configs:
-      Debug:
-        # W4a review H3 intended crb_verify_certificate_ex's insecure "accept
-        # unconditionally, this session only" behavior to be Debug-only, gated on this
-        # macro. KNOWN-INEFFECTIVE (W8 round finding): XcodeGen silently ignores a
-        # target-level `configs:` key, so this macro has NEVER been defined in any
-        # configuration (verified: `xcodebuild -target CRBridge -configuration Debug
-        # -showBuildSettings` shows only DEBUG=1, and the generated pbxproj contains no
-        # CRB_ALLOW_INSECURE_CERT). Actual behavior today: EVERY configuration, Debug
-        # included, rejects every certificate -- the W4a Debug escape hatch has never
-        # existed. Fail-safe, so deliberately left unfixed: the working fix (moving this
-        # under `settings.configs` like the Macdows target's Release entry) would enable
-        # insecure certificate acceptance in Debug builds, a security-relevant change in
-        # W4a's area that needs an explicit owner decision weighing the dev-loop cost of
-        # having no escape hatch. Never define this for a Release/distributed build.
-        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CRB_ALLOW_INSECURE_CERT=1"
     prebuildScripts:
       - name: "Build vendored FreeRDP"
         script: |
@@ -492,6 +481,12 @@ targets:
       # from adr/0022 slice ②, the status item controller), so the section is asserted against an
       # NSMenu built in the test, offline.
       - path: Macdows/StatusMenu
+      # ADR-0024 D-10 ⑤ / ⑧: the security stores, driven through test doubles and, for the
+      # real keychain, a `.test` service that never touches the App's own items.
+      - path: Security
+      # UI slice ①: the views are built offline here (sheet gating, editor validation, the
+      # Connect to list); the host-record and connect-flow logic is driven with the store doubles.
+      - path: UI
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.haru.macdows.dev.apptests

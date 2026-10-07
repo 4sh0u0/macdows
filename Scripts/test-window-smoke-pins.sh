@@ -51,6 +51,10 @@ pin() { # pin <expected> <actual> <name>
 # spots, neither of which affects the pins below: a trailing comment on a code line still counts,
 # and a multi-line string literal whose line starts with `//` would be filtered out.
 code_only() { grep -vE '^[[:space:]]*(//|\*)' "$SRC"; }
+# Same filter, keeping the file's own line numbers (for ORDER pins).
+code_only_n() { grep -nE '' "$SRC" | grep -vE '^[0-9]+:[[:space:]]*(//|\*)'; }
+BRIDGE_SRC="$REPO_ROOT/Tools/bridge-smoke/main.mm"
+BRIDGE_SHIM="$REPO_ROOT/Tools/bridge-smoke/GateShim.swift"
 
 echo "== send paths (always) =="
 # 1. ClientExecute leaves this harness from exactly TWO call sites -- the t>=6s launch loop and
@@ -409,6 +413,40 @@ baseline_ln="$(grep -nE 'print\(latestRailSize\.baselineLine\(forWindowId: w\.wi
 leg_ln="$(grep -nE 'startMoveLeg\(session: session, windowId: w\.windowId' "$SRC" | cut -d: -f1)"
 pin yes "$([ -n "$assign_ln" ] && [ -n "$baseline_ln" ] && [ "$assign_ln" -lt "$baseline_ln" ] && echo yes || echo no)" "the baseline print is AFTER the id assignment"
 pin yes "$([ -n "$leg_ln" ] && [ -n "$baseline_ln" ] && [ "$baseline_ln" -lt "$leg_ln" ] && echo yes || echo no)" "the baseline print is BEFORE the first leg"
+
+echo "== ADR-0024 D-4 (W-b): the lab certificate pin, set once before -start, no nil fallback =="
+# The bridge rejects every certificate unless `acceptedCertificateFingerprint` names it, so each
+# harness assigns it from MACDOWS_LAB_PIN_SHA256 at exactly one site, before the session's first
+# start, from a value that cannot be nil there (a missing / invalid key exits first). No assignment
+# of nil, no `?? ` default and no optional-chained fallback may appear at that site.
+pin 1 "$(code_only | grep -cE 'acceptedCertificateFingerprint = ' || true)" "window-smoke: one snapshot assignment"
+pin 0 "$(code_only | grep -cE 'acceptedCertificateFingerprint = (nil|.*\?\?)' || true)" "window-smoke: no nil / ?? fallback at the site"
+ws_assign_ln="$(code_only_n | grep -E 'acceptedCertificateFingerprint = ' | head -1 | cut -d: -f1 || true)"
+ws_start_ln="$(code_only_n | grep -E 'newSession\.start\(\)' | head -1 | cut -d: -f1 || true)"
+ws_new_ln="$(code_only_n | grep -E 'let newSession = CRSession\(' | head -1 | cut -d: -f1 || true)"
+pin yes "$([ -n "$ws_assign_ln" ] && [ -n "$ws_start_ln" ] && [ -n "$ws_new_ln" ] && [ "$ws_new_ln" -lt "$ws_assign_ln" ] && [ "$ws_assign_ln" -lt "$ws_start_ln" ] && echo yes || echo no)" "window-smoke: assignment after CRSession(, before .start()"
+pin 1 "$(code_only | grep -cE 'switch LabCertificatePin\.resolve\(EnvFile\.value\(forKey: LabCertificatePin\.key, in: fileEnv\)\)' || true)" "window-smoke: one resolve, env-then-host.env"
+pin 1 "$(code_only | grep -cE 'exit\(LabCertificatePin\.refusalExitCode\)' || true)" "window-smoke: refusal exits"
+pin 1 "$(code_only | grep -cE 'CertificateDecision\.acceptedFingerprint\(for: \.preset\(' || true)" "window-smoke: snapshot via the preset rule"
+ws_resolve_ln="$(code_only_n | grep -E 'switch LabCertificatePin\.resolve\(' | head -1 | cut -d: -f1 || true)"
+ws_delegate_ln="$(code_only_n | grep -E '^[0-9]+:let delegate = WindowSmokeDelegate\(' | head -1 | cut -d: -f1 || true)"
+pin yes "$([ -n "$ws_resolve_ln" ] && [ -n "$ws_delegate_ln" ] && [ "$ws_resolve_ln" -lt "$ws_delegate_ln" ] && echo yes || echo no)" "window-smoke: resolved before the delegate exists"
+if [ -f "$BRIDGE_SRC" ] && [ -f "$BRIDGE_SHIM" ]; then
+	bridge_code() { grep -vE '^[[:space:]]*(//|\*|/\*)' "$BRIDGE_SRC"; }
+	pin 1 "$(bridge_code | grep -cE 'acceptedCertificateFingerprint = ' || true)" "bridge-smoke: one snapshot assignment"
+	pin 0 "$(bridge_code | grep -cE 'acceptedCertificateFingerprint = (nil|.*\?)' || true)" "bridge-smoke: no nil / ternary fallback at the site"
+	bs_assign_ln="$(grep -nE 'session\.acceptedCertificateFingerprint = acceptedFingerprint;' "$BRIDGE_SRC" | head -1 | cut -d: -f1 || true)"
+	bs_start_ln="$(grep -nE '^[[:space:]]*\[session start\];' "$BRIDGE_SRC" | head -1 | cut -d: -f1 || true)"
+	bs_alloc_ln="$(grep -nE 'session = \[\[CRSession alloc\]' "$BRIDGE_SRC" | head -1 | cut -d: -f1 || true)"
+	bs_refuse_ln="$(grep -nE '^[[:space:]]*return 77;' "$BRIDGE_SRC" | head -1 | cut -d: -f1 || true)"
+	pin yes "$([ -n "$bs_assign_ln" ] && [ -n "$bs_start_ln" ] && [ -n "$bs_alloc_ln" ] && [ "$bs_alloc_ln" -lt "$bs_assign_ln" ] && [ "$bs_assign_ln" -lt "$bs_start_ln" ] && echo yes || echo no)" "bridge-smoke: assignment after alloc, before the first start"
+	pin yes "$([ -n "$bs_refuse_ln" ] && [ -n "$bs_alloc_ln" ] && [ "$bs_refuse_ln" -lt "$bs_alloc_ln" ] && echo yes || echo no)" "bridge-smoke: refusal (77) before any CRSession"
+	pin 1 "$(bridge_code | grep -cE '\[BridgeSmokeGate resolveLabAcceptedFingerprint\]' || true)" "bridge-smoke: one resolve call"
+	pin 1 "$(grep -vE '^[[:space:]]*//' "$BRIDGE_SHIM" | grep -cE 'CertificateDecision\.acceptedFingerprint\(for: \.preset\(fingerprint\)\)\?\.canonical' || true)" "bridge-smoke shim: snapshot via the preset rule"
+	pin 1 "$(grep -vE '^[[:space:]]*//' "$BRIDGE_SHIM" | grep -cE 'EnvFile\.value\(forKey: "MACDOWS_LAB_PIN_SHA256", in: fileValues\)' || true)" "bridge-smoke shim: env-then-host.env lookup"
+else
+	pin present missing "bridge-smoke sources"
+fi
 
 echo "== summary =="
 printf 'failures=%s\n' "$FAILURES"

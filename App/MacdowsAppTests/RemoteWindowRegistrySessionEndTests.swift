@@ -109,7 +109,7 @@ private func fixtureTopology() throws -> DisplayTopology {
 /// `fixtureTopology()`. NOTHING IN THIS FILE CONTACTS ANY HOST, and the strings are empty.
 @MainActor
 private func makeRegistry() throws -> (CRSession, RemoteWindowRegistry) {
-    let session = CRSession(host: "", user: "", password: "", program: "")
+    let session = CRSession(host: "", user: "", passwordBytes: Data(), program: "")
     let registry = RemoteWindowRegistry(
         session: session, topologyProvider: StaticDisplayTopologyProvider(try fixtureTopology()))
     return (session, registry)

@@ -203,7 +203,7 @@ private enum GfxRegistryFixture {
 
     @MainActor
     static func makeRegistry() throws -> (RemoteWindowRegistry, SurfaceVendingSession) {
-        let session = SurfaceVendingSession(host: "", user: "", password: "", program: "")
+        let session = SurfaceVendingSession(host: "", user: "", passwordBytes: Data(), program: "")
         let registry = RemoteWindowRegistry(
             session: session,
             topologyProvider: StaticDisplayTopologyProvider(try fixtureTopology())
@@ -422,7 +422,7 @@ struct GfxFrameCountersTests {
         // the GFX hook, which never runs without a live RDPGFX channel. A registry over a real
         // (unstarted) session must therefore say `tracked == false` everywhere -- if this ever
         // starts reporting `true`, the counters are being fed by something other than the hook.
-        let session = CRSession(host: "", user: "", password: "", program: "")
+        let session = CRSession(host: "", user: "", passwordBytes: Data(), program: "")
         let registry = RemoteWindowRegistry(
             session: session,
             topologyProvider: StaticDisplayTopologyProvider(try GfxRegistryFixture.fixtureTopology())
@@ -719,7 +719,7 @@ struct GfxMappingPeriodTests {
         // The PRODUCTION implementation, not the double: an unstarted session has a real (empty)
         // surface table, so the one outcome reachable offline must be the honest one -- and the
         // out-parameter must be written even though the call returns nothing.
-        let real = CRSession(host: "", user: "", password: "", program: "")
+        let real = CRSession(host: "", user: "", passwordBytes: Data(), program: "")
         var miss = CRPublishedSurfaceMiss.staleGeneration
         #expect(real.copyPublishedSurface(11, reason: &miss) == nil)
         #expect(miss == .noSlot)

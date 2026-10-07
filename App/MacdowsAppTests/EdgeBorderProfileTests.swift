@@ -538,7 +538,7 @@ struct EdgeProfileStalenessWindowTests {
     func aWindowsSampleFollowsTheSurfaceItActuallyPresented() throws {
         let edgeMapped = CGSize(width: 522, height: 515)
         let currentMapped = CGSize(width: 500, height: 505)
-        let session = CRSession(host: "", user: "", password: "", program: "")
+        let session = CRSession(host: "", user: "", passwordBytes: Data(), program: "")
         let window = RemoteWindow(
             key: RemoteWindowKey(windowId: 1, generation: 1),
             contentRect: NSRect(x: 0, y: 0, width: edgeMapped.width, height: edgeMapped.height),

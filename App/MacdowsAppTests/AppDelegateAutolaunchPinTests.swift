@@ -359,6 +359,30 @@ struct AppDelegateAutolaunchPinTests {
     /// End-session button's predicate (adr/0022 D-11). The actions themselves are untouched. The
     /// region now folds to 34853 characters, a net folded edit of +1290.
     ///
+    /// RE-FROZEN by ADR-0024 UI slice ① commit 1 (the bridge takes the password as bytes, D-2):
+    /// `beginSession`'s `CRSession(...)` call passes `passwordBytes: Data(pass.utf8)` instead of the
+    /// string. Nothing else in the region moved. It now folds to 34869 characters, +16.
+    ///
+    /// RE-FROZEN by ADR-0024 UI slice ① commit 3 (host.env retired, D-9; the chain wiring, D-2 /
+    /// D-2′ / D-5): `connectTapped` now preflights the selected host record off the main actor
+    /// (`ConnectFlow.preflight`) instead of reading host.env, `ConnectPreflight` is gone,
+    /// `beginSession` takes the chain's session and its trust context, the drain hooks call
+    /// `drainThenReview`, `applyReconnectState` also updates the Hosts window, and the chain helpers
+    /// (password sheet, certificate question, failure banners) sit before
+    /// `applicationShouldTerminateAfterLastWindowClosed`. `tearDownSession`, `applyShell`,
+    /// `endSessionTapped`, `drainTick` and `applicationWillTerminate` are unchanged. It folded to
+    /// 43835 characters, +8966.
+    ///
+    /// RE-FROZEN by the UI-6 gate r1 fold (same commit 3): the preflight runs in
+    /// `KeychainQueue.run` instead of a detached task (m-5), the Password sheet's Remember is
+    /// recorded only when the save succeeded (m-11), the certificate question clears the give-up
+    /// flag (m-13), `applicationShouldTerminateAfterLastWindowClosed` answers false and
+    /// `applicationShouldHandleReopen` shows the Hosts window (I-2), and three stale comments
+    /// (`applyShell`'s five literal trues, `tearDownSession`'s exit-ordering note, the preflight's
+    /// queue) were corrected (m-1). `tearDownSession`'s code, `applyShell`'s code,
+    /// `endSessionTapped`, `drainTick` and `applicationWillTerminate` are unchanged. It now folds to
+    /// 45012 characters, +1177.
+    ///
     /// The "net folded edit" above is the folded-length delta for each re-freeze, which is what the
     /// length chain below already checks; it is not a token-by-token added/removed count -- those
     /// depend on the diff algorithm and separator convention used to produce them, so this pin does
@@ -374,9 +398,9 @@ struct AppDelegateAutolaunchPinTests {
     /// expected to re-freeze this constant in the same commit that makes the edit, and the length
     /// below is here so that such a re-freeze can be sanity-checked (a length that MOVED by the size
     /// of the edit is a re-freeze; a length that moved by 22638 is a needle that stopped matching).
-    private static let foldedTailLength = 34853
+    private static let foldedTailLength = 45012
     private static let foldedTailSHA256 =
-        "9ef8defe4ed129c6f99d7aaf0941edb3b4050d1d3c55cad70fd904a80fa4e269"
+        "a7bb17029424113495c4ead1960582b0cb8b16270d18d16209bb43a20f0161d6"
 
     @Test("connectTapped to end-of-file is byte-identical to its last deliberate freeze")
     func theRestOfTheFileIsUnchanged() throws {
@@ -388,62 +412,112 @@ struct AppDelegateAutolaunchPinTests {
         #expect(autolaunchSHA256(folded) == Self.foldedTailSHA256)
     }
 
-    // MARK: - adr/0020 S-8: the press reads host.env off the main actor and never locks itself
+    // MARK: - adr/0020 S-8, rewritten by ADR-0024 D-9: Connect reads no plaintext file, off-main preflight, never locks itself
 
-    /// adr/0020 S-8 (D-8, #6). The host.env read and its three-key check live INSIDE the
-    /// `Task.detached` closure, with the gate: `EnvFile.parse(` sits between `Task.detached(` and
-    /// the closure's `}.value`, and there is exactly one of each. Parsing on the main actor again
-    /// would put a possibly-stalled file read back on the press that must feel instant.
+    /// adr/0020 S-8 as REWRITTEN by ADR-0024 D-9 (M-a; UI slice ①, which retired the App's host.env
+    /// read in the same merge, together with its two failure lines). The old clause -- "the host.env
+    /// read and its three-key check live INSIDE the `Task.detached` closure" -- has no subject any
+    /// more; what it protected carries over in three parts:
     ///
-    /// The other half is the interlock. Both host.env failures now happen after the button has
-    /// been disabled, so the verdict is read as ONE contiguous run: `isCheckingBoundary` reset once,
-    /// before the `switch`, for every outcome; each of the three failure arms (unreadable, keys
-    /// missing, refused) writes its line and re-enables Connect with a literal `true`; only the
-    /// allowed arm starts a session. A failure arm without its `true` would leave Connect disabled
-    /// with nothing left to enable it -- a button locked for the life of the process -- and the
-    /// autoconnect knob presses this very button.
+    ///  (a) the App reads no plaintext credential file: no `EnvFile`, no `hostEnvPath`, no
+    ///      `host.env` and none of the three WIN_* key names anywhere in the App's product sources
+    ///      (comment-stripped; the harnesses under `Tools/` keep theirs, D-9 M-a). The host comes
+    ///      from the selected host record, the password from the keychain or the Password sheet;
+    ///  (b) the press's blocking work -- the live-host gate (getaddrinfo) AND the keychain reads
+    ///      (the file-based keychain blocks on its authorisation prompt, ADR-0024 probe K) -- runs
+    ///      inside the ONE `KeychainQueue.run` body (UI-6 gate r1 m-5: the serial keychain queue,
+    ///      never a detached task on the cooperative pool), as `ConnectFlow.preflight(` with the
+    ///      gate passed in;
+    ///  (c) the interlock: `isCheckingBoundary` is reset once, before the result is read, and every
+    ///      arm that starts no session (boundary refusal, pin unavailable) hands Connect back with a
+    ///      literal `true` -- the Password sheet's Cancel is the fifth literal, pinned by the wiring
+    ///      pins' count. Only `.ready` starts a chain.
     ///
-    /// MUST-RED for: the parse moved back in front of the Task (onto the main actor), a failure arm
-    /// that forgets to re-enable Connect, the reset moved into some arms only, and a verdict arm
-    /// that starts a session without the gate's `.allowed`.
-    @Test("the Connect press reads host.env off the main actor, and every failure hands the button back")
-    func theHostEnvReadIsOffMainAndEveryFailureReEnablesConnect() throws {
+    /// MUST-RED for: any plaintext-file read reintroduced into the App, the preflight moved onto the
+    /// main actor, a no-session arm that forgets to re-enable Connect, and an arm that starts a
+    /// session on a refusal.
+    ///
+    /// A LIMIT of (a), registered by UI-6 gate r1 m-7: it counts literal names, and a name built by
+    /// concatenation (`"host" + ".env"`) does not contain them -- r1's mutant M13c read the file that
+    /// way from `ConnectFlow.swift` and survived. (a′) closes that with CALL shapes instead of
+    /// names: outside `HostRecordStore` (`App/UI/Hosts/HostRecord.swift`, the App's one file it
+    /// reads, its own JSON) no product source may call a file-reading API at all, whatever path it
+    /// builds.
+    @Test("ADR-0024 D-9: the App reads no plaintext credential file, and the Connect preflight is off-main and hands the button back")
+    func theConnectPressReadsNoFileAndEveryFailureReEnablesConnect() throws {
+        // (a)
+        var scanned = 0
+        for directory in ["App/Macdows", "App/UI", "App/Security", "App/SessionControl", "App/RemoteWindowRendering"] {
+            let root = repoRoot().appendingPathComponent(directory)
+            guard let walker = FileManager.default.enumerator(atPath: root.path) else { continue }
+            for case let entry as String in walker where entry.hasSuffix(".swift") {
+                scanned += 1
+                let code = autolaunchCodeOnly(try autolaunchRawSource("\(directory)/\(entry)"))
+                for needle in ["EnvFile", "hostEnvPath", "host.env", "WIN_" + "HOST", "WIN_" + "USER", "WIN_" + "PASS"] {
+                    #expect(autolaunchOccurrences(of: needle, in: code) == 0, "\(directory)/\(entry): \(needle)")
+                }
+            }
+        }
+        #expect(scanned > 20, "the walk found the App's sources (\(scanned))")
+
+        // (a′) gate r1 m-7: file-reading CALL shapes, not names.
+        var fileReaders = 0
+        var readsInStore = 0
+        for directory in ["App/Macdows", "App/UI", "App/Security", "App/SessionControl", "App/RemoteWindowRendering"] {
+            let root = repoRoot().appendingPathComponent(directory)
+            guard let walker = FileManager.default.enumerator(atPath: root.path) else { continue }
+            for case let entry as String in walker where entry.hasSuffix(".swift") {
+                let path = "\(directory)/\(entry)"
+                let code = autolaunchCodeOnly(try autolaunchRawSource(path))
+                let count = ["contentsOfFile:", "contentsOf:", "contentsAtPath", "FileHandle(forReadingAtPath",
+                             "FileHandle(forReadingFrom", "fopen("].reduce(0) { $0 + autolaunchOccurrences(of: $1, in: code) }
+                if path == "App/UI/Hosts/HostRecord.swift" {
+                    readsInStore = count
+                    let store = try autolaunchIndex(of: "final class HostRecordStore", in: code)
+                    let read = try autolaunchIndex(of: "Data(contentsOf: fileURL)", in: code)
+                    #expect(store < read, "the one read is HostRecordStore's")
+                } else {
+                    fileReaders += count
+                    #expect(count == 0, "\(path) calls a file-reading API")
+                }
+            }
+        }
+        #expect(fileReaders == 0)
+        #expect(readsInStore == 1, "HostRecordStore reads its own JSON once")
+
+        // (b)
         let code = try Self.code()
-        #expect(autolaunchOccurrences(of: "EnvFile.parse(", in: code) == 1)
-        #expect(autolaunchOccurrences(of: "Task.detached(", in: code) == 1)
-        #expect(autolaunchOccurrences(of: "}.value", in: code) == 1)
-        let detached = try autolaunchIndex(of: "Task.detached(", in: code)
-        let parse = try autolaunchIndex(of: "EnvFile.parse(", in: code)
-        let value = try autolaunchIndex(of: "}.value", in: code)
-        #expect(detached < parse, "the read is inside the detached closure, not in front of it")
-        #expect(parse < value, "the read is inside the detached closure, not after it")
-
+        #expect(autolaunchOccurrences(of: "Task.detached(", in: code) == 0)
+        #expect(autolaunchOccurrences(of: "KeychainQueue.run {", in: code) == 1)
+        #expect(autolaunchOccurrences(of: "ConnectFlow.preflight(", in: code) == 1)
+        let queued = try autolaunchIndex(of: "KeychainQueue.run {", in: code)
+        let preflight = try autolaunchIndex(of: "ConnectFlow.preflight(", in: code)
+        let reset = try autolaunchIndex(of: "self.isCheckingBoundary = false", in: code)
+        #expect(queued < preflight && preflight < reset, "the preflight is inside the queued body")
         #expect(autolaunchOccurrences(
-            of: "let preflight = await Task.detached(priority: .userInitiated) { () -> ConnectPreflight in "
-                + "let values: [String: String] "
-                + "do { values = try EnvFile.parse(path: MacdowsPaths.hostEnvPath()) } catch { return .unreadable } "
-                + "guard let host = values[\"WIN_HOST\"], let user = values[\"WIN_USER\"], let pass = values[\"WIN_PASS\"], "
-                + "!host.isEmpty, !user.isEmpty, !pass.isEmpty else { return .missingKeys } "
-                + "return .checked(host: host, user: user, password: pass, verdict: LabBoundary.check(host: host)) "
-                + "}.value",
+            of: "let preflight = await KeychainQueue.run { () -> ConnectFlow.Preflight in "
+                + "ConnectFlow.preflight( host: host, address: address, recordSaysPinned: recordSaysPinned, "
+                + "remembersPassword: readsKeychain, credentials: credentials, pins: pins, "
+                + "boundary: { LabBoundary.check(host: $0) } ) }",
             in: code) == 1)
+
+        // (c)
         #expect(autolaunchOccurrences(
-            of: "}.value guard let self else { return } self.isCheckingBoundary = false switch preflight { "
-                + "case .unreadable: "
-                + "self.statusLabel.stringValue = \"Could not read ~/.config/macdows/host.env\" "
+            of: "boundary: { LabBoundary.check(host: $0) } ) } guard let self else { return } self.isCheckingBoundary = false switch preflight { "
+                + "case .refusedByBoundary(let refusal): "
+                + "self.statusLabel.stringValue = LabBoundary.refusalLine(host: address, refusal: refusal) "
                 + "self.connectButton.isEnabled = true "
-                + "case .missingKeys: "
-                + "self.statusLabel.stringValue = \"host.env missing WIN_HOST/WIN_USER/WIN_PASS\" "
+                + "self.chainEnded() "
+                + "case .pinUnavailable(let status): "
+                + "self.showPinUnavailable(record, status: status) "
                 + "self.connectButton.isEnabled = true "
-                + "case .checked(let host, let user, let pass, .allowed): "
-                + "self.beginSession(host: host, user: user, password: pass) "
-                + "case .checked(let host, _, _, .refused(let refusal)): "
-                + "self.statusLabel.stringValue = LabBoundary.refusalLine(host: host, refusal: refusal) "
-                + "self.connectButton.isEnabled = true "
-                + "} }",
+                + "self.chainEnded() "
+                + "case .ready(let context, let secret?, _): "
+                + "self.beginChain(record, context: context, secret: secret) "
+                + "case .ready(let context, nil, let keychainStatus): ",
             in: code) == 1)
         #expect(autolaunchOccurrences(of: "isCheckingBoundary = false", in: code) == 2,
-                "the stored property's initial value, and the one reset in front of the verdict")
+                "the stored property's initial value, and the one reset in front of the result")
     }
 
     // MARK: - Pin 7 (adr/0020 lane K, gate r1 I-1): the press anchor, before each real press
