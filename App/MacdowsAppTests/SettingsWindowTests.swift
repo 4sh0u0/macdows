@@ -401,17 +401,22 @@ struct SettingsWindowTests {
         #expect(!controller.advanced.isBusy)
     }
 
-    @Test("the Reset alert: Cancel first (Return, with Escape derived by AppKit), Reset second and destructive, no hand-set key equivalent (gate r1 I-1)")
+    @Test("the Reset alert: Cancel first and the default button (Return), Reset second, destructive and keyless (F-2; gate r1 I-1)")
     func resetAlertShape() throws {
         let alert = SettingsWindowController.makeResetAlert()
         #expect(alert.alertStyle == .warning)
         #expect(alert.buttons.map(\.title) == [UIStrings.cancel, SettingsStrings.resetConfirm])
-        // AppKit gives the first button Return (and Escape from its title) only when the sheet is
-        // shown, so that half is checked in the .app probe; offline: nothing is set by hand.
+        // Left alone, AppKit gives the Cancel-titled first button Escape at addButton time and no
+        // button has Return (F-2); Cancel's Return is set by hand, Escape comes back via the monitor.
+        #expect(alert.buttons[0].keyEquivalent == "\r", "Cancel is the default button")
         #expect(alert.buttons[1].keyEquivalent.isEmpty, "Reset has no key")
         #expect(alert.buttons[1].hasDestructiveAction)
+        #expect(!alert.buttons[0].hasDestructiveAction)
         let code = settingsCodeOnly(try settingsSource("\(settingsDirectory)/SettingsWindowController.swift"))
-        #expect(!code.contains("keyEquivalent"), "an explicit key equivalent replaces the Escape AppKit derives from the Cancel title")
+        #expect(settingsOccurrences(of: "keyEquivalent", in: code) == 1, "the only key equivalent set by hand")
+        #expect(code.contains("cancel.keyEquivalent = \"\\r\""), "and it is Cancel's Return")
+        #expect(code.contains("let escape = cancelOnEscape(alert)"), "the sheet path installs the Escape monitor")
+        #expect(code.contains("if let escape { NSEvent.removeMonitor(escape) }"), "and removes it when the alert ends")
         #expect(code.contains("completion(response == .alertSecondButtonReturn)"))
         #expect(!code.contains(".alertFirstButtonReturn"), "the first button is Cancel")
         #expect(code.contains("await HostOperations.resetAllPins(actions: actions, store: store)"), "only calls the existing operation")
@@ -419,6 +424,31 @@ struct SettingsWindowTests {
             let other = settingsCodeOnly(file.code)
             #expect(!other.contains("SecItem") && !other.contains("KeychainItems") && !other.contains(".delete(for:"), "\(file.name) touches the keychain itself")
         }
+    }
+
+    @Test("the Reset alert's Escape filter: plain Escape in the alert window only (F-2)")
+    func resetAlertEscapeFilter() throws {
+        // Offline the alert's own window has no window number until shown (an event cannot name it),
+        // so two undeferred stand-ins play the alert window and another window.
+        func standIn() -> NSWindow {
+            NSWindow(contentRect: NSRect(x: 0, y: 0, width: 100, height: 100), styleMask: [.titled], backing: .buffered, defer: false)
+        }
+        let window = standIn(), other = standIn()
+        func key(_ chars: String, _ code: UInt16, _ flags: NSEvent.ModifierFlags = [], in window: NSWindow, _ type: NSEvent.EventType = .keyDown) -> NSEvent {
+            NSEvent.keyEvent(with: type, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: window.windowNumber,
+                             context: nil, characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code)!
+        }
+        #expect(window.windowNumber > 0 && other.windowNumber > 0 && window.windowNumber != other.windowNumber)
+        #expect(SettingsWindowController.isEscape(key("\u{1b}", 0x35, in: window), in: window))
+        #expect(!SettingsWindowController.isEscape(key("\u{1b}", 0x35, in: window, .keyUp), in: window), "key-up")
+        #expect(!SettingsWindowController.isEscape(key("\r", 0x24, in: window), in: window), "Return is Cancel's own key equivalent")
+        #expect(!SettingsWindowController.isEscape(key("\u{1b}", 0x35, .command, in: window), in: window), "Command-Escape")
+        #expect(!SettingsWindowController.isEscape(key("\u{1b}", 0x35, .shift, in: window), in: window), "Shift-Escape")
+        #expect(!SettingsWindowController.isEscape(key("\u{1b}", 0x35, .control, in: window), in: window), "Control-Escape")
+        #expect(!SettingsWindowController.isEscape(key("\u{1b}", 0x35, .option, in: window), in: window), "Option-Escape")
+        #expect(!SettingsWindowController.isEscape(key("\u{1b}", 0x35, in: other), in: window), "another window")
+        let monitor = try #require(SettingsWindowController.cancelOnEscape(SettingsWindowController.makeResetAlert()))
+        NSEvent.removeMonitor(monitor)
     }
 
     // MARK: - Export Diagnostics… (ADR-0024 D-8)
