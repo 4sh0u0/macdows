@@ -31,6 +31,25 @@ enum ConnectChain {
     /// copies it into the diagnostics ring buffer the export reads.
     static let log = DiagnosticLogger(subsystem: "dev.haru.macdows", category: "Connect")
 
+    /// adr/0019 supplementary ruling RB-1: the one line for a connect that failed on a reconnect
+    /// leg the driver started (`ReconnectDriver`'s step 1 is its only caller). The App's
+    /// connect-error branch logs `[connect] failed:` for the legs it takes; this is the line for the
+    /// legs it leaves to the driver, so every failed connect has exactly one `[connect]` line.
+    ///
+    /// Domain, code and class only -- never the error's description, which can carry the host's
+    /// address -- and no `user=` field, so the export's `[connect]` shape passes it as it is.
+    static func logLegFailure(_ error: NSError, as failureClass: ConnectFailureClass,
+                              to logger: DiagnosticLogger = ConnectChain.log) {
+        let token: String
+        switch failureClass {
+        case .transient:
+            token = "transient"
+        case .final:
+            token = "final"
+        }
+        logger.notice("[connect] leg-failed: domain=\(error.domain, privacy: .public) code=\(error.code, privacy: .public) class=\(token, privacy: .public)")
+    }
+
     /// Saves a Password-sheet password with Remember ticked. Returns false on failure (the chain
     /// still connects; the password just is not remembered).
     static func savePassword(_ secret: SessionSecret, for host: HostID, displayName: String,

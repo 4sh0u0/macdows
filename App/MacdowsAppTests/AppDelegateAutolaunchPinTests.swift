@@ -400,6 +400,20 @@ struct AppDelegateAutolaunchPinTests {
     /// paths (gate r1 fold: Learn More to Settings > Keyboard). `tearDownSession`, `endSessionTapped`
     /// and `applicationWillTerminate` are unchanged. It now folds to 49205 characters, +2747.
     ///
+    /// RE-FROZEN by RB-2 (adr/0019 supplementary ruling RB-1 (a′)): `drainTick`'s connect-error
+    /// branch gained one condition -- it leaves a leg the reconnect driver started to the driver
+    /// (`ReconnectDriver.connectErrorBelongsToDriver(in:)`) -- and its comment, and
+    /// `tearDownSession`'s connect-error precondition, were rewritten to match. The branch's
+    /// statements, `tearDownSession`'s code, `endSessionTapped` and `applicationWillTerminate` are
+    /// unchanged. It folded to 50380 characters, +1175.
+    ///
+    /// RE-FROZEN again by RB-2's gate r1 fold-in (F-1, gate r1 I-3): in `reviewSessionEnd`, the
+    /// connect-failure banner of a chain that never went live is now shown only when the end is not
+    /// the reconnect driver's give-up (`if !endingByGiveUp { ... }` inside the branch, plus a
+    /// two-line comment); the `.connectFailed` record and every other statement stay as they were.
+    /// `tearDownSession`, `endSessionTapped`, `drainTick` and `applicationWillTerminate` are
+    /// unchanged. It now folds to 50570 characters, +190.
+    ///
     /// The "net folded edit" above is the folded-length delta for each re-freeze, which is what the
     /// length chain below already checks; it is not a token-by-token added/removed count -- those
     /// depend on the diff algorithm and separator convention used to produce them, so this pin does
@@ -415,9 +429,9 @@ struct AppDelegateAutolaunchPinTests {
     /// expected to re-freeze this constant in the same commit that makes the edit, and the length
     /// below is here so that such a re-freeze can be sanity-checked (a length that MOVED by the size
     /// of the edit is a re-freeze; a length that moved by 22638 is a needle that stopped matching).
-    private static let foldedTailLength = 49205
+    private static let foldedTailLength = 50570
     private static let foldedTailSHA256 =
-        "b1c10f3fcc7869341649f0955d8d113b9c7a01a83dba049a2199e259a00333cb"
+        "87878764f29879fae8e446e89b82bff5a881992a1585d859b9e945b33704ab22"
 
     @Test("connectTapped to end-of-file is byte-identical to its last deliberate freeze")
     func theRestOfTheFileIsUnchanged() throws {

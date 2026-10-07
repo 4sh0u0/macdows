@@ -342,11 +342,13 @@ struct ReconnectDriverReactionTests {
         #expect(fixture.driver.state == .waiting(attempt: 0, delay: first))
     }
 
-    /// Test ⑩. A refused connection is not a dropped one. `-lastConnectError` non-nil means the
-    /// bridge itself said no -- DNS/TCP/TLS/NLA, or the ADR-0017 §4 A2 decode-path refusal -- and
-    /// the same attempt will be refused the same way however long the driver waits. Checked BEFORE
-    /// everything else because a refusal also posts the disconnect sentinel, so any later branch
-    /// would swallow it and start a five-attempt back-off against a wall.
+    /// Test ⑩. A refused connection is not a dropped one. `-lastConnectError` with a FINAL class
+    /// (adr/0019 supplementary ruling RB-1: the bridge's own codes such as the ADR-0017 §4 A2
+    /// decode-path refusal's -5, credential and protocol failures, anything unknown) means the same
+    /// attempt will be refused the same way however long the driver waits. Checked BEFORE every
+    /// later step because a refusal also posts the disconnect sentinel, so any later branch would
+    /// swallow it and start a five-attempt back-off against a wall. The transient connect codes
+    /// (DNS/TCP/TLS/transport) are a failed attempt instead: `ReconnectDriverConnectClassTests`.
     @Test("a disconnect with a connect error gives up immediately, with the bridge's own code")
     func bridgeRefusalSkipsTheBackoff() throws {
         let fixture = try Fixture.make()
@@ -483,6 +485,170 @@ struct ReconnectDriverReactionTests {
         #expect(fixture.driver.state == .idle)
         #expect(fixture.clock.requested.isEmpty)
         #expect(fixture.session.restartCount == 0)
+    }
+}
+
+// MARK: - adr/0019 supplementary ruling RB-1: step 1 by connect-failure class
+
+@MainActor
+@Suite("ReconnectDriver: step 1 splits a connect failure by class (adr/0019 RB-1)")
+struct ReconnectDriverConnectClassTests {
+
+    private static func connectError(_ code: Int) -> NSError {
+        NSError(domain: "Macdows.CRSession", code: code)
+    }
+
+    /// 0x20006 CONNECT_FAILED (TCP refused / unreachable / timed out) and 0x20008
+    /// TLS_CONNECT_FAILED, both transient.
+    private static let tcpFailed = 131_078
+    private static let tlsFailed = 131_080
+
+    /// A drop, then the first retry fired: the driver is in `.reconnecting(attempt: 0)` with one
+    /// failed attempt counted -- the state a connect failure on a driver leg arrives in.
+    private static func onFirstReconnectLeg() throws -> Fixture {
+        let fixture = try Fixture.make()
+        fixture.handshake()
+        fixture.disconnect()
+        fixture.clock.fireNext()
+        #expect(fixture.driver.state == .reconnecting(attempt: 0))
+        #expect(fixture.driver.failedAttempts == 1)
+        return fixture
+    }
+
+    @Test("a transient connect failure on a reconnect leg schedules the policy's next delay")
+    func transientFailureBacksOff() throws {
+        let fixture = try Self.onFirstReconnectLeg()
+        fixture.session.stubConnectError = Self.connectError(Self.tcpFailed)
+
+        fixture.disconnect()
+
+        let expected = try ReconnectPolicy.delay(forFailedAttempt: 1)
+        #expect(fixture.driver.state == .waiting(attempt: 1, delay: expected))
+        #expect(fixture.clock.requested.last == expected)
+        #expect(fixture.clock.pendingCount == 1)
+        #expect(fixture.driver.lastGiveUpCause == nil)
+    }
+
+    @Test("a transient connect failure during our own teardown schedules nothing")
+    func transientFailureYieldsToOwnTeardown() throws {
+        let fixture = try Fixture.make()
+        fixture.session.stubConnectError = Self.connectError(Self.tcpFailed)
+        fixture.session.stubTeardownInitiated = true
+
+        fixture.disconnect()
+
+        #expect(fixture.driver.state == .idle)
+        #expect(fixture.clock.requested.isEmpty)
+        #expect(fixture.clock.pendingCount == 0)
+        #expect(fixture.driver.lastGiveUpCause == nil)
+        #expect(fixture.session.restartCount == 0)
+    }
+
+    @Test("transient failures on every leg walk the curve to attempts-exhausted, on the shared five-attempt sequence")
+    func transientFailuresExhaustThePolicy() throws {
+        let fixture = try Self.onFirstReconnectLeg()
+        fixture.session.stubConnectError = Self.connectError(Self.tlsFailed)
+
+        // The drop was failure 1; legs 1...3 fail transiently and are retried.
+        for index in 1..<(ReconnectPolicy.maxAttempts - 1) {
+            fixture.disconnect()
+            #expect(fixture.driver.state == .waiting(attempt: index, delay: try ReconnectPolicy.delay(forFailedAttempt: index)))
+            fixture.clock.fireNext()
+        }
+        // Leg 4's failure is the fifth: the policy gives up.
+        fixture.disconnect()
+
+        #expect(fixture.driver.state == .gaveUp(.policy(.attemptsExhausted)))
+        #expect(fixture.driver.lastGiveUpCause == .policy(.attemptsExhausted))
+        #expect(fixture.session.restartCount == ReconnectPolicy.maxAttempts - 1)
+        #expect(fixture.clock.fireAllPending() == 0)
+        #expect(ReconnectDriver.logLine(for: fixture.driver.state, failedAttempts: fixture.driver.failedAttempts)
+                == "[reconnect] attempt=4 delay-ms= state=gaveup cause=attempts-exhausted")
+    }
+
+    @Test("a handshake after transient failures puts the next failure back at index 0")
+    func handshakeAfterTransientFailuresResets() throws {
+        let fixture = try Self.onFirstReconnectLeg()
+        fixture.session.stubConnectError = Self.connectError(Self.tcpFailed)
+        fixture.disconnect()
+        fixture.clock.fireNext()
+        #expect(fixture.driver.failedAttempts == 2)
+
+        // The next `-start` cleared the error, and that leg completed its handshake.
+        fixture.session.stubConnectError = nil
+        fixture.handshake()
+        #expect(fixture.driver.state == .live)
+        #expect(fixture.driver.failedAttempts == 0)
+
+        fixture.disconnect()
+        let first = try ReconnectPolicy.delay(forFailedAttempt: 0)
+        #expect(fixture.driver.state == .waiting(attempt: 0, delay: first))
+    }
+
+    @Test("a final connect failure on a reconnect leg gives up at once, with FreeRDP's code in the cause",
+          arguments: [131_081, 131_083, 131_074, 0x1_0005])
+    func finalFailureGivesUp(code: Int) throws {
+        let fixture = try Self.onFirstReconnectLeg()
+        let requestedBefore = fixture.clock.requested.count
+        fixture.session.stubConnectError = Self.connectError(code)
+
+        fixture.disconnect()
+
+        #expect(fixture.driver.state == .gaveUp(.refusedByBridge(code: code)))
+        #expect(fixture.clock.requested.count == requestedBefore)
+        #expect(fixture.clock.pendingCount == 0)
+        #expect(ReconnectDriver.token(for: .refusedByBridge(code: code)) == "refused-by-bridge:\(code)")
+    }
+
+    @Test("a transient code in another domain is final")
+    func otherDomainIsFinal() throws {
+        let fixture = try Self.onFirstReconnectLeg()
+        fixture.session.stubConnectError = NSError(domain: NSPOSIXErrorDomain, code: Self.tcpFailed)
+        fixture.disconnect()
+        #expect(fixture.driver.state == .gaveUp(.refusedByBridge(code: Self.tcpFailed)))
+    }
+
+    /// The restart branch is unchanged by the ruling: it only ever sees `-start`'s synchronous
+    /// codes (the bridge's -1...-4 and a pthread errno, all final), and it gives up on whatever
+    /// error it finds without classifying it.
+    @Test("the restart-failed branch still gives up on any connect error, unclassified")
+    func restartBranchIsUnclassified() throws {
+        let fixture = try Fixture.make()
+        fixture.disconnect()
+        fixture.session.restartResult = false
+        fixture.session.stubConnectError = Self.connectError(Self.tcpFailed)
+        fixture.clock.fireNext()
+        #expect(fixture.driver.state == .gaveUp(.refusedByBridge(code: Self.tcpFailed)))
+    }
+
+    /// Step 0 still outranks a transient TLS code: a certificate rejection is never a back-off.
+    @Test("a certificate rejection with its TLS code is the certificate cause, not a failed attempt")
+    func certificateOutranksTransientTLS() throws {
+        let fixture = try Self.onFirstReconnectLeg()
+        fixture.session.stubCertificateRejection = try rejection(route: false)
+        fixture.session.stubConnectError = Self.connectError(Self.tlsFailed)
+        let requestedBefore = fixture.clock.requested.count
+
+        fixture.disconnect()
+
+        #expect(fixture.driver.state == .gaveUp(.certificateRejected(unsupportedRoute: false)))
+        #expect(fixture.clock.requested.count == requestedBefore)
+    }
+
+    /// The behaviour pin on step 0's place before step 1 (RB-2 gate r1 I-1). Since RB-1 put the TLS
+    /// code in the transient set, `certificateOutranksTransientTLS` stays green with the two steps
+    /// swapped -- a transient code falls through step 1 and still reaches step 0. A FINAL code does
+    /// not fall through: with the order swapped the cause reads `refusedByBridge` and the App never
+    /// offers the certificate question. Only the outcome is asserted.
+    @Test("a certificate rejection with a final code is still the certificate cause", arguments: [131_081, -5])
+    func certificateOutranksFinalCode(code: Int) throws {
+        let fixture = try Self.onFirstReconnectLeg()
+        fixture.session.stubCertificateRejection = try rejection(route: false)
+        fixture.session.stubConnectError = Self.connectError(code)
+
+        fixture.disconnect()
+
+        #expect(fixture.driver.state == .gaveUp(.certificateRejected(unsupportedRoute: false)))
     }
 }
 

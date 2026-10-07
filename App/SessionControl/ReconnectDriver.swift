@@ -23,10 +23,14 @@ import os
 ///  0. `CRSession.lastCertificateRejection` (ADR-0024 D-5, R-a) — the bridge's certificate callback
 ///     rejected the certificate. It comes with a TLS `lastConnectError`, so it is read first; the
 ///     cause is `.certificateRejected` and nothing is retried (the App asks the user instead).
-///  1. `CRSession.lastConnectError` — non-nil means the bridge itself refused this connection
-///     (DNS/TCP/TLS/NLA, or the RDPGFX decode-path refusal of ADR-0017 §4 A2). Retrying a refusal
-///     on a back-off is how a client spends five minutes failing at something that failed for a
-///     reason; the driver gives up immediately and hands the cause out for the UI to show.
+///  1. `CRSession.lastConnectError` — non-nil means this connection failed while connecting
+///     (DNS/TCP/TLS/NLA, a bridge-side setup failure, or the RDPGFX decode-path refusal of
+///     ADR-0017 §4 A2). adr/0019 supplementary ruling RB-1 splits it by
+///     `MacdowsCore.ConnectFailureClass`: a final failure (credentials, a refused protocol, the
+///     bridge's own codes, anything unknown) gives up immediately, because retrying it on a
+///     back-off is how a client spends five minutes failing at something that failed for a
+///     reason; a transient one (the network or the host was away for a moment) is one failed
+///     attempt and falls through to the steps below, so the policy decides as it does for a drop.
 ///  2. `CRSession.teardownInitiated` — this side asked for the shutdown. The driver must not
 ///     "reconnect" a session its owner is deliberately closing, including the one `-dealloc`
 ///     closes and the one `applicationWillTerminate` closes.
@@ -83,8 +87,10 @@ final class ReconnectDriver {
     enum GiveUpCause: Equatable {
         /// The back-off policy said stop — today, only "attempts exhausted".
         case policy(ReconnectPolicy.GiveUpReason)
-        /// The bridge refused the connection; `code` is `CRSession.lastConnectError`'s code (the
-        /// `Macdows.CRSession` domain's own small negative codes).
+        /// The connection failed for a reason another attempt would meet again; `code` is
+        /// `CRSession.lastConnectError`'s code (the bridge's own negative codes or FreeRDP's
+        /// connect-error code in the same domain -- `ConnectFailureClass` says which are final,
+        /// adr/0019 supplementary ruling RB-1).
         case refusedByBridge(code: Int)
         /// The policy rejected the attempt index itself. Unreachable by construction — the index
         /// starts at zero and only ever increments, and `ReconnectPolicy` refuses only negatives —
@@ -224,7 +230,8 @@ final class ReconnectDriver {
         // 0. Did the bridge's certificate callback reject this connection (ADR-0024 D-5, R-a)?
         //    Checked BEFORE step 1: a certificate rejection also sets `lastConnectError` (a TLS
         //    failure, the same code as every other one), so step 1 would swallow it as an
-        //    ordinary refusal and the user would never be shown the changed-certificate sheet. The
+        //    ordinary TLS failure -- since adr/0019 RB-1 a transient one, retried against the same
+        //    certificate -- and the user would never be shown the changed-certificate sheet. The
         //    callback publishes the rejection inside the TLS handshake, before the error and before
         //    the sentinel, so it is visible whenever the error is.
         if let rejection = session.lastCertificateRejection {
@@ -232,14 +239,28 @@ final class ReconnectDriver {
             return
         }
 
-        // 1. Did the bridge refuse this connection? Then there is nothing to back off from: the
-        //    same attempt will be refused the same way. Checked right after step 0 (which owns the
-        //    one refusal that needs a different answer) and before every later step, because a
-        //    refusal also produces a disconnect sentinel (`crb_rdp_thread_main`'s epilogue publishes the error
-        //    just before posting it), so any later branch would swallow it.
-        if let error = session.lastConnectError {
-            giveUp(.refusedByBridge(code: (error as NSError).code))
-            return
+        // 1. Did this connection fail while connecting? adr/0019 supplementary ruling RB-1 (b):
+        //    the class decides. A FINAL failure has nothing to back off from -- the same attempt
+        //    will be refused the same way -- so it gives up here, right after step 0 (which owns
+        //    the one refusal that needs a different answer) and before every later step, because a
+        //    failed connect also produces a disconnect sentinel (`crb_rdp_thread_main` publishes
+        //    the error before posting it), so any later branch would swallow it. A TRANSIENT
+        //    failure does NOT return: it is one failed attempt, counted when the attempt began
+        //    (`performReconnect`), so it falls through to step 2 (our own teardown still wins),
+        //    step 3 and step 4, where the policy schedules the next attempt or gives up with
+        //    `attempts-exhausted`. Either way the class goes to one `[connect] leg-failed:` line
+        //    (ConnectChain's family; the `[reconnect]` line keeps its frozen shape and tokens).
+        //
+        //    The App hands this disconnect to the driver only when the leg is the driver's
+        //    (`connectErrorBelongsToDriver(in:)`); a first connect and a live leg are still
+        //    taken by the App's connect-error branch before the drain.
+        if let error = session.lastConnectError as NSError? {
+            let failureClass = ConnectFailureClass.classify(domain: error.domain, code: error.code)
+            ConnectChain.logLegFailure(error, as: failureClass)
+            if failureClass == .final {
+                giveUp(.refusedByBridge(code: error.code))
+                return
+            }
         }
 
         // 2. Did WE ask for this? `-shutdownAndWait` sets `teardownInitiated` before it does
@@ -355,6 +376,27 @@ final class ReconnectDriver {
         }
         // Otherwise stay in `.reconnecting` and let the events decide: a handshake means live, a
         // disconnect means this attempt failed and the policy gets the next index.
+    }
+
+    /// adr/0019 supplementary ruling RB-1 (a′): whether a connect error now set on the session
+    /// belongs to a leg this driver started, so the App's connect-error branch must leave it -- and
+    /// the disconnect that comes with it -- to the driver's step 1.
+    ///
+    /// `.reconnecting` is the leg in flight. `.waiting` is the same leg after a transient failure:
+    /// the error stays on the session until the next `-start` clears it, and the App's backstop
+    /// timer ticks through the back-off, so without `.waiting` here the next tick would take the
+    /// stale error as a first-connect failure and end the session the driver is about to retry.
+    /// Every other state -- no driver, `.idle` (a first connect: the driver is armed before the
+    /// session starts and stays idle until a handshake), `.live` (a live leg, including the
+    /// decode-path refusal, which stays the App's `st_err`) and `.gaveUp` -- leaves the error to the
+    /// App, as before the ruling.
+    static func connectErrorBelongsToDriver(in state: State?) -> Bool {
+        switch state {
+        case .reconnecting?, .waiting?:
+            return true
+        case nil, .idle?, .live?, .gaveUp?:
+            return false
+        }
     }
 
     private func cancelPendingRetry() {
