@@ -6,7 +6,9 @@ import SwiftUI
 /// material cards, content layer, no glass (§3 material rule) -- built from `SettingsModel`: a
 /// choice is enabled only when it is the behaviour the App has today, every other one is disabled
 /// and labelled Coming later (§7.1: not by dimming alone). No page keeps or writes a setting; the
-/// bindings are constant. Every text is `verbatim` (catalog strings are resolved in
+/// bindings are constant -- except the General page's start-panel checkbox (ADR-0025 R-2), whose
+/// value lives in `StartPanelPreferences` (`App/UI/StartPanel/`) and is only rendered and handed
+/// back from here. Every text is `verbatim` (catalog strings are resolved in
 /// `SettingsStrings`; `Text("…")` would look its argument up a second time and read `%` as a
 /// format).
 
@@ -159,6 +161,10 @@ struct SettingsPopUp: NSViewRepresentable {
 // MARK: - General
 
 struct SettingsGeneralPage: View {
+    /// ADR-0025 R-2 / design note §7: the start panel's one stored preference and the Accessibility
+    /// state beside it. This page renders it and calls its methods; it stores nothing itself.
+    @ObservedObject var startPanel: StartPanelPreferences
+
     var body: some View {
         Form {
             Section {
@@ -172,6 +178,27 @@ struct SettingsGeneralPage: View {
                     }
                 }
             }
+            Section {
+                SettingsRow(UIStrings.startPanelTitle) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle(isOn: Binding(get: { startPanel.preciseDockPositioning }, set: { startPanel.setPreciseDockPositioning($0) })) {
+                            Text(verbatim: UIStrings.startPanelPrecise)
+                        }
+                        .toggleStyle(.checkbox)
+                        SettingsNote(text: UIStrings.startPanelPreciseNote)
+                        if startPanel.showsAuthorizationHint {
+                            SettingsNote(text: UIStrings.startPanelNotAuthorized)
+                            Button {
+                                startPanel.openAccessibilityPrivacy()
+                            } label: {
+                                Text(verbatim: UIStrings.startPanelOpenPrivacy)
+                            }
+                            .settingsSecondaryButtonStyle()
+                        }
+                    }
+                }
+            }
+            .onAppear { startPanel.refreshTrust() }
             Section {
                 SettingsRow(SettingsStrings.notifications) {
                     VStack(alignment: .leading, spacing: 4) {

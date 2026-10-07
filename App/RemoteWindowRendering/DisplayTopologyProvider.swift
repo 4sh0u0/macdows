@@ -298,7 +298,16 @@ final class DisplayTopologyProvider: DisplayTopologyProviding {
 
     // MARK: - The adapter itself
 
-    /// `NSScreen` -> `DisplayTopology`. **The only `NSScreen` read in the project** (ADR §5.A.5);
+    /// ADR-0025 §1.3: each local screen's `frame` and `visibleFrame` in AppKit global points, for
+    /// placing the Dock start panel -- local window placement, not the remote topology. Kept in this
+    /// file so `NSScreen` stays read in one place (ADR §5.A.5); it reads, logs nothing, freezes
+    /// nothing, and no session or snapshot is touched.
+    static func anchorScreens() -> [AnchorScreen] {
+        NSScreen.screens.map { AnchorScreen(frame: $0.frame, visibleFrame: $0.visibleFrame) }
+    }
+
+    /// `NSScreen` -> `DisplayTopology`. **The only `NSScreen` read behind the topology** (ADR §5.A.5;
+    /// `anchorScreens()` above is the start panel's local-placement read, in this same file);
     /// `reason` exists so the log says which of the three read points this was.
     private static func readTopologyFromScreens(reason: String) -> DisplayTopology? {
         let screens = NSScreen.screens

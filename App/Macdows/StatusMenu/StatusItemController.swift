@@ -12,6 +12,8 @@ import MacdowsCore
 ///     One session at a time. ...        disabled, shown while a session exists
 ///     Disconnect                        the File menu's Disconnect item (adr/0022 D-11)
 ///     ---------------------------
+///     Run…                              ADR-0025 R-8: the start panel under this item; enabled
+///                                       while a session exists (Disconnect's predicate)
 ///     Open Macdows                      activates the App
 ///     Settings…                         the main menu's Settings… (UI slice ③)
 ///     ---------------------------
@@ -40,7 +42,7 @@ import MacdowsCore
 ///  - Open Macdows activates the App, so a key remote window resigns key and releases its
 ///    modifiers through its own `.focusLost` path (adr/0022 D-6) -- the expected outcome.
 @MainActor
-final class StatusItemController: NSObject, NSMenuDelegate {
+final class StatusItemController: NSObject, NSMenuDelegate, NSMenuItemValidation {
     /// What the status rows and the Remote tray section are computed from.
     struct SessionReading: Equatable {
         var hasSession: Bool
@@ -83,6 +85,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     let connectToMenu = NSMenu(title: "")
     let oneSessionItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let disconnectItem = MainMenu.disconnectItem()
+    /// ADR-0025 R-8: opens the start panel under the status item, its Run field focused.
+    let runItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let openItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let settingsItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let quitItem = NSMenuItem(title: "", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
@@ -106,6 +110,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// Gate r1 I-2: Open Macdows also brings the Hosts window back (the App points this at the
     /// Hosts window controller's `showHosts`), so a closed Hosts window is always one click away.
     var onOpenMacdows: (() -> Void)?
+    /// ADR-0025 R-8: Run… -- the App opens the start panel anchored under the status item button,
+    /// whose screen frame this passes (nil before `install()`).
+    var onRun: ((CGRect?) -> Void)?
 
     private(set) var statusItem: NSStatusItem?
     /// The registry of the current session, nil without one. Weak: the App owns it.
@@ -125,6 +132,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         connectToMenu.autoenablesItems = false
         oneSessionItem.title = String(localized: "si_one", defaultValue: "One session at a time. Disconnect first.", comment: "Status menu: why Connect to is unavailable during a session")
         oneSessionItem.isHidden = true
+        runItem.title = UIStrings.startPanelRun
+        runItem.action = #selector(runProgram(_:))
+        runItem.target = self
         openItem.title = String(localized: "si_open", defaultValue: "Open Macdows", comment: "Status menu: bring Macdows to the front")
         openItem.action = #selector(openMacdows(_:))
         openItem.target = self
@@ -140,6 +150,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(oneSessionItem)
         menu.addItem(disconnectItem)
         menu.addItem(.separator())
+        menu.addItem(runItem)
         menu.addItem(openItem)
         menu.addItem(settingsItem)
         menu.addItem(.separator())
@@ -215,6 +226,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         detailRow.title = rows.detail ?? ""
         detailRow.isHidden = rows.detail == nil
         oneSessionItem.isHidden = !reading.hasSession
+        runItem.isEnabled = reading.hasSession
         let entries = hostEntries()
         connectToMenu.items = entries.map { entry in
             let item = NSMenuItem(title: entry.title, action: #selector(connectToHost(_:)), keyEquivalent: "")
@@ -307,6 +319,26 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func openMacdows(_ sender: Any?) {
         NSApp.activate(ignoringOtherApps: true)
         onOpenMacdows?()
+    }
+
+    /// ADR-0025 R-8: Run… opens the start panel under this status item (its Run field focused).
+    /// Only with a session: the same predicate as Disconnect, checked again here.
+    @objc private func runProgram(_ sender: Any?) {
+        guard reading().hasSession else { return }
+        onRun?(buttonScreenFrame)
+    }
+
+    /// The status item button's frame on screen, the start panel's anchor.
+    var buttonScreenFrame: CGRect? {
+        guard let button = statusItem?.button, let window = button.window else { return nil }
+        return window.convertToScreen(button.convert(button.bounds, to: nil))
+    }
+
+    /// Run… is enabled exactly while a session exists (the menu auto-enables items with a target);
+    /// every other item keeps AppKit's answer.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        guard menuItem === runItem else { return true }
+        return reading().hasSession
     }
 
     /// UI slice ③: Settings… activates the App (as Open Macdows does) and performs the main menu's

@@ -46,7 +46,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSMe
     private(set) var pendingWork: Task<Void, Never>?
 
     init(actions: HostActions, store: HostRecordStore, buffer: DiagnosticLogBuffer = .shared,
-         environment: [String: String] = ProcessInfo.processInfo.environment) {
+         environment: [String: String] = ProcessInfo.processInfo.environment,
+         startPanel: StartPanelPreferences = .shared) {
         self.actions = actions
         self.store = store
         self.buffer = buffer
@@ -60,7 +61,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSMe
         window.setAccessibilityLabel(SettingsStrings.windowLabel)
         super.init(window: window)
 
-        addPage(.general, title: SettingsStrings.tabGeneral, symbol: "gearshape", view: SettingsGeneralPage())
+        addPage(.general, title: SettingsStrings.tabGeneral, symbol: "gearshape", view: SettingsGeneralPage(startPanel: startPanel))
         addPage(.keyboard, title: SettingsStrings.tabKeyboard, symbol: "keyboard", view: SettingsKeyboardPage())
         addPage(.display, title: SettingsStrings.tabDisplay, symbol: "display", view: SettingsDisplayPage())
         addPage(.advanced, title: SettingsStrings.tabAdvanced, symbol: "gearshape.2", view: SettingsAdvancedPage(state: advanced))

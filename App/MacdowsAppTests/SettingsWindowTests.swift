@@ -204,8 +204,13 @@ struct SettingsWindowTests {
         #expect(pages.contains("SettingsChoiceButton(kind: kind, choice: choice) .fixedSize() .disabled(!choice.isEnabled) if choice.showsComingLater { ComingLaterLabel() }"))
         #expect(pages.contains("button.isEnabled = choice.isEnabled && environmentEnabled"))
         #expect(pages.contains("button.lastItem?.isEnabled = choice.isEnabled"))
-        #expect(settingsOccurrences(of: "Toggle(", in: pages) == 1, "a_include is the one live control")
+        // RE-WRITTEN by ADR-0025 a-1 (R-2, ruling ㋯ §10-7): two live controls now. The General page's
+        // start-panel checkbox is the second, and its value is NOT kept here: the binding reads and
+        // calls `StartPanelPreferences` (App/UI/StartPanel), so the no-persistence-API loop below
+        // still holds for every Settings file.
+        #expect(settingsOccurrences(of: "Toggle(", in: pages) == 2, "a_include and sp_ax are the two live controls")
         #expect(pages.contains("Toggle(isOn: $state.includeAccountAndKeyWitness)"))
+        #expect(pages.contains("Toggle(isOn: Binding(get: { startPanel.preciseDockPositioning }, set: { startPanel.setPreciseDockPositioning($0) }))"))
         for file in try settingsFiles() {
             let code = settingsCodeOnly(file.code)
             for forbidden in ["UserDefaults", "@AppStorage", "@SceneStorage", "NSUserDefaults"] {
@@ -296,15 +301,21 @@ struct SettingsWindowTests {
         }
     }
 
-    @Test("General has exactly three rows (At launch / If the connection drops / Notifications); no 'disconnect when the last window closes' row (UI-1 v0.2 §10 (7))")
+    /// RE-WRITTEN by ADR-0025 a-1 (design note §7): a fourth row, the start panel's, in a section of
+    /// its own between the first section and Notifications. Still no last-window row.
+    @Test("General has exactly four rows (At launch / If the connection drops / Start panel / Notifications); no 'disconnect when the last window closes' row (UI-1 v0.2 §10 (7))")
     func generalHasNoLastWindowRow() throws {
         let pages = settingsCodeOnly(try settingsSource("\(settingsDirectory)/SettingsPages.swift"))
         let start = try #require(pages.range(of: "struct SettingsGeneralPage"))
         let end = try #require(pages.range(of: "struct SettingsKeyboardPage"))
         let general = String(pages[start.lowerBound..<end.lowerBound])
-        #expect(settingsOccurrences(of: "SettingsRow(", in: general) == 3)
+        #expect(settingsOccurrences(of: "SettingsRow(", in: general) == 4)
         #expect(general.contains("SettingsRow(SettingsStrings.launch)") && general.contains("SettingsRow(SettingsStrings.connectionDrops)")
-                && general.contains("SettingsRow(SettingsStrings.notifications)"))
+                && general.contains("SettingsRow(SettingsStrings.notifications)") && general.contains("SettingsRow(UIStrings.startPanelTitle)"))
+        let drops = try #require(general.range(of: "SettingsRow(SettingsStrings.connectionDrops)"))
+        let panel = try #require(general.range(of: "SettingsRow(UIStrings.startPanelTitle)"))
+        let notifications = try #require(general.range(of: "SettingsRow(SettingsStrings.notifications)"))
+        #expect(drops.lowerBound < panel.lowerBound && panel.lowerBound < notifications.lowerBound, "after the first section, before Notifications")
         let catalog = try settingsSource("App/Macdows/Localizable.xcstrings")
         let general_keys = ["g_launch", "g_launch_v", "g_drop", "g_drop_n", "g_drop_v", "g_notif", "g_n1", "g_n2", "g_n3"]
         let found = try Regex(#""(g_[a-z0-9_]+)" : \{"#)
@@ -515,7 +526,9 @@ struct SettingsWindowTests {
         let glass = settingsCodeOnly(try settingsSource("App/UI/Style/GlassStyle.swift"))
         #expect(glass.contains("func settingsSecondaryButtonStyle() -> some View { if #available(macOS 26, *) { buttonStyle(.glass) } else { buttonStyle(.bordered) } }"))
         let pages = settingsCodeOnly(try settingsSource("\(settingsDirectory)/SettingsPages.swift"))
-        #expect(settingsOccurrences(of: ".settingsSecondaryButtonStyle()", in: pages) == 2, "Export Diagnostics… and Reset All Pins…")
+        // RE-WRITTEN by ADR-0025 a-1 (§10-6): the start panel's Open Privacy & Security… is the third.
+        #expect(settingsOccurrences(of: ".settingsSecondaryButtonStyle()", in: pages) == 3,
+                "Export Diagnostics…, Reset All Pins… and Open Privacy & Security…")
         let project = try settingsSource("App/project.yml")
         #expect(project.contains("MACOSX_DEPLOYMENT_TARGET: \"14.0\""))
     }

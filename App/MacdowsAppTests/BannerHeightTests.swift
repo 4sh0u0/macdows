@@ -187,7 +187,10 @@ struct BannerHeightTests {
         }
     }
 
-    @Test("the App never sets GlassStyle.forceLegacyMaterial: only GlassStyle.swift names it, once declared and once read")
+    /// RE-WRITTEN by ADR-0025 a-1: the start panel's background (`GlassStyle.panelBackground`) reads
+    /// the same seam, so the panel's 14–25 branch is testable on 26 too -- declared once, read twice,
+    /// still only in GlassStyle.swift and still never set by the App.
+    @Test("the App never sets GlassStyle.forceLegacyMaterial: only GlassStyle.swift names it, once declared and read by the banner and the start panel")
     func seamIsTestOnly() throws {
         var hits: [String: Int] = [:]
         for directory in ["App/UI", "App/Macdows", "App/Security", "App/SessionControl", "App/RemoteWindowRendering"] {
@@ -200,9 +203,10 @@ struct BannerHeightTests {
                 if count > 0 { hits[url.lastPathComponent] = count }
             }
         }
-        #expect(hits == ["GlassStyle.swift": 2])
+        #expect(hits == ["GlassStyle.swift": 3])
         let glass = try String(contentsOf: bannerHeightRepoRoot().appendingPathComponent("App/UI/Style/GlassStyle.swift"), encoding: .utf8)
         #expect(glass.contains("static var forceLegacyMaterial = false"))
-        #expect(glass.contains("if #available(macOS 26, *), !forceLegacyMaterial {"))
+        #expect(glass.components(separatedBy: "if #available(macOS 26, *), !forceLegacyMaterial {").count - 1 == 2,
+                "the banner's branch and the start panel's")
     }
 }

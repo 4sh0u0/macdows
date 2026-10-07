@@ -872,8 +872,8 @@ final class RemoteWindowRegistry {
             Self.logger.debug("received zOrderSync windowIdMarker=\(event.windowId, privacy: .public) (recorded only, no policy attached -- adr/0008 §6)")
         // Phase 2 W6 (docs/plans/phase2.md §2 W6): the three notify-icon event cases route
         // to `trayStatusController` -- previously part of the unconditional `break` case
-        // below alongside `.windowIcon`/`.execResult`/`.handshakeFlags` (still genuinely
-        // ignored; no consumer wants them yet).
+        // below alongside `.windowIcon`/`.handshakeFlags` (still genuinely ignored; no consumer
+        // wants them yet). `.execResult` left that case with ADR-0025 (see `onExecResult`).
         case .notifyIconCreate:
             trayStatusController.noteStoreOverflowCount(Int(session.iconStoreOverflowCount))
             trayStatusController.noteStoreOversizeRefusalCount(Int(session.iconStoreOversizeRefusalCount))
@@ -894,7 +894,12 @@ final class RemoteWindowRegistry {
             )
         case .notifyIconDelete:
             trayStatusController.handleNotifyIconDelete(windowId: event.windowId, notifyIconId: event.notifyIconId)
-        case .windowIcon, .execResult, .handshakeFlags:
+        case .execResult:
+            // ADR-0025 S-4: the registry's one ExecResult forward, to the App's launcher, on the
+            // main thread like every event here. Forwarded as three values and never logged: the
+            // echoed program may carry a user's path (S-2). The registry keeps no launch state.
+            onExecResult?(event.execResult, event.rawResult, event.program)
+        case .windowIcon, .handshakeFlags:
             break
         @unknown default:
             break
@@ -1289,6 +1294,13 @@ final class RemoteWindowRegistry {
     /// See `handleTrayIconClick`'s own doc comment on why this exists. Diagnostics only --
     /// not read anywhere on the real rendering path.
     var onTrayNotifyEventSent: ((_ windowId: UInt32, _ notifyIconId: UInt32, _ message: UInt32) -> Void)?
+
+    /// ADR-0025 S-4: every ExecResult the server sends -- the start panel's launches and the
+    /// ARC_COMPLETED re-sends of the session's initial program alike -- leaves the registry here and
+    /// nowhere else, as `execResult`, `rawResult` and the echoed program. The App points it at its
+    /// `AppLauncher`, which matches results to its own launches and only counts the rest. `nil` (the
+    /// default, and window-smoke's) drops them as before.
+    var onExecResult: ((_ execResult: UInt32, _ rawResult: UInt32, _ program: String) -> Void)?
 
     /// Diagnostics only (`Tools/window-smoke`'s `WINDOW_SMOKE_TRAY_CLICK` scenario, adr/0014
     /// §6): drives a tray left click for `(windowId, notifyIconId)` through the REAL path --
