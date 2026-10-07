@@ -17,7 +17,8 @@ import MacdowsCore
 /// exception (gate r1 I-2): the App binds it to this controller explicitly
 /// (`MainMenu.bindShowHosts`), because it has to work while the Hosts window is closed, and so do
 /// the status item's Open Macdows and a Dock-icon reopen. Closing the window only orders it out
-/// (`isReleasedWhenClosed = false`).
+/// (`isReleasedWhenClosed = false`). File ▸ Close Window (⌘W, `MainMenu.closeWindowAction`) is
+/// one of those nil-target items too: it closes this window while it is key (UI-9).
 ///
 /// Keychain work runs on `KeychainQueue`, never in a detached task (gate r1 m-5).
 @MainActor
@@ -164,15 +165,21 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
 
     // MARK: - Banners
 
+    /// Shows `model`: a banner with the same id is replaced where it stands (UI-9, gate UI-8 R-2 --
+    /// waiting -> reconnecting no longer moves the connection banner below the others); a new id
+    /// goes to the bottom. The detail rebuilds only what changed (`setBanners`).
     func showBanner(_ model: BannerView.Model) {
-        banners.removeAll { $0.id == model.id }
-        banners.append(model)
-        detail.setBanners(banners.map(BannerView.init))
+        if let index = banners.firstIndex(where: { $0.id == model.id }) {
+            banners[index] = model
+        } else {
+            banners.append(model)
+        }
+        detail.setBanners(banners)
     }
 
     func removeBanner(id: String) {
         banners.removeAll { $0.id == id }
-        detail.setBanners(banners.map(BannerView.init))
+        detail.setBanners(banners)
     }
 
     func clearBanners() {
@@ -253,6 +260,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         window?.makeKeyAndOrderFront(nil)
     }
 
+    /// File ▸ Close Window (⌘W; UI-9): the standard close of this window -- `performClose`, so
+    /// the close button's path (`windowShouldClose`, the close animation) is the same as a click
+    /// on the red button. The window only orders out; View ▸ Show Hosts brings it back. Enabled
+    /// only while this window is key (`validateMenuItem`), so a key remote window or an open
+    /// sheet never lets it close the Hosts window behind them.
+    @objc func closeKeyWindow(_ sender: Any?) {
+        window?.performClose(sender)
+    }
+
     // MARK: - Settings (UI slice ③)
 
     /// The Settings window, built on first use. It shares this controller's host records and
@@ -313,6 +329,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             return selectedRecord != nil && (connectButton?.isEnabled ?? false)
         case Self.removeAction?:
             return selectedRecord != nil && selectedHostID != activeHostID
+        case MainMenu.closeWindowAction?:
+            return window?.isKeyWindow == true
         default:
             return true
         }

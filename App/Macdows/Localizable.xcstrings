@@ -3444,6 +3444,30 @@
         }
       }
     },
+    "m_close" : {
+      "comment" : "File menu: Close Window item (closes the key Mac window)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Close Window"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ウインドウを閉じる"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭窗口"
+          }
+        }
+      }
+    },
     "m_copy" : {
       "comment" : "Edit menu: Copy item",
       "extractionState" : "manual",

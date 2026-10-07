@@ -28,10 +28,19 @@ import AppKit
 ///    key equivalent here -- slice ②'s ⌘N, ⌘↩, ⇧⌘D, ⌘1 and ⌃⌘F included -- is claimed by a
 ///    key remote window before the menu bar sees it (adr/0022 D-2 B), so it only acts while a Mac
 ///    window is key or when the item is chosen with the pointer.
-///  - File has no Close Window item (UI-1 spec §6.1 footnote): on the scaffold window ⌘W would
-///    close the last window and terminate the app, ending the session, and AppKit would inject an
-///    enabled ⌥⌘W Close All next to it. It waits for slice ①, which owns the main window's
-///    lifetime.
+///  - File ▸ Close Window ⌘W (UI-1 spec §6.1; adr/0022 §3 ⌘W row, "② adds Close Window") closes
+///    the key Mac window -- the Hosts window or Settings -- and nothing else. The reason it was
+///    deferred (on the scaffold window ⌘W closed the last window and terminated the App) is gone
+///    since slice ①: the App no longer terminates after its last window closes, and both Mac
+///    windows only order out (`isReleasedWhenClosed = false`) and come back through View ▸ Show
+///    Hosts, the status item, a Dock reopen or ⌘,. Its action is NOT AppKit's `performClose:`: a
+///    `performClose:` item with ⌘W makes AppKit inject an alternate ⌥⌘W Close All (`closeAll:`,
+///    enabled even while a remote window is key, closing every titled window). `closeKeyWindow:`
+///    is our own nil-target selector, implemented by the two Mac window controllers (each calls
+///    `performClose` on its own window and validates the item only while that window is key), so
+///    nothing is injected and a remote window -- whose chain implements no `closeKeyWindow:` --
+///    leaves the item grey. ⌘W on a key remote window is still claimed by its content view and
+///    sent as SC_CLOSE (adr/0022 D-3); the reserved set is unchanged.
 ///  - `install(on:)` turns automatic window tabbing off before handing the menus over, so AppKit
 ///    never injects its tab items (Show Previous / Next Tab ⌃⇧⇥ / ⌃⇥, Show Tab Bar, …) into Window
 ///    / View. A matching item swallows its key even while disabled, so with them a key remote
@@ -108,6 +117,11 @@ enum MainMenu {
             action: connectAction, key: "\r", modifiers: [.command]
         ))
         fileMenu.addItem(disconnectItem())
+        fileMenu.addItem(.separator())
+        fileMenu.addItem(item(
+            String(localized: "m_close", defaultValue: "Close Window", comment: "File menu: Close Window item (closes the key Mac window)"),
+            action: closeWindowAction, key: "w", modifiers: [.command]
+        ))
         mainMenu.addItem(topLevel(fileMenu.title, submenu: fileMenu))
 
         // Edit (adr/0022 D-4 E1).
@@ -215,6 +229,10 @@ enum MainMenu {
     static let showHostsAction = NSSelectorFromString("showHosts:")
     /// Macdows ▸ Settings… (⌘,; UI slice ③): the Hosts window's controller opens the Settings window.
     static let settingsAction = NSSelectorFromString("showSettings:")
+    /// File ▸ Close Window (⌘W; UI-9): closes the key Mac window. Implemented by
+    /// `MainWindowController` and `SettingsWindowController`, never by a remote window; not
+    /// `performClose:`, so AppKit injects no ⌥⌘W Close All (see the type doc).
+    static let closeWindowAction = NSSelectorFromString("closeKeyWindow:")
 
     /// Gate r1 I-2: View ▸ Show Hosts must reach the Hosts window while that window is closed, and
     /// a closed window's controller is not in the responder chain -- a nil-target item would grey
