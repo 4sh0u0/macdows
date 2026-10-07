@@ -103,12 +103,14 @@ enum ConnectFlow {
         (try? pins.pin(expected, source: .preset, subject: nil, issuer: nil, for: host, displayName: displayName)) != nil
     }
 
-    /// UI-1 spec §4.3: the three first-connect failure banners.
+    /// UI-1 spec §4.3: the first-connect failure kinds (`BannerView.Model.connectFailure` picks the
+    /// banner; a certificate rejection has the certificate path's banner and sheet instead).
     enum FailureKind: Equatable, Sendable {
         case unreachable
         case signIn
         case certificate
-        /// Anything else: the status line only.
+        /// Anything else -- an ERRINFO-class end, or a CONNECT-class code not listed below: since
+        /// F-7 a banner with Edit Host… and Reconnect; the status line says Connection failed.
         case other
     }
 

@@ -127,6 +127,12 @@ enum UIStrings {
         String(format: Bundle.main.localizedString(forKey: "cf_n_t", value: "Sign-in to %@ failed", table: nil), host)
     }
     static var signInBody: String { String(localized: "cf_n_b", defaultValue: "The host didn’t accept the user name or password (Network Level Authentication). Your saved password was not changed. Enter the password again to try once more.", comment: "First-connect failure banner: sign-in") }
+    /// F-7: the `.other` kind -- the remote PC ended the connection, or the connection failed in a
+    /// way the classifier does not name, before the desktop appeared.
+    static func otherFailureTitle(_ host: String) -> String {
+        String(format: Bundle.main.localizedString(forKey: "cf_o_t", value: "Couldn’t connect to %@", table: nil), host)
+    }
+    static var otherFailureBody: String { String(localized: "cf_o_b", defaultValue: "The remote PC ended the connection, or the connection failed before the desktop appeared. Try again, or check this host’s settings.", comment: "First-connect failure banner: other (F-7)") }
     static func certificateRejectedTitle(_ host: String) -> String {
         String(format: Bundle.main.localizedString(forKey: "cf_c_t", value: "Certificate rejected for %@", table: nil), host)
     }

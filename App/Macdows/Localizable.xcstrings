@@ -1036,6 +1036,52 @@
         }
       }
     },
+    "cf_o_b" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The remote PC ended the connection, or the connection failed before the desktop appeared. Try again, or check this host’s settings."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "リモートコンピュータが接続を終了したか、デスクトップが表示される前に接続に失敗しました。もう一度試すか、このホストの設定を確認してください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "远程电脑结束了连接，或连接在桌面出现前失败。请再试一次，或检查此主机的设置。"
+          }
+        }
+      }
+    },
+    "cf_o_t" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Couldn’t connect to %@"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ への接続に失敗しました"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "连接 %@ 失败"
+          }
+        }
+      }
+    },
     "cf_route_b" : {
       "extractionState" : "manual",
       "localizations" : {
