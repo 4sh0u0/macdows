@@ -63,6 +63,14 @@ enum UIStrings {
     /// UI slice ④: the input-method banner's button to Settings > Keyboard.
     static var learnMore: String { String(localized: "learn_more", defaultValue: "Learn More", comment: "Input-method banner: opens Settings > Keyboard (UI slice 4)") }
 
+    // MARK: Display-change note (adr/0015 §5.A.3; UI-11)
+    /// The one thing a screen-parameter change does in this app: `AppDelegate` picks one of these
+    /// four and writes it to the status line. Text only -- no reconnect, no resize.
+    static var displayNoteNoDisplay: String { String(localized: "dn_none", defaultValue: "Display change: no usable display right now.", comment: "adr/0015 §5.A.3 display-change note: the screen list is empty (§5.A.6)") }
+    static var displayNoteNoSession: String { String(localized: "dn_nosess", defaultValue: "Display change: no session yet -- the desktop size is taken at connect.", comment: "adr/0015 §5.A.3 display-change note: no session, the desktop size is taken at connect") }
+    static var displayNoteStale: String { String(localized: "dn_stale", defaultValue: "Display change: this session's desktop size is now out of date -- reconnect to re-negotiate.", comment: "adr/0015 §5.A.3 display-change note: the session desktop size is out of date") }
+    static var displayNoteUnaffected: String { String(localized: "dn_ok", defaultValue: "Display change: this session's desktop size is unaffected.", comment: "adr/0015 §5.A.3 display-change note: the session desktop size is unaffected") }
+
     // MARK: Main window detail
     static var connectionHeader: String { String(localized: "conn_h", defaultValue: "Connection", comment: "Main window: card title") }
     static var fieldAddress: String { String(localized: "f_addr", defaultValue: "Address", comment: "Main window: field label") }

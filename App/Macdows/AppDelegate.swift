@@ -205,17 +205,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			if change.currentTopologyIsEmpty {
 				// adr/0015 §5.A.6: an empty screen list is a real, transient state (lock, sleep,
 				// a display switching mode) and is reported, never folded into a 0x0 desktop.
-				note = "Display change: no usable display right now."
+				note = UIStrings.displayNoteNoDisplay
 			} else if change.sessionDesktopSize == nil {
 				// No connect since launch (or since the last session ended), so there is no
 				// negotiated size to be stale. Distinguishable precisely because the payload
 				// carries the session's size (adr/0015 §5.A.2), so say so instead of reporting
 				// "unaffected", which would imply a session exists.
-				note = "Display change: no session yet -- the desktop size is taken at connect."
+				note = UIStrings.displayNoteNoSession
 			} else if change.connectedDesktopSizeIsStale {
-				note = "Display change: this session's desktop size is now out of date -- reconnect to re-negotiate."
+				note = UIStrings.displayNoteStale
 			} else {
-				note = "Display change: this session's desktop size is unaffected."
+				note = UIStrings.displayNoteUnaffected
 			}
 			self.lastDisplayChangeNote = note
 			self.statusLabel.stringValue = note
