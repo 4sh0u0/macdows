@@ -86,6 +86,14 @@ final class BannerView: NSView {
         content.spacing = 12
         content.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
         texts.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        // F-5: across a horizontal stack, NSStackView keeps the top / bottom edgeInsets only as a
+        // priority-250 preference (`>= 0` is the only required edge), so the stack's own hugging
+        // pulled the banner down onto a two-line text column and the text touched both edges.
+        // Each item keeps the top / bottom inset as a required minimum instead.
+        for item in row {
+            item.topAnchor.constraint(greaterThanOrEqualTo: content.topAnchor, constant: content.edgeInsets.top).isActive = true
+            content.bottomAnchor.constraint(greaterThanOrEqualTo: item.bottomAnchor, constant: content.edgeInsets.bottom).isActive = true
+        }
 
         let background = GlassStyle.bannerBackground(containing: content, tone: model.tone)
         addSubview(background)

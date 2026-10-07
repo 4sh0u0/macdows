@@ -68,12 +68,16 @@ enum GlassStyle {
         }
     }
 
+    /// F-5 test seam: true makes `bannerBackground` build the 14–25 material on 26 too, so the
+    /// offline tests can lay out both branches on one machine. The App never sets it.
+    static var forceLegacyMaterial = false
+
     /// A banner's background with `content` inside: `NSGlassEffectView` (Regular, corner radius 16,
     /// a low-saturation tint for warnings / errors) on 26; on 14–25 an `NSVisualEffectView` with the
     /// `.headerView` material and a 12 % wash of the same colour, same radius (§3 banner row).
     static func bannerBackground(containing content: NSView, tone: Tone) -> NSView {
         content.translatesAutoresizingMaskIntoConstraints = false
-        if #available(macOS 26, *) {
+        if #available(macOS 26, *), !forceLegacyMaterial {
             let glass = NSGlassEffectView()
             glass.style = .regular
             glass.cornerRadius = 16
