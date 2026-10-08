@@ -8094,10 +8094,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     /// keyUp carrying `charactersIgnoringModifiers`, flagsChanged Cmd-up) -- never a direct
     /// `RemoteWindowRegistry.handleInput` call, so `RemoteWindowContentView` ->
     /// `CommandKeyMapper` -> the wire is all genuinely exercised. Operator note (adr/0011
-    /// §1's mixing rule): the chords only take the scancode path while the Mac's CURRENT
-    /// keyboard input source is ASCII-capable -- a composing CJK source would hand the
-    /// letter keys to `interpretKeyEvents` instead, which is the `.ime` battery's lane, not
-    /// this one's.
+    /// §1's mixing rule, its Command row since F-a1-5): a Command chord takes the scancode
+    /// path whatever the Mac's CURRENT keyboard input source is -- a composing CJK source
+    /// no longer hands these chords to `interpretKeyEvents` (that lane is the `.ime`
+    /// battery's, for plain keys), so the source selected on the Mac does not gate this
+    /// battery any more.
     private func armCmdMapLiveScript(windowId: UInt32) {
         guard let seed = cmdMapSeed else {
             // Already reported loudly at startup (`applicationDidFinishLaunching`) and gated
@@ -8149,11 +8150,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     ///
     /// Operator note: no real input method needs to be SELECTED on the Mac for this -- the
     /// commit is delivered programmatically to the very method an input method would call,
-    /// which is the whole point. Run it with an ordinary ASCII-capable source active, so the
-    /// Cmd+S that follows still takes the scancode path (adr/0011 §1's mixing rule hands
-    /// non-always-scancode keys to `interpretKeyEvents` while a composing source is active,
-    /// and a Cmd+S swallowed there would never save the file the readback pass is going to
-    /// read).
+    /// which is the whole point. The Cmd+S that follows takes the scancode path whatever
+    /// source is active (adr/0011 §1's Command row, F-a1-5: a Command chord never goes to
+    /// `interpretKeyEvents`), so the Mac's selected input source no longer gates the save the
+    /// readback pass is going to read.
     private func armImeScript(windowId: UInt32) {
         let text = Self.imeCommitText
         // adr/0011 §5 item 6 says fifty characters; this asserts the constant still IS fifty
