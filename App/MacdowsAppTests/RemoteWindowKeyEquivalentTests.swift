@@ -13,9 +13,10 @@ import Testing
 // here), so "key" is supplied by `KeyStateWindow`, a window whose `isKeyWindow` the test sets. A
 // standalone .app launched through LaunchServices (`open`) does get a real key window: gate r1's
 // probe `probe-dispatch-order.swift` ran that way and observed the view answering before the menu.
-// Which lane a claimed letter then takes (scancode vs `interpretKeyEvents`) depends on the
-// live input source, so claimed events are compared with what `keyDown` produces for the same
-// event on a twin view -- the claim must be "the same body", whatever that body does here.
+// Claimed events are compared with what `keyDown` produces for the same event on a twin view --
+// the claim must be "the same body", whatever that body does here. Since F-a1-5 that body sends a
+// Command chord down the scancode lane whatever the input source; the lane itself is pinned with
+// the input-source seam fixed to a CJK source (`aClaimedChordIsNotHandedToTheIMEUnderACJKSource`).
 
 private func keyEquivalentRepoRoot() -> URL {
     URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -182,6 +183,33 @@ struct RemoteWindowKeyEquivalentTests {
         defer { window.close() }
         #expect(view.performKeyEquivalent(with: try Self.key("c", keyCode: 8, flags)) == false)
         #expect(box.events.isEmpty)
+    }
+
+    /// F-a1-5 (a): the claim path shares `handleKeyDown`, so the fork fix holds there too -- under a
+    /// non-ASCII-capable source a claimed ⌘W reports the alignment and then the key itself, instead
+    /// of being handed to `interpretKeyEvents` and swallowed (YES was returned all the same, so the
+    /// menu never saw it either: ⌘W did nothing at all).
+    @Test("F-a1-5: a claimed ⌘W under a CJK source is not handed to the IME: alignment, then the key")
+    func aClaimedChordIsNotHandedToTheIMEUnderACJKSource() throws {
+        let (window, view, box) = Self.makeHosted()
+        defer { window.close() }
+        let event = try Self.key("w", keyCode: 13, .command)
+        let live = RemoteWindowContentView.inputSourceIsASCIICapable
+        RemoteWindowContentView.inputSourceIsASCIICapable = { false }
+        defer { RemoteWindowContentView.inputSourceIsASCIICapable = live }
+        #expect(view.performKeyEquivalent(with: event) == true)
+        try #require(box.events.count == 2, "\(box.rendered)")
+        guard case .flagsChanged(let aligned) = box.events[0] else {
+            Issue.record("first event was \(box.events[0]), expected the alignment .flagsChanged")
+            return
+        }
+        #expect(aligned.contains(.command))
+        guard case .keyDown(let code, _, let charsIM) = box.events[1] else {
+            Issue.record("second event was \(box.events[1]), expected .keyDown")
+            return
+        }
+        #expect(code == 13)
+        #expect(charsIM == "w")
     }
 
     @Test("adr/0022 I-4: a window that is not key claims nothing, reserved or not")

@@ -249,7 +249,8 @@ final class RemoteWindowContentView: NSView {
     ///     I-1 -- AppKit's injected fn / Globe items included); only when no item matches does
     ///     AppKit re-deliver it as `keyDown`.
     ///  3. Command, not reserved: the same body `keyDown` runs (modifier alignment first, then the
-    ///     input-source fork), and YES, so the menu never sees it.
+    ///     scancode lane -- a Command chord never takes the IME lane, F-a1-5), and YES, so the menu
+    ///     never sees it.
     ///  4. Command, reserved (`LocalKeyEquivalent.reserved`): align modifiers exactly as `keyDown`
     ///     does -- so a Cmd press this view never observed puts `CommandKeyMapper` into its
     ///     withheld state first and the bare letter cannot leak through the ordinary lane -- then
@@ -302,12 +303,12 @@ final class RemoteWindowContentView: NSView {
         // produces zero transitions), so this is always safe to send.
         reportModifierAlignment(for: event)
 
-        // adr/0011 §1's mixing rule: modifier/function/arrow/Enter/Tab/Esc keys always go
-        // scancode regardless of input source; everything else defers to whether the
-        // *current* input source is ASCII-capable -- a non-ASCII-capable (CJK/合成型)
-        // source hands its work back via NSTextInputClient (insertText:/setMarkedText:
-        // below), not scancodes.
-        if !Self.isAlwaysScancodeKey(macKeyCode: event.keyCode), !Self.isCurrentInputSourceASCIICapable() {
+        // adr/0011 §1's mixing rule: modifier/function/arrow/Enter/Tab/Esc keys and (F-a1-5)
+        // every Command chord always go scancode regardless of input source
+        // (`takesScancodeLane`); everything else defers to whether the *current* input source
+        // is ASCII-capable -- a non-ASCII-capable (CJK/合成型) source hands its work back via
+        // NSTextInputClient (insertText:/setMarkedText: below), not scancodes.
+        if !Self.takesScancodeLane(event), !Self.inputSourceIsASCIICapable() {
             interpretKeyEvents([event])
             return
         }
@@ -326,8 +327,10 @@ final class RemoteWindowContentView: NSView {
         // the physical key that produced this keyUp was already fully consumed locally by
         // interpretKeyEvents on the matching keyDown (adr/0011 §1/§2: only the final
         // committed string ever crosses the wire for that path) -- no scancode keyUp for
-        // it either, except for the same always-scancode carve-out.
-        if !Self.isAlwaysScancodeKey(macKeyCode: event.keyCode), !Self.isCurrentInputSourceASCIICapable() {
+        // it either, except for the same carve-out (`takesScancodeLane`: the always-scancode
+        // keys and, F-a1-5, every Command chord -- its keyDown went to the wire, so its keyUp
+        // must too).
+        if !Self.takesScancodeLane(event), !Self.inputSourceIsASCIICapable() {
             return
         }
         onEvent?(.keyUp(
@@ -339,6 +342,20 @@ final class RemoteWindowContentView: NSView {
 
     override func flagsChanged(with event: NSEvent) {
         onEvent?(.flagsChanged(modifierFlags: event.modifierFlags.intersection(.deviceIndependentFlagsMask)))
+    }
+
+    /// adr/0011 §1's table, with one row added by F-a1-5: an event takes the scancode lane,
+    /// whatever the input source, when its key is an always-scancode key (below) OR its
+    /// modifier flags contain Command. A Command chord is `CommandKeyMapper`'s lane (adr/0011
+    /// §3), never text input: an input method does not handle ⌘W / ⌘C / ⌘V / ⌘Z, so handing
+    /// one to `interpretKeyEvents` under a non-ASCII-capable source swallowed it -- no
+    /// `.keyDown` reached the mapper, already withheld by the alignment `.flagsChanged`, and the
+    /// chord did nothing (F-a1-5, owner in person 2026-10-08: ⌘W on a remote Notepad window).
+    /// Control and Option chords keep the input-source fork (an input method does use some
+    /// Control chords). `handleKeyDown` and `keyUp(with:)` share this one predicate, so a
+    /// chord's down and up always take the same lane.
+    private static func takesScancodeLane(_ event: NSEvent) -> Bool {
+        isAlwaysScancodeKey(macKeyCode: event.keyCode) || event.modifierFlags.contains(.command)
     }
 
     /// adr/0011 §1's table: "修饰键、功能键、方向键、Enter/Tab/Esc——无论输入源" always take the
@@ -363,6 +380,13 @@ final class RemoteWindowContentView: NSView {
         default: return false
         }
     }
+
+    /// F-a1-5's test seam: where `handleKeyDown` and `keyUp(with:)` read whether the current
+    /// input source is ASCII-capable. The App never sets it, so the live read below is what
+    /// runs; a test sets a fixed answer and restores this default in a `defer`, which makes the
+    /// input-source fork assertable without depending on the test runner's own keyboard
+    /// settings (the shape of `DockAnchorLocator.screensProvider`).
+    static var inputSourceIsASCIICapable: () -> Bool = { RemoteWindowContentView.isCurrentInputSourceASCIICapable() }
 
     /// adr/0011 §1/§2: whether the *currently active* keyboard input source is ASCII-
     /// capable (`TISCopyCurrentKeyboardInputSource`'s `kTISPropertyInputSourceIsASCIICapable`

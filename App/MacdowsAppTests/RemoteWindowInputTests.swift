@@ -6,12 +6,15 @@ import Testing
 // NSWindow). See DisplayTopologyProviderTests.swift's file header for the lane's shared
 // coverage-boundary register; boundaries specific to THIS file:
 //
-//  * The IME routing fork in `keyDown(with:)`/`keyUp(with:)` (`isCurrentInputSourceASCIICapable`)
-//    reads the LIVE `TISCopyCurrentKeyboardInputSource`, so which lane a non-carve-out key
-//    takes depends on whatever input source the test runner's user session happens to have
-//    active -- environment-dependent, not assertable. Only the always-scancode carve-out
-//    (Return below), which bypasses that check by construction, is pinned. The
-//    `interpretKeyEvents` lane additionally needs a live input context.
+//  * The IME routing fork in `keyDown(with:)`/`keyUp(with:)` reads the input source through
+//    `RemoteWindowContentView.inputSourceIsASCIICapable` (F-a1-5's seam), so which lane a key
+//    takes IS assertable: the F-a1-5 tests below fix the answer and put the live read back in a
+//    `defer`. What stays unpinned is only the live read itself (`isCurrentInputSourceASCIICapable`,
+//    the seam's default: `TISCopyCurrentKeyboardInputSource` answers for whatever input source the
+//    test runner's user session has active) and what `interpretKeyEvents` then does with a key (it
+//    needs a live input context), so the IME-lane tests assert only "no scancode key event". Tests
+//    that leave the seam alone run with the live read; their keys (Return, Escape) take the
+//    scancode lane whatever it says.
 //  * Mouse coverage is left-button only: `NSEvent.mouseEvent(...)` offers no way to set
 //    `buttonNumber`, so `otherMouseDown`'s `buttonNumber == 2` middle-vs-side-button gate is
 //    not synthesizable headless. `scrollWheel`'s `deltaX/deltaY` are likewise not settable on
@@ -33,6 +36,54 @@ struct RemoteWindowInputTests {
 
     private final class EventBox {
         var events: [RemoteWindowInputEvent] = []
+    }
+
+    /// F-a1-5's seam, fixed to `asciiCapable` for the length of `body`; the live read goes back in
+    /// a `defer`, whatever `body` does.
+    private static func withInputSource<T>(asciiCapable: Bool, _ body: () throws -> T) rethrows -> T {
+        let live = RemoteWindowContentView.inputSourceIsASCIICapable
+        RemoteWindowContentView.inputSourceIsASCIICapable = { asciiCapable }
+        defer { RemoteWindowContentView.inputSourceIsASCIICapable = live }
+        return try body()
+    }
+
+    private static func key(
+        _ charactersIgnoringModifiers: String, characters: String? = nil, keyCode: UInt16,
+        _ flags: NSEvent.ModifierFlags, type: NSEvent.EventType = .keyDown
+    ) throws -> NSEvent {
+        try #require(NSEvent.keyEvent(
+            with: type, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: 0,
+            context: nil, characters: characters ?? charactersIgnoringModifiers,
+            charactersIgnoringModifiers: charactersIgnoringModifiers, isARepeat: false, keyCode: keyCode
+        ))
+    }
+
+    /// What a fresh windowless view reports for `event` (delivered as `keyDown` or `keyUp` by its
+    /// type) with the input source fixed to `asciiCapable`.
+    private static func reported(_ event: NSEvent, asciiCapable: Bool) -> [RemoteWindowInputEvent] {
+        let (view, events) = makeView()
+        withInputSource(asciiCapable: asciiCapable) {
+            if event.type == .keyUp {
+                view.keyUp(with: event)
+            } else {
+                view.keyDown(with: event)
+            }
+        }
+        return events()
+    }
+
+    private static func rendered(_ events: [RemoteWindowInputEvent]) -> [String] {
+        events.map { "\($0)" }
+    }
+
+    /// Whether `events` holds a scancode key event (`.keyDown` or `.keyUp`).
+    private static func hasScancodeKey(_ events: [RemoteWindowInputEvent]) -> Bool {
+        events.contains {
+            switch $0 {
+            case .keyDown, .keyUp: true
+            default: false
+            }
+        }
     }
 
     /// The W4c first-click contract this file's own doc comment names: a borderless RAIL
@@ -215,5 +266,104 @@ struct RemoteWindowInputTests {
         #expect(view.selectedRange().location == NSNotFound)
         #expect(view.characterIndex(for: .zero) == NSNotFound)
         #expect(view.attributedSubstring(forProposedRange: NSRange(location: 0, length: 1), actualRange: nil) == nil)
+    }
+
+    // MARK: - F-a1-5: the input-source fork, through the seam
+
+    /// F-a1-5 (a): under a non-ASCII-capable source (a CJK input method, the owner's usual state) a
+    /// Command chord used to go to `interpretKeyEvents`, which swallowed it, so `CommandKeyMapper`
+    /// never saw the key. It now takes the scancode lane: the alignment `.flagsChanged` carrying
+    /// Command, then `.keyDown` -- exactly what an ASCII-capable source reports for the same event
+    /// -- and never `.unicodeText`.
+    @Test(
+        "F-a1-5: a Command chord takes the scancode lane under a CJK source, exactly as under an ASCII one",
+        arguments: [("w", UInt16(13)), ("c", UInt16(8)), ("v", UInt16(9)), ("z", UInt16(6))]
+    )
+    func commandChordTakesTheScancodeLaneUnderACJKSource(character: String, keyCode: UInt16) throws {
+        let event = try Self.key(character, keyCode: keyCode, .command)
+        let cjk = Self.reported(event, asciiCapable: false)
+        #expect(Self.rendered(cjk) == Self.rendered(Self.reported(event, asciiCapable: true)))
+        try #require(cjk.count == 2, "\(cjk)")
+        guard case .flagsChanged(let flags) = cjk[0] else {
+            Issue.record("first event was \(cjk[0]), expected the alignment .flagsChanged")
+            return
+        }
+        #expect(flags.contains(.command))
+        guard case .keyDown(let code, let chars, let charsIM) = cjk[1] else {
+            Issue.record("second event was \(cjk[1]), expected .keyDown")
+            return
+        }
+        #expect(code == keyCode)
+        #expect(chars == character && charsIM == character)
+        #expect(!cjk.contains { if case .unicodeText = $0 { true } else { false } })
+    }
+
+    /// F-a1-5 (a), the up half: the keyUp of a Command chord takes the same lane as its keyDown, so
+    /// the remote key is released.
+    @Test("F-a1-5: the keyUp of ⌘W takes the scancode lane under a CJK source too")
+    func commandChordKeyUpTakesTheScancodeLaneUnderACJKSource() throws {
+        let event = try Self.key("w", keyCode: 13, .command, type: .keyUp)
+        let cjk = Self.reported(event, asciiCapable: false)
+        #expect(Self.rendered(cjk) == Self.rendered(Self.reported(event, asciiCapable: true)))
+        try #require(cjk.count == 2, "\(cjk)")
+        guard case .flagsChanged(let flags) = cjk[0] else {
+            Issue.record("first event was \(cjk[0]), expected the alignment .flagsChanged")
+            return
+        }
+        #expect(flags.contains(.command))
+        guard case .keyUp(let code, _, let charsIM) = cjk[1] else {
+            Issue.record("second event was \(cjk[1]), expected .keyUp")
+            return
+        }
+        #expect(code == 13)
+        #expect(charsIM == "w")
+    }
+
+    /// F-a1-5 changes nothing for a plain key: under a CJK source a bare letter still goes to the
+    /// input method (whatever `interpretKeyEvents` does with it on a windowless view is not asserted
+    /// beyond "no scancode key event"), and under an ASCII-capable source it is a scancode key.
+    @Test("F-a1-5 leaves plain keys alone: a bare letter takes the IME lane under a CJK source, the scancode lane under an ASCII one")
+    func plainKeysStillTakeTheIMELaneUnderACJKSource() throws {
+        let down = try Self.key("a", keyCode: 0, [])
+        let up = try Self.key("a", keyCode: 0, [], type: .keyUp)
+        let cjkDown = Self.reported(down, asciiCapable: false)
+        #expect(!Self.hasScancodeKey(cjkDown), "\(cjkDown)")
+        let cjkUp = Self.reported(up, asciiCapable: false)
+        #expect(!Self.hasScancodeKey(cjkUp), "\(cjkUp)")
+        let asciiDown = Self.reported(down, asciiCapable: true)
+        #expect(asciiDown.contains { if case .keyDown(0, "a", "a") = $0 { true } else { false } }, "\(asciiDown)")
+        let asciiUp = Self.reported(up, asciiCapable: true)
+        #expect(asciiUp.contains { if case .keyUp(0, "a", "a") = $0 { true } else { false } }, "\(asciiUp)")
+    }
+
+    /// The F-a1-5 row is Command only: a Control chord keeps today's fork (an input method does use
+    /// some Control chords) -- the IME lane under a CJK source, the scancode lane under an ASCII one.
+    @Test("F-a1-5 is Command only: ⌃A keeps today's fork")
+    func controlChordKeepsTodaysFork() throws {
+        let event = try Self.key("a", characters: "\u{1}", keyCode: 0, .control)
+        let cjk = Self.reported(event, asciiCapable: false)
+        #expect(!Self.hasScancodeKey(cjk), "\(cjk)")
+        let ascii = Self.reported(event, asciiCapable: true)
+        #expect(ascii.contains { if case .keyDown(0, _, "a") = $0 { true } else { false } }, "\(ascii)")
+    }
+
+    /// adr/0011 §1's always-scancode carve-out does not depend on the source: the Return keyDown and
+    /// Escape keyUp pinned above report the same two events with the seam fixed to a CJK source.
+    @Test("the always-scancode carve-out holds under a CJK source: Return down, Escape up")
+    func alwaysScancodeKeysTakeTheScancodeLaneUnderACJKSource() throws {
+        let enter = try Self.key("\r", keyCode: 36, [])
+        let escape = try Self.key("\u{1b}", keyCode: 53, [], type: .keyUp)
+        let down = Self.reported(enter, asciiCapable: false)
+        try #require(down.count == 2, "\(down)")
+        guard case .flagsChanged = down[0], case .keyDown(36, "\r", "\r") = down[1] else {
+            Issue.record("Return under a CJK source reported \(down)")
+            return
+        }
+        let up = Self.reported(escape, asciiCapable: false)
+        try #require(up.count == 2, "\(up)")
+        guard case .flagsChanged = up[0], case .keyUp(53, "\u{1b}", "\u{1b}") = up[1] else {
+            Issue.record("Escape under a CJK source reported \(up)")
+            return
+        }
     }
 }

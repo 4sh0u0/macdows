@@ -395,6 +395,10 @@ final class RemoteWindow {
     /// `self` -- see its registration below -- so it is not what keeps a `RemoteWindow`
     /// instance alive either.)
     private var didResignKeyObserver: NSObjectProtocol?
+    /// F-a1-5 (b): token for the `NSWindow.didBecomeKeyNotification` observer that puts the
+    /// content view back as first responder whenever this window becomes key -- removed in
+    /// `close(via:)` beside `didResignKeyObserver`, for the same reason.
+    private var didBecomeKeyObserver: NSObjectProtocol?
 
     /// Phase 2 W3 (docs/plans/phase2.md §2 W3, adr/0012's optimistic-prediction principle
     /// applied to geometry): incremented by each of the two independent local-geometry-
@@ -531,7 +535,9 @@ final class RemoteWindow {
         // reach RemoteWindowContentView's overrides at all until *something else* first
         // made it first responder (e.g. a second click) — makeFirstResponder here plus
         // acceptsFirstMouse==true together are what let a single click on a background
-        // remote window both raise it and register as real forwarded input.
+        // remote window both raise it and register as real forwarded input. This is the
+        // creation-time half; `didBecomeKeyObserver` below re-asserts it every time the window
+        // becomes key (F-a1-5).
         win.makeFirstResponder(contentView)
 
         self.window = win
@@ -568,6 +574,24 @@ final class RemoteWindow {
             // dynamically always main-actor" situation.
             MainActor.assumeIsolated {
                 contentView?.onEvent?(.focusLost)
+            }
+        }
+
+        // F-a1-5 (b): a remote window has exactly one view, so whenever the window is key the
+        // content view must be its first responder. If the first responder ever drifted (to the
+        // window itself, say), every key would go to `NSWindow.keyDown` and the content view's
+        // `performKeyEquivalent` would refuse to claim ⌘W / ⌘C / ... under adr/0022 I-4's
+        // first-responder half -- silently, until a click made the view first responder again
+        // (the owner's in-person sequence, 2026-10-08). Becoming key re-asserts it; a no-op when
+        // it already holds. I-4 itself is not relaxed. [weak win, weak contentView]: same
+        // reasoning as the didResignKey observer above; same `queue: .main` + assumeIsolated
+        // shape.
+        didBecomeKeyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: win, queue: .main
+        ) { [weak win, weak contentView] _ in
+            MainActor.assumeIsolated {
+                guard let win, let contentView, win.firstResponder !== contentView else { return }
+                win.makeFirstResponder(contentView)
             }
         }
 
@@ -1661,6 +1685,10 @@ final class RemoteWindow {
             NotificationCenter.default.removeObserver(didResignKeyObserver)
             self.didResignKeyObserver = nil
         }
+        if let didBecomeKeyObserver {
+            NotificationCenter.default.removeObserver(didBecomeKeyObserver)
+            self.didBecomeKeyObserver = nil
+        }
         // Phase 2 W3: same "block observers keep firing until explicitly removed" reasoning
         // as didResignKeyObserver above, times four. moveSettleWorkItem is cancelled too --
         // nothing left to settle once this window is closing.
@@ -1696,12 +1724,13 @@ final class RemoteWindow {
             self.displayedMappedSize = nil
         }
     }
-    // No deinit backstop for didResignKeyObserver: `deinit` is always nonisolated even on
+    // No deinit backstop for didResignKeyObserver (or didBecomeKeyObserver, or the four
+    // geometry observers): `deinit` is always nonisolated even on
     // a @MainActor class (deallocation can happen from any thread), so it cannot safely
     // read a MainActor-isolated, non-Sendable stored property like an NSObjectProtocol
     // observer token. close(via:) above is this class's own documented single point of
     // teardown ("call exactly once, from RemoteWindowRegistry only") and already removes
-    // the observer. Every path that ends a session while windows are still tracked routes
+    // every observer. Every path that ends a session while windows are still tracked routes
     // through it via `closeAllWindows()` -- including, via the session-end entry
     // `RemoteWindowRegistry.closeWindowsForSessionEnd()` (adr/0020 §2 lane R), the App's own
     // teardown `AppDelegate.tearDownSession()` (adr/0020 §2 lane S), for every one of that
