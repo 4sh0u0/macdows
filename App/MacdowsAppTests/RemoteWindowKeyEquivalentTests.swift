@@ -13,9 +13,10 @@ import Testing
 // here), so "key" is supplied by `KeyStateWindow`, a window whose `isKeyWindow` the test sets. A
 // standalone .app launched through LaunchServices (`open`) does get a real key window: gate r1's
 // probe `probe-dispatch-order.swift` ran that way and observed the view answering before the menu.
-// Which lane a claimed letter then takes (scancode vs `interpretKeyEvents`) depends on the
-// live input source, so claimed events are compared with what `keyDown` produces for the same
-// event on a twin view -- the claim must be "the same body", whatever that body does here.
+// Claimed events are compared with what `keyDown` produces for the same event on a twin view --
+// the claim must be "the same body", whatever that body does here. Since F-a1-5 that body sends a
+// Command chord down the scancode lane whatever the input source; the lane itself is pinned with
+// the input-source seam fixed to a CJK source (`aClaimedChordIsNotHandedToTheIMEUnderACJKSource`).
 
 private func keyEquivalentRepoRoot() -> URL {
     URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -184,6 +185,33 @@ struct RemoteWindowKeyEquivalentTests {
         #expect(box.events.isEmpty)
     }
 
+    /// F-a1-5 (a): the claim path shares `handleKeyDown`, so the fork fix holds there too -- under a
+    /// non-ASCII-capable source a claimed ⌘W reports the alignment and then the key itself, instead
+    /// of being handed to `interpretKeyEvents` and swallowed (YES was returned all the same, so the
+    /// menu never saw it either: ⌘W did nothing at all).
+    @Test("F-a1-5: a claimed ⌘W under a CJK source is not handed to the IME: alignment, then the key")
+    func aClaimedChordIsNotHandedToTheIMEUnderACJKSource() throws {
+        let (window, view, box) = Self.makeHosted()
+        defer { window.close() }
+        let event = try Self.key("w", keyCode: 13, .command)
+        let live = RemoteWindowContentView.inputSourceIsASCIICapable
+        RemoteWindowContentView.inputSourceIsASCIICapable = { false }
+        defer { RemoteWindowContentView.inputSourceIsASCIICapable = live }
+        #expect(view.performKeyEquivalent(with: event) == true)
+        try #require(box.events.count == 2, "\(box.rendered)")
+        guard case .flagsChanged(let aligned) = box.events[0] else {
+            Issue.record("first event was \(box.events[0]), expected the alignment .flagsChanged")
+            return
+        }
+        #expect(aligned.contains(.command))
+        guard case .keyDown(let code, _, let charsIM) = box.events[1] else {
+            Issue.record("second event was \(box.events[1]), expected .keyDown")
+            return
+        }
+        #expect(code == 13)
+        #expect(charsIM == "w")
+    }
+
     @Test("adr/0022 I-4: a window that is not key claims nothing, reserved or not")
     func notKeyWindowClaimsNothing() throws {
         let (window, view, box) = Self.makeHosted(key: false)
@@ -238,6 +266,40 @@ struct RemoteWindowKeyEquivalentTests {
         #expect(events.first?.hasPrefix("flagsChanged") == true)
     }
 
+    /// gate r1 I-1's keyUp ledger records only keyDowns that took the scancode lane; a reserved
+    /// pair's keyDown never reaches it -- `performKeyEquivalent` hands the pair to the menu and the
+    /// re-delivered `keyDown` returns before `handleKeyDown` -- so the pair's release is what it was
+    /// before the ledger: Q released while ⌘ is still held reports the alignment and `.keyUp` (a
+    /// Command chord's lane), and Q released after ⌘ under a CJK source reports only the alignment.
+    /// No earlier pin covered a reserved pair's `keyUp(with:)` (`keyUpIsNotClaimed` is about
+    /// `performKeyEquivalent`), so this is a new test rather than an extended one.
+    @Test("gate r1 I-1: a reserved pair's release is unchanged by the keyUp ledger (⌘Q)")
+    func aReservedPairsReleaseIsUnchanged() throws {
+        let live = RemoteWindowContentView.inputSourceIsASCIICapable
+        defer { RemoteWindowContentView.inputSourceIsASCIICapable = live }
+        let down = try Self.key("q", keyCode: 12, .command)
+
+        RemoteWindowContentView.inputSourceIsASCIICapable = { true }
+        let (window, view, box) = Self.makeHosted()
+        defer { window.close() }
+        #expect(view.performKeyEquivalent(with: down) == false)
+        box.events.removeAll()
+        view.keyUp(with: try Self.key("q", keyCode: 12, .command, type: .keyUp))
+        #expect(box.rendered == [
+            "\(RemoteWindowInputEvent.flagsChanged(modifierFlags: .command))",
+            "\(RemoteWindowInputEvent.keyUp(macKeyCode: 12, characters: "q", charactersIgnoringModifiers: "q"))",
+        ])
+
+        RemoteWindowContentView.inputSourceIsASCIICapable = { false }
+        let (cjkWindow, cjkView, cjkBox) = Self.makeHosted()
+        defer { cjkWindow.close() }
+        #expect(cjkView.performKeyEquivalent(with: down) == false)
+        cjkView.keyDown(with: down)
+        cjkBox.events.removeAll()
+        cjkView.keyUp(with: try Self.key("q", keyCode: 12, [], type: .keyUp))
+        #expect(cjkBox.rendered == ["\(RemoteWindowInputEvent.flagsChanged(modifierFlags: []))"])
+    }
+
     // MARK: - T-5: remote windows stay out of the Window menu (adr/0022 D-5 W2)
 
     @Test("a RemoteWindow's NSWindow is excluded from the Window menu")
@@ -284,5 +346,26 @@ struct RemoteWindowKeyEquivalentTests {
     func registryArmCallsTheMapper() throws {
         let arm = try Self.localKeyEquivalentArm(in: try Self.registryCode())
         #expect(keyEquivalentOccurrences(of: "commandKeyMapper.localKeyEquivalent()", in: String(arm)) == 1, "\(arm)")
+    }
+
+    // MARK: - F-a1-5's input-source seam (gate r1 m-3)
+
+    private static let input = "App/RemoteWindowRendering/RemoteWindowInput.swift"
+
+    /// gate r1 m-3: the seam's declaration line calls the live read, so the App -- which never sets
+    /// the seam -- forks on the real input source. The runtime twin,
+    /// `RemoteWindowInputTests.seamDefaultIsTheLiveInputSourceRead`, catches a constant default only
+    /// while the runner's active source disagrees with it; this one always does. Each line goes
+    /// through the strip on its own, so the declaration stays one line and its doc comment drops out.
+    @Test("gate r1 m-3: the input-source seam's declaration defaults to isCurrentInputSourceASCIICapable()")
+    func theSeamDeclarationCallsTheLiveRead() throws {
+        let url = keyEquivalentRepoRoot().appendingPathComponent(Self.input)
+        let text = try String(contentsOf: url, encoding: .utf8)
+        let label = "static var inputSourceIsASCIICapable"
+        #expect(keyEquivalentOccurrences(of: label, in: keyEquivalentCodeOnly(text)) == 1, "the seam is not declared once")
+        let lines = text.split(separator: "\n").map { keyEquivalentCodeOnly(String($0)) }
+        #expect(!lines.contains { $0.contains("F-a1-5's test seam") }, "a line comment survived the strip")
+        let declaration = try #require(lines.first { $0.contains(label) })
+        #expect(declaration.contains("isCurrentInputSourceASCIICapable()"), "\(declaration)")
     }
 }

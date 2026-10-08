@@ -86,10 +86,15 @@ final class DockMenuController: NSObject {
     /// F-a1-2 (owner ruling (a)): the Dock draws this menu itself and drops every colour of an
     /// attributed title (probe runbook 3.1 and the product, in person), so the arguments are set off
     /// by a visible separator in a plain title -- "Example.exe — /open" -- and no
-    /// attributed title is set. The 40-character middle cut applies to the whole string. The panel's
-    /// rows keep the arguments in the secondary colour.
+    /// attributed title is set. Gate r1 observation (813d76f): when another row of the same section
+    /// has the same display name, the row's qualifier (its parent folder, `LaunchCatalog.Row`)
+    /// follows the title in parentheses, before the separator -- "Example.exe (Tools) — /open",
+    /// "Example.exe (Other)" -- so two such rows no longer read identically here while the panel's
+    /// rows tell them apart. The 40-character middle cut applies to the whole string, qualifier
+    /// included. The panel's rows keep the qualifier and arguments in the secondary colour.
     private static func launchItem(_ row: LaunchCatalog.Row, target: DockMenuController?) -> NSMenuItem {
-        let full = row.arguments.isEmpty ? row.title : row.title + argumentSeparator + row.arguments
+        let name = row.qualifier.map { "\(row.title) (\($0))" } ?? row.title
+        let full = row.arguments.isEmpty ? name : name + argumentSeparator + row.arguments
         let title = truncated(full, limit: StartPanelPolicy.dockMenuTitleLimit)
         let item = NSMenuItem(title: title, action: #selector(launchProgram(_:)), keyEquivalent: "")
         item.target = target

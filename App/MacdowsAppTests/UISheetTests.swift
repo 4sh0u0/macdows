@@ -97,6 +97,116 @@ struct PasswordAndEditorTests {
                 == .success(.init(address: "192.0.2.10", port: 3389, preset: TestFingerprints.a)))
         #expect(E.message(for: .presetSHA1) == UIStrings.editorFingerprintSHA1)
     }
+
+    /// `start`, then the views reached by following `step` up to `count` times; a nil link or the
+    /// return to `start` (appended once) ends the walk.
+    private static func keyViewWalk(from start: NSView, count: Int, step: (NSView) -> NSView?) -> [ObjectIdentifier] {
+        var walk = [ObjectIdentifier(start)]
+        var view = start
+        for _ in 0..<count {
+            guard let next = step(view) else { break }
+            walk.append(ObjectIdentifier(next))
+            if next === start { break }
+            view = next
+        }
+        return walk
+    }
+
+    @Test("F-a1-10: the Host Editor's Tab order is the field order and closes back to Name; Shift-Tab follows it")
+    func editorTabOrderIsTheFieldOrder() {
+        let record = HostRecord(displayName: "Office PC", address: "workstation.example", userName: "user", remembersPassword: true)
+        let modes: [(HostEditorSheet.Mode, HostEditorSheet.PresetState)] = [(.new, .loaded(nil)), (.edit(record), .loaded(TestFingerprints.a))]
+        for (mode, preset) in modes {
+            let sheet = HostEditorSheet(mode: mode, presetState: preset)
+            #expect(sheet.window.initialFirstResponder === sheet.nameField)
+            let chain: [NSView] = [sheet.nameField, sheet.addressField, sheet.portField, sheet.userField, sheet.passwordField,
+                                   sheet.revealedPasswordField, sheet.revealButton, sheet.rememberBox, sheet.touchIDBox,
+                                   sheet.presetField, sheet.cancelButton, sheet.saveButton]
+            let walk = Self.keyViewWalk(from: sheet.nameField, count: 12) { $0.nextKeyView }
+            #expect(walk == chain.map(ObjectIdentifier.init) + [ObjectIdentifier(sheet.nameField)])
+            #expect(sheet.addressField.previousKeyView === sheet.nameField)
+            #expect(sheet.nameField.previousKeyView === sheet.saveButton)
+        }
+    }
+
+    @Test("F-a1-10: the Password sheet's Tab order is password, Remember, Cancel, Connect, and closes back to the field")
+    func passwordSheetTabOrder() {
+        let sheet = PasswordSheet(hostTitle: "Office PC", userName: "user")
+        #expect(sheet.window.initialFirstResponder === sheet.passwordField)
+        let chain: [NSView] = [sheet.passwordField, sheet.rememberBox, sheet.cancelButton, sheet.connectButton]
+        let walk = Self.keyViewWalk(from: sheet.passwordField, count: 4) { $0.nextKeyView }
+        #expect(walk == chain.map(ObjectIdentifier.init) + [ObjectIdentifier(sheet.passwordField)])
+        #expect(sheet.rememberBox.previousKeyView === sheet.passwordField)
+        #expect(sheet.passwordField.previousKeyView === sheet.connectButton)
+    }
+
+    @Test("F-a1-10: Tab skips the hidden password twin and the disabled Touch ID box; revealing swaps which twin it visits")
+    func tabOrderSkipsWhatIsNotValid() {
+        let sheet = HostEditorSheet(mode: .new, presetState: .loaded(nil))
+        let fields: [NSView] = [sheet.nameField, sheet.addressField, sheet.portField, sheet.userField, sheet.passwordField,
+                                sheet.revealedPasswordField, sheet.presetField]
+        let fieldIDs = Set(fields.map(ObjectIdentifier.init))
+        func validWalk() -> [ObjectIdentifier] { Self.keyViewWalk(from: sheet.nameField, count: 20) { $0.nextValidKeyView } }
+        func fieldOrder(_ views: [NSView]) -> [ObjectIdentifier] { views.map(ObjectIdentifier.init) }
+        // Buttons are valid key views only with Full Keyboard Access (a machine setting), so the walks
+        // pin the text fields' order and the two exclusions, never the buttons.
+
+        #expect(sheet.nameField.nextValidKeyView === sheet.addressField)
+        let hidden = validWalk()
+        #expect(!hidden.contains(ObjectIdentifier(sheet.revealedPasswordField)))
+        #expect(!hidden.contains(ObjectIdentifier(sheet.touchIDBox)))
+        #expect(hidden.filter(fieldIDs.contains) == fieldOrder([sheet.nameField, sheet.addressField, sheet.portField, sheet.userField,
+                                                               sheet.passwordField, sheet.presetField, sheet.nameField]))
+
+        sheet.revealButton.performClick(nil)
+        #expect(sheet.passwordField.isHidden)
+        #expect(!sheet.revealedPasswordField.isHidden)
+        let revealed = validWalk()
+        #expect(!revealed.contains(ObjectIdentifier(sheet.passwordField)))
+        #expect(!revealed.contains(ObjectIdentifier(sheet.touchIDBox)))
+        #expect(revealed.filter(fieldIDs.contains) == fieldOrder([sheet.nameField, sheet.addressField, sheet.portField, sheet.userField,
+                                                                 sheet.revealedPasswordField, sheet.presetField, sheet.nameField]))
+    }
+
+    /// gate r1 m-4: a window that recalculates its key-view loop rebuilds it from geometry when it is
+    /// displayed, overwriting the explicit F-a1-10 chain (and stopping at the selectable labels and
+    /// notes the chain leaves out); neither sheet turns it on.
+    @Test("gate r1 m-4: neither sheet's window recalculates its key-view loop")
+    func sheetsNeverRecalculateTheirKeyViewLoop() {
+        let record = HostRecord(displayName: "Office PC", address: "workstation.example", userName: "user", remembersPassword: true)
+        #expect(HostEditorSheet(mode: .new, presetState: .loaded(nil)).window.autorecalculatesKeyViewLoop == false)
+        #expect(HostEditorSheet(mode: .edit(record), presetState: .loaded(TestFingerprints.a)).window.autorecalculatesKeyViewLoop == false)
+        #expect(PasswordSheet(hostTitle: "Office PC", userName: "user").window.autorecalculatesKeyViewLoop == false)
+    }
+
+    /// gate r1 m-4, the reviewer's P-2 shape: the walks above run on sheets never shown, so they
+    /// would not see a chain that AppKit rebuilds at display. The same `nextKeyView` walk is taken
+    /// before and after the window is ordered front and drawn, for both sheets.
+    @Test("gate r1 m-4: the explicit Tab chain is unchanged after the sheet's window is ordered front and displayed")
+    func theChainSurvivesDisplay() {
+        _ = NSApplication.shared
+        func walk(_ start: NSView, _ count: Int) -> [ObjectIdentifier] { Self.keyViewWalk(from: start, count: count) { $0.nextKeyView } }
+        func displayed(_ window: NSWindow) {
+            window.orderFront(nil)
+            window.display()
+        }
+
+        let editor = HostEditorSheet(mode: .new, presetState: .loaded(nil))
+        defer { editor.window.orderOut(nil) }
+        let editorBefore = walk(editor.nameField, 12)
+        #expect(editorBefore.count == 13 && editorBefore.last == ObjectIdentifier(editor.nameField), "the loop closes before display")
+        displayed(editor.window)
+        #expect(editor.window.isVisible)
+        #expect(walk(editor.nameField, 12) == editorBefore)
+
+        let password = PasswordSheet(hostTitle: "Office PC", userName: "user")
+        defer { password.window.orderOut(nil) }
+        let passwordBefore = walk(password.passwordField, 4)
+        #expect(passwordBefore.count == 5 && passwordBefore.last == ObjectIdentifier(password.passwordField), "the loop closes before display")
+        displayed(password.window)
+        #expect(password.window.isVisible)
+        #expect(walk(password.passwordField, 4) == passwordBefore)
+    }
 }
 
 @MainActor

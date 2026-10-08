@@ -87,6 +87,43 @@ struct DockMenuControllerTests {
         #expect(longRow.title.count == 40 && longRow.title.hasPrefix("Example.exe — ") && longRow.attributedTitle == nil)
     }
 
+    /// Gate r1 observation (813d76f): two rows of a section with the same display name carry their
+    /// parent folder as a qualifier, and the Dock menu shows it -- in parentheses after the title,
+    /// before the em dash -- so the two rows no longer read identically. Catalog order, plain titles,
+    /// the full commands as tooltips.
+    @Test("same display name in one section: \"Example.exe (Tools) — /open\" and \"Example.exe (Other)\", in catalog order")
+    func duplicateNamesCarryTheQualifier() throws {
+        let lists = HostLaunchItems(pinned: [LaunchItem(displayName: "Example.exe", program: #"C:\Tools\Example.exe"#, arguments: "/open", date: Self.now),
+                                             LaunchItem(displayName: "Example.exe", program: #"C:\Other\Example.exe"#, arguments: "", date: Self.now)],
+                                    recent: [])
+        let menu = DockMenuController.menu(for: Self.reading(.live), lists: lists, target: nil)
+        let rows = menu.items.filter { $0.action == #selector(DockMenuController.launchProgram(_:)) }
+        #expect(rows.map(\.title) == ["Example.exe (Tools) — /open", "Example.exe (Other)"])
+        #expect(rows.allSatisfy { $0.attributedTitle == nil })
+        #expect(rows.map(\.toolTip) == [#"C:\Tools\Example.exe /open"#, #"C:\Other\Example.exe"#])
+        #expect(Self.titles(menu) == ["Example.exe (Tools) — /open", "Example.exe (Other)", "---", "Run…", "Open Macdows"])
+    }
+
+    /// The 40-character middle cut runs over the qualified whole: a 50-character qualifier, or a
+    /// qualified row's 50-character arguments, still gives exactly 40 characters that start with the
+    /// title and its opening parenthesis.
+    @Test("the 40-character cut applies to the qualified title as a whole")
+    func theCutCoversTheQualifier() throws {
+        let folder = String(repeating: "q", count: 50)
+        let arguments = String(repeating: "a", count: 50)
+        let lists = HostLaunchItems(pinned: [LaunchItem(displayName: "Example.exe", program: "C:\\" + folder + "\\Example.exe", arguments: "", date: Self.now),
+                                             LaunchItem(displayName: "Example.exe", program: #"C:\Tools\Example.exe"#, arguments: arguments, date: Self.now)],
+                                    recent: [])
+        let rows = DockMenuController.menu(for: Self.reading(.live), lists: lists, target: nil).items
+            .filter { $0.action == #selector(DockMenuController.launchProgram(_:)) }
+        try #require(rows.count == 2)
+        #expect(rows[0].title == DockMenuController.truncated("Example.exe (" + folder + ")", limit: 40))
+        #expect(rows[0].title.count == 40 && rows[0].title.hasPrefix("Example.exe (") && rows[0].title.hasSuffix(")"))
+        #expect(rows[1].title == DockMenuController.truncated("Example.exe (Tools) — " + arguments, limit: 40))
+        #expect(rows[1].title.count == 40 && rows[1].title.hasPrefix("Example.exe (Tools)"))
+        #expect(rows.allSatisfy { $0.attributedTitle == nil })
+    }
+
     /// F-a1-2's other half: the panel keeps the secondary colour -- its rows were never attributed
     /// strings: the title is one label in the label colour, the arguments another in the secondary.
     @Test("F-a1-2: the panel's row keeps the arguments in their own secondary-colour label")

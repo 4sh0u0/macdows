@@ -33,11 +33,17 @@ import Testing
 // after a real settle, the server-driven apply NOT echoing back, and observer scoping on both
 // halves (one window's resize must not settle another; nor must its move).
 //
-// Also unpinned, and left so on purpose: `close(via:)`'s observer teardown (five
-// `removeObserver` calls: didResignKey plus the four geometry observers) has no coverage
-// anywhere -- driving it needs a `CRSession`, which
-// is not constructible headless, and adding a test seam would cross the D7 boundary (no
-// test-motivated changes to the production Sources). Registered, not silently assumed.
+// `close(via:)`'s observer teardown (six `removeObserver` calls: didResignKey, didBecomeKey
+// (F-a1-5) and the four geometry observers) has no BEHAVIOURAL coverage anywhere -- driving it
+// needs a `CRSession`, which is not constructible headless, and adding a test seam would cross
+// the D7 boundary (no test-motivated changes to the production Sources). Since F-a1-5 it is pinned
+// as source instead (`closeRemovesEveryObserverTheInitializerAdds`: every observer the initializer
+// adds is removed exactly once, inside `close(via:)`'s body -- bounded by brace matching since gate
+// r1 m-1, so a removal moved into a method after it no longer counts). That a removal really stops
+// the block from firing is AppKit's contract, not pinned.
+//
+// The F-a1-5 (b) tests at the end use this suite's real-`RemoteWindow` construction for a
+// different hook: the content view is put back as first responder whenever the window becomes key.
 //
 // Where two windows appear in one test they take distinct `RemoteWindowKey.windowId`s purely
 // to mirror production; nothing in this suite keys on them -- the scoping key is the NSWindow
@@ -208,5 +214,94 @@ struct RemoteWindowLocalGeometrySyncTests {
         // ... and was not echoed.
         #expect(box.rects.isEmpty)
         #expect(rw.debugGeometrySuppressionCount == 0)
+    }
+
+    // MARK: - F-a1-5 (b): the content view is first responder whenever the window is key
+
+    private final class InputBox {
+        var events: [RemoteWindowInputEvent] = []
+    }
+
+    /// F-a1-5 (b): a remote window has one view, so if its first responder ever drifted, every key
+    /// would miss the content view and adr/0022 I-4 would refuse to claim ⌘W -- silently. Becoming
+    /// key puts the content view back. A throw-away text field stands in for the drift; the
+    /// notification is posted the way AppKit posts it, synchronously on the main thread. Posting it
+    /// again once the content view is first responder changes nothing and reports nothing (the
+    /// `.focusLost` the content view reports when it resigns is the event that would show a spurious
+    /// round trip).
+    @Test func becomingKeyRestoresTheContentViewAsFirstResponder() throws {
+        let (rw, _) = Self.make()
+        let inputs = InputBox()
+        rw.onInput = { inputs.events.append($0) }
+        let window = rw.window
+        let contentView = try #require(window.contentView as? RemoteWindowContentView)
+        try #require(window.firstResponder === contentView, "the creation-time makeFirstResponder")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 50, height: 20))
+        contentView.addSubview(field)
+        try #require(window.makeFirstResponder(field))
+        try #require(window.firstResponder !== contentView)
+
+        NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: window)
+        #expect(window.firstResponder === contentView)
+
+        inputs.events.removeAll()
+        NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: window)
+        #expect(window.firstResponder === contentView)
+        #expect(inputs.events.isEmpty, "\(inputs.events)")
+    }
+
+    /// The text of `RemoteWindow.swift` with line comments removed, so a call shape counted here is
+    /// a statement and never the prose explaining it.
+    private static func remoteWindowCode() throws -> String {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let text = try String(
+            contentsOf: root.appendingPathComponent("App/RemoteWindowRendering/RemoteWindow.swift"), encoding: .utf8
+        )
+        return text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> Substring in
+            guard let marker = line.range(of: "//") else { return line }
+            return line[line.startIndex..<marker.lowerBound]
+        }.joined(separator: "\n")
+    }
+
+    /// The body of the method whose signature is `signature` in `code`: the text between the
+    /// signature's opening brace and its matching closing brace, braces counted on the
+    /// comment-stripped text (no string literal in `close(via:)` holds a brace). Nil when the
+    /// signature is missing or its brace never closes.
+    private static func body(of signature: String, in code: String) -> Substring? {
+        guard let open = code.range(of: signature) else { return nil }
+        var depth = 1
+        var index = open.upperBound
+        while index < code.endIndex {
+            if code[index] == "{" {
+                depth += 1
+            } else if code[index] == "}" {
+                depth -= 1
+                if depth == 0 { return code[open.upperBound..<index] }
+            }
+            index = code.index(after: index)
+        }
+        return nil
+    }
+
+    /// The observer-count pin (F-a1-5 brief A8; the header's old "five removeObserver calls" became
+    /// six): the initializer adds exactly these six block observers, and `close(via:)` removes each
+    /// of them exactly once -- no `removeObserver` anywhere else in the file. The scan covers
+    /// `close(via:)`'s body only (gate r1 m-1: it used to run from the signature to the end of the
+    /// file, and `close(via:)` is the class's last method, so a removal moved into a new method after
+    /// it still counted as inside).
+    @Test func closeRemovesEveryObserverTheInitializerAdds() throws {
+        let code = try Self.remoteWindowCode()
+        let added = code.matches(of: try Regex(#"(\w+Observer) = NotificationCenter\.default\.addObserver\("#))
+            .compactMap { $0.output[1].substring.map(String.init) }
+        #expect(added == ["didResignKeyObserver", "didBecomeKeyObserver", "didMoveObserver", "didResizeObserver",
+                          "willStartLiveResizeObserver", "didEndLiveResizeObserver"])
+        let removal = try Regex(#"NotificationCenter\.default\.removeObserver\((\w+)\)"#)
+        let close = try #require(Self.body(of: "func close(via session: CRSession) {", in: code))
+        #expect(close.contains("session.recycle(displayedSurface)"), "the slice stops before close(via:)'s last statement")
+        #expect(!close.contains("func "), "the slice runs past close(via:) into another method")
+        let removedInClose = close.matches(of: removal).compactMap { $0.output[1].substring.map(String.init) }
+        #expect(code.matches(of: removal).count == removedInClose.count, "a removeObserver outside close(via:)")
+        #expect(removedInClose.sorted() == added.sorted(), "\(removedInClose)")
     }
 }
