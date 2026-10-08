@@ -97,6 +97,76 @@ struct PasswordAndEditorTests {
                 == .success(.init(address: "192.0.2.10", port: 3389, preset: TestFingerprints.a)))
         #expect(E.message(for: .presetSHA1) == UIStrings.editorFingerprintSHA1)
     }
+
+    /// `start`, then the views reached by following `step` up to `count` times; a nil link or the
+    /// return to `start` (appended once) ends the walk.
+    private static func keyViewWalk(from start: NSView, count: Int, step: (NSView) -> NSView?) -> [ObjectIdentifier] {
+        var walk = [ObjectIdentifier(start)]
+        var view = start
+        for _ in 0..<count {
+            guard let next = step(view) else { break }
+            walk.append(ObjectIdentifier(next))
+            if next === start { break }
+            view = next
+        }
+        return walk
+    }
+
+    @Test("F-a1-10: the Host Editor's Tab order is the field order and closes back to Name; Shift-Tab follows it")
+    func editorTabOrderIsTheFieldOrder() {
+        let record = HostRecord(displayName: "Office PC", address: "workstation.example", userName: "user", remembersPassword: true)
+        let modes: [(HostEditorSheet.Mode, HostEditorSheet.PresetState)] = [(.new, .loaded(nil)), (.edit(record), .loaded(TestFingerprints.a))]
+        for (mode, preset) in modes {
+            let sheet = HostEditorSheet(mode: mode, presetState: preset)
+            #expect(sheet.window.initialFirstResponder === sheet.nameField)
+            let chain: [NSView] = [sheet.nameField, sheet.addressField, sheet.portField, sheet.userField, sheet.passwordField,
+                                   sheet.revealedPasswordField, sheet.revealButton, sheet.rememberBox, sheet.touchIDBox,
+                                   sheet.presetField, sheet.cancelButton, sheet.saveButton]
+            let walk = Self.keyViewWalk(from: sheet.nameField, count: 12) { $0.nextKeyView }
+            #expect(walk == chain.map(ObjectIdentifier.init) + [ObjectIdentifier(sheet.nameField)])
+            #expect(sheet.addressField.previousKeyView === sheet.nameField)
+            #expect(sheet.nameField.previousKeyView === sheet.saveButton)
+        }
+    }
+
+    @Test("F-a1-10: the Password sheet's Tab order is password, Remember, Cancel, Connect, and closes back to the field")
+    func passwordSheetTabOrder() {
+        let sheet = PasswordSheet(hostTitle: "Office PC", userName: "user")
+        #expect(sheet.window.initialFirstResponder === sheet.passwordField)
+        let chain: [NSView] = [sheet.passwordField, sheet.rememberBox, sheet.cancelButton, sheet.connectButton]
+        let walk = Self.keyViewWalk(from: sheet.passwordField, count: 4) { $0.nextKeyView }
+        #expect(walk == chain.map(ObjectIdentifier.init) + [ObjectIdentifier(sheet.passwordField)])
+        #expect(sheet.rememberBox.previousKeyView === sheet.passwordField)
+        #expect(sheet.passwordField.previousKeyView === sheet.connectButton)
+    }
+
+    @Test("F-a1-10: Tab skips the hidden password twin and the disabled Touch ID box; revealing swaps which twin it visits")
+    func tabOrderSkipsWhatIsNotValid() {
+        let sheet = HostEditorSheet(mode: .new, presetState: .loaded(nil))
+        let fields: [NSView] = [sheet.nameField, sheet.addressField, sheet.portField, sheet.userField, sheet.passwordField,
+                                sheet.revealedPasswordField, sheet.presetField]
+        let fieldIDs = Set(fields.map(ObjectIdentifier.init))
+        func validWalk() -> [ObjectIdentifier] { Self.keyViewWalk(from: sheet.nameField, count: 20) { $0.nextValidKeyView } }
+        func fieldOrder(_ views: [NSView]) -> [ObjectIdentifier] { views.map(ObjectIdentifier.init) }
+        // Buttons are valid key views only with Full Keyboard Access (a machine setting), so the walks
+        // pin the text fields' order and the two exclusions, never the buttons.
+
+        #expect(sheet.nameField.nextValidKeyView === sheet.addressField)
+        let hidden = validWalk()
+        #expect(!hidden.contains(ObjectIdentifier(sheet.revealedPasswordField)))
+        #expect(!hidden.contains(ObjectIdentifier(sheet.touchIDBox)))
+        #expect(hidden.filter(fieldIDs.contains) == fieldOrder([sheet.nameField, sheet.addressField, sheet.portField, sheet.userField,
+                                                               sheet.passwordField, sheet.presetField, sheet.nameField]))
+
+        sheet.revealButton.performClick(nil)
+        #expect(sheet.passwordField.isHidden)
+        #expect(!sheet.revealedPasswordField.isHidden)
+        let revealed = validWalk()
+        #expect(!revealed.contains(ObjectIdentifier(sheet.passwordField)))
+        #expect(!revealed.contains(ObjectIdentifier(sheet.touchIDBox)))
+        #expect(revealed.filter(fieldIDs.contains) == fieldOrder([sheet.nameField, sheet.addressField, sheet.portField, sheet.userField,
+                                                                 sheet.revealedPasswordField, sheet.presetField, sheet.nameField]))
+    }
 }
 
 @MainActor

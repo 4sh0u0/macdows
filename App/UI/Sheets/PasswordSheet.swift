@@ -54,6 +54,13 @@ final class PasswordSheet: NSObject, NSTextFieldDelegate {
         connectButton.action = #selector(connectPressed(_:))
         connectButton.isEnabled = false
         window.initialFirstResponder = passwordField
+        /// F-a1-10: Tab / Shift-Tab follow this explicit loop because a set `initialFirstResponder`
+        /// keeps AppKit from building its default one, and an automatic loop would also stop at the
+        /// sheet's selectable host / user values and note.
+        let keyViewLoop: [NSView] = [passwordField, rememberBox, cancelButton, connectButton]
+        for (view, next) in zip(keyViewLoop, keyViewLoop.dropFirst() + [keyViewLoop[0]]) {
+            view.nextKeyView = next
+        }
         window.onCancel = { [weak self] in self?.cancelPressed(nil) }
     }
 

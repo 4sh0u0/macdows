@@ -151,6 +151,15 @@ final class HostEditorSheet: NSObject, NSTextFieldDelegate {
         saveButton.action = #selector(savePressed(_:))
         window.onCancel = { [weak self] in self?.cancelPressed(nil) }
         window.initialFirstResponder = nameField
+        /// F-a1-10: Tab / Shift-Tab follow this explicit loop because a set `initialFirstResponder`
+        /// keeps AppKit from building its default one, and an automatic loop would also stop at the
+        /// sheet's selectable labels and notes; `nextValidKeyView` skips the hidden password twin, the
+        /// disabled Touch ID box and (without Full Keyboard Access) the buttons.
+        let keyViewLoop: [NSView] = [nameField, addressField, portField, userField, passwordField, revealedPasswordField,
+                                     revealButton, rememberBox, touchIDBox, presetField, cancelButton, saveButton]
+        for (view, next) in zip(keyViewLoop, keyViewLoop.dropFirst() + [keyViewLoop[0]]) {
+            view.nextKeyView = next
+        }
         revalidate()
     }
 
