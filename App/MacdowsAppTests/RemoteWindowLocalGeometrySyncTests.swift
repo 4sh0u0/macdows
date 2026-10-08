@@ -38,8 +38,9 @@ import Testing
 // needs a `CRSession`, which is not constructible headless, and adding a test seam would cross
 // the D7 boundary (no test-motivated changes to the production Sources). Since F-a1-5 it is pinned
 // as source instead (`closeRemovesEveryObserverTheInitializerAdds`: every observer the initializer
-// adds is removed exactly once, inside `close(via:)`). That a removal really stops the block from
-// firing is AppKit's contract, not pinned.
+// adds is removed exactly once, inside `close(via:)`'s body -- bounded by brace matching since gate
+// r1 m-1, so a removal moved into a method after it no longer counts). That a removal really stops
+// the block from firing is AppKit's contract, not pinned.
 //
 // The F-a1-5 (b) tests at the end use this suite's real-`RemoteWindow` construction for a
 // different hook: the content view is put back as first responder whenever the window becomes key.
@@ -263,9 +264,32 @@ struct RemoteWindowLocalGeometrySyncTests {
         }.joined(separator: "\n")
     }
 
+    /// The body of the method whose signature is `signature` in `code`: the text between the
+    /// signature's opening brace and its matching closing brace, braces counted on the
+    /// comment-stripped text (no string literal in `close(via:)` holds a brace). Nil when the
+    /// signature is missing or its brace never closes.
+    private static func body(of signature: String, in code: String) -> Substring? {
+        guard let open = code.range(of: signature) else { return nil }
+        var depth = 1
+        var index = open.upperBound
+        while index < code.endIndex {
+            if code[index] == "{" {
+                depth += 1
+            } else if code[index] == "}" {
+                depth -= 1
+                if depth == 0 { return code[open.upperBound..<index] }
+            }
+            index = code.index(after: index)
+        }
+        return nil
+    }
+
     /// The observer-count pin (F-a1-5 brief A8; the header's old "five removeObserver calls" became
     /// six): the initializer adds exactly these six block observers, and `close(via:)` removes each
-    /// of them exactly once -- no `removeObserver` anywhere else in the file.
+    /// of them exactly once -- no `removeObserver` anywhere else in the file. The scan covers
+    /// `close(via:)`'s body only (gate r1 m-1: it used to run from the signature to the end of the
+    /// file, and `close(via:)` is the class's last method, so a removal moved into a new method after
+    /// it still counted as inside).
     @Test func closeRemovesEveryObserverTheInitializerAdds() throws {
         let code = try Self.remoteWindowCode()
         let added = code.matches(of: try Regex(#"(\w+Observer) = NotificationCenter\.default\.addObserver\("#))
@@ -273,8 +297,10 @@ struct RemoteWindowLocalGeometrySyncTests {
         #expect(added == ["didResignKeyObserver", "didBecomeKeyObserver", "didMoveObserver", "didResizeObserver",
                           "willStartLiveResizeObserver", "didEndLiveResizeObserver"])
         let removal = try Regex(#"NotificationCenter\.default\.removeObserver\((\w+)\)"#)
-        let close = try #require(code.range(of: "func close(via session: CRSession) {"))
-        let removedInClose = code[close.upperBound...].matches(of: removal).compactMap { $0.output[1].substring.map(String.init) }
+        let close = try #require(Self.body(of: "func close(via session: CRSession) {", in: code))
+        #expect(close.contains("session.recycle(displayedSurface)"), "the slice stops before close(via:)'s last statement")
+        #expect(!close.contains("func "), "the slice runs past close(via:) into another method")
+        let removedInClose = close.matches(of: removal).compactMap { $0.output[1].substring.map(String.init) }
         #expect(code.matches(of: removal).count == removedInClose.count, "a removeObserver outside close(via:)")
         #expect(removedInClose.sorted() == added.sorted(), "\(removedInClose)")
     }

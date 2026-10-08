@@ -167,6 +167,46 @@ struct PasswordAndEditorTests {
         #expect(revealed.filter(fieldIDs.contains) == fieldOrder([sheet.nameField, sheet.addressField, sheet.portField, sheet.userField,
                                                                  sheet.revealedPasswordField, sheet.presetField, sheet.nameField]))
     }
+
+    /// gate r1 m-4: a window that recalculates its key-view loop rebuilds it from geometry when it is
+    /// displayed, overwriting the explicit F-a1-10 chain (and stopping at the selectable labels and
+    /// notes the chain leaves out); neither sheet turns it on.
+    @Test("gate r1 m-4: neither sheet's window recalculates its key-view loop")
+    func sheetsNeverRecalculateTheirKeyViewLoop() {
+        let record = HostRecord(displayName: "Office PC", address: "workstation.example", userName: "user", remembersPassword: true)
+        #expect(HostEditorSheet(mode: .new, presetState: .loaded(nil)).window.autorecalculatesKeyViewLoop == false)
+        #expect(HostEditorSheet(mode: .edit(record), presetState: .loaded(TestFingerprints.a)).window.autorecalculatesKeyViewLoop == false)
+        #expect(PasswordSheet(hostTitle: "Office PC", userName: "user").window.autorecalculatesKeyViewLoop == false)
+    }
+
+    /// gate r1 m-4, the reviewer's P-2 shape: the walks above run on sheets never shown, so they
+    /// would not see a chain that AppKit rebuilds at display. The same `nextKeyView` walk is taken
+    /// before and after the window is ordered front and drawn, for both sheets.
+    @Test("gate r1 m-4: the explicit Tab chain is unchanged after the sheet's window is ordered front and displayed")
+    func theChainSurvivesDisplay() {
+        _ = NSApplication.shared
+        func walk(_ start: NSView, _ count: Int) -> [ObjectIdentifier] { Self.keyViewWalk(from: start, count: count) { $0.nextKeyView } }
+        func displayed(_ window: NSWindow) {
+            window.orderFront(nil)
+            window.display()
+        }
+
+        let editor = HostEditorSheet(mode: .new, presetState: .loaded(nil))
+        defer { editor.window.orderOut(nil) }
+        let editorBefore = walk(editor.nameField, 12)
+        #expect(editorBefore.count == 13 && editorBefore.last == ObjectIdentifier(editor.nameField), "the loop closes before display")
+        displayed(editor.window)
+        #expect(editor.window.isVisible)
+        #expect(walk(editor.nameField, 12) == editorBefore)
+
+        let password = PasswordSheet(hostTitle: "Office PC", userName: "user")
+        defer { password.window.orderOut(nil) }
+        let passwordBefore = walk(password.passwordField, 4)
+        #expect(passwordBefore.count == 5 && passwordBefore.last == ObjectIdentifier(password.passwordField), "the loop closes before display")
+        displayed(password.window)
+        #expect(password.window.isVisible)
+        #expect(walk(password.passwordField, 4) == passwordBefore)
+    }
 }
 
 @MainActor

@@ -266,6 +266,40 @@ struct RemoteWindowKeyEquivalentTests {
         #expect(events.first?.hasPrefix("flagsChanged") == true)
     }
 
+    /// gate r1 I-1's keyUp ledger records only keyDowns that took the scancode lane; a reserved
+    /// pair's keyDown never reaches it -- `performKeyEquivalent` hands the pair to the menu and the
+    /// re-delivered `keyDown` returns before `handleKeyDown` -- so the pair's release is what it was
+    /// before the ledger: Q released while ⌘ is still held reports the alignment and `.keyUp` (a
+    /// Command chord's lane), and Q released after ⌘ under a CJK source reports only the alignment.
+    /// No earlier pin covered a reserved pair's `keyUp(with:)` (`keyUpIsNotClaimed` is about
+    /// `performKeyEquivalent`), so this is a new test rather than an extended one.
+    @Test("gate r1 I-1: a reserved pair's release is unchanged by the keyUp ledger (⌘Q)")
+    func aReservedPairsReleaseIsUnchanged() throws {
+        let live = RemoteWindowContentView.inputSourceIsASCIICapable
+        defer { RemoteWindowContentView.inputSourceIsASCIICapable = live }
+        let down = try Self.key("q", keyCode: 12, .command)
+
+        RemoteWindowContentView.inputSourceIsASCIICapable = { true }
+        let (window, view, box) = Self.makeHosted()
+        defer { window.close() }
+        #expect(view.performKeyEquivalent(with: down) == false)
+        box.events.removeAll()
+        view.keyUp(with: try Self.key("q", keyCode: 12, .command, type: .keyUp))
+        #expect(box.rendered == [
+            "\(RemoteWindowInputEvent.flagsChanged(modifierFlags: .command))",
+            "\(RemoteWindowInputEvent.keyUp(macKeyCode: 12, characters: "q", charactersIgnoringModifiers: "q"))",
+        ])
+
+        RemoteWindowContentView.inputSourceIsASCIICapable = { false }
+        let (cjkWindow, cjkView, cjkBox) = Self.makeHosted()
+        defer { cjkWindow.close() }
+        #expect(cjkView.performKeyEquivalent(with: down) == false)
+        cjkView.keyDown(with: down)
+        cjkBox.events.removeAll()
+        cjkView.keyUp(with: try Self.key("q", keyCode: 12, [], type: .keyUp))
+        #expect(cjkBox.rendered == ["\(RemoteWindowInputEvent.flagsChanged(modifierFlags: []))"])
+    }
+
     // MARK: - T-5: remote windows stay out of the Window menu (adr/0022 D-5 W2)
 
     @Test("a RemoteWindow's NSWindow is excluded from the Window menu")
@@ -312,5 +346,26 @@ struct RemoteWindowKeyEquivalentTests {
     func registryArmCallsTheMapper() throws {
         let arm = try Self.localKeyEquivalentArm(in: try Self.registryCode())
         #expect(keyEquivalentOccurrences(of: "commandKeyMapper.localKeyEquivalent()", in: String(arm)) == 1, "\(arm)")
+    }
+
+    // MARK: - F-a1-5's input-source seam (gate r1 m-3)
+
+    private static let input = "App/RemoteWindowRendering/RemoteWindowInput.swift"
+
+    /// gate r1 m-3: the seam's declaration line calls the live read, so the App -- which never sets
+    /// the seam -- forks on the real input source. The runtime twin,
+    /// `RemoteWindowInputTests.seamDefaultIsTheLiveInputSourceRead`, catches a constant default only
+    /// while the runner's active source disagrees with it; this one always does. Each line goes
+    /// through the strip on its own, so the declaration stays one line and its doc comment drops out.
+    @Test("gate r1 m-3: the input-source seam's declaration defaults to isCurrentInputSourceASCIICapable()")
+    func theSeamDeclarationCallsTheLiveRead() throws {
+        let url = keyEquivalentRepoRoot().appendingPathComponent(Self.input)
+        let text = try String(contentsOf: url, encoding: .utf8)
+        let label = "static var inputSourceIsASCIICapable"
+        #expect(keyEquivalentOccurrences(of: label, in: keyEquivalentCodeOnly(text)) == 1, "the seam is not declared once")
+        let lines = text.split(separator: "\n").map { keyEquivalentCodeOnly(String($0)) }
+        #expect(!lines.contains { $0.contains("F-a1-5's test seam") }, "a line comment survived the strip")
+        let declaration = try #require(lines.first { $0.contains(label) })
+        #expect(declaration.contains("isCurrentInputSourceASCIICapable()"), "\(declaration)")
     }
 }
