@@ -52,8 +52,9 @@ import Testing
 @Suite("ClientWindowMove's left border is keyed on the window style (F-R1)")
 struct RemoteWindowRegistryLeftBorderTests {
     /// A `WindowCreate` order with fields this test chooses. See the file header for why a
-    /// subclass is the only way to build one.
-    private final class WindowOrderStub: CRDPEvent {
+    /// subclass is the only way to build one. `fileprivate` (F-a1-6): the local-move suite at
+    /// the end of this file builds its windows with it too, and its `WindowUpdate` with `kind:`.
+    fileprivate final class WindowOrderStub: CRDPEvent {
         /// `WINDOW_ORDER_FIELD_*`, duplicated narrowly from the file-private `WindowOrderField`
         /// in `RemoteWindowRegistry.swift:36-51` -- the same "duplicate the bits, not the
         /// policy" precedent `Tools/window-smoke` follows for its own copy.
@@ -66,6 +67,7 @@ struct RemoteWindowRegistryLeftBorderTests {
         static let showNormal: UInt32 = 5
 
         private let id: UInt32
+        private let orderKind: CRDPEventKind
         private let styleBits: UInt32
         private let flags: UInt32
         private let railX: Int32
@@ -76,11 +78,14 @@ struct RemoteWindowRegistryLeftBorderTests {
         /// - Parameter carriesStyleField: `false` models the case the seam's doc comment calls
         ///   out -- a window whose orders never set `WINDOW_ORDER_FIELD_STYLE`, leaving
         ///   `PendingWindowState.style` at its default 0.
+        /// - Parameter kind: `.windowCreate` by default; the local-move suite sends the same
+        ///   fields as a `.windowUpdate` to model the server announcing a new position.
         init(
             windowId: UInt32, style: UInt32, carriesStyleField: Bool = true,
-            x: Int32, y: Int32, width: UInt32, height: UInt32
+            x: Int32, y: Int32, width: UInt32, height: UInt32, kind: CRDPEventKind = .windowCreate
         ) {
             id = windowId
+            orderKind = kind
             styleBits = style
             railX = x
             railY = y
@@ -92,7 +97,7 @@ struct RemoteWindowRegistryLeftBorderTests {
             super.init()
         }
 
-        override var kind: CRDPEventKind { .windowCreate }
+        override var kind: CRDPEventKind { orderKind }
         override var generation: UInt32 { 0 }
         override var windowId: UInt32 { id }
         override var fieldFlags: UInt32 { flags }
@@ -109,13 +114,13 @@ struct RemoteWindowRegistryLeftBorderTests {
 
     /// F-R1's own target style: Notepad's `0x000F0000`
     /// (`WS_MAXIMIZEBOX | WS_MINIMIZEBOX | WS_THICKFRAME | WS_SYSMENU`).
-    private static let thickFrameStyle: UInt32 = 0x000F_0000
+    fileprivate static let thickFrameStyle: UInt32 = 0x000F_0000
     /// The About dialog's captured style, `WS_POPUP | WS_SYSMENU` -- no `WS_THICKFRAME`.
     private static let aboutStyle: UInt32 = 0x8008_0000
 
     /// A fixture layout, not this machine's: one 1920x1080 1x primary. Injected through the
     /// registry's existing provider parameter, so nothing here reads `NSScreen`.
-    private static func fixtureTopology() throws -> DisplayTopology {
+    fileprivate static func fixtureTopology() throws -> DisplayTopology {
         try fixtureTopology(rasterScale: 1)
     }
 
@@ -135,13 +140,13 @@ struct RemoteWindowRegistryLeftBorderTests {
         return try #require(DisplayTopology(displays: [display]))
     }
 
-    private final class SentBox {
+    fileprivate final class SentBox {
         var moves: [UInt32: (left: Int32, top: Int32, right: Int32, bottom: Int32)] = [:]
     }
 
     /// Builds a registry over an UNSTARTED session (see the file header) with the fixture
     /// topology, and returns it alongside the box its `onWindowMoveSent` records into.
-    private static func makeRegistry() throws -> (RemoteWindowRegistry, SentBox) {
+    fileprivate static func makeRegistry() throws -> (RemoteWindowRegistry, SentBox) {
         try makeRegistry(advertisedDesktopScaleFactor: 0)
     }
 
@@ -827,5 +832,542 @@ struct RemoteWindowRegistryOutboundRectPinTests {
         // R's above. Both take it from the SAME frozen topology snapshot this method already
         // read, which is the same-read discipline §5.A.4 states for the topology.
         #expect(Self.occurrences(of: "rasterScale: topology.rasterScale", in: code) == 2)
+    }
+}
+
+// MARK: - F-a1-6: the RAIL local-move loop
+
+/// F-a1-6 (owner in person 2026-10-08: a remote window could not be dragged by its title bar).
+/// The mouse-down goes to the server, whose window manager hands the move back to the client --
+/// `TS_RAIL_ORDER_LOCALMOVESIZE` with `isMoveSizeStart` and `RAIL_WMSZ_MOVE` (9) -- and the client
+/// moves its own window while the button is held, then sends only the button-up at the release
+/// point (MS-RDPERP 1.3.2.5; both FreeRDP clients do the same). These cases drive the real registry
+/// over the left-border suite's unstarted session and fixture topology (see this file's header:
+/// NOTHING HERE CONTACTS ANY HOST), feed input through the content view's own `onEvent` (the
+/// closure `RemoteWindow` hands the registry), and read the wire through the registry's three
+/// diagnostic hooks: `onMouseMoveSent`, `onMouseButtonSent`, `onWindowMoveSent`.
+///
+/// The pointer comes from the registry's `pointerLocation` seam, and every move event below carries
+/// a DIFFERENT, stale point of its own -- so a window that followed the event instead of the
+/// pointer, or an up sent at the event's point, fails a case rather than passing by coincidence.
+///
+/// COVERAGE BOUNDARY, stated: the order of the server's button-up answer, its `WindowUpdate` and its
+/// LMS end has never been observed live; these cases fix one order each (the update before the
+/// end, an end while the button is held) and say which. Clamping, 2x rounding and a drag across
+/// displays are the in-person check's.
+@MainActor
+@Suite("F-a1-6: a remote window follows a title-bar drag (RAIL local move)")
+struct RemoteWindowRegistryLocalMoveTests {
+    private typealias Fixture = RemoteWindowRegistryLeftBorderTests
+
+    /// MS-RDPERP 2.2.2.7.2: `RAIL_WMSZ_MOVE`, and `RAIL_WMSZ_TOP` as the resize type the
+    /// local-move path must leave alone.
+    private static let moveType: UInt16 = 9
+    private static let resizeTopType: UInt16 = 3
+    /// No chrome-implying bit: StyleTranslator's borderless chrome, so the registry picks
+    /// `RemoteWindow.popupFirstFrameTimeout` (0.25 s) -- the cases that need a server rect APPLIED
+    /// (or the window on screen) wait for the gate through it. Nothing on the local-move path
+    /// reads the style.
+    private static let chromelessStyle: UInt32 = 0
+
+    /// `TS_RAIL_ORDER_LOCALMOVESIZE` with the fields this suite chooses, under the bridge's own
+    /// property names (`App/CRBridge/CRSession.h`); the same getter-override construct as
+    /// `WindowOrderStub`. `posX/posY` are fixed: the registry takes the grab offset from the local
+    /// down point and must not read them.
+    private final class LMSStub: CRDPEvent {
+        private let id: UInt32
+        private let start: Bool
+        private let type: UInt16
+
+        init(windowId: UInt32, start: Bool, type: UInt16) {
+            id = windowId
+            self.start = start
+            self.type = type
+            super.init()
+        }
+
+        override var kind: CRDPEventKind { .localMoveSize }
+        override var generation: UInt32 { 0 }
+        override var windowId: UInt32 { id }
+        override var isMoveSizeStart: Bool { start }
+        override var moveSizeType: UInt16 { type }
+        override var moveSizePosX: Int32 { 100 }
+        override var moveSizePosY: Int32 { 14 }
+    }
+
+    private final class WindowDeleteStub: CRDPEvent {
+        private let id: UInt32
+
+        init(windowId: UInt32) {
+            id = windowId
+            super.init()
+        }
+
+        override var kind: CRDPEventKind { .windowDelete }
+        override var generation: UInt32 { 0 }
+        override var windowId: UInt32 { id }
+    }
+
+    /// A MonitoredDesktop order carrying a Z-order array (`WINDOW_ORDER_FIELD_DESKTOP_ZORDER`,
+    /// 0x10). `windowId` is the active window, as the bridge reports it.
+    private final class MonitoredDesktopStub: CRDPEvent {
+        private let active: UInt32
+        private let ids: [UInt32]
+
+        init(activeWindowId: UInt32, topDown: [UInt32]) {
+            active = activeWindowId
+            ids = topDown
+            super.init()
+        }
+
+        override var kind: CRDPEventKind { .monitoredDesktop }
+        override var generation: UInt32 { 0 }
+        override var windowId: UInt32 { active }
+        override var fieldFlags: UInt32 { 0x0000_0010 }
+        override var windowIds: [NSNumber] { ids.map { NSNumber(value: $0) } }
+        override var numWindowIds: UInt32 { UInt32(ids.count) }
+        override var windowIdsTruncated: Bool { false }
+    }
+
+    private final class WireBox {
+        var moves: [(windowId: UInt32, x: Int32, y: Int32)] = []
+        var buttons: [(windowId: UInt32, button: CRMouseButton, down: Bool, x: Int32, y: Int32)] = []
+        var windowMoves: [UInt32] = []
+        var ups: [(windowId: UInt32, button: CRMouseButton, down: Bool, x: Int32, y: Int32)] {
+            buttons.filter { !$0.down }
+        }
+    }
+
+    private final class PointerBox {
+        var point = NSPoint.zero
+    }
+
+    private struct Harness {
+        let registry: RemoteWindowRegistry
+        let wire: WireBox
+        let pointer: PointerBox
+        let topology: DisplayTopology
+    }
+
+    /// The left-border suite's registry, with all three wire hooks recording here (its own
+    /// `onWindowMoveSent` box keeps one rect per window; these cases need every call) and the
+    /// pointer seam reading `PointerBox`.
+    private static func makeHarness() throws -> Harness {
+        let (registry, _) = try Fixture.makeRegistry()
+        let wire = WireBox()
+        let pointer = PointerBox()
+        registry.onWindowMoveSent = { windowId, _, _, _, _ in wire.windowMoves.append(windowId) }
+        registry.onMouseMoveSent = { windowId, x, y in wire.moves.append((windowId: windowId, x: x, y: y)) }
+        registry.onMouseButtonSent = { windowId, button, down, x, y in
+            wire.buttons.append((windowId: windowId, button: button, down: down, x: x, y: y))
+        }
+        registry.pointerLocation = { pointer.point }
+        return Harness(registry: registry, wire: wire, pointer: pointer, topology: try Fixture.fixtureTopology())
+    }
+
+    /// RAIL (300, 200) 522x514, the left-border suite's geometry: a mac content rect of
+    /// (300, 366, 522, 514) on the fixture layout.
+    private static func makeWindow(_ h: Harness, id: UInt32, style: UInt32 = Fixture.thickFrameStyle) throws -> NSWindow {
+        h.registry.handle(Fixture.WindowOrderStub(windowId: id, style: style, x: 300, y: 200, width: 522, height: 514))
+        return try #require(h.registry.window(forWindowId: id))
+    }
+
+    /// Feeds one event through the content view's `onEvent`, i.e. into `handleInput`.
+    private static func send(_ event: RemoteWindowInputEvent, to window: NSWindow) throws {
+        let view = try #require(window.contentView as? RemoteWindowContentView)
+        let onEvent = try #require(view.onEvent)
+        onEvent(event)
+    }
+
+    private static func offset(_ point: NSPoint, _ dx: CGFloat, _ dy: CGFloat) -> NSPoint {
+        NSPoint(x: point.x + dx, y: point.y + dy)
+    }
+
+    /// The remote point the registry sends for `point`: its `remotePoint(from:)` conversion and
+    /// its `Int32(...)` narrowing, nothing else.
+    private static func remote(_ point: NSPoint, _ topology: DisplayTopology) -> (x: Int32, y: Int32) {
+        let converted = WindowGeometry.windowsPoint(from: MacPoint(x: point.x, y: point.y), in: topology)
+        return (x: Int32(converted.x), y: Int32(converted.y))
+    }
+
+    /// The content rect the registry derives from a RAIL rect with no mapped surface
+    /// (`macContentRect(for:windowId:in:)`, correction `.zero`).
+    private static func macContentRect(x: Double, y: Double, width: Double, height: Double, _ topology: DisplayTopology) -> NSRect {
+        let display = WindowGeometry.displayRect(from: WindowsRect(x: x, y: y, width: width, height: height), correction: .zero)
+        let mac = WindowGeometry.macRect(from: display, in: topology)
+        return NSRect(x: mac.x, y: mac.y, width: mac.width, height: mac.height)
+    }
+
+    /// Polls until every window is on screen (20 ms steps, 3 s cap): the popup tier's
+    /// first-frame timeout clears the gate and applies the pending show.
+    private static func waitUntilShown(_ windows: [NSWindow]) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while windows.contains(where: { !$0.isVisible }), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let allShown = windows.allSatisfy { $0.isVisible }
+        try #require(allShown, "the first-frame gate never cleared")
+    }
+
+    /// L1. The loop itself: after the server's start the window follows the pointer, no pointer
+    /// motion reaches the wire, the up is sent once at the pointer (the up event's own point lags
+    /// it on purpose) after one more placement, and the server's end releases the suppression
+    /// with no `ClientWindowMove`.
+    @Test func aMoveFollowsThePointerAndForwardsNothingButTheUp() throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 601)
+        let origin = window.frame.origin
+        let down = Self.offset(origin, 100, 500)
+
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 601, start: true, type: Self.moveType))
+        #expect(h.registry.debugLocalMoveIsActive(forWindowId: 601))
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 601) == 1)
+        let downOnWire = Self.remote(down, h.topology)
+        #expect(h.wire.buttons.count == 1 && h.wire.buttons.first?.down == true
+                && h.wire.buttons.first?.x == downOnWire.x && h.wire.buttons.first?.y == downOnWire.y,
+                "the down goes out as before: \(h.wire.buttons)")
+
+        h.pointer.point = Self.offset(down, 30, -20)
+        try Self.send(.mouseMoved(screenPoint: down), to: window)
+        #expect(window.frame.origin == Self.offset(origin, 30, -20))
+        h.pointer.point = Self.offset(down, 50, 10)
+        try Self.send(.mouseMoved(screenPoint: down), to: window)
+        #expect(window.frame.origin == Self.offset(origin, 50, 10))
+        #expect(h.wire.moves.isEmpty, "pointer motion went to the wire mid-move: \(h.wire.moves)")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 601) == 1)
+        #expect(h.registry.debugLocalMoveIsActive(forWindowId: 601))
+
+        let release = Self.offset(down, 52, 12)
+        h.pointer.point = release
+        try Self.send(.mouseButton(.left, down: false, screenPoint: Self.offset(down, 45, 5)), to: window)
+        #expect(window.frame.origin == Self.offset(origin, 52, 12), "the up places the window once more")
+        let expectedUp = Self.remote(release, h.topology)
+        #expect(h.wire.ups.count == 1, "\(h.wire.buttons)")
+        #expect(h.wire.ups.first?.button == .left)
+        #expect(h.wire.ups.first?.x == expectedUp.x && h.wire.ups.first?.y == expectedUp.y,
+                "the up goes out at the pointer, not at the event's point: \(h.wire.ups)")
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 601))
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 601) == 1, "held until the server's end")
+
+        h.registry.handle(LMSStub(windowId: 601, start: false, type: Self.moveType))
+        #expect(h.wire.windowMoves.isEmpty, "the end of a handled move reports no settle")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 601) == 0)
+        #expect(h.wire.moves.isEmpty)
+        #expect(window.frame.origin == Self.offset(origin, 52, 12), "nothing was dropped after the up, nothing re-applied")
+    }
+
+    /// L2. Order fixed here: the server's `WindowUpdate` for the dropped window arrives BEFORE its
+    /// end, while the suppression still holds (dropped: the frame stays where the drag left it).
+    /// The end then applies that rect -- the server's position wins over the local one (its own
+    /// clamp, its own rounding) -- and still reports no settle.
+    @Test func theServersFinalPositionWinsAfterTheEnd() async throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 611, style: Self.chromelessStyle)
+        try await Self.waitUntilShown([window])
+        let origin = window.frame.origin
+        let down = Self.offset(origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 611, start: true, type: Self.moveType))
+        h.pointer.point = Self.offset(down, 50, 10)
+        try Self.send(.mouseMoved(screenPoint: down), to: window)
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: window)
+        let dropped = window.frame
+        try #require(dropped.origin == Self.offset(origin, 50, 10))
+
+        // The local drop is RAIL (350, 190); the server answers (387, 167).
+        h.registry.handle(Fixture.WindowOrderStub(
+            windowId: 611, style: Self.chromelessStyle, x: 387, y: 167, width: 522, height: 514, kind: .windowUpdate))
+        #expect(window.frame == dropped, "a rect applied while the suppression holds")
+
+        h.registry.handle(LMSStub(windowId: 611, start: false, type: Self.moveType))
+        #expect(window.contentRect(forFrameRect: window.frame)
+                == Self.macContentRect(x: 387, y: 167, width: 522, height: 514, h.topology))
+        #expect(h.wire.windowMoves.isEmpty)
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 611) == 0)
+    }
+
+    /// L2b. A server rect dropped BEFORE the up -- here an update re-announcing the pre-drag rect
+    /// mid-drag, the shape any title-only order takes since every order recomputes the rect from
+    /// the server's state -- describes the window before the release, and the up's placement
+    /// supersedes it: an end with nothing newer leaves the window where the drag dropped it
+    /// instead of snapping it back.
+    @Test func aRectDroppedBeforeTheUpIsNotReapplied() async throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 615, style: Self.chromelessStyle)
+        try await Self.waitUntilShown([window])
+        let origin = window.frame.origin
+        let down = Self.offset(origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 615, start: true, type: Self.moveType))
+        h.pointer.point = Self.offset(down, 50, 10)
+        try Self.send(.mouseMoved(screenPoint: down), to: window)
+        h.registry.handle(Fixture.WindowOrderStub(
+            windowId: 615, style: Self.chromelessStyle, x: 300, y: 200, width: 522, height: 514, kind: .windowUpdate))
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 615, start: false, type: Self.moveType))
+        #expect(window.frame.origin == Self.offset(origin, 50, 10))
+        #expect(h.wire.windowMoves.isEmpty)
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 615) == 0)
+    }
+
+    /// L2c. Nor does a rect dropped in an EARLIER suppression period: a resize-type loop drops one
+    /// and ends with today's settle; the next move-type start begins a fresh period, and an end
+    /// that arrives while the button is still held (no placement in between) applies nothing.
+    @Test func aRectDroppedBeforeTheStartIsNotReapplied() async throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 616, style: Self.chromelessStyle)
+        try await Self.waitUntilShown([window])
+        let before = window.frame
+        let down = Self.offset(before.origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 616, start: true, type: Self.resizeTopType))
+        h.registry.handle(Fixture.WindowOrderStub(
+            windowId: 616, style: Self.chromelessStyle, x: 387, y: 167, width: 522, height: 514, kind: .windowUpdate))
+        h.registry.handle(LMSStub(windowId: 616, start: false, type: Self.resizeTopType))
+        try #require(h.wire.windowMoves == [616], "today's settle for the resize-type end")
+        try #require(window.frame == before)
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: window)
+
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 616, start: true, type: Self.moveType))
+        h.registry.handle(LMSStub(windowId: 616, start: false, type: Self.moveType))
+        #expect(window.frame == before, "the earlier period's rect came back")
+        #expect(h.wire.windowMoves == [616])
+    }
+
+    /// L3. The round-trip race: the user released before the server's start arrived. The up
+    /// already went to the server, so no local move begins -- the window must not follow a pointer
+    /// nobody is dragging with; moves are forwarded as ordinary input and the end is today's
+    /// settle.
+    @Test func anLmsStartAfterTheUpStartsNoLocalMove() throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 621)
+        let before = window.frame
+        let down = Self.offset(before.origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 621, start: true, type: Self.moveType))
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 621))
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 621) == 1, "the start still suppresses")
+
+        h.pointer.point = Self.offset(down, 40, 40)
+        let hover = Self.offset(down, 5, 5)
+        try Self.send(.mouseMoved(screenPoint: hover), to: window)
+        let expected = Self.remote(hover, h.topology)
+        #expect(h.wire.moves.count == 1 && h.wire.moves.first?.x == expected.x && h.wire.moves.first?.y == expected.y,
+                "\(h.wire.moves)")
+        #expect(window.frame == before)
+
+        h.registry.handle(LMSStub(windowId: 621, start: false, type: Self.moveType))
+        #expect(h.wire.windowMoves == [621], "today's settle")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 621) == 0)
+    }
+
+    /// L4. A resize type (`RAIL_WMSZ_TOP`) with the button held is not a local move: moves are
+    /// forwarded, the window stays put, the up goes out at its own point, the end settles.
+    @Test func aResizeTypeIsNotALocalMove() throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 631)
+        let before = window.frame
+        let down = Self.offset(before.origin, 100, 513)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 631, start: true, type: Self.resizeTopType))
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 631))
+
+        h.pointer.point = Self.offset(down, 40, 40)
+        let drag = Self.offset(down, 0, 6)
+        try Self.send(.mouseMoved(screenPoint: drag), to: window)
+        #expect(h.wire.moves.count == 1)
+        #expect(window.frame == before)
+        try Self.send(.mouseButton(.left, down: false, screenPoint: drag), to: window)
+        let expectedUp = Self.remote(drag, h.topology)
+        #expect(h.wire.ups.count == 1 && h.wire.ups.first?.x == expectedUp.x && h.wire.ups.first?.y == expectedUp.y)
+
+        h.registry.handle(LMSStub(windowId: 631, start: false, type: Self.resizeTopType))
+        #expect(h.wire.windowMoves == [631])
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 631) == 0)
+    }
+
+    /// L5. A pause in the middle of the drag longer than `RemoteWindow.moveSettleDebounce` (0.2 s)
+    /// must not settle: the local placements are bracketed as programmatic frame changes, so the
+    /// `didMove` observer neither claims a second suppression nor arms the debounce.
+    @Test func noDidMoveSettleDuringTheDrag() async throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 641)
+        let origin = window.frame.origin
+        let down = Self.offset(origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 641, start: true, type: Self.moveType))
+        h.pointer.point = Self.offset(down, 30, -20)
+        try Self.send(.mouseMoved(screenPoint: down), to: window)
+        h.pointer.point = Self.offset(down, 60, -10)
+        try Self.send(.mouseMoved(screenPoint: down), to: window)
+        try #require(window.frame.origin == Self.offset(origin, 60, -10))
+
+        try await Task.sleep(for: .milliseconds(450))
+        #expect(h.wire.windowMoves.isEmpty, "a mid-drag settle sent a ClientWindowMove")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 641) == 1, "a didMove claimed suppression")
+        #expect(h.registry.debugLocalMoveIsActive(forWindowId: 641))
+    }
+
+    /// L6. A Z-order order that arrives mid-drag is not applied (the stacking order is read back
+    /// from AppKit); the same order after the server's end is -- the control arm that shows the
+    /// order really would have reordered these two windows.
+    @Test func zOrderIsNotAppliedMidDrag() async throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let dragged = try Self.makeWindow(h, id: 651, style: Self.chromelessStyle)
+        let other = try Self.makeWindow(h, id: 652, style: Self.chromelessStyle)
+        try await Self.waitUntilShown([dragged, other])
+        let down = Self.offset(dragged.frame.origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: dragged)
+        h.registry.handle(LMSStub(windowId: 651, start: true, type: Self.moveType))
+        try #require(h.registry.debugLocalMoveIsActive(forWindowId: 651))
+
+        let before = h.registry.currentTopDownWindowIds()
+        try #require(Set(before) == [651, 652], "\(before)")
+        let reversed = Array(before.reversed())
+        let appliesBefore = h.registry.zOrderDiagnostics().appliesPerformed
+        h.registry.handle(MonitoredDesktopStub(activeWindowId: 651, topDown: reversed))
+        #expect(h.registry.currentTopDownWindowIds() == before, "reordered mid-drag")
+        #expect(h.registry.zOrderDiagnostics().appliesPerformed == appliesBefore)
+
+        h.pointer.point = Self.offset(down, 10, 0)
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: dragged)
+        h.registry.handle(LMSStub(windowId: 651, start: false, type: Self.moveType))
+        h.registry.handle(MonitoredDesktopStub(activeWindowId: 651, topDown: reversed))
+        #expect(h.registry.currentTopDownWindowIds() == reversed, "the control arm: the order does reorder once the drag is over")
+    }
+
+    /// L7. The server ends its loop while the button is still held: the local move ends there --
+    /// no settle, suppression released -- and the rest of the gesture is ordinary input: the next
+    /// move is forwarded, the up goes out at its own point and clears the held button (a later
+    /// move-type start no longer begins a local move).
+    @Test func theEndWhileHeldEndsTheMove() throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 671)
+        let origin = window.frame.origin
+        let down = Self.offset(origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 671, start: true, type: Self.moveType))
+        h.pointer.point = Self.offset(down, 20, 0)
+        try Self.send(.mouseMoved(screenPoint: down), to: window)
+        try #require(window.frame.origin == Self.offset(origin, 20, 0))
+
+        h.registry.handle(LMSStub(windowId: 671, start: false, type: Self.moveType))
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 671))
+        #expect(h.wire.windowMoves.isEmpty)
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 671) == 0)
+
+        h.pointer.point = Self.offset(down, 90, 90)
+        let after = Self.offset(down, 25, 0)
+        try Self.send(.mouseMoved(screenPoint: after), to: window)
+        let expectedMove = Self.remote(after, h.topology)
+        #expect(h.wire.moves.count == 1 && h.wire.moves.first?.x == expectedMove.x && h.wire.moves.first?.y == expectedMove.y)
+        #expect(window.frame.origin == Self.offset(origin, 20, 0))
+        try Self.send(.mouseButton(.left, down: false, screenPoint: after), to: window)
+        #expect(h.wire.ups.count == 1 && h.wire.ups.first?.x == expectedMove.x && h.wire.ups.first?.y == expectedMove.y)
+
+        h.registry.handle(LMSStub(windowId: 671, start: true, type: Self.moveType))
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 671), "the up did not clear the held button")
+        h.registry.handle(LMSStub(windowId: 671, start: false, type: Self.moveType))
+    }
+
+    /// L8. The local-move state goes with its window: a `WindowDelete` and the session-end reset
+    /// (`closeWindowsForSessionEnd()`, the entry `RemoteWindowRegistrySessionEndTests` drives) both
+    /// clear it -- and a window that comes back under the same RAIL id inherits neither the move
+    /// nor the held button.
+    @Test func deleteAndSessionEndClearTheMove() throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 661)
+        let down = Self.offset(window.frame.origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 661, start: true, type: Self.moveType))
+        try #require(h.registry.debugLocalMoveIsActive(forWindowId: 661))
+
+        h.registry.handle(WindowDeleteStub(windowId: 661))
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 661), "WindowDelete")
+        let again = try Self.makeWindow(h, id: 661)
+        h.registry.handle(LMSStub(windowId: 661, start: true, type: Self.moveType))
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 661), "the deleted window's held button survived")
+        h.registry.handle(LMSStub(windowId: 661, start: false, type: Self.moveType))
+
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: again)
+        h.registry.handle(LMSStub(windowId: 661, start: true, type: Self.moveType))
+        try #require(h.registry.debugLocalMoveIsActive(forWindowId: 661))
+        h.registry.closeWindowsForSessionEnd()
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 661), "the session-end reset")
+        _ = try Self.makeWindow(h, id: 661)
+        h.registry.handle(LMSStub(windowId: 661, start: true, type: Self.moveType))
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 661), "the held button survived the session-end reset")
+        h.registry.handle(LMSStub(windowId: 661, start: false, type: Self.moveType))
+    }
+
+    // MARK: L9, source
+
+    private static func registryCode() throws -> String {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let text = try String(
+            contentsOf: root.appendingPathComponent("App/RemoteWindowRendering/RemoteWindowRegistry.swift"),
+            encoding: .utf8
+        )
+        let stripped = text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> Substring in
+            guard let marker = line.range(of: "//") else { return line }
+            return line[line.startIndex..<marker.lowerBound]
+        }.joined(separator: "\n")
+        return stripped.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    }
+
+    private static func occurrences(of needle: String, in haystack: some StringProtocol) -> Int {
+        haystack.components(separatedBy: needle).count - 1
+    }
+
+    /// The body of the method whose signature is `signature`: the text between its opening brace
+    /// and the matching closing brace, braces counted on the comment-stripped text (the shape of
+    /// `RemoteWindowLocalGeometrySyncTests.body(of:in:)`).
+    private static func body(of signature: String, in code: String) -> Substring? {
+        guard let open = code.range(of: signature) else { return nil }
+        var depth = 1
+        var index = open.upperBound
+        while index < code.endIndex {
+            if code[index] == "{" {
+                depth += 1
+            } else if code[index] == "}" {
+                depth -= 1
+                if depth == 0 { return code[open.upperBound..<index] }
+            }
+            index = code.index(after: index)
+        }
+        return nil
+    }
+
+    /// L9. The pointer seam is read at exactly the two places the rule names -- the move and the
+    /// up, both inside `handleInput` -- the window is placed locally from exactly those two, and
+    /// the live pointer read exists once, as the seam's default. A third read (say, in the LMS
+    /// start) or a second live read would bypass the seam the behaviour cases drive.
+    @Test func thePointerIsReadOnlyByTheInputPath() throws {
+        let code = try Self.registryCode()
+        let input = try #require(Self.body(
+            of: "private func handleInput(windowId: UInt32, event: RemoteWindowInputEvent) {", in: code))
+        #expect(input.contains("case .mouseMoved(let screenPoint):") && input.contains("case .scrollWheel("),
+                "the slice is not handleInput's body")
+        #expect(!input.contains("private func "), "the slice runs past handleInput")
+        #expect(Self.occurrences(of: "pointerLocation()", in: code) == 2)
+        #expect(Self.occurrences(of: "pointerLocation()", in: input) == 2)
+        #expect(Self.occurrences(of: "moveLocally(", in: code) == 2)
+        #expect(Self.occurrences(of: "moveLocally(toOrigin: move.origin(forPointer: pointer))", in: input) == 2)
+        #expect(Self.occurrences(of: "NSEvent.mouseLocation", in: code) == 1)
+        #expect(Self.occurrences(of: "var pointerLocation: () -> NSPoint = { NSEvent.mouseLocation }", in: code) == 1)
     }
 }

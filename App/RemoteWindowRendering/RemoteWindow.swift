@@ -415,6 +415,15 @@ final class RemoteWindow {
     /// not fought against mid-gesture.
     private var geometryAuthoritySuppressionCount = 0
     private var isLocalGeometrySuppressed: Bool { geometryAuthoritySuppressionCount > 0 }
+    /// F-a1-6: the last server content rect `applyContentRectNow` refused because of the
+    /// suppression above, since the latest `beginServerAnnouncedMoveResize` or local placement
+    /// (`moveLocally(toOrigin:)`) -- whichever came last. Consumed only by
+    /// `endServerAnnouncedMoveResize(reportSettle: false)`, the end of a RAIL local move this
+    /// client handled: the server places the window from the button-up and usually announces it
+    /// before its end arrives, so that rect was dropped, and the server's position must win over
+    /// the local one. `pendingContentRect` cannot serve: it is every requested rect, dropped or
+    /// not, so after a drag with no update it still holds the pre-drag rect.
+    private var contentRectDroppedWhileSuppressed: NSRect?
 
     /// True between `NSWindow.willStartLiveResizeNotification` and
     /// `didEndLiveResizeNotification` -- AppKit's own clean begin/end pair for an
@@ -441,7 +450,8 @@ final class RemoteWindow {
 
     /// Phase 2 W3: set around every INTERNAL `window.setFrame`/`.styleMask` mutation this
     /// class makes on the server's behalf (`updateFrame`'s own server-driven frame apply,
-    /// and `applyChromeNow`'s styleMask-change + frame-restore pair) -- AppKit posts
+    /// `applyChromeNow`'s styleMask-change + frame-restore pair, and since F-a1-6 the steps of
+    /// a RAIL local move, `moveLocally(toOrigin:)`) -- AppKit posts
     /// `NSWindow.didMoveNotification` for ANY origin change, programmatic or interactive,
     /// with no way to distinguish "the server just told us to move" from "the user is
     /// dragging" at the notification level itself. Without this flag, `updateFrame`
@@ -1073,7 +1083,10 @@ final class RemoteWindow {
     /// let on screen -- but this keeps the check exactly where it always was rather than
     /// assuming that invariant elsewhere).
     private func applyContentRectNow(_ contentRect: NSRect) {
-        guard !isLocalGeometrySuppressed else { return }
+        guard !isLocalGeometrySuppressed else {
+            contentRectDroppedWhileSuppressed = contentRect
+            return
+        }
         let targetFrame = window.frameRect(forContentRect: contentRect)
         guard window.frame != targetFrame else { return }
         isApplyingProgrammaticFrame = true
@@ -1162,17 +1175,47 @@ final class RemoteWindow {
     /// the same suppression counter so neither can prematurely release the other.
     func beginServerAnnouncedMoveResize() {
         geometryAuthoritySuppressionCount += 1
+        contentRectDroppedWhileSuppressed = nil
     }
 
     /// The matching `isMoveSizeStart == false` transition: "release + treat like settle"
     /// (task item 4's own instruction) -- reports the current frame exactly like a native
     /// drag settling, in case whatever the server's own gesture left this window at
     /// diverged from this class's last-known frame.
-    func endServerAnnouncedMoveResize() {
+    ///
+    /// F-a1-6: `reportSettle: false` is the end of a RAIL local move this client handled
+    /// (`RemoteWindowRegistry.handleLocalMoveSize`): the suppression is released, NO settle is
+    /// reported (the server placed the window from the button-up; a `ClientWindowMove` here
+    /// would re-push a rect the server may have clamped), and the server rect dropped since the
+    /// up, if any, is applied now (`contentRectDroppedWhileSuppressed`). The default keeps every
+    /// other end exactly as it was.
+    func endServerAnnouncedMoveResize(reportSettle: Bool = true) {
         geometryAuthoritySuppressionCount = max(0, geometryAuthoritySuppressionCount - 1)
+        guard reportSettle else {
+            if hasClearedFirstFrameGate, let dropped = contentRectDroppedWhileSuppressed {
+                contentRectDroppedWhileSuppressed = nil
+                applyContentRectNow(dropped)
+            }
+            return
+        }
         // Real-host regression: report the CONTENT rect, not the raw frame -- see
         // `onLocalGeometrySettled`'s own doc comment.
         onLocalGeometrySettled?(window.contentRect(forFrameRect: window.frame))
+    }
+
+    /// F-a1-6: one step of a RAIL local move -- `RemoteWindowRegistry` puts the window's frame
+    /// origin where the pointer's grab offset says, while the left button is held and the
+    /// server's suppression (`beginServerAnnouncedMoveResize`) is in force. Bracketed by
+    /// `isApplyingProgrammaticFrame` like every other frame change this class makes on the
+    /// session's behalf, so the `didMove` observer ignores it: without the bracket the first
+    /// step would claim a second suppression and a pause of `moveSettleDebounce` mid-drag would
+    /// send a `ClientWindowMove` in the middle of the server's move loop. A placement also
+    /// supersedes any server rect dropped before it (`contentRectDroppedWhileSuppressed`).
+    func moveLocally(toOrigin origin: NSPoint) {
+        contentRectDroppedWhileSuppressed = nil
+        isApplyingProgrammaticFrame = true
+        window.setFrameOrigin(origin)
+        isApplyingProgrammaticFrame = false
     }
 
     /// Phase 2 W3 task item 3: applies `ServerMinMaxInfo`'s track-size fields
