@@ -428,6 +428,12 @@ final class RemoteWindowRegistry {
         /// not from the order's `posX/posY`: those are measured from the outer RAIL rect, which
         /// includes the border column this client does not draw.
         let grabOffset: NSPoint
+        /// Gate r1 m-4: the windows attached to the dragged one as `addChildWindow` children when
+        /// the move started. AppKit carries them along with every placement, so each was marked
+        /// `RemoteWindow.isFollowingOwnerLocalMove` and its own unbracketed `didMove` settles
+        /// nothing mid-loop. Kept here so every end of this move unmarks exactly these
+        /// (`stopFollowing(_:)`), whatever was attached or detached in between.
+        let followingChildren: Set<UInt32>
 
         /// The frame origin that keeps the grab point under `pointer`.
         func origin(forPointer pointer: NSPoint) -> NSPoint {
@@ -435,8 +441,9 @@ final class RemoteWindowRegistry {
         }
     }
     /// F-a1-6: windows with a local move in flight (button held). See `handleLocalMoveSize` and
-    /// `handleInput` for the rules; cleared by the button-up, by the server's end, and with the
-    /// window (`windows`' own `didSet`).
+    /// `handleInput` for the rules; cleared by the button-up (or the first motion that finds the
+    /// left button released, `pressedMouseButtons`), by the server's end, and with the window
+    /// (`windows`' own `didSet`).
     private var localMoves: [UInt32: LocalMove] = [:]
     /// F-a1-6: windows whose local move ended with the button-up and whose server end has not
     /// arrived yet -- what lets `handleLocalMoveSize`'s end tell a handled move (no settle) from
@@ -456,6 +463,14 @@ final class RemoteWindowRegistry {
     /// (the move and the up). A seam for the tests, the shape of `onWindowMoveSent`; the App
     /// never sets it.
     var pointerLocation: () -> NSPoint = { NSEvent.mouseLocation }
+    /// F-a1-6, gate r1 m-3: the mouse buttons the OS reports as held right now (bit 0 = left),
+    /// read while a local move is in flight. If the left-up never reached this window (taken by
+    /// Mission Control, an app switch or a modal), the next motion finds bit 0 clear and ends the
+    /// move as that up would have (`handleInput`); otherwise the window would follow the bare
+    /// pointer and `applyZOrder` would stay off until the next click. Read at exactly one place
+    /// in `handleInput` (the move). A seam for the tests, the shape of `pointerLocation`; the App
+    /// never sets it.
+    var pressedMouseButtons: () -> Int = { NSEvent.pressedMouseButtons }
 
     private static let logger = Logger(subsystem: "dev.haru.macdows", category: "RemoteWindowRendering")
     /// L1 (W4b review): logged once, not on every event, so a genuinely no-display
@@ -1004,15 +1019,25 @@ final class RemoteWindowRegistry {
     /// stays explicitly out of scope for this slice -- logged verbatim, not interpreted.
     ///
     /// F-a1-6 interprets exactly one type, `RAIL_WMSZ_MOVE` (9), and only while the left button
-    /// is held on that window: the start records the grab offset and the client then moves the
-    /// window itself (`handleInput`). The end of a move this client handled releases the
-    /// suppression WITHOUT a settle -- the server placed the window from the button-up, and a
-    /// `ClientWindowMove` here would re-push a rect it may have clamped -- and re-applies the
-    /// server's own rect if one was dropped since the up (`RemoteWindow.endServerAnnouncedMoveResize
-    /// (reportSettle:)`). An end that arrives while the button is still held ends the local move
-    /// the same way; the rest of that gesture is forwarded as ordinary input. Every other start
-    /// and end (types 1-8 and 10-11, a start after the up, an end with no local move) is the
-    /// suppression-only handling above, unchanged.
+    /// is held on that window: the start records the grab offset, marks the window's attached
+    /// children as riding along (gate r1 m-4, `LocalMove.followingChildren`), and the client then
+    /// moves the window itself (`handleInput`). The end of a move this client ended with the
+    /// button-up releases the suppression WITHOUT a settle -- the server placed the window from
+    /// that up, and a `ClientWindowMove` here would re-push a rect it may have clamped -- and
+    /// re-applies the server's own rect if one was dropped since the up
+    /// (`RemoteWindow.endServerAnnouncedMoveResize(reportSettle:snapBack:)`).
+    ///
+    /// Gate r1 I-1: an end that arrives while the button is still held means the server cancelled
+    /// its loop (Esc, capture loss). No motion and no up went out, so the server window never
+    /// moved: the local window SNAPS BACK to the server's latest rect, again with no settle. The
+    /// server's position is the truth here, and a `ClientWindowMove` would re-move a window the
+    /// user just cancelled. FreeRDP's X11 client pushes instead -- its next ConfigureNotify sends
+    /// the local rect (`client/X11/xf_rail.c`, `xf_rail_adjust_position`) -- which is the one
+    /// difference, chosen so a cancel stays a cancel. Either way the local window is no longer
+    /// displaced from the server's, so later clicks land where they look; the rest of that
+    /// gesture is forwarded as ordinary input. Every other start and end (types 1-8 and 10-11, a
+    /// start after the up, an end with no local move) is the suppression-only handling above,
+    /// unchanged.
     private func handleLocalMoveSize(_ event: CRDPEvent) {
         if !loggedFirstLocalMoveSize {
             loggedFirstLocalMoveSize = true
@@ -1027,15 +1052,28 @@ final class RemoteWindowRegistry {
         if event.isMoveSizeStart {
             if event.moveSizeType == Self.railMoveSizeTypeMove, let down = leftButtonDown[windowId] {
                 let origin = window.window.frame.origin
-                localMoves[windowId] = LocalMove(grabOffset: NSPoint(x: down.x - origin.x, y: down.y - origin.y))
+                let children = Set(attachedChildOwner.filter { $0.value == windowId }.keys)
+                for childId in children {
+                    windows[childId]?.beginFollowingOwnerLocalMove()
+                }
+                localMoves[windowId] = LocalMove(
+                    grabOffset: NSPoint(x: down.x - origin.x, y: down.y - origin.y), followingChildren: children)
                 // A parked trailing move would fire into the middle of the drag.
                 pendingTrailingMove.removeValue(forKey: windowId)
             }
             window.beginServerAnnouncedMoveResize()
         } else {
-            let endedWhileHeld = localMoves.removeValue(forKey: windowId) != nil
+            let heldMove = localMoves.removeValue(forKey: windowId)
             let endedAfterUp = localMovesAwaitingEnd.remove(windowId) != nil
-            if endedWhileHeld || endedAfterUp {
+            if let heldMove {
+                // Ended while held (I-1): snap back. The children are unmarked AFTER it, so the
+                // frame each one is compared at is where the snap-back carried it (F-6): after a
+                // pure cancel that is the frame it began with and nothing is reported; if the
+                // owner's server rect changed mid-drag the child reports once, the Mac's
+                // ride-along winning as for any server-driven owner move.
+                window.endServerAnnouncedMoveResize(reportSettle: false, snapBack: true)
+                stopFollowing(heldMove, reportIfMoved: true)
+            } else if endedAfterUp {
                 window.endServerAnnouncedMoveResize(reportSettle: false)
             } else {
                 window.endServerAnnouncedMoveResize()
@@ -1925,9 +1963,16 @@ final class RemoteWindowRegistry {
             // F-a1-6: during a RAIL local move the window follows the pointer and nothing goes to
             // the wire -- no throttle stamp, no move, no trailing flush (the server does not need
             // pointer motion during a local move, and neither FreeRDP client sends any). The
-            // position is the pointer's own, not this event's (see `pointerLocation`).
+            // position is the pointer's own, not this event's (see `pointerLocation`). Gate r1
+            // m-3: when the OS says the left button is no longer held, its up never reached this
+            // window -- end the move exactly as that up would have and stop there: the server is
+            // waiting for that up, not for this motion (`pressedMouseButtons`).
             if let move = localMoves[windowId] {
                 let pointer = pointerLocation()
+                if pressedMouseButtons() & 1 == 0 {
+                    endLocalMoveWithButtonUp(windowId: windowId, move: move, pointer: pointer)
+                    return
+                }
                 windows[windowId]?.moveLocally(toOrigin: move.origin(forPointer: pointer))
                 return
             }
@@ -1963,22 +2008,17 @@ final class RemoteWindowRegistry {
             // stale (and letting it fire after the click would jiggle the remote pointer).
             pendingTrailingMove.removeValue(forKey: windowId)
             // F-a1-6: the left button's held state, per window, for `handleLocalMoveSize`'s
-            // start; and the up that ends a local move. That up puts the window under the
-            // pointer once more (this event's own point may lag the last applied frame) and is
-            // sent at the pointer, the release point the server places the window from. The
-            // server's end, not this up, releases the suppression.
-            var sendPoint = screenPoint
+            // start; and the up that ends a local move (`endLocalMoveWithButtonUp`, which sends
+            // that up itself, at the pointer). Only the left button arms or ends a move: a right
+            // or middle click mid-drag is forwarded as ordinary input and leaves the move alone.
             if button == .left {
                 if down {
                     leftButtonDown[windowId] = screenPoint
+                } else if let move = localMoves[windowId] {
+                    endLocalMoveWithButtonUp(windowId: windowId, move: move, pointer: pointerLocation())
+                    return
                 } else {
                     leftButtonDown.removeValue(forKey: windowId)
-                    if let move = localMoves.removeValue(forKey: windowId) {
-                        let pointer = pointerLocation()
-                        windows[windowId]?.moveLocally(toOrigin: move.origin(forPointer: pointer))
-                        localMovesAwaitingEnd.insert(windowId)
-                        sendPoint = pointer
-                    }
                 }
             }
             if down {
@@ -1995,12 +2035,11 @@ final class RemoteWindowRegistry {
                 execute(focusAuthority.localActivate(windowId: windowId, at: now))
                 scheduleFocusAuthorityTick()
             }
-            // ADR-0015 §5.A.6, as above. Placed after the focus-authority step deliberately: the
-            // local activation is this client's own state machine and is unaffected by whether a
-            // coordinate can be expressed; only the wire send is skipped.
-            guard let point = remotePoint(from: sendPoint) else { return }
-            session.send(crMouseButton(for: button), down: down, atX: Int32(point.x), y: Int32(point.y))
-            onMouseButtonSent?(windowId, crMouseButton(for: button), down, Int32(point.x), Int32(point.y))
+            // ADR-0015 §5.A.6, as above (inside `sendMouseButton`). Placed after the
+            // focus-authority step deliberately: the local activation is this client's own state
+            // machine and is unaffected by whether a coordinate can be expressed; only the wire
+            // send is skipped.
+            sendMouseButton(button, down: down, at: screenPoint, windowId: windowId)
 
         case .scrollWheel(let deltaX, let deltaY, let screenPoint):
             // Same reasoning as .mouseButton above: this event carries its own position,
@@ -2308,6 +2347,43 @@ final class RemoteWindowRegistry {
         if case .converging = focusAuthority.state {
             scheduleFocusAuthorityTick()
         }
+    }
+
+    /// F-a1-6: the button-up that ends `windowId`'s local move -- the real left-up, or (gate r1
+    /// m-3) the first motion that finds the left button released, whose up never arrived. One
+    /// more placement at `pointer` (an up event's own point may lag the last applied frame), the
+    /// window parked until the server's end (that end, not this up, releases the suppression),
+    /// ONE left-up sent at `pointer`, the release point the server places the window from -- and
+    /// only then the attached children unmarked, each reporting one settle if the ride-along
+    /// moved it (F-6), so their `ClientWindowMove`s follow the up that releases the server's loop
+    /// on the wire. Unmarked after the placement either way: that placement carried them too.
+    private func endLocalMoveWithButtonUp(windowId: UInt32, move: LocalMove, pointer: NSPoint) {
+        localMoves.removeValue(forKey: windowId)
+        leftButtonDown.removeValue(forKey: windowId)
+        windows[windowId]?.moveLocally(toOrigin: move.origin(forPointer: pointer))
+        localMovesAwaitingEnd.insert(windowId)
+        sendMouseButton(.left, down: false, at: pointer, windowId: windowId)
+        stopFollowing(move, reportIfMoved: true)
+    }
+
+    /// Gate r1 m-4: unmarks the children a local move marked at its start
+    /// (`LocalMove.followingChildren`). Called at every end of that move: the up, real or lost,
+    /// and the server's end while held (`reportIfMoved: true`, F-6), and the prune of the dragged
+    /// window (`false`).
+    private func stopFollowing(_ move: LocalMove, reportIfMoved: Bool) {
+        for childId in move.followingChildren {
+            windows[childId]?.endFollowingOwnerLocalMove(reportIfMoved: reportIfMoved)
+        }
+    }
+
+    /// The one place a mouse button event reaches the wire -- `handleInput`'s `.mouseButton` and a
+    /// local move's up (`endLocalMoveWithButtonUp`) -- with `onMouseButtonSent` right after the
+    /// send. ADR-0015 §5.A.6: no topology -> skip the conversion and the send, do not substitute
+    /// one.
+    private func sendMouseButton(_ button: RemoteWindowMouseButton, down: Bool, at screenPoint: NSPoint, windowId: UInt32) {
+        guard let point = remotePoint(from: screenPoint) else { return }
+        session.send(crMouseButton(for: button), down: down, atX: Int32(point.x), y: Int32(point.y))
+        onMouseButtonSent?(windowId, crMouseButton(for: button), down, Int32(point.x), Int32(point.y))
     }
 
     /// Trailing-edge flush for the move throttle (see `pendingTrailingMove`): sends the
@@ -2769,17 +2845,22 @@ final class RemoteWindowRegistry {
     }
 
     /// Diagnostics only (F-a1-6) -- true while a RAIL local move is in flight for `windowId`
-    /// (the server's start arrived with the left button held, and neither the up nor the
-    /// server's end has arrived since). Reads the registry's own table, not the window: a stale
+    /// (the server's start arrived with the left button held, and neither the up -- real, or a
+    /// motion that found the button released -- nor the server's end has arrived since). Reads the registry's own table, not the window: a stale
     /// entry for a window that is gone must read `true` here, not be hidden by the lookup.
     func debugLocalMoveIsActive(forWindowId windowId: UInt32) -> Bool {
         localMoves[windowId] != nil
     }
 
     /// F-a1-6: `windows`' own `didSet` -- see its doc comment. Cheap on every other mutation: the
-    /// three tables are empty except during a drag.
+    /// three tables are empty except during a drag. A dropped move unmarks its children first
+    /// (gate r1 m-4): they outlive their owner here, and a stale mark would silence their own
+    /// moves for good.
     private func dropLocalMoveStateOfRemovedWindows() {
         guard !localMoves.isEmpty || !localMovesAwaitingEnd.isEmpty || !leftButtonDown.isEmpty else { return }
+        for (windowId, move) in localMoves where windows[windowId] == nil {
+            stopFollowing(move, reportIfMoved: false)
+        }
         localMoves = localMoves.filter { windows[$0.key] != nil }
         localMovesAwaitingEnd = localMovesAwaitingEnd.filter { windows[$0] != nil }
         leftButtonDown = leftButtonDown.filter { windows[$0.key] != nil }

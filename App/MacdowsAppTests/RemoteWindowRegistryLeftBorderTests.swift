@@ -58,6 +58,7 @@ struct RemoteWindowRegistryLeftBorderTests {
         /// `WINDOW_ORDER_FIELD_*`, duplicated narrowly from the file-private `WindowOrderField`
         /// in `RemoteWindowRegistry.swift:36-51` -- the same "duplicate the bits, not the
         /// policy" precedent `Tools/window-smoke` follows for its own copy.
+        static let fieldOwner: UInt32 = 0x0000_0002
         static let fieldTitle: UInt32 = 0x0000_0004
         static let fieldStyle: UInt32 = 0x0000_0008
         static let fieldShow: UInt32 = 0x0000_0010
@@ -74,15 +75,20 @@ struct RemoteWindowRegistryLeftBorderTests {
         private let railY: Int32
         private let railWidth: UInt32
         private let railHeight: UInt32
+        private let owner: UInt32
 
         /// - Parameter carriesStyleField: `false` models the case the seam's doc comment calls
         ///   out -- a window whose orders never set `WINDOW_ORDER_FIELD_STYLE`, leaving
         ///   `PendingWindowState.style` at its default 0.
         /// - Parameter kind: `.windowCreate` by default; the local-move suite sends the same
         ///   fields as a `.windowUpdate` to model the server announcing a new position.
+        /// - Parameter owner: 0 by default, and then the order carries no OWNER field (every case
+        ///   before gate r1's fold); nonzero sets the field, so the registry attaches the window to
+        ///   that owner (`updateParentChild`) -- the local-move suite's attached-child cases.
         init(
             windowId: UInt32, style: UInt32, carriesStyleField: Bool = true,
-            x: Int32, y: Int32, width: UInt32, height: UInt32, kind: CRDPEventKind = .windowCreate
+            x: Int32, y: Int32, width: UInt32, height: UInt32, kind: CRDPEventKind = .windowCreate,
+            owner: UInt32 = 0
         ) {
             id = windowId
             orderKind = kind
@@ -91,8 +97,10 @@ struct RemoteWindowRegistryLeftBorderTests {
             railY = y
             railWidth = width
             railHeight = height
+            self.owner = owner
             var flags = Self.fieldOffset | Self.fieldSize | Self.fieldShow | Self.fieldTitle
             if carriesStyleField { flags |= Self.fieldStyle }
+            if owner != 0 { flags |= Self.fieldOwner }
             self.flags = flags
             super.init()
         }
@@ -103,7 +111,7 @@ struct RemoteWindowRegistryLeftBorderTests {
         override var fieldFlags: UInt32 { flags }
         override var style: UInt32 { styleBits }
         override var styleEx: UInt32 { 0 }
-        override var ownerWindowId: UInt32 { 0 }
+        override var ownerWindowId: UInt32 { owner }
         override var title: String { "left-border-probe" }
         override var offsetX: Int32 { railX }
         override var offsetY: Int32 { railY }
@@ -239,7 +247,7 @@ struct RemoteWindowRegistryLeftBorderTests {
     /// if one existed -- that method's non-zero return sets `width`/`height` only and pins
     /// `originX: 0, originY: 0` -- but the zero is stated as a fixture fact rather than leaned on
     /// as an invariant of a method this file does not own.
-    private static func expectedSentTop(forContentRect contentRect: NSRect, in topology: DisplayTopology) -> Int32 {
+    fileprivate static func expectedSentTop(forContentRect contentRect: NSRect, in topology: DisplayTopology) -> Int32 {
         let macRect = MacRect(
             x: contentRect.origin.x, y: contentRect.origin.y,
             width: contentRect.size.width, height: contentRect.size.height
@@ -933,6 +941,9 @@ struct RemoteWindowRegistryLocalMoveTests {
         var moves: [(windowId: UInt32, x: Int32, y: Int32)] = []
         var buttons: [(windowId: UInt32, button: CRMouseButton, down: Bool, x: Int32, y: Int32)] = []
         var windowMoves: [UInt32] = []
+        /// Every `onWindowMoveSent` call in full, with how many ups had gone to the wire by then
+        /// (F-6: a child's report must follow the owner's up).
+        var windowMoveRects: [(windowId: UInt32, left: Int32, top: Int32, right: Int32, bottom: Int32, upsBefore: Int)] = []
         var ups: [(windowId: UInt32, button: CRMouseButton, down: Bool, x: Int32, y: Int32)] {
             buttons.filter { !$0.down }
         }
@@ -940,6 +951,9 @@ struct RemoteWindowRegistryLocalMoveTests {
 
     private final class PointerBox {
         var point = NSPoint.zero
+        /// What the `pressedMouseButtons` seam reports: bit 0, the left button, held -- every drag
+        /// below holds it, and only the lost-up case (F4) clears it.
+        var buttons = 1
     }
 
     private struct Harness {
@@ -950,18 +964,23 @@ struct RemoteWindowRegistryLocalMoveTests {
     }
 
     /// The left-border suite's registry, with all three wire hooks recording here (its own
-    /// `onWindowMoveSent` box keeps one rect per window; these cases need every call) and the
-    /// pointer seam reading `PointerBox`.
+    /// `onWindowMoveSent` box keeps one rect per window; these cases need every call) and both
+    /// pointer seams, the position and the pressed buttons, reading `PointerBox`.
     private static func makeHarness() throws -> Harness {
         let (registry, _) = try Fixture.makeRegistry()
         let wire = WireBox()
         let pointer = PointerBox()
-        registry.onWindowMoveSent = { windowId, _, _, _, _ in wire.windowMoves.append(windowId) }
+        registry.onWindowMoveSent = { windowId, left, top, right, bottom in
+            wire.windowMoves.append(windowId)
+            wire.windowMoveRects.append(
+                (windowId: windowId, left: left, top: top, right: right, bottom: bottom, upsBefore: wire.ups.count))
+        }
         registry.onMouseMoveSent = { windowId, x, y in wire.moves.append((windowId: windowId, x: x, y: y)) }
         registry.onMouseButtonSent = { windowId, button, down, x, y in
             wire.buttons.append((windowId: windowId, button: button, down: down, x: x, y: y))
         }
         registry.pointerLocation = { pointer.point }
+        registry.pressedMouseButtons = { pointer.buttons }
         return Harness(registry: registry, wire: wire, pointer: pointer, topology: try Fixture.fixtureTopology())
     }
 
@@ -1114,10 +1133,13 @@ struct RemoteWindowRegistryLocalMoveTests {
         #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 615) == 0)
     }
 
-    /// L2c. Nor does a rect dropped in an EARLIER suppression period: a resize-type loop drops one
-    /// and ends with today's settle; the next move-type start begins a fresh period, and an end
-    /// that arrives while the button is still held (no placement in between) applies nothing.
-    @Test func aRectDroppedBeforeTheStartIsNotReapplied() async throws {
+    /// L2c. A rect dropped in an EARLIER suppression period: a resize-type loop drops one and ends
+    /// with today's settle, which does not apply it. The next move-type start begins a fresh
+    /// period, and an end that arrives while the button is still held SNAPS BACK (gate r1 I-1) to
+    /// the server's latest rect -- that dropped one, the only rect the server announced since the
+    /// window's creation -- with no settle. Changed by the I-1 fold: this end used to apply nothing
+    /// and leave the window at `before`, and the case was `aRectDroppedBeforeTheStartIsNotReapplied`.
+    @Test func anEndWhileHeldSnapsBackToARectDroppedBeforeTheStart() async throws {
         let h = try Self.makeHarness()
         defer { h.registry.closeWindowsForSessionEnd() }
         let window = try Self.makeWindow(h, id: 616, style: Self.chromelessStyle)
@@ -1136,8 +1158,11 @@ struct RemoteWindowRegistryLocalMoveTests {
         try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
         h.registry.handle(LMSStub(windowId: 616, start: true, type: Self.moveType))
         h.registry.handle(LMSStub(windowId: 616, start: false, type: Self.moveType))
-        #expect(window.frame == before, "the earlier period's rect came back")
-        #expect(h.wire.windowMoves == [616])
+        #expect(window.contentRect(forFrameRect: window.frame)
+                == Self.macContentRect(x: 387, y: 167, width: 522, height: 514, h.topology),
+                "the end while held did not land on the server's latest rect")
+        #expect(h.wire.windowMoves == [616], "the end while held settled")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 616) == 0)
     }
 
     /// L3. The round-trip race: the user released before the server's start arrived. The up
@@ -1247,14 +1272,20 @@ struct RemoteWindowRegistryLocalMoveTests {
         #expect(h.registry.currentTopDownWindowIds() == reversed, "the control arm: the order does reorder once the drag is over")
     }
 
-    /// L7. The server ends its loop while the button is still held: the local move ends there --
-    /// no settle, suppression released -- and the rest of the gesture is ordinary input: the next
-    /// move is forwarded, the up goes out at its own point and clears the held button (a later
-    /// move-type start no longer begins a local move).
-    @Test func theEndWhileHeldEndsTheMove() throws {
+    /// L7. The server ends its loop while the button is still held (gate r1 I-1: Esc, capture loss
+    /// -- the server cancelled the move, and no motion or up ever went out): the local move ends
+    /// there and the window SNAPS BACK to the server's rect, here its creation rect, the only one
+    /// the server announced -- no settle (`onWindowMoveSent` not called), suppression released.
+    /// The rest of the gesture is ordinary input: the next move is forwarded at its own point and
+    /// leaves the window alone, the up goes out at its own point and clears the held button (a
+    /// later move-type start no longer begins a local move, and its end is today's settle).
+    @Test func theEndWhileHeldEndsTheMove() async throws {
         let h = try Self.makeHarness()
         defer { h.registry.closeWindowsForSessionEnd() }
-        let window = try Self.makeWindow(h, id: 671)
+        let window = try Self.makeWindow(h, id: 671, style: Self.chromelessStyle)
+        try await Self.waitUntilShown([window])
+        let serverRect = Self.macContentRect(x: 300, y: 200, width: 522, height: 514, h.topology)
+        try #require(window.contentRect(forFrameRect: window.frame) == serverRect)
         let origin = window.frame.origin
         let down = Self.offset(origin, 100, 500)
         try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
@@ -1265,7 +1296,9 @@ struct RemoteWindowRegistryLocalMoveTests {
 
         h.registry.handle(LMSStub(windowId: 671, start: false, type: Self.moveType))
         #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 671))
-        #expect(h.wire.windowMoves.isEmpty)
+        #expect(window.contentRect(forFrameRect: window.frame) == serverRect,
+                "the window stayed displaced from the server's: \(window.frame)")
+        #expect(h.wire.windowMoves.isEmpty, "a cancelled move settled a ClientWindowMove")
         #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 671) == 0)
 
         h.pointer.point = Self.offset(down, 90, 90)
@@ -1273,30 +1306,86 @@ struct RemoteWindowRegistryLocalMoveTests {
         try Self.send(.mouseMoved(screenPoint: after), to: window)
         let expectedMove = Self.remote(after, h.topology)
         #expect(h.wire.moves.count == 1 && h.wire.moves.first?.x == expectedMove.x && h.wire.moves.first?.y == expectedMove.y)
-        #expect(window.frame.origin == Self.offset(origin, 20, 0))
+        #expect(window.contentRect(forFrameRect: window.frame) == serverRect, "an ordinary move placed the window")
         try Self.send(.mouseButton(.left, down: false, screenPoint: after), to: window)
         #expect(h.wire.ups.count == 1 && h.wire.ups.first?.x == expectedMove.x && h.wire.ups.first?.y == expectedMove.y)
 
         h.registry.handle(LMSStub(windowId: 671, start: true, type: Self.moveType))
         #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 671), "the up did not clear the held button")
         h.registry.handle(LMSStub(windowId: 671, start: false, type: Self.moveType))
+        #expect(h.wire.windowMoves == [671], "the later loop's end is today's settle")
     }
 
-    /// L8. The local-move state goes with its window: a `WindowDelete` and the session-end reset
-    /// (`closeWindowsForSessionEnd()`, the entry `RemoteWindowRegistrySessionEndTests` drives) both
-    /// clear it -- and a window that comes back under the same RAIL id inherits neither the move
-    /// nor the held button.
+    /// L7b. The snap-back lands on the server's LATEST rect, not its creation rect: a
+    /// `WindowUpdate` that arrives mid-drag is dropped (the suppression holds), a later placement
+    /// clears the dropped-rect holder, and the end while held still restores that update's rect --
+    /// `RemoteWindow.pendingContentRect`, every rect the server requested, is what it reads.
+    @Test func theSnapBackLandsOnTheLatestServerRect() async throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 672, style: Self.chromelessStyle)
+        try await Self.waitUntilShown([window])
+        let origin = window.frame.origin
+        let down = Self.offset(origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 672, start: true, type: Self.moveType))
+        h.pointer.point = Self.offset(down, 20, 0)
+        try Self.send(.mouseMoved(screenPoint: down), to: window)
+        let dragged = window.frame
+        h.registry.handle(Fixture.WindowOrderStub(
+            windowId: 672, style: Self.chromelessStyle, x: 387, y: 167, width: 522, height: 514, kind: .windowUpdate))
+        #expect(window.frame == dragged, "a rect applied while the suppression holds")
+        h.pointer.point = Self.offset(down, 40, -10)
+        try Self.send(.mouseMoved(screenPoint: down), to: window)
+        try #require(window.frame.origin == Self.offset(origin, 40, -10))
+
+        h.registry.handle(LMSStub(windowId: 672, start: false, type: Self.moveType))
+        #expect(window.contentRect(forFrameRect: window.frame)
+                == Self.macContentRect(x: 387, y: 167, width: 522, height: 514, h.topology),
+                "the snap-back did not land on the latest server rect: \(window.frame)")
+        #expect(h.wire.windowMoves.isEmpty)
+        #expect(h.wire.moves.isEmpty)
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 672) == 0)
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: window)
+    }
+
+    /// L8. The local-move state goes with ITS window, and only with it (gate r1 m-1: with one
+    /// window this case could not tell "prune the deleted one" from "prune all"). A `WindowDelete`
+    /// of another window leaves the drag alone: the move stays active, the held button stays
+    /// recorded (after an end while held a new start begins a move again), and the up still goes
+    /// out at the pointer, as a local move's up. A `WindowDelete` of the dragged window clears it
+    /// while a third window is still open, and so does the session-end reset
+    /// (`closeWindowsForSessionEnd()`, the entry `RemoteWindowRegistrySessionEndTests` drives). A
+    /// window that comes back under the same RAIL id inherits neither the move nor the held button.
     @Test func deleteAndSessionEndClearTheMove() throws {
         let h = try Self.makeHarness()
         defer { h.registry.closeWindowsForSessionEnd() }
-        let window = try Self.makeWindow(h, id: 661)
-        let down = Self.offset(window.frame.origin, 100, 500)
-        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        let dragged = try Self.makeWindow(h, id: 661)
+        _ = try Self.makeWindow(h, id: 662)
+        _ = try Self.makeWindow(h, id: 663)
+        let down = Self.offset(dragged.frame.origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: dragged)
         h.registry.handle(LMSStub(windowId: 661, start: true, type: Self.moveType))
         try #require(h.registry.debugLocalMoveIsActive(forWindowId: 661))
 
+        h.registry.handle(WindowDeleteStub(windowId: 662))
+        #expect(h.registry.debugLocalMoveIsActive(forWindowId: 661), "deleting another window dropped the move")
+        h.registry.handle(LMSStub(windowId: 661, start: false, type: Self.moveType))
+        h.registry.handle(LMSStub(windowId: 661, start: true, type: Self.moveType))
+        #expect(h.registry.debugLocalMoveIsActive(forWindowId: 661), "deleting another window dropped the held button")
+        let release = Self.offset(down, 10, 10)
+        h.pointer.point = release
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: dragged)
+        let expectedUp = Self.remote(release, h.topology)
+        #expect(h.wire.ups.count == 1 && h.wire.ups.first?.x == expectedUp.x && h.wire.ups.first?.y == expectedUp.y,
+                "the up is not a local move's up at the pointer: \(h.wire.ups)")
+        h.registry.handle(LMSStub(windowId: 661, start: false, type: Self.moveType))
+
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: dragged)
+        h.registry.handle(LMSStub(windowId: 661, start: true, type: Self.moveType))
+        try #require(h.registry.debugLocalMoveIsActive(forWindowId: 661))
         h.registry.handle(WindowDeleteStub(windowId: 661))
-        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 661), "WindowDelete")
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 661), "WindowDelete of the dragged window, 663 still open")
         let again = try Self.makeWindow(h, id: 661)
         h.registry.handle(LMSStub(windowId: 661, start: true, type: Self.moveType))
         #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 661), "the deleted window's held button survived")
@@ -1311,6 +1400,345 @@ struct RemoteWindowRegistryLocalMoveTests {
         h.registry.handle(LMSStub(windowId: 661, start: true, type: Self.moveType))
         #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 661), "the held button survived the session-end reset")
         h.registry.handle(LMSStub(windowId: 661, start: false, type: Self.moveType))
+    }
+
+    /// F3a (gate r1 m-2). The start cancels a trailing move parked just before it: the drag's first
+    /// motion goes out, the second -- inside the 8 ms throttle -- is parked, and the server's start
+    /// arrives before the flush is due. Once it is due, nothing more has reached the wire.
+    @Test func theStartCancelsAParkedTrailingMove() async throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 691)
+        let down = Self.offset(window.frame.origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        let first = Self.offset(down, 2, 0)
+        try Self.send(.mouseMoved(screenPoint: first), to: window)
+        try Self.send(.mouseMoved(screenPoint: Self.offset(down, 4, 0)), to: window)
+        let expected = Self.remote(first, h.topology)
+        try #require(h.wire.moves.count == 1 && h.wire.moves.first?.x == expected.x && h.wire.moves.first?.y == expected.y,
+                     "the second motion was not parked: \(h.wire.moves)")
+
+        h.registry.handle(LMSStub(windowId: 691, start: true, type: Self.moveType))
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(h.wire.moves.count == 1, "the parked motion reached the wire after the start: \(h.wire.moves)")
+        #expect(h.registry.debugLocalMoveIsActive(forWindowId: 691))
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 691, start: false, type: Self.moveType))
+    }
+
+    /// F3b (gate r1 m-2). The awaiting-end set is pruned with its window: a drag ended by the up
+    /// (the window now waits for the server's end), a `WindowDelete`, and a new window under the
+    /// same RAIL id whose resize-type loop ends -- that end is today's, with its settle. A stale
+    /// awaiting entry would have taken it for a handled move's end, with none.
+    @Test func theAwaitingEndSetIsPrunedWithTheWindow() throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 692)
+        let down = Self.offset(window.frame.origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 692, start: true, type: Self.moveType))
+        h.pointer.point = Self.offset(down, 30, 0)
+        try Self.send(.mouseMoved(screenPoint: down), to: window)
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: window)
+        try #require(!h.registry.debugLocalMoveIsActive(forWindowId: 692))
+        try #require(h.wire.ups.count == 1)
+
+        h.registry.handle(WindowDeleteStub(windowId: 692))
+        _ = try Self.makeWindow(h, id: 692)
+        h.registry.handle(LMSStub(windowId: 692, start: true, type: Self.resizeTopType))
+        h.registry.handle(LMSStub(windowId: 692, start: false, type: Self.resizeTopType))
+        #expect(h.wire.windowMoves == [692], "the new window's resize-type end did not settle")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 692) == 0)
+    }
+
+    /// F3c (gate r1 m-2). Only the left button arms and ends a move. A right-button down records
+    /// no held left button (a move-type start then begins nothing); a right click in the middle of
+    /// a left-button drag goes out at its own points and leaves the move running -- the window
+    /// still follows, no up is parked for it -- and the left up ends the move as usual.
+    @Test func onlyTheLeftButtonArmsAndEndsAMove() throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 693)
+        let origin = window.frame.origin
+        let down = Self.offset(origin, 100, 500)
+
+        try Self.send(.mouseButton(.right, down: true, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 693, start: true, type: Self.moveType))
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 693), "a right-button down armed a move")
+        h.registry.handle(LMSStub(windowId: 693, start: false, type: Self.moveType))
+        try Self.send(.mouseButton(.right, down: false, screenPoint: down), to: window)
+        try #require(h.wire.windowMoves == [693], "the unhandled end is today's settle")
+
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 693, start: true, type: Self.moveType))
+        try #require(h.registry.debugLocalMoveIsActive(forWindowId: 693))
+        h.pointer.point = Self.offset(down, 30, 0)
+        let rightAt = Self.offset(down, 7, 7)
+        try Self.send(.mouseButton(.right, down: true, screenPoint: rightAt), to: window)
+        try Self.send(.mouseButton(.right, down: false, screenPoint: rightAt), to: window)
+        #expect(h.registry.debugLocalMoveIsActive(forWindowId: 693), "a right click ended the move")
+        let rightOnWire = Self.remote(rightAt, h.topology)
+        let rights = h.wire.buttons.filter { $0.button == .right }
+        #expect(rights.count == 4 && rights.suffix(2).allSatisfy { $0.x == rightOnWire.x && $0.y == rightOnWire.y },
+                "\(rights)")
+        h.pointer.point = Self.offset(down, 40, -5)
+        try Self.send(.mouseMoved(screenPoint: down), to: window)
+        #expect(window.frame.origin == Self.offset(origin, 40, -5), "the window stopped following")
+
+        let release = Self.offset(down, 42, -6)
+        h.pointer.point = release
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: window)
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 693))
+        let leftUps = h.wire.ups.filter { $0.button == .left }
+        let expectedUp = Self.remote(release, h.topology)
+        #expect(leftUps.count == 1 && leftUps.first?.x == expectedUp.x && leftUps.first?.y == expectedUp.y, "\(leftUps)")
+        h.registry.handle(LMSStub(windowId: 693, start: false, type: Self.moveType))
+        #expect(h.wire.windowMoves == [693], "the left drag's end settled")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 693) == 0)
+        #expect(h.wire.moves.isEmpty)
+    }
+
+    /// F4 (gate r1 m-3). A lost left-up: the OS stops reporting the left button held (its up went to
+    /// Mission Control, another app, a modal) while the window still has a local move. The next
+    /// motion ends the move as that up would have -- one more placement at the pointer, exactly one
+    /// left-up at the pointer, nothing else on the wire; the motion after it is ordinary input, and
+    /// the server's end is a handled move's (no settle).
+    @Test func aLostUpEndsTheMoveOnTheNextMotion() throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 694)
+        let origin = window.frame.origin
+        let down = Self.offset(origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 694, start: true, type: Self.moveType))
+        h.pointer.buttons = 1
+        h.pointer.point = Self.offset(down, 30, -20)
+        try Self.send(.mouseMoved(screenPoint: down), to: window)
+        try #require(window.frame.origin == Self.offset(origin, 30, -20))
+        try #require(h.wire.moves.isEmpty && h.wire.ups.isEmpty)
+
+        h.pointer.buttons = 0
+        let release = Self.offset(down, 44, -8)
+        h.pointer.point = release
+        try Self.send(.mouseMoved(screenPoint: Self.offset(down, 31, -19)), to: window)
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 694), "the move outlived its button")
+        #expect(window.frame.origin == Self.offset(origin, 44, -8), "the lost up places the window once more")
+        let expectedUp = Self.remote(release, h.topology)
+        #expect(h.wire.ups.count == 1 && h.wire.ups.first?.button == .left
+                && h.wire.ups.first?.x == expectedUp.x && h.wire.ups.first?.y == expectedUp.y,
+                "one left-up at the pointer: \(h.wire.ups)")
+        #expect(h.wire.moves.isEmpty, "the motion that found the button released went to the wire: \(h.wire.moves)")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 694) == 1, "held until the server's end")
+
+        h.pointer.point = Self.offset(down, 90, 90)
+        let hover = Self.offset(down, 60, -30)
+        try Self.send(.mouseMoved(screenPoint: hover), to: window)
+        let expectedMove = Self.remote(hover, h.topology)
+        #expect(h.wire.moves.count == 1 && h.wire.moves.first?.x == expectedMove.x && h.wire.moves.first?.y == expectedMove.y,
+                "\(h.wire.moves)")
+        #expect(window.frame.origin == Self.offset(origin, 44, -8), "ordinary input moved the window")
+
+        h.registry.handle(LMSStub(windowId: 694, start: false, type: Self.moveType))
+        #expect(h.wire.windowMoves.isEmpty, "the end after a lost up settled")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 694) == 0)
+        #expect(h.wire.buttons.count == 2, "the down and the one up: \(h.wire.buttons)")
+    }
+
+    /// An owner and a child attached to it (adr/0010 §4: the child's order names the owner, and the
+    /// registry attaches it with `addChildWindow` once the child's first-frame gate clears -- the
+    /// popup tier's 0.25 s here). Returns the two windows on screen, attached.
+    private static func makeOwnerAndChild(_ h: Harness, owner: UInt32, child: UInt32) async throws -> (NSWindow, NSWindow) {
+        let ownerWindow = try Self.makeWindow(h, id: owner, style: Self.chromelessStyle)
+        h.registry.handle(Fixture.WindowOrderStub(
+            windowId: child, style: Self.chromelessStyle, x: 400, y: 300, width: 200, height: 120, owner: owner))
+        let childWindow = try #require(h.registry.window(forWindowId: child))
+        try await Self.waitUntilShown([ownerWindow, childWindow])
+        try #require(h.registry.attachedOwner(forWindowId: child) == owner, "the child never attached")
+        try #require(ownerWindow.childWindows?.contains(childWindow) == true)
+        return (ownerWindow, childWindow)
+    }
+
+    /// Moves `child` by its own frame (as a native drag would) and polls (20 ms steps, 2 s cap) for
+    /// that move's settle, then waits one more debounce so a second one would show too.
+    private static func moveChildAndAwaitSettle(_ h: Harness, _ child: NSWindow, id: UInt32) async throws {
+        let before = h.wire.windowMoves.filter { $0 == id }.count
+        var frame = child.frame
+        frame.origin.x += 25
+        child.setFrame(frame, display: false)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while h.wire.windowMoves.filter({ $0 == id }).count == before, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try await Task.sleep(for: .milliseconds(300))
+    }
+
+    /// F5 (gate r1 m-4). An attached child rides its owner's drag -- AppKit moves it with the
+    /// parent and posts its `didMove` outside the parent's bracket -- but settles nothing on its
+    /// own: no `ClientWindowMove` for it during the drag, even past `moveSettleDebounce`. The up
+    /// reports its ride-along once (F-6; F5c pins that report in detail) and nothing follows the
+    /// server's end. Once the move is over, the child's own moves settle again. (Changed by F-6:
+    /// after the up this case used to expect no settle at all.)
+    @Test func anAttachedChildRidesTheDragWithoutSettling() async throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let (owner, child) = try await Self.makeOwnerAndChild(h, owner: 681, child: 682)
+        let ownerOrigin = owner.frame.origin
+        let childOrigin = child.frame.origin
+        let down = Self.offset(ownerOrigin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: owner)
+        h.registry.handle(LMSStub(windowId: 681, start: true, type: Self.moveType))
+        h.pointer.point = Self.offset(down, 30, -20)
+        try Self.send(.mouseMoved(screenPoint: down), to: owner)
+        h.pointer.point = Self.offset(down, 60, -10)
+        try Self.send(.mouseMoved(screenPoint: down), to: owner)
+        try #require(child.frame.origin == Self.offset(childOrigin, 60, -10), "AppKit did not carry the child")
+
+        try await Task.sleep(for: .milliseconds(450))
+        #expect(h.wire.windowMoves.isEmpty, "a settle mid-drag: \(h.wire.windowMoves)")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 682) == 0, "the child claimed suppression")
+
+        h.pointer.point = Self.offset(down, 64, -12)
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: owner)
+        try #require(child.frame.origin == Self.offset(childOrigin, 64, -12))
+        #expect(h.wire.windowMoves == [682], "F-6: the up reports the child's ride-along once: \(h.wire.windowMoves)")
+        h.registry.handle(LMSStub(windowId: 681, start: false, type: Self.moveType))
+        try await Task.sleep(for: .milliseconds(450))
+        #expect(h.wire.windowMoves == [682], "a settle after the server's end: \(h.wire.windowMoves)")
+
+        try await Self.moveChildAndAwaitSettle(h, child, id: 682)
+        #expect(h.wire.windowMoves == [682, 682], "the child's own move does not settle after the drag")
+    }
+
+    /// F5c (F-6, controller ruling on the c4 fold's Q1). Windows does not move an owned window with
+    /// its owner; AppKit does. So the up that ends the owner's drag reports the child's ride-along
+    /// ONCE -- the `ClientWindowMove` the pre-fold debounce would have sent -- after the up on the
+    /// wire, carrying the child's moved rect (the child's own earlier settle, shifted by the drag),
+    /// and never again. First half: a drag by zero delta moves nothing and reports nothing.
+    @Test func aChildSettlesOnceAfterTheOwnersDrag() async throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let (owner, child) = try await Self.makeOwnerAndChild(h, owner: 685, child: 686)
+        let down = Self.offset(owner.frame.origin, 100, 500)
+
+        h.pointer.point = down
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: owner)
+        h.registry.handle(LMSStub(windowId: 685, start: true, type: Self.moveType))
+        try Self.send(.mouseMoved(screenPoint: down), to: owner)
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: owner)
+        h.registry.handle(LMSStub(windowId: 685, start: false, type: Self.moveType))
+        try await Task.sleep(for: .milliseconds(450))
+        #expect(h.wire.windowMoves.isEmpty, "a drag that moved nothing reported: \(h.wire.windowMoves)")
+
+        try await Self.moveChildAndAwaitSettle(h, child, id: 686)
+        let reference = try #require(h.wire.windowMoveRects.last)
+        try #require(h.wire.windowMoveRects.count == 1 && reference.windowId == 686, "\(h.wire.windowMoveRects)")
+        let childOrigin = child.frame.origin
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: owner)
+        h.registry.handle(LMSStub(windowId: 685, start: true, type: Self.moveType))
+        h.pointer.point = Self.offset(down, 30, -10)
+        try Self.send(.mouseMoved(screenPoint: down), to: owner)
+        try await Task.sleep(for: .milliseconds(450))
+        #expect(h.wire.windowMoveRects.count == 1, "a settle mid-drag: \(h.wire.windowMoveRects)")
+
+        h.pointer.point = Self.offset(down, 40, -15)
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: owner)
+        try #require(child.frame.origin == Self.offset(childOrigin, 40, -15))
+        try #require(h.wire.windowMoveRects.count == 2, "the up did not report the child once: \(h.wire.windowMoveRects)")
+        let report = h.wire.windowMoveRects[1]
+        #expect(report.windowId == 686)
+        #expect(report.upsBefore == 2, "the child's report went out before the owner's up")
+        #expect(report.left == reference.left + 40 && report.right == reference.right + 40, "\(report) vs \(reference)")
+        #expect(report.top == reference.top + 15 && report.bottom == reference.bottom + 15, "\(report) vs \(reference)")
+        #expect(report.top == Fixture.expectedSentTop(forContentRect: child.contentRect(forFrameRect: child.frame), in: h.topology))
+        h.registry.handle(LMSStub(windowId: 685, start: false, type: Self.moveType))
+        try await Task.sleep(for: .milliseconds(450))
+        #expect(h.wire.windowMoves == [686, 686], "a second report: \(h.wire.windowMoves)")
+    }
+
+    /// F5d (F-6, controller ruling 21:4x). A pure cancel reports nothing: the server's end while
+    /// held snaps the owner back to its server rect, AppKit carries the child back to its own, and
+    /// neither window settles -- the child is compared at the frame it began with. Second half: the
+    /// owner's server rect changed mid-drag (a dropped `WindowUpdate`, L7b's shape), so the
+    /// snap-back lands the owner on the new rect and carries the child off its own; the child then
+    /// reports exactly once, with its new rect (its own earlier settle shifted by the owner's
+    /// move), and the owner never -- the Mac's ride-along wins, as for any server-driven owner move.
+    @Test func aChildDoesNotSettleAfterACancelledDrag() async throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let (owner, child) = try await Self.makeOwnerAndChild(h, owner: 687, child: 688)
+        let ownerServer = Self.macContentRect(x: 300, y: 200, width: 522, height: 514, h.topology)
+        let childServer = Self.macContentRect(x: 400, y: 300, width: 200, height: 120, h.topology)
+        try #require(owner.contentRect(forFrameRect: owner.frame) == ownerServer)
+        try #require(child.contentRect(forFrameRect: child.frame) == childServer)
+        let down = Self.offset(owner.frame.origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: owner)
+        h.registry.handle(LMSStub(windowId: 687, start: true, type: Self.moveType))
+        h.pointer.point = Self.offset(down, 30, -20)
+        try Self.send(.mouseMoved(screenPoint: down), to: owner)
+        try await Task.sleep(for: .milliseconds(450))
+        h.registry.handle(LMSStub(windowId: 687, start: false, type: Self.moveType))
+        #expect(owner.contentRect(forFrameRect: owner.frame) == ownerServer, "the owner did not snap back")
+        #expect(child.contentRect(forFrameRect: child.frame) == childServer, "the child was not carried back")
+        try await Task.sleep(for: .milliseconds(450))
+        #expect(h.wire.windowMoves.isEmpty, "a cancelled drag reported: \(h.wire.windowMoves)")
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: owner)
+
+        try await Self.moveChildAndAwaitSettle(h, child, id: 688)
+        let reference = try #require(h.wire.windowMoveRects.last)
+        try #require(h.wire.windowMoveRects.count == 1 && reference.windowId == 688, "\(h.wire.windowMoveRects)")
+        let childBefore = child.frame.origin
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: owner)
+        h.registry.handle(LMSStub(windowId: 687, start: true, type: Self.moveType))
+        try Self.send(.mouseMoved(screenPoint: down), to: owner)
+        h.registry.handle(Fixture.WindowOrderStub(
+            windowId: 687, style: Self.chromelessStyle, x: 320, y: 190, width: 522, height: 514, kind: .windowUpdate))
+        h.registry.handle(LMSStub(windowId: 687, start: false, type: Self.moveType))
+        #expect(owner.contentRect(forFrameRect: owner.frame)
+                == Self.macContentRect(x: 320, y: 190, width: 522, height: 514, h.topology))
+        // RAIL (300, 200) -> (320, 190): +20 in x, +10 in AppKit's y.
+        try #require(child.frame.origin == Self.offset(childBefore, 20, 10), "the premise: the snap-back carried the child off")
+        try #require(h.wire.windowMoveRects.count == 2, "the held end did not report the child once: \(h.wire.windowMoveRects)")
+        let report = h.wire.windowMoveRects[1]
+        #expect(report.windowId == 688, "\(report)")
+        #expect(report.left == reference.left + 20 && report.right == reference.right + 20, "\(report) vs \(reference)")
+        #expect(report.top == reference.top - 10 && report.bottom == reference.bottom - 10, "\(report) vs \(reference)")
+        #expect(report.top == Fixture.expectedSentTop(forContentRect: child.contentRect(forFrameRect: child.frame), in: h.topology))
+        try await Task.sleep(for: .milliseconds(450))
+        #expect(h.wire.windowMoves == [688, 688], "a second report, or one for the owner: \(h.wire.windowMoves)")
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: owner)
+    }
+
+    /// F5b. Every other end of the owner's move releases the child too: the server's end while
+    /// held -- whose snap-back carries the child back, settling nothing -- and a `WindowDelete` of
+    /// the owner mid-drag (the prune). After each, the child's own move settles again.
+    @Test func everyEndOfTheOwnersMoveReleasesTheChild() async throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let (owner, child) = try await Self.makeOwnerAndChild(h, owner: 683, child: 684)
+        let childOrigin = child.frame.origin
+        let down = Self.offset(owner.frame.origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: owner)
+        h.registry.handle(LMSStub(windowId: 683, start: true, type: Self.moveType))
+        h.pointer.point = Self.offset(down, 30, -20)
+        try Self.send(.mouseMoved(screenPoint: down), to: owner)
+        try #require(child.frame.origin == Self.offset(childOrigin, 30, -20))
+        h.registry.handle(LMSStub(windowId: 683, start: false, type: Self.moveType))
+        #expect(child.frame.origin == childOrigin, "the snap-back did not carry the child back")
+        try await Task.sleep(for: .milliseconds(450))
+        #expect(h.wire.windowMoves.isEmpty, "a settle after the end while held: \(h.wire.windowMoves)")
+        try await Self.moveChildAndAwaitSettle(h, child, id: 684)
+        #expect(h.wire.windowMoves == [684], "the server's end left the child marked")
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: owner)
+
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: owner)
+        h.registry.handle(LMSStub(windowId: 683, start: true, type: Self.moveType))
+        try #require(h.registry.debugLocalMoveIsActive(forWindowId: 683))
+        h.pointer.point = Self.offset(down, 20, 0)
+        try Self.send(.mouseMoved(screenPoint: down), to: owner)
+        h.registry.handle(WindowDeleteStub(windowId: 683))
+        try #require(h.registry.window(forWindowId: 684) === child)
+        try await Self.moveChildAndAwaitSettle(h, child, id: 684)
+        #expect(h.wire.windowMoves == [684, 684], "the prune left the child marked")
     }
 
     // MARK: L9, source
@@ -1353,9 +1781,13 @@ struct RemoteWindowRegistryLocalMoveTests {
     }
 
     /// L9. The pointer seam is read at exactly the two places the rule names -- the move and the
-    /// up, both inside `handleInput` -- the window is placed locally from exactly those two, and
-    /// the live pointer read exists once, as the seam's default. A third read (say, in the LMS
-    /// start) or a second live read would bypass the seam the behaviour cases drive.
+    /// up, both inside `handleInput` -- the window is placed locally from exactly two places (the
+    /// move, and since gate r1's fold `endLocalMoveWithButtonUp`, which the real up and the lost
+    /// up (m-3) share), and the live pointer read exists once, as the seam's default. A third read
+    /// (say, in the LMS start) or a second live read would bypass the seam the behaviour cases
+    /// drive. The same for m-3's pressed-buttons seam: read once, in the move, live once as its
+    /// default. And every mouse button event reaches the wire through ONE send, a local move's up
+    /// included -- the lost up is not a second, hand-copied send.
     @Test func thePointerIsReadOnlyByTheInputPath() throws {
         let code = try Self.registryCode()
         let input = try #require(Self.body(
@@ -1365,9 +1797,23 @@ struct RemoteWindowRegistryLocalMoveTests {
         #expect(!input.contains("private func "), "the slice runs past handleInput")
         #expect(Self.occurrences(of: "pointerLocation()", in: code) == 2)
         #expect(Self.occurrences(of: "pointerLocation()", in: input) == 2)
+        let endAtUp = try #require(Self.body(
+            of: "private func endLocalMoveWithButtonUp(windowId: UInt32, move: LocalMove, pointer: NSPoint) {", in: code))
+        #expect(!endAtUp.contains("private func ") && endAtUp.contains("localMovesAwaitingEnd.insert(windowId)"),
+                "the slice is not endLocalMoveWithButtonUp's body")
         #expect(Self.occurrences(of: "moveLocally(", in: code) == 2)
-        #expect(Self.occurrences(of: "moveLocally(toOrigin: move.origin(forPointer: pointer))", in: input) == 2)
+        #expect(Self.occurrences(of: "moveLocally(toOrigin: move.origin(forPointer: pointer))", in: input) == 1)
+        #expect(Self.occurrences(of: "moveLocally(toOrigin: move.origin(forPointer: pointer))", in: endAtUp) == 1)
+        #expect(Self.occurrences(of: "endLocalMoveWithButtonUp(windowId: windowId, move: move, pointer:", in: input) == 2,
+                "the real up and the lost up")
+        #expect(Self.occurrences(of: "endLocalMoveWithButtonUp(", in: code) == 3, "the declaration and the two calls")
         #expect(Self.occurrences(of: "NSEvent.mouseLocation", in: code) == 1)
         #expect(Self.occurrences(of: "var pointerLocation: () -> NSPoint = { NSEvent.mouseLocation }", in: code) == 1)
+        #expect(Self.occurrences(of: "pressedMouseButtons()", in: code) == 1)
+        #expect(Self.occurrences(of: "pressedMouseButtons()", in: input) == 1)
+        #expect(Self.occurrences(of: "NSEvent.pressedMouseButtons", in: code) == 1)
+        #expect(Self.occurrences(of: "var pressedMouseButtons: () -> Int = { NSEvent.pressedMouseButtons }", in: code) == 1)
+        #expect(Self.occurrences(of: "session.send(crMouseButton(", in: code) == 1)
+        #expect(Self.occurrences(of: "sendMouseButton(.left, down: false, at: pointer, windowId: windowId)", in: endAtUp) == 1)
     }
 }

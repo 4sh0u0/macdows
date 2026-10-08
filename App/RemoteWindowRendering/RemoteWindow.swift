@@ -344,6 +344,14 @@ final class RemoteWindow {
     /// itself (rather than only the new call site) also closes what was already a
     /// structurally-identical, just less-frequently-triggered gap in the ORIGINAL
     /// `handleWindowOrder`-driven path.
+    ///
+    /// F-a1-6, gate r1 I-1: seeded with the creation rect in `init`. The WindowCreate's rect is the
+    /// server's first requested rect, and the snap-back of a cancelled local move
+    /// (`endServerAnnouncedMoveResize(reportSettle:snapBack:)`) reads this as the server's latest
+    /// rect -- a window with no WindowUpdate and no surface remap since its creation would
+    /// otherwise have none and stay displaced. Applying the seed when the gate clears changes
+    /// nothing: the window was built with that very rect (`applyContentRectNow`'s frame-unchanged
+    /// check).
     private var pendingContentRect: NSRect?
     /// The `CAShapeLayer` built once and reused across mask updates (rebuilding a new layer
     /// per order would churn `contentLayer.mask` unnecessarily) -- `nil` until the first
@@ -424,6 +432,18 @@ final class RemoteWindow {
     /// the local one. `pendingContentRect` cannot serve: it is every requested rect, dropped or
     /// not, so after a drag with no update it still holds the pre-drag rect.
     private var contentRectDroppedWhileSuppressed: NSRect?
+    /// F-a1-6, gate r1 m-4: true while this window is an `addChildWindow` child of a window the
+    /// user is dragging through a RAIL local move -- set by `RemoteWindowRegistry` at the move's
+    /// start and cleared at every end of it. AppKit moves attached children together with their
+    /// parent and posts their `didMove` outside the parent's `isApplyingProgrammaticFrame`
+    /// bracket, so without this a pause of `moveSettleDebounce` mid-drag would settle a
+    /// `ClientWindowMove` for the child in the middle of the server's move loop.
+    /// `handleLocalGeometryChanged` ignores every notification while it is set. Set and cleared
+    /// only through `beginFollowingOwnerLocalMove()` / `endFollowingOwnerLocalMove(reportIfMoved:)`.
+    private(set) var isFollowingOwnerLocalMove = false
+    /// F-6 (controller ruling on the c4 fold's Q1): this window's frame when it began following,
+    /// so the end of the owner's move can tell whether the ride-along moved it.
+    private var frameWhenFollowingBegan: NSRect?
 
     /// True between `NSWindow.willStartLiveResizeNotification` and
     /// `didEndLiveResizeNotification` -- AppKit's own clean begin/end pair for an
@@ -553,6 +573,8 @@ final class RemoteWindow {
         self.window = win
         self.contentLayer = layer
         self.contentView = contentView
+        // F-a1-6, gate r1 I-1: see `pendingContentRect`'s own doc comment.
+        pendingContentRect = contentRect
 
         // Phase 2 W2 (task item 3): wires RemoteWindowBackingWindow's three action
         // overrides straight to `onChromeAction` -- see both types' own doc comments for
@@ -1113,6 +1135,9 @@ final class RemoteWindow {
     /// signal and doesn't need a debounce at all.
     private func handleLocalGeometryChanged() {
         guard !isApplyingProgrammaticFrame else { return }
+        // Gate r1 m-4: carried by an owner's RAIL local move, not a gesture of this window's own
+        // (`isFollowingOwnerLocalMove`) -- no suppression claim, no debounce.
+        guard !isFollowingOwnerLocalMove else { return }
         guard !isInLiveResize else { return }
         if moveSettleWorkItem == nil {
             // First didMove of a fresh gesture (no debounce already in flight) -- claim
@@ -1189,15 +1214,62 @@ final class RemoteWindow {
     /// would re-push a rect the server may have clamped), and the server rect dropped since the
     /// up, if any, is applied now (`contentRectDroppedWhileSuppressed`). The default keeps every
     /// other end exactly as it was.
-    func endServerAnnouncedMoveResize(reportSettle: Bool = true) {
+    ///
+    /// Gate r1 I-1: `snapBack: true` (with `reportSettle: false`) is the end of a local move the
+    /// server cancelled while the button was still held. No motion and no up went out, so the
+    /// server window never moved; this window goes back to the server's LATEST rect,
+    /// `pendingContentRect` (every requested rect, dropped or applied, seeded at creation), not
+    /// the dropped-rect holder, which every placement clears. Still no settle: the server's
+    /// position is the truth, and a `ClientWindowMove` would re-move a window the user just
+    /// cancelled (FreeRDP's X11 client pushes the local rect here instead -- the difference is
+    /// deliberate, see `RemoteWindowRegistry.handleLocalMoveSize`). A gate-held window is left to
+    /// the gate, which applies `pendingContentRect` itself when it clears.
+    func endServerAnnouncedMoveResize(reportSettle: Bool = true, snapBack: Bool = false) {
         geometryAuthoritySuppressionCount = max(0, geometryAuthoritySuppressionCount - 1)
         guard reportSettle else {
+            if snapBack {
+                contentRectDroppedWhileSuppressed = nil
+                if hasClearedFirstFrameGate, let serverRect = pendingContentRect {
+                    applyContentRectNow(serverRect)
+                }
+                return
+            }
             if hasClearedFirstFrameGate, let dropped = contentRectDroppedWhileSuppressed {
                 contentRectDroppedWhileSuppressed = nil
                 applyContentRectNow(dropped)
             }
             return
         }
+        // Real-host regression: report the CONTENT rect, not the raw frame -- see
+        // `onLocalGeometrySettled`'s own doc comment.
+        onLocalGeometrySettled?(window.contentRect(forFrameRect: window.frame))
+    }
+
+    /// F-a1-6, gate r1 m-4: this window starts riding an owner's RAIL local move
+    /// (`isFollowingOwnerLocalMove`); its frame now is what `endFollowingOwnerLocalMove` compares
+    /// against.
+    func beginFollowingOwnerLocalMove() {
+        isFollowingOwnerLocalMove = true
+        frameWhenFollowingBegan = window.frame
+    }
+
+    /// The owner's move is over. F-6 (controller ruling on the c4 fold's Q1): Windows does not move
+    /// owned windows with their owner, AppKit does (`addChildWindow`), so after a drag the server's
+    /// child is where it was while this one rode along. With `reportIfMoved` (every end of the
+    /// owner's move but the prune: the button-up, real or lost, and the server's end while held,
+    /// after its snap-back) and a frame that differs from the one following began with, ONE
+    /// settle is reported -- the ClientWindowMove the pre-fold debounce would have sent, so the
+    /// Mac's ride-along wins as it always has for server-driven owner moves, only not inside the
+    /// server's loop. A pure cancel reports nothing by this same check: the snap-back returns the
+    /// child to the frame it began with. No suppression accounting: following claimed none.
+    /// Without `reportIfMoved` (the prune: the owner is gone) nothing is reported. A window that
+    /// is not following is left alone (a RAIL id reused mid-move).
+    func endFollowingOwnerLocalMove(reportIfMoved: Bool) {
+        guard isFollowingOwnerLocalMove else { return }
+        isFollowingOwnerLocalMove = false
+        let began = frameWhenFollowingBegan
+        frameWhenFollowingBegan = nil
+        guard reportIfMoved, let began, window.frame != began else { return }
         // Real-host regression: report the CONTENT rect, not the raw frame -- see
         // `onLocalGeometrySettled`'s own doc comment.
         onLocalGeometrySettled?(window.contentRect(forFrameRect: window.frame))
