@@ -877,6 +877,17 @@ struct RemoteWindowRegistryLocalMoveTests {
     /// (or the window on screen) wait for the gate through it. Nothing on the local-move path
     /// reads the style.
     private static let chromelessStyle: UInt32 = 0
+    /// The RAIL y of every window a case SHOWS (all of them style 0): a mac content rect of
+    /// (300, 126, 522, 514) on the fixture layout, top edge at 640 pt. Tier 2 run 37780992172 (on
+    /// c408d71) ran this suite on a display whose visible frame tops out at 737 pt: the original
+    /// RAIL y 200 put a shown window's top at 880, AppKit pushed it below the menu bar as it was
+    /// shown, and that move -- not bracketed, it is not ours -- claimed a suppression and settled a
+    /// ClientWindowMove 200 ms later, so nineteen expectations about suppression, snap-backs and
+    /// settles failed together (reproduced locally by showing a window above this display's own
+    /// visible top). Every rect a shown window reaches below (drags, updates, snap-backs) keeps its
+    /// top under 680 and its bottom over 100. `waitUntilShown` fails loudly if a display still
+    /// moves a window it shows.
+    private static let shownRailY: Int32 = 440
 
     /// `TS_RAIL_ORDER_LOCALMOVESIZE` with the fields this suite chooses, under the bridge's own
     /// property names (`App/CRBridge/CRSession.h`); the same getter-override construct as
@@ -984,10 +995,13 @@ struct RemoteWindowRegistryLocalMoveTests {
         return Harness(registry: registry, wire: wire, pointer: pointer, topology: try Fixture.fixtureTopology())
     }
 
-    /// RAIL (300, 200) 522x514, the left-border suite's geometry: a mac content rect of
-    /// (300, 366, 522, 514) on the fixture layout.
-    private static func makeWindow(_ h: Harness, id: UInt32, style: UInt32 = Fixture.thickFrameStyle) throws -> NSWindow {
-        h.registry.handle(Fixture.WindowOrderStub(windowId: id, style: style, x: 300, y: 200, width: 522, height: 514))
+    /// RAIL (300, `railY`) 522x514, the left-border suite's geometry: at the default y 200 a mac
+    /// content rect of (300, 366, 522, 514) on the fixture layout -- used only by windows that are
+    /// never shown (the 2 s gate); the cases that show theirs pass `shownRailY`.
+    private static func makeWindow(
+        _ h: Harness, id: UInt32, style: UInt32 = Fixture.thickFrameStyle, railY: Int32 = 200
+    ) throws -> NSWindow {
+        h.registry.handle(Fixture.WindowOrderStub(windowId: id, style: style, x: 300, y: railY, width: 522, height: 514))
         return try #require(h.registry.window(forWindowId: id))
     }
 
@@ -1018,14 +1032,21 @@ struct RemoteWindowRegistryLocalMoveTests {
     }
 
     /// Polls until every window is on screen (20 ms steps, 3 s cap): the popup tier's
-    /// first-frame timeout clears the gate and applies the pending show.
+    /// first-frame timeout clears the gate and applies the pending show. Then requires that
+    /// showing moved none of them (see `shownRailY`): a display that moves a window as it shows it
+    /// has made an unbracketed move, which claims a suppression and settles 200 ms later -- every
+    /// later expectation in the case would fail for that reason, not for the one it states.
     private static func waitUntilShown(_ windows: [NSWindow]) async throws {
+        let framesBefore = windows.map(\.frame)
         let deadline = ContinuousClock.now.advanced(by: .seconds(3))
         while windows.contains(where: { !$0.isVisible }), ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(20))
         }
         let allShown = windows.allSatisfy { $0.isVisible }
         try #require(allShown, "the first-frame gate never cleared")
+        let framesAfter = windows.map(\.frame)
+        try #require(framesAfter == framesBefore,
+                     "the display moved a window as it showed it (a screen smaller than shownRailY assumes): \(framesBefore) -> \(framesAfter)")
     }
 
     /// L1. The loop itself: after the server's start the window follows the pointer, no pointer
@@ -1084,7 +1105,7 @@ struct RemoteWindowRegistryLocalMoveTests {
     @Test func theServersFinalPositionWinsAfterTheEnd() async throws {
         let h = try Self.makeHarness()
         defer { h.registry.closeWindowsForSessionEnd() }
-        let window = try Self.makeWindow(h, id: 611, style: Self.chromelessStyle)
+        let window = try Self.makeWindow(h, id: 611, style: Self.chromelessStyle, railY: Self.shownRailY)
         try await Self.waitUntilShown([window])
         let origin = window.frame.origin
         let down = Self.offset(origin, 100, 500)
@@ -1096,14 +1117,14 @@ struct RemoteWindowRegistryLocalMoveTests {
         let dropped = window.frame
         try #require(dropped.origin == Self.offset(origin, 50, 10))
 
-        // The local drop is RAIL (350, 190); the server answers (387, 167).
+        // The local drop is RAIL (350, 430); the server answers (387, 417).
         h.registry.handle(Fixture.WindowOrderStub(
-            windowId: 611, style: Self.chromelessStyle, x: 387, y: 167, width: 522, height: 514, kind: .windowUpdate))
+            windowId: 611, style: Self.chromelessStyle, x: 387, y: 417, width: 522, height: 514, kind: .windowUpdate))
         #expect(window.frame == dropped, "a rect applied while the suppression holds")
 
         h.registry.handle(LMSStub(windowId: 611, start: false, type: Self.moveType))
         #expect(window.contentRect(forFrameRect: window.frame)
-                == Self.macContentRect(x: 387, y: 167, width: 522, height: 514, h.topology))
+                == Self.macContentRect(x: 387, y: 417, width: 522, height: 514, h.topology))
         #expect(h.wire.windowMoves.isEmpty)
         #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 611) == 0)
     }
@@ -1116,7 +1137,7 @@ struct RemoteWindowRegistryLocalMoveTests {
     @Test func aRectDroppedBeforeTheUpIsNotReapplied() async throws {
         let h = try Self.makeHarness()
         defer { h.registry.closeWindowsForSessionEnd() }
-        let window = try Self.makeWindow(h, id: 615, style: Self.chromelessStyle)
+        let window = try Self.makeWindow(h, id: 615, style: Self.chromelessStyle, railY: Self.shownRailY)
         try await Self.waitUntilShown([window])
         let origin = window.frame.origin
         let down = Self.offset(origin, 100, 500)
@@ -1125,7 +1146,7 @@ struct RemoteWindowRegistryLocalMoveTests {
         h.pointer.point = Self.offset(down, 50, 10)
         try Self.send(.mouseMoved(screenPoint: down), to: window)
         h.registry.handle(Fixture.WindowOrderStub(
-            windowId: 615, style: Self.chromelessStyle, x: 300, y: 200, width: 522, height: 514, kind: .windowUpdate))
+            windowId: 615, style: Self.chromelessStyle, x: 300, y: 440, width: 522, height: 514, kind: .windowUpdate))
         try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: window)
         h.registry.handle(LMSStub(windowId: 615, start: false, type: Self.moveType))
         #expect(window.frame.origin == Self.offset(origin, 50, 10))
@@ -1142,14 +1163,14 @@ struct RemoteWindowRegistryLocalMoveTests {
     @Test func anEndWhileHeldSnapsBackToARectDroppedBeforeTheStart() async throws {
         let h = try Self.makeHarness()
         defer { h.registry.closeWindowsForSessionEnd() }
-        let window = try Self.makeWindow(h, id: 616, style: Self.chromelessStyle)
+        let window = try Self.makeWindow(h, id: 616, style: Self.chromelessStyle, railY: Self.shownRailY)
         try await Self.waitUntilShown([window])
         let before = window.frame
         let down = Self.offset(before.origin, 100, 500)
         try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
         h.registry.handle(LMSStub(windowId: 616, start: true, type: Self.resizeTopType))
         h.registry.handle(Fixture.WindowOrderStub(
-            windowId: 616, style: Self.chromelessStyle, x: 387, y: 167, width: 522, height: 514, kind: .windowUpdate))
+            windowId: 616, style: Self.chromelessStyle, x: 387, y: 417, width: 522, height: 514, kind: .windowUpdate))
         h.registry.handle(LMSStub(windowId: 616, start: false, type: Self.resizeTopType))
         try #require(h.wire.windowMoves == [616], "today's settle for the resize-type end")
         try #require(window.frame == before)
@@ -1159,7 +1180,7 @@ struct RemoteWindowRegistryLocalMoveTests {
         h.registry.handle(LMSStub(windowId: 616, start: true, type: Self.moveType))
         h.registry.handle(LMSStub(windowId: 616, start: false, type: Self.moveType))
         #expect(window.contentRect(forFrameRect: window.frame)
-                == Self.macContentRect(x: 387, y: 167, width: 522, height: 514, h.topology),
+                == Self.macContentRect(x: 387, y: 417, width: 522, height: 514, h.topology),
                 "the end while held did not land on the server's latest rect")
         #expect(h.wire.windowMoves == [616], "the end while held settled")
         #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 616) == 0)
@@ -1249,8 +1270,8 @@ struct RemoteWindowRegistryLocalMoveTests {
     @Test func zOrderIsNotAppliedMidDrag() async throws {
         let h = try Self.makeHarness()
         defer { h.registry.closeWindowsForSessionEnd() }
-        let dragged = try Self.makeWindow(h, id: 651, style: Self.chromelessStyle)
-        let other = try Self.makeWindow(h, id: 652, style: Self.chromelessStyle)
+        let dragged = try Self.makeWindow(h, id: 651, style: Self.chromelessStyle, railY: Self.shownRailY)
+        let other = try Self.makeWindow(h, id: 652, style: Self.chromelessStyle, railY: Self.shownRailY)
         try await Self.waitUntilShown([dragged, other])
         let down = Self.offset(dragged.frame.origin, 100, 500)
         try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: dragged)
@@ -1282,9 +1303,9 @@ struct RemoteWindowRegistryLocalMoveTests {
     @Test func theEndWhileHeldEndsTheMove() async throws {
         let h = try Self.makeHarness()
         defer { h.registry.closeWindowsForSessionEnd() }
-        let window = try Self.makeWindow(h, id: 671, style: Self.chromelessStyle)
+        let window = try Self.makeWindow(h, id: 671, style: Self.chromelessStyle, railY: Self.shownRailY)
         try await Self.waitUntilShown([window])
-        let serverRect = Self.macContentRect(x: 300, y: 200, width: 522, height: 514, h.topology)
+        let serverRect = Self.macContentRect(x: 300, y: 440, width: 522, height: 514, h.topology)
         try #require(window.contentRect(forFrameRect: window.frame) == serverRect)
         let origin = window.frame.origin
         let down = Self.offset(origin, 100, 500)
@@ -1323,7 +1344,7 @@ struct RemoteWindowRegistryLocalMoveTests {
     @Test func theSnapBackLandsOnTheLatestServerRect() async throws {
         let h = try Self.makeHarness()
         defer { h.registry.closeWindowsForSessionEnd() }
-        let window = try Self.makeWindow(h, id: 672, style: Self.chromelessStyle)
+        let window = try Self.makeWindow(h, id: 672, style: Self.chromelessStyle, railY: Self.shownRailY)
         try await Self.waitUntilShown([window])
         let origin = window.frame.origin
         let down = Self.offset(origin, 100, 500)
@@ -1333,7 +1354,7 @@ struct RemoteWindowRegistryLocalMoveTests {
         try Self.send(.mouseMoved(screenPoint: down), to: window)
         let dragged = window.frame
         h.registry.handle(Fixture.WindowOrderStub(
-            windowId: 672, style: Self.chromelessStyle, x: 387, y: 167, width: 522, height: 514, kind: .windowUpdate))
+            windowId: 672, style: Self.chromelessStyle, x: 387, y: 417, width: 522, height: 514, kind: .windowUpdate))
         #expect(window.frame == dragged, "a rect applied while the suppression holds")
         h.pointer.point = Self.offset(down, 40, -10)
         try Self.send(.mouseMoved(screenPoint: down), to: window)
@@ -1341,7 +1362,7 @@ struct RemoteWindowRegistryLocalMoveTests {
 
         h.registry.handle(LMSStub(windowId: 672, start: false, type: Self.moveType))
         #expect(window.contentRect(forFrameRect: window.frame)
-                == Self.macContentRect(x: 387, y: 167, width: 522, height: 514, h.topology),
+                == Self.macContentRect(x: 387, y: 417, width: 522, height: 514, h.topology),
                 "the snap-back did not land on the latest server rect: \(window.frame)")
         #expect(h.wire.windowMoves.isEmpty)
         #expect(h.wire.moves.isEmpty)
@@ -1548,9 +1569,9 @@ struct RemoteWindowRegistryLocalMoveTests {
     /// registry attaches it with `addChildWindow` once the child's first-frame gate clears -- the
     /// popup tier's 0.25 s here). Returns the two windows on screen, attached.
     private static func makeOwnerAndChild(_ h: Harness, owner: UInt32, child: UInt32) async throws -> (NSWindow, NSWindow) {
-        let ownerWindow = try Self.makeWindow(h, id: owner, style: Self.chromelessStyle)
+        let ownerWindow = try Self.makeWindow(h, id: owner, style: Self.chromelessStyle, railY: Self.shownRailY)
         h.registry.handle(Fixture.WindowOrderStub(
-            windowId: child, style: Self.chromelessStyle, x: 400, y: 300, width: 200, height: 120, owner: owner))
+            windowId: child, style: Self.chromelessStyle, x: 400, y: 500, width: 200, height: 120, owner: owner))
         let childWindow = try #require(h.registry.window(forWindowId: child))
         try await Self.waitUntilShown([ownerWindow, childWindow])
         try #require(h.registry.attachedOwner(forWindowId: child) == owner, "the child never attached")
@@ -1666,8 +1687,8 @@ struct RemoteWindowRegistryLocalMoveTests {
         let h = try Self.makeHarness()
         defer { h.registry.closeWindowsForSessionEnd() }
         let (owner, child) = try await Self.makeOwnerAndChild(h, owner: 687, child: 688)
-        let ownerServer = Self.macContentRect(x: 300, y: 200, width: 522, height: 514, h.topology)
-        let childServer = Self.macContentRect(x: 400, y: 300, width: 200, height: 120, h.topology)
+        let ownerServer = Self.macContentRect(x: 300, y: 440, width: 522, height: 514, h.topology)
+        let childServer = Self.macContentRect(x: 400, y: 500, width: 200, height: 120, h.topology)
         try #require(owner.contentRect(forFrameRect: owner.frame) == ownerServer)
         try #require(child.contentRect(forFrameRect: child.frame) == childServer)
         let down = Self.offset(owner.frame.origin, 100, 500)
@@ -1691,11 +1712,11 @@ struct RemoteWindowRegistryLocalMoveTests {
         h.registry.handle(LMSStub(windowId: 687, start: true, type: Self.moveType))
         try Self.send(.mouseMoved(screenPoint: down), to: owner)
         h.registry.handle(Fixture.WindowOrderStub(
-            windowId: 687, style: Self.chromelessStyle, x: 320, y: 190, width: 522, height: 514, kind: .windowUpdate))
+            windowId: 687, style: Self.chromelessStyle, x: 320, y: 430, width: 522, height: 514, kind: .windowUpdate))
         h.registry.handle(LMSStub(windowId: 687, start: false, type: Self.moveType))
         #expect(owner.contentRect(forFrameRect: owner.frame)
-                == Self.macContentRect(x: 320, y: 190, width: 522, height: 514, h.topology))
-        // RAIL (300, 200) -> (320, 190): +20 in x, +10 in AppKit's y.
+                == Self.macContentRect(x: 320, y: 430, width: 522, height: 514, h.topology))
+        // RAIL (300, 440) -> (320, 430): +20 in x, +10 in AppKit's y.
         try #require(child.frame.origin == Self.offset(childBefore, 20, 10), "the premise: the snap-back carried the child off")
         try #require(h.wire.windowMoveRects.count == 2, "the held end did not report the child once: \(h.wire.windowMoveRects)")
         let report = h.wire.windowMoveRects[1]
