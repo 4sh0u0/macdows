@@ -34,6 +34,22 @@ import MacdowsCore
 // the attempt denominator is the number of RECONNECTS (`maxAttempts - 1` = 4: the first of the
 // policy's five attempts is the connection that dropped), and the give-up cause token stays in the
 // `[reconnect]` line and the diagnostics export only -- it is no longer on screen.
+//
+// ## ADR-0025 R-7 (a-1b): the last launch failure, live only, outside the state switch
+//
+// A start-panel launch that failed after its panel closed is written into the status line too
+// (`sp_last_fail` + the `sp_r_*` reason the caller resolved), between the state's own line and the
+// display-change note. Two shape decisions, both on purpose:
+//
+// - ONLY WHILE `.live`. In every other state the connection is the news: "Connecting…", a lost
+//   connection's retry or a give-up must not be pushed down or diluted by a launch that cannot be
+//   retried until the connection is back. The value is not dropped -- the start panel keeps it --
+//   so the next live drain shows it again until the panel opens, a new launch for that host is
+//   sent, or the session ends (the panel's three clearing points).
+// - COMPUTED OUTSIDE `line(for:)`, like the note. That switch is the UI-1 table and stays one
+//   string per state; the failure is a separate component that one function decides, so no arm can
+//   grow a second, disagreeing copy of the rule. The status bar and the Connect button never read
+//   it: a launch failure says nothing about the connection.
 
 /// The Connect button, the status line and the status bar, decided together, from the reconnect
 /// state.
@@ -65,7 +81,8 @@ enum ShellReconnectPresenter {
     struct Shell: Equatable {
         /// Whether the Connect button accepts a press.
         let connectEnabled: Bool
-        /// The complete status line text, display-change note included.
+        /// The complete status line text: the state's line, then (live only) the last launch failure,
+        /// then the display-change note.
         let statusLine: String
         /// The status bar's text (UI-1 spec §4.1, long form).
         let statusBar: String
@@ -76,15 +93,19 @@ enum ShellReconnectPresenter {
     /// - Parameter connected: read only by `.live`; the other states say nothing about windows.
     /// - Parameter displayNote: the most recent screen-parameter note (adr/0015 §5.A.3), or `nil`.
     ///   APPENDED to every state's status line rather than replacing it -- see `noteSuffix`.
+    /// - Parameter lastLaunchFailure: the reason sentence of the start panel's waiting late launch
+    ///   failure for the session's host (ADR-0025 R-7), already resolved, or `nil`. Shown on the
+    ///   line only while `.live` -- see `launchFailureSuffix`.
     static func shell(
         for state: ReconnectDriver.State,
         connected: ConnectedSummary,
         displayNote: String?,
+        lastLaunchFailure: String? = nil,
         text: ShellText = .main
     ) -> Shell {
         Shell(
             connectEnabled: connectEnabled(for: state),
-            statusLine: line(for: state, text: text) + noteSuffix(displayNote),
+            statusLine: line(for: state, text: text) + launchFailureSuffix(for: state, lastLaunchFailure, text: text) + noteSuffix(displayNote),
             statusBar: statusBar(for: state, connected: connected, text: text)
         )
     }
@@ -196,6 +217,15 @@ enum ShellReconnectPresenter {
     /// unwritable.
     private static func noteSuffix(_ displayNote: String?) -> String {
         displayNote.map { "\n\($0)" } ?? ""
+    }
+
+    /// The last launch failure as a suffix (`sp_last_fail` around `reason`), or the empty string.
+    ///
+    /// Live only, and outside the state switch: see the file's ADR-0025 R-7 note. Any other state
+    /// returns nothing here and the caller keeps the reason for the next live line.
+    private static func launchFailureSuffix(for state: ReconnectDriver.State, _ reason: String?, text: ShellText) -> String {
+        guard case .live = state, let reason else { return "" }
+        return "\n" + text.format("sp_last_fail", "The last launch did not succeed: %@", [reason])
     }
 
     /// UI-1 spec §4.1: "attempt k of 4". The denominator counts RECONNECTS -- the policy's

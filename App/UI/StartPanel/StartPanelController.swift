@@ -79,6 +79,12 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
     /// never calls it. The App forwards it to the status item; the panel knows nothing of it.
     var onStatusItemAnchorChange: ((Bool) -> Void)?
 
+    /// ADR-0025 R-7 (a-1b): the waiting late failures changed -- one was recorded, or one was cleared
+    /// (by the next open, a new launch sent for that host, or the session's end). Called only when the
+    /// table really changed, never for a write that left it as it was. The App rewrites the Hosts
+    /// window's status line from `lastLaunchFailureReason(for:)`; the panel knows nothing of it.
+    var onLastFailureChange: (() -> Void)?
+
     /// Design note §6: an inline error is read out to VoiceOver. A seam so tests can see what is
     /// announced on which element; the App keeps the default, the system announcement.
     var announce: (_ element: Any, _ text: String) -> Void = { element, text in
@@ -132,7 +138,14 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
             if isAnchoredToStatusItem != oldValue { onStatusItemAnchorChange?(isAnchoredToStatusItem) }
         }
     }
-    private(set) var lastFailures: [HostID: LastFailure] = [:]
+    /// Late failures by host, waiting for the next open (design note §2) and, while live, shown on the
+    /// Hosts window's status line (R-7). Cleared by that open, a new launch sent for the host, and the
+    /// session's end.
+    private(set) var lastFailures: [HostID: LastFailure] = [:] {
+        didSet {
+            if lastFailures != oldValue { onLastFailureChange?() }
+        }
+    }
     private(set) var shownLastFailure: LastFailure?
     private var shownAt: Date?
     private var lastAutomaticClose: Date?
@@ -384,6 +397,8 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
                 launcher.cancelAll()
                 pendingByKey = [:]
                 runFieldPending = nil
+                // After `cancelAll`, which reports no outcome, so no late failure can land behind this.
+                lastFailures = [:]
             }
             close(.sessionEnded)
             return
@@ -399,6 +414,12 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
                 panel.makeFirstResponder(row.view)
             }
         }
+    }
+
+    /// The reason sentence of `host`'s waiting late failure, or nil (none, or no host): what the Hosts
+    /// window's status line shows while live (R-7, a-1b).
+    func lastLaunchFailureReason(for host: HostID?) -> String? {
+        host.flatMap { lastFailures[$0] }.map { UIStrings.startPanelReason(forKey: $0.reasonKey) }
     }
 
     /// The registry's ExecResult, forwarded (S-4).
@@ -647,6 +668,7 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
         switch launcher.launch(program: row.item.program, arguments: row.item.arguments, origin: .row(row.item.id)) {
         case .sent(let request):
             pendingByKey[row.item.key] = request.id
+            if let host = request.host { lastFailures.removeValue(forKey: host) }
         case .refused(let key):
             if let key { rowErrors[row.item.key] = key }
         case .notLive:
@@ -663,6 +685,7 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
         switch launcher.launch(text: runField.stringValue, origin: .runField) {
         case .sent(let request):
             runFieldPending = request.id
+            if let host = request.host { lastFailures.removeValue(forKey: host) }
         case .refused(let key):
             runFieldError = key
         case .notLive:
@@ -671,9 +694,13 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
         if isShown { refresh() } else { render() }
     }
 
-    /// A Dock menu item: sent at once; the menu has closed, so the outcome is a late one.
+    /// A Dock menu item: sent at once; the menu has closed, so the outcome is a late one. A send
+    /// supersedes the host's waiting failure, as a send from the panel does.
     func launchFromDockMenu(_ item: LaunchItem) {
-        _ = launcher.launch(program: item.program, arguments: item.arguments, origin: .dockMenu)
+        if case .sent(let request) = launcher.launch(program: item.program, arguments: item.arguments, origin: .dockMenu),
+           let host = request.host {
+            lastFailures.removeValue(forKey: host)
+        }
     }
 
     /// One launch ended (`AppLauncher.onOutcome`). Success writes Recent -- the only writer of

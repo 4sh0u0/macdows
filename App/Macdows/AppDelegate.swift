@@ -210,6 +210,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		startPanel.onStatusItemAnchorChange = { [weak self] highlighted in
 			self?.statusItemController.setPanelHighlight(highlighted)
 		}
+		// ADR-0025 R-7 (a-1b): a launch that failed after the panel closed is on the Hosts window's
+		// status line too. `applyShell` stays that line's one writer and reads the failure itself;
+		// this only makes it write at once when the failure is recorded or cleared, rather than at the
+		// next drain. `session != nil` is load-bearing: the session's end clears the failures as well,
+		// and `applyShell(.live)` with no session would write the connected line back over the end's
+		// own line and disable Connect.
+		startPanel.onLastFailureChange = { [weak self] in
+			guard let self, self.session != nil else { return }
+			self.applyShell(for: self.reconnectDriver?.state ?? .live)
+		}
 
 		// M1/W1 deliverable 2: the screen-parameter observer's *observable* half. The provider
 		// already logs every change (Console.app, category "DisplayTopology"); this puts the same
@@ -926,11 +936,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// UI slice ④: the status bar is written here too, because the drain tick calls this and the
 	/// bar's live text carries the window count; `applyHostsWindow` writes the same text on a state
 	/// change, from the same presenter function.
+	///
+	/// ADR-0025 R-7 (a-1b): the line also carries the start panel's waiting late launch failure for
+	/// the chain's host; the presenter shows it only while live. The panel's change callback calls
+	/// this too, so the line follows a failure being recorded or cleared without waiting for a tick.
 	private func applyShell(for state: ReconnectDriver.State) {
 		let shell = ShellReconnectPresenter.shell(
 			for: state,
 			connected: connectedSummary(),
-			displayNote: lastDisplayChangeNote
+			displayNote: lastDisplayChangeNote,
+			lastLaunchFailure: startPanel.lastLaunchFailureReason(for: chainHost)
 		)
 		statusLabel.stringValue = shell.statusLine
 		connectButton.isEnabled = shell.connectEnabled

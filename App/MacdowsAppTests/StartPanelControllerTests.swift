@@ -183,18 +183,20 @@ struct StartPanelControllerTests {
     func onlySuccessWritesRecent() throws {
         let store = LaunchItemStore(fileURL: nil)
         let (controller, sender) = Self.controller(store: store)
-        controller.runField.stringValue = "missing.exe"
-        controller.submitRunField()
-        #expect(sender.calls.map(\.program) == ["missing.exe"])
-        controller.handleExecResult(execResult: 5, rawResult: 2, program: "MISSING.EXE")
-        #expect(store.items(for: Self.host).recent.isEmpty, "a failure writes nothing")
-        #expect(controller.lastFailures[Self.host] == .init(reasonKey: "sp_r_nf", programName: "missing.exe"))
-
+        // a-1b (R-7, ruling ㋱): a launch sent for the host supersedes its waiting failure, so the
+        // successful launch comes first and the failure is the last thing before the open.
         controller.runField.stringValue = #"C:\Windows\System32\notepad.exe"#
         controller.submitRunField()
         controller.handleExecResult(execResult: 0, rawResult: 0, program: #"C:\Windows\System32\notepad.exe"#)
         #expect(store.items(for: Self.host).recent.map(\.displayName) == ["notepad.exe"])
         #expect(controller.runField.stringValue.isEmpty, "a successful Run field launch clears the field")
+
+        controller.runField.stringValue = "missing.exe"
+        controller.submitRunField()
+        #expect(sender.calls.map(\.program) == [#"C:\Windows\System32\notepad.exe"#, "missing.exe"])
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: "MISSING.EXE")
+        #expect(store.items(for: Self.host).recent.map(\.displayName) == ["notepad.exe"], "a failure writes nothing")
+        #expect(controller.lastFailures[Self.host] == .init(reasonKey: "sp_r_nf", programName: "missing.exe"))
 
         controller.show(anchor: .fallback)
         defer { controller.close(.dismissed) }
@@ -434,6 +436,173 @@ struct StartPanelControllerTests {
         controller.submitRunField()
         controller.handleExecResult(execResult: 6, rawResult: 0, program: "late.exe")
         #expect(announced.count == 2, "a late failure goes to the next open's bar, unannounced")
+    }
+
+    // MARK: - ADR-0025 R-7 (a-1b): the waiting failure, its callback and its clearing points
+
+    private static let notFound = "The program was not found on the remote PC. Check the path."
+
+    private static func item(_ program: String) -> LaunchItem {
+        LaunchItem(displayName: program, program: program, arguments: "", date: Date(timeIntervalSince1970: 0))
+    }
+
+    @Test("a-1b C1: a late failure calls back once per change and reads as its sentence; an equal write calls nothing")
+    func lateFailureCallsBackOnChange() {
+        let (controller, sender) = Self.controller()
+        var changes = 0
+        var seen: [String?] = []
+        controller.onLastFailureChange = {
+            changes += 1
+            // Read INSIDE the callback, as AppDelegate's applyShell does: the table must already hold
+            // the new value when the callback runs (gate r1 m-1: a willSet would hand out the old table).
+            seen.append(controller.lastLaunchFailureReason(for: Self.host))
+        }
+        // Three Dock-menu sends of one program before any result: none of them changes the empty table.
+        for _ in 0..<3 { controller.launchFromDockMenu(Self.item("missing.exe")) }
+        #expect(sender.calls.count == 3)
+        #expect(changes == 0, "a send over an empty table is no change")
+        #expect(controller.lastLaunchFailureReason(for: Self.host) == nil)
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: "missing.exe")
+        #expect(changes == 1)
+        #expect(controller.lastLaunchFailureReason(for: Self.host) == Self.notFound, "the sentence, not the key")
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: "missing.exe")
+        #expect(changes == 1, "the same failure again is no change")
+        controller.handleExecResult(execResult: 3, rawResult: 0, program: "missing.exe")
+        #expect(changes == 2, "another reason is")
+        #expect(controller.lastLaunchFailureReason(for: Self.host) == "This program is not allowed on the remote PC.")
+        #expect(controller.lastLaunchFailureReason(for: nil) == nil && controller.lastLaunchFailureReason(for: HostID()) == nil)
+        #expect(seen == [Self.notFound, "This program is not allowed on the remote PC."], "each callback saw the table after the write")
+        #expect(!controller.isShown)
+    }
+
+    @Test("a-1b C2: opening the panel moves the failure into the last-launch strip: one callback, nothing left for the status line")
+    func showTakesTheWaitingFailure() {
+        let (controller, _) = Self.controller()
+        var changes = 0
+        var seen: [String?] = []
+        controller.onLastFailureChange = {
+            changes += 1
+            seen.append(controller.lastLaunchFailureReason(for: Self.host))
+        }
+        controller.runField.stringValue = "missing.exe"
+        controller.submitRunField()
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: "missing.exe")
+        #expect(changes == 1)
+        controller.show(anchor: .fallback)
+        defer { controller.close(.dismissed) }
+        #expect(changes == 2)
+        #expect(seen == [Self.notFound, nil], "the open's callback already sees the table without the failure (gate r1 m-1)")
+        #expect(controller.lastLaunchFailureReason(for: Self.host) == nil)
+        #expect(controller.shownLastFailure == .init(reasonKey: "sp_r_nf", programName: "missing.exe"))
+        controller.close(.dismissed)
+        controller.show(anchor: .fallback)
+        #expect(changes == 2, "an open with nothing waiting is no change")
+        #expect(controller.shownLastFailure == nil)
+    }
+
+    @Test("a-1b C3: a launch sent for the host clears its waiting failure -- row, Run field, Dock menu; a refusal or a closed gate does not")
+    func aSentLaunchSupersedesTheFailure() throws {
+        let store = LaunchItemStore(fileURL: nil)
+        store.recordLaunch(RunCommand(program: "calc.exe", arguments: ""), displayName: "calc.exe", for: Self.host, at: Date(timeIntervalSince1970: 0))
+        var state: ReconnectDriver.State? = .live
+        let (controller, sender) = Self.controller(store: store)
+        controller.reading = { .init(hasSession: true, state: state, host: Self.host, hostTitle: "h") }
+        var changes = 0
+        controller.onLastFailureChange = { changes += 1 }
+        func failLate() {
+            controller.launchFromDockMenu(Self.item("missing.exe"))
+            controller.handleExecResult(execResult: 5, rawResult: 2, program: "missing.exe")
+        }
+        controller.render()
+
+        failLate()
+        #expect(changes == 1 && controller.lastLaunchFailureReason(for: Self.host) == Self.notFound)
+        controller.launch(try #require(controller.itemRows.first?.row))
+        #expect(changes == 2 && controller.lastLaunchFailureReason(for: Self.host) == nil, "a row launch")
+        controller.handleExecResult(execResult: 0, rawResult: 0, program: "calc.exe")
+
+        failLate()
+        #expect(changes == 3)
+        controller.runField.stringValue = "notepad.exe"
+        controller.submitRunField()
+        #expect(changes == 4 && controller.lastLaunchFailureReason(for: Self.host) == nil, "a Run field launch")
+        controller.handleExecResult(execResult: 0, rawResult: 0, program: "notepad.exe")
+
+        failLate()
+        #expect(changes == 5)
+        controller.launchFromDockMenu(Self.item("winver.exe"))
+        #expect(changes == 6 && controller.lastLaunchFailureReason(for: Self.host) == nil, "a Dock menu launch")
+
+        failLate()
+        #expect(changes == 7)
+        let sent = sender.calls.count
+        controller.runField.stringValue = String(repeating: "a", count: 256)
+        controller.submitRunField()
+        #expect(controller.runFieldError == "sp_r_long" && sender.calls.count == sent)
+        #expect(changes == 7 && controller.lastLaunchFailureReason(for: Self.host) == Self.notFound, "a refusal sends nothing, so supersedes nothing")
+
+        state = .reconnecting(attempt: 0)
+        controller.render()
+        controller.launch(try #require(controller.itemRows.first?.row))
+        controller.runField.stringValue = "notepad.exe"
+        controller.submitRunField()
+        controller.launchFromDockMenu(Self.item("winver.exe"))
+        #expect(sender.calls.count == sent, "the gate is closed")
+        #expect(changes == 7 && controller.lastLaunchFailureReason(for: Self.host) == Self.notFound, "nothing sent, nothing superseded")
+    }
+
+    @Test("a-1b C4: the session's end clears every waiting failure, once; a dropped connection or a give-up's own refresh keeps it")
+    func sessionEndClearsTheFailures() {
+        var reading = StartPanelController.Reading(hasSession: true, state: .live, host: Self.host, hostTitle: "h")
+        let (controller, _) = Self.controller()
+        controller.reading = { reading }
+        var changes = 0
+        var seen: [String?] = []
+        controller.onLastFailureChange = {
+            changes += 1
+            seen.append(controller.lastLaunchFailureReason(for: Self.host))
+        }
+        controller.runField.stringValue = "missing.exe"
+        controller.submitRunField()
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: "missing.exe")
+        #expect(changes == 1)
+        reading.state = .waiting(attempt: 0, delay: .seconds(1))
+        controller.refresh()
+        #expect(changes == 1 && controller.lastLaunchFailureReason(for: Self.host) == Self.notFound, "kept for the next live line")
+        reading.state = .gaveUp(.policy(.attemptsExhausted))
+        controller.refresh()
+        #expect(changes == 1, "the give-up's refresh still has the session; its teardown is the end")
+        reading = .noSession
+        controller.refresh()
+        #expect(changes == 2 && controller.lastFailures.isEmpty)
+        #expect(controller.lastLaunchFailureReason(for: Self.host) == nil)
+        #expect(seen == [Self.notFound, nil], "the end's callback already sees the empty table (gate r1 m-1)")
+        controller.refresh()
+        #expect(changes == 2, "an end over an empty table is no change")
+        reading = .init(hasSession: true, state: nil, host: Self.host, hostTitle: "h")
+        controller.refresh()
+        #expect(changes == 2, "a session beginning changes nothing")
+    }
+
+    @Test("a-1b C5: a failure shown inline in the open panel is not a waiting one: no callback, nothing for the status line")
+    func inlineFailuresAreNotWaiting() throws {
+        let store = LaunchItemStore(fileURL: nil)
+        store.recordLaunch(RunCommand(program: "calc.exe", arguments: ""), displayName: "calc.exe", for: Self.host, at: Date(timeIntervalSince1970: 0))
+        let (controller, _) = Self.controller(store: store)
+        controller.announce = { _, _ in }
+        var changes = 0
+        controller.onLastFailureChange = { changes += 1 }
+        controller.show(anchor: .fallback)
+        defer { controller.close(.dismissed) }
+        let calc = try #require(controller.itemRows.first?.row)
+        controller.launch(calc)
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: "calc.exe")
+        controller.runField.stringValue = "missing.exe"
+        controller.submitRunField()
+        controller.handleExecResult(execResult: 3, rawResult: 0, program: "missing.exe")
+        #expect(controller.rowErrors[calc.item.key] == "sp_r_nf" && controller.runFieldError == "sp_r_allow")
+        #expect(controller.lastFailures.isEmpty && changes == 0)
+        #expect(controller.lastLaunchFailureReason(for: Self.host) == nil)
     }
 
     // MARK: - Ruling R-a1-1 (i)

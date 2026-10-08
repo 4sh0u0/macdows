@@ -429,8 +429,17 @@ struct AppDelegateAutolaunchPinTests {
     /// clause (R-7; the no-session clause is word for word as before, see
     /// `AppDelegateChainPinTests.hostsWindowLifecycle`) and `applicationDockMenu(_:)` its one-line
     /// forward. `connectTapped`, `drainTick`, `tearDownSession`, `endSessionTapped` and
-    /// `applicationWillTerminate` are unchanged; no `@objc` was added. It now folds to 52179
+    /// `applicationWillTerminate` are unchanged; no `@objc` was added. It folded to 52179
     /// characters, +1571.
+    ///
+    /// RE-FROZEN by ADR-0025 a-1b (R-7: a late launch failure also reaches the Hosts window's status
+    /// line): `applyShell` hands the presenter one more argument, the start panel's waiting failure
+    /// for the chain's host (`lastLaunchFailure: startPanel.lastLaunchFailureReason(for: chainHost)`),
+    /// and its doc comment says so in three lines. The panel's change callback that also calls
+    /// `applyShell` is wired in `applicationDidFinishLaunching`, before `connectTapped`, so outside
+    /// this region. `connectTapped`, `drainTick`, `tearDownSession`, `endSessionTapped`,
+    /// `sessionPresenceChanged` and `applicationWillTerminate` are unchanged; no `@objc` was added.
+    /// It now folds to 52545 characters, +366.
     ///
     /// The "net folded edit" above is the folded-length delta for each re-freeze, which is what the
     /// length chain below already checks; it is not a token-by-token added/removed count -- those
@@ -447,9 +456,9 @@ struct AppDelegateAutolaunchPinTests {
     /// expected to re-freeze this constant in the same commit that makes the edit, and the length
     /// below is here so that such a re-freeze can be sanity-checked (a length that MOVED by the size
     /// of the edit is a re-freeze; a length that moved by 22638 is a needle that stopped matching).
-    private static let foldedTailLength = 52179
+    private static let foldedTailLength = 52545
     private static let foldedTailSHA256 =
-        "1148a5b541a60e077e2bb555301484c9762b0281b92af7607f5914bc4085e3eb"
+        "40ac0323d87858f9f623971fdcc7aa51988653b088ea401a0610ccf892d3cdff"
 
     @Test("connectTapped to end-of-file is byte-identical to its last deliberate freeze")
     func theRestOfTheFileIsUnchanged() throws {

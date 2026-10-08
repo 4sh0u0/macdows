@@ -354,6 +354,28 @@ struct StartPanelSourcePinTests {
         }
     }
 
+    /// ADR-0025 R-7 (a-1b): the late failure reaches the Hosts window's status line through the panel's
+    /// change callback and `applyShell`, the line's one writer. The `session != nil` guard is
+    /// load-bearing -- the session's end clears the failures too, and `applyShell(.live)` with no
+    /// session would write the connected line over the end's own line and disable Connect -- and no
+    /// offline test can run `AppDelegate`, so the closure is pinned whole. The presenter half: the
+    /// suffix is `sp_last_fail`, live only, in one function.
+    @Test("a-1b: the panel's failure callback rewrites the shell only with a session; the presenter adds sp_last_fail only while live")
+    func lateFailureStatusLineWiring() throws {
+        let delegate = pinCode(try pinSource("App/Macdows/AppDelegate.swift"))
+        #expect(pinCount("startPanel.onLastFailureChange = { [weak self] in "
+                         + "guard let self, self.session != nil else { return } "
+                         + "self.applyShell(for: self.reconnectDriver?.state ?? .live) }", delegate) == 1)
+        #expect(pinCount("onLastFailureChange", delegate) == 1, "wired once")
+        let presenter = pinCode(try pinSource("App/SessionControl/ShellReconnectPresenter.swift"))
+        #expect(pinCount("sp_last_fail", presenter) == 1)
+        #expect(pinCount("guard case .live = state, let reason else { return \"\" } "
+                         + "return \"\\n\" + text.format(\"sp_last_fail\", \"The last launch did not succeed: %@\", [reason])", presenter) == 1)
+        #expect(pinCount("statusLine: line(for: state, text: text) + launchFailureSuffix(for: state, lastLaunchFailure, text: text) "
+                         + "+ noteSuffix(displayNote),", presenter) == 1, "state, failure, note -- in that order")
+        #expect(pinCount("launchFailureSuffix(", presenter) == 2, "declared once, called once")
+    }
+
     @Test("the App delegate's session end reaches the panel through the presence hook, and the teardown is untouched")
     func panelClosesOnEverySessionEnd() throws {
         let delegate = pinCode(try pinSource("App/Macdows/AppDelegate.swift"))
