@@ -86,8 +86,12 @@ final class DockAnchorLocator {
         DockAnchorGeometry.panelFrame(size: size, anchor: anchor, screens: screens(), dockEdgeHint: Self.dockEdgeHint())
     }
 
+    /// Where the screens come from: `DisplayTopologyProvider.anchorScreens()` in the App. A test sets
+    /// fixed screens, so a panel frame it checks does not depend on the machine's displays and Dock.
+    var screensProvider: () -> [AnchorScreen] = { DisplayTopologyProvider.anchorScreens() }
+
     func screens() -> [AnchorScreen] {
-        DisplayTopologyProvider.anchorScreens()
+        screensProvider()
     }
 
     private func primaryMaxY() -> CGFloat {

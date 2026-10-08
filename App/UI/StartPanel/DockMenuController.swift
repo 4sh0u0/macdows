@@ -79,21 +79,23 @@ final class DockMenuController: NSObject {
         }
     }
 
+    /// Between a program and its arguments in a Dock menu title: an em dash (U+2014) with one space
+    /// on each side.
+    static let argumentSeparator = " \u{2014} "
+
+    /// F-a1-2 (owner ruling (a)): the Dock draws this menu itself and drops every colour of an
+    /// attributed title (probe runbook 3.1 and the product, in person), so the arguments are set off
+    /// by a visible separator in a plain title -- "Example.exe — /open" -- and no
+    /// attributed title is set. The 40-character middle cut applies to the whole string. The panel's
+    /// rows keep the arguments in the secondary colour.
     private static func launchItem(_ row: LaunchCatalog.Row, target: DockMenuController?) -> NSMenuItem {
-        let full = row.arguments.isEmpty ? row.title : row.title + "  " + row.arguments
+        let full = row.arguments.isEmpty ? row.title : row.title + argumentSeparator + row.arguments
         let title = truncated(full, limit: StartPanelPolicy.dockMenuTitleLimit)
         let item = NSMenuItem(title: title, action: #selector(launchProgram(_:)), keyEquivalent: "")
         item.target = target
         item.isEnabled = true
         item.representedObject = row.item.id.uuidString
         item.toolTip = row.fullCommand
-        if title == full, !row.arguments.isEmpty {
-            // Design note §8: the arguments in the secondary colour (whether the Dock keeps the colour
-            // is probe P-DMENU / runbook 3.1; the plain title says the same either way).
-            let attributed = NSMutableAttributedString(string: row.title, attributes: [.foregroundColor: NSColor.labelColor])
-            attributed.append(NSAttributedString(string: "  " + row.arguments, attributes: [.foregroundColor: NSColor.secondaryLabelColor]))
-            item.attributedTitle = attributed
-        }
         return item
     }
 

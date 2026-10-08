@@ -59,18 +59,50 @@ struct DockMenuControllerTests {
         }
     }
 
-    @Test("titles longer than 40 characters are cut in the middle to exactly 40; arguments ride along in the secondary colour")
+    /// RE-WRITTEN by the a-1 in-person fold (F-a1-2, owner ruling (a)): the Dock drops an attributed
+    /// title's colours, so the arguments are set off by " — " in a plain title and no attributed title
+    /// is set; the 40-character middle cut applies to the whole string.
+    @Test("titles longer than 40 characters are cut in the middle to exactly 40; arguments follow an em dash in a plain title (F-a1-2)")
     func titles() throws {
         let long = String(repeating: "x", count: 92)
         let cut = DockMenuController.truncated(long, limit: 40)
         #expect(cut.count == 40 && cut.contains("…") && cut.hasPrefix("xxxx") && cut.hasSuffix("xxxx"))
         #expect(DockMenuController.truncated("short.exe", limit: 40) == "short.exe")
-        let lists = HostLaunchItems(pinned: [LaunchItem(displayName: "Example.exe", program: #"C:\Tools\Example.exe"#, arguments: "/open", date: Self.now)])
-        let item = try #require(DockMenuController.menu(for: Self.reading(.live), lists: lists, target: nil).items.first)
-        #expect(item.title == "Example.exe  /open")
+        #expect(DockMenuController.argumentSeparator.unicodeScalars.map(\.value) == [0x20, 0x2014, 0x20])
+        let lists = HostLaunchItems(pinned: [LaunchItem(displayName: "Example.exe", program: #"C:\Tools\Example.exe"#, arguments: "/open", date: Self.now)],
+                                    recent: [LaunchItem(displayName: "notepad.exe", program: "notepad.exe", arguments: "", date: Self.now),
+                                             LaunchItem(displayName: "Example.exe", program: #"C:\Tools\Example.exe"#,
+                                                        arguments: String(repeating: "a", count: 50), date: Self.now)])
+        let items = DockMenuController.menu(for: Self.reading(.live), lists: lists, target: nil).items
+        let item = try #require(items.first)
+        #expect(item.title == "Example.exe — /open")
+        #expect(item.attributedTitle == nil, "a plain title: the Dock would drop the colours anyway")
         #expect(item.toolTip == #"C:\Tools\Example.exe /open"#)
-        #expect(item.attributedTitle?.string == "Example.exe  /open")
         #expect(item.action == #selector(DockMenuController.launchProgram(_:)))
+        let plain = try #require(items.first { $0.title == "notepad.exe" }, "no arguments: the program alone, no dash")
+        #expect(plain.attributedTitle == nil)
+        let longRow = try #require(items.last { !$0.isSeparatorItem && $0.action == #selector(DockMenuController.launchProgram(_:)) })
+        let whole = "Example.exe — " + String(repeating: "a", count: 50)
+        #expect(longRow.title == DockMenuController.truncated(whole, limit: 40), "the middle cut runs over the whole string")
+        #expect(longRow.title.count == 40 && longRow.title.hasPrefix("Example.exe — ") && longRow.attributedTitle == nil)
+    }
+
+    /// F-a1-2's other half: the panel keeps the secondary colour -- its rows were never attributed
+    /// strings: the title is one label in the label colour, the arguments another in the secondary.
+    @Test("F-a1-2: the panel's row keeps the arguments in their own secondary-colour label")
+    func panelRowKeepsTheSecondaryColour() throws {
+        let store = LaunchItemStore(fileURL: nil)
+        store.recordLaunch(RunCommand(program: #"C:\Tools\Example.exe"#, arguments: "/open"), displayName: "Example.exe",
+                           for: StartPanelControllerTests.host, at: Self.now)
+        let controller = StartPanelController(items: store, launcher: AppLauncher(timeout: .seconds(8), clock: DispatchReconnectClock()),
+                                              preferences: StartPanelControllerTests.preferences())
+        controller.reading = { .init(hasSession: true, state: .live, host: StartPanelControllerTests.host, hostTitle: "workstation.example") }
+        controller.render()
+        let row = try #require(controller.itemRows.first?.view)
+        #expect(row.titleLabel.stringValue == "Example.exe" && row.titleLabel.textColor == .labelColor)
+        #expect(row.detailLabel.stringValue == "/open" && row.detailLabel.textColor == .secondaryLabelColor)
+        #expect(!row.detailLabel.isHidden)
+        #expect(!row.titleLabel.stringValue.contains(DockMenuController.argumentSeparator), "no dash in the panel")
     }
 
     @Test("every action targets the Dock menu controller, never the App delegate (S-5)")

@@ -446,7 +446,12 @@ struct StartPanelControllerTests {
         LaunchItem(displayName: program, program: program, arguments: "", date: Date(timeIntervalSince1970: 0))
     }
 
-    @Test("a-1b C1: a late failure calls back once per change and reads as its sentence; an equal write calls nothing")
+    /// RE-WRITTEN by the a-1 in-person fold (a-1c, owner ruling (3)): of the three sends below only the
+    /// third -- the host's latest -- may leave a late failure, so the first two results now write
+    /// nothing, and an equal write of the same failure can no longer happen (a result is matched to one
+    /// send once). The no-change guard stays pinned by the sends over an empty table here and by C2's
+    /// and C4's empty opens and ends.
+    @Test("a-1b C1: a late failure calls back once per change and reads as its sentence; a write that changes nothing calls nothing")
     func lateFailureCallsBackOnChange() {
         let (controller, sender) = Self.controller()
         var changes = 0
@@ -462,16 +467,21 @@ struct StartPanelControllerTests {
         #expect(sender.calls.count == 3)
         #expect(changes == 0, "a send over an empty table is no change")
         #expect(controller.lastLaunchFailureReason(for: Self.host) == nil)
+        // Results match the oldest pending send first: the first two belong to superseded sends.
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: "missing.exe")
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: "missing.exe")
+        #expect(changes == 0 && controller.lastLaunchFailureReason(for: Self.host) == nil, "a-1c (3): superseded sends leave nothing")
         controller.handleExecResult(execResult: 5, rawResult: 2, program: "missing.exe")
         #expect(changes == 1)
         #expect(controller.lastLaunchFailureReason(for: Self.host) == Self.notFound, "the sentence, not the key")
-        controller.handleExecResult(execResult: 5, rawResult: 2, program: "missing.exe")
-        #expect(changes == 1, "the same failure again is no change")
+        // Another reason: a new send clears the failure (one change), its own failure is another.
+        controller.launchFromDockMenu(Self.item("missing.exe"))
+        #expect(changes == 2 && controller.lastLaunchFailureReason(for: Self.host) == nil)
         controller.handleExecResult(execResult: 3, rawResult: 0, program: "missing.exe")
-        #expect(changes == 2, "another reason is")
+        #expect(changes == 3, "another reason is")
         #expect(controller.lastLaunchFailureReason(for: Self.host) == "This program is not allowed on the remote PC.")
         #expect(controller.lastLaunchFailureReason(for: nil) == nil && controller.lastLaunchFailureReason(for: HostID()) == nil)
-        #expect(seen == [Self.notFound, "This program is not allowed on the remote PC."], "each callback saw the table after the write")
+        #expect(seen == [Self.notFound, nil, "This program is not allowed on the remote PC."], "each callback saw the table after the write")
         #expect(!controller.isShown)
     }
 
@@ -603,6 +613,183 @@ struct StartPanelControllerTests {
         #expect(controller.rowErrors[calc.item.key] == "sp_r_nf" && controller.runFieldError == "sp_r_allow")
         #expect(controller.lastFailures.isEmpty && changes == 0)
         #expect(controller.lastLaunchFailureReason(for: Self.host) == nil)
+    }
+
+    // MARK: - a-1c (owner ruling (3)): only the host's latest sent launch leaves a late failure
+
+    @Test("a-1c (d): A then B from the Dock menu; A's late failure is dropped with no callback, B's waits")
+    func onlyTheLatestSendLeavesALateFailure() {
+        let (controller, sender) = Self.controller()
+        var changes = 0
+        controller.onLastFailureChange = { changes += 1 }
+        controller.launchFromDockMenu(Self.item("notepad.exe"))
+        controller.launchFromDockMenu(Self.item(#"C:\Tools\Example.exe"#))
+        #expect(sender.calls.map(\.program) == ["notepad.exe", #"C:\Tools\Example.exe"#])
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: "notepad.exe")
+        #expect(controller.lastFailures.isEmpty && changes == 0, "A was superseded by B: dropped")
+        #expect(controller.lastLaunchFailureReason(for: Self.host) == nil)
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: #"C:\Tools\Example.exe"#)
+        #expect(changes == 1)
+        #expect(controller.lastFailures[Self.host] == .init(reasonKey: "sp_r_nf", programName: "Example.exe"))
+    }
+
+    @Test("a-1c (f): a timeout is judged the same way -- an earlier send's timeout after a later send (even a successful one) writes nothing; the latest's waits")
+    func onlyTheLatestSendsTimeoutWaits() {
+        let clock = PanelClock()
+        let store = LaunchItemStore(fileURL: nil)
+        let (controller, _) = Self.controller(store: store, clock: clock)
+        var changes = 0
+        controller.onLastFailureChange = { changes += 1 }
+        // Gate r1 m-4's shape: B succeeds, then A's timeout lands.
+        controller.launchFromDockMenu(Self.item("notepad.exe"))
+        controller.launchFromDockMenu(Self.item("winver.exe"))
+        controller.handleExecResult(execResult: 0, rawResult: 0, program: "winver.exe")
+        #expect(store.items(for: Self.host).recent.map(\.displayName) == ["winver.exe"])
+        clock.fireAll()
+        #expect(controller.launcher.pendingRequests.isEmpty, "A timed out")
+        #expect(controller.lastFailures.isEmpty && changes == 0, "B's S_OK is not overwritten by A's timeout")
+        // Both time out: only the later one waits.
+        controller.launchFromDockMenu(Self.item("notepad.exe"))
+        controller.launchFromDockMenu(Self.item(#"C:\Tools\Example.exe"#))
+        clock.fireAll()
+        #expect(changes == 1)
+        #expect(controller.lastFailures[Self.host] == .init(reasonKey: "sp_r_timeout", programName: "Example.exe"))
+    }
+
+    /// The clear itself is read as state: request ids never repeat (one launcher for the App's life)
+    /// and every send overwrites its host's entry, so a stale entry could neither match nor block a
+    /// later outcome -- leaving it is invisible to behaviour, and only `latestSentID.isEmpty` sees it.
+    @Test("a-1c (g): the session's end forgets the latest sends; a new session's single late failure still waits")
+    func sessionEndForgetsTheLatestSends() {
+        var reading = StartPanelController.Reading(hasSession: true, state: .live, host: Self.host, hostTitle: "h")
+        let (controller, _) = Self.controller()
+        controller.reading = { reading }
+        controller.launchFromDockMenu(Self.item("notepad.exe"))
+        #expect(controller.latestSentID[Self.host] != nil)
+        reading = .noSession
+        controller.refresh()
+        #expect(controller.latestSentID.isEmpty, "cleared with the waiting failures")
+        reading = .init(hasSession: true, state: .live, host: Self.host, hostTitle: "h")
+        controller.refresh()
+        controller.launchFromDockMenu(Self.item(#"C:\Tools\Example.exe"#))
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: #"C:\Tools\Example.exe"#)
+        #expect(controller.lastFailures[Self.host] == .init(reasonKey: "sp_r_nf", programName: "Example.exe"))
+    }
+
+    // MARK: - gate r1 (fold-in) m-1 / m-2 / m-3: the row entry writes the latest send, an older S_OK clears nothing (ruling (3)), the clamp holds across a refresh
+
+    @Test("gate r1 m-1 (fold): a row send whose failure lands after the panel closed is the latest send")
+    func rowSendIsTheLatestSend() throws {
+        let store = LaunchItemStore(fileURL: nil)
+        store.recordLaunch(RunCommand(program: #"C:\Tools\Example.exe"#, arguments: ""), displayName: "Example.exe", for: Self.host,
+                           at: Date(timeIntervalSince1970: 0))
+        let (controller, _) = Self.controller(store: store)
+        controller.announce = { _, _ in }
+        controller.launchFromDockMenu(Self.item("notepad.exe"))
+        controller.show(anchor: .fallback)
+        controller.launch(try #require(controller.itemRows.first?.row))
+        controller.close(.dismissed)
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: "notepad.exe")
+        #expect(controller.lastFailures.isEmpty, "m-1a: the earlier Dock-menu send is superseded by the row send")
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: #"C:\Tools\Example.exe"#)
+        #expect(controller.lastFailures[Self.host] == .init(reasonKey: "sp_r_nf", programName: "Example.exe"), "m-1b: the row's late failure waits")
+    }
+
+    @Test("gate r1 m-2 (fold): an earlier send's S_OK after the latest send's failure clears nothing (ruling (3), not (2))")
+    func olderSuccessClearsNothing() {
+        let (controller, _) = Self.controller()
+        controller.launchFromDockMenu(Self.item("notepad.exe"))
+        controller.launchFromDockMenu(Self.item(#"C:\Tools\Example.exe"#))
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: #"C:\Tools\Example.exe"#)
+        controller.handleExecResult(execResult: 0, rawResult: 0, program: "notepad.exe")
+        #expect(controller.lastFailures[Self.host] == .init(reasonKey: "sp_r_nf", programName: "Example.exe"), "m-2")
+    }
+
+    @Test("gate r1 m-3 (fold): a panel taller than the visible frame is capped and its content fits the capped frame, also after a refresh")
+    func tallPanelIsCappedAlsoAfterRefresh() throws {
+        let store = LaunchItemStore(fileURL: nil)
+        for i in 0..<8 {
+            store.recordLaunch(RunCommand(program: "p\(i).exe", arguments: ""), displayName: "p\(i).exe", for: Self.host,
+                               at: Date(timeIntervalSince1970: Double(i)))
+        }
+        let (controller, _) = Self.controller(store: store)
+        controller.announce = { _, _ in }
+        controller.locator.screensProvider = {
+            [AnchorScreen(frame: CGRect(x: 0, y: 0, width: 1440, height: 300), visibleFrame: CGRect(x: 0, y: 70, width: 1440, height: 205))]
+        }
+        controller.show(anchor: .dockPointer(CGPoint(x: 300, y: 30)))
+        defer { controller.close(.dismissed) }
+        let content = try #require(controller.panel.contentView)
+        let frame = controller.panel.frame
+        #expect(frame.height <= 205 - 16, "m-3a capped: \(frame)")
+        content.layoutSubtreeIfNeeded()
+        #expect(content.fittingSize.height <= frame.height + 0.5, "m-3b content fits: \(content.fittingSize) in \(frame)")
+        controller.launch(try #require(controller.itemRows.first?.row))
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: controller.itemRows.first?.row.item.program ?? "")
+        let grown = controller.panel.frame
+        content.layoutSubtreeIfNeeded()
+        #expect(grown.height <= 205 - 16 && content.fittingSize.height <= grown.height + 0.5, "m-3c after refresh: \(content.fittingSize) in \(grown)")
+    }
+
+    // MARK: - F-a1-9: a refresh places the panel again at the anchor it was opened at
+
+    /// One 1440 × 900 screen with a 70 pt Dock gap at the bottom and a 25 pt menu bar, so a frame does
+    /// not depend on this machine's displays or Dock.
+    private static let fixedScreen = AnchorScreen(frame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+                                                  visibleFrame: CGRect(x: 0, y: 70, width: 1440, height: 805))
+
+    /// A live panel whose one Recent row is `C:\Tools\Example.exe /open`, placed on `fixedScreen`.
+    private static func placedController() -> (StartPanelController, PanelSender) {
+        let store = LaunchItemStore(fileURL: nil)
+        store.recordLaunch(RunCommand(program: #"C:\Tools\Example.exe"#, arguments: "/open"), displayName: "Example.exe", for: Self.host,
+                           at: Date(timeIntervalSince1970: 0))
+        let (controller, sender) = Self.controller(store: store)
+        controller.announce = { _, _ in }
+        controller.locator.screensProvider = { [Self.fixedScreen] }
+        return (controller, sender)
+    }
+
+    @Test("F-a1-9 (a)/(c): Dock anchor -- an inline reason grows the panel upward (bottom edge and midline stay); cleared, it shrinks back in place")
+    func dockAnchoredPanelGrowsUpward() throws {
+        let (controller, _) = Self.placedController()
+        controller.show(anchor: .dockPointer(CGPoint(x: 300, y: 30)))
+        defer { controller.close(.dismissed) }
+        let shown = controller.panel.frame
+        #expect(shown.minY == 78 && shown.midX == 300, "8 pt above the Dock's inner edge, on the icon's midline: \(shown)")
+        controller.launch(try #require(controller.itemRows.first?.row))
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: #"C:\Tools\Example.exe"#)
+        #expect(controller.rowErrors.count == 1, "the reason shows inline")
+        let grown = controller.panel.frame
+        #expect(grown.height > shown.height, "the reason line adds height: \(shown) -> \(grown)")
+        #expect(grown.minY == shown.minY && grown.minX == shown.minX, "the Dock-side edge stays: it grew upward, not over the Dock")
+        // (c) Pressing the row again clears its reason (and sends again).
+        controller.launch(try #require(controller.itemRows.first?.row))
+        #expect(controller.rowErrors.isEmpty)
+        let back = controller.panel.frame
+        #expect(back.height == shown.height && back.minY == shown.minY && back.minX == shown.minX, "\(shown) -> \(back)")
+    }
+
+    @Test("F-a1-9 (b)/(c): status-item anchor -- an inline reason grows the panel down from under the menu bar (top edge stays); cleared, it shrinks back")
+    func statusItemPanelGrowsDown() throws {
+        let (controller, _) = Self.placedController()
+        controller.showFromStatusItem(buttonFrame: CGRect(x: 900, y: 875, width: 30, height: 25))
+        defer { controller.close(.dismissed) }
+        let shown = controller.panel.frame
+        // The clamp rounds the origin to whole points, so a top edge hung from the button sits within
+        // half a point of 871 when the content's height is fractional.
+        #expect(abs(shown.maxY - 871) <= 0.5 && shown.minX == 900, "4 pt under the button, leading edges aligned: \(shown)")
+        controller.runField.stringValue = #"C:\Tools\Example.exe"#
+        controller.submitRunField()
+        controller.handleExecResult(execResult: 5, rawResult: 2, program: #"C:\Tools\Example.exe"#)
+        #expect(controller.runFieldError == "sp_r_nf")
+        let grown = controller.panel.frame
+        #expect(grown.height > shown.height, "\(shown) -> \(grown)")
+        #expect(abs(grown.maxY - shown.maxY) <= 0.5 && grown.minX == shown.minX, "the top edge stays under the menu bar: \(shown) -> \(grown)")
+        // (c) Sending again clears the Run field's reason.
+        controller.submitRunField()
+        #expect(controller.runFieldError == nil)
+        let back = controller.panel.frame
+        #expect(back.height == shown.height && abs(back.maxY - shown.maxY) <= 0.5 && back.minX == shown.minX, "\(shown) -> \(back)")
     }
 
     // MARK: - Ruling R-a1-1 (i)

@@ -38,7 +38,7 @@ struct StartPanelStringsTests {
         ("sp_r_locked", "The remote session is locked."), ("sp_r_unknown", "Windows returned an unknown result."),
         ("sp_r_timeout", "Windows did not reply. If the program doesn’t open, try again."), ("sp_r_long", "The path is too long."),
         ("sp_r_args_long", "The path and arguments are too long together."), ("sp_ax", "Precise Dock positioning"),
-        ("sp_ax_d", "Uses Accessibility to find the Macdows icon in the Dock. Without access, the panel opens where you clicked. You can allow access in System Settings > Privacy & Security > Accessibility."),
+        ("sp_ax_d", "Uses Accessibility to find the Macdows icon in the Dock. Without access, the panel opens where you clicked. You can allow access in System Settings > Privacy & Security."),
         ("sp_ax_off", "Accessibility access isn’t allowed yet. Allow Macdows in Privacy & Security to open the panel at its Dock icon."),
         ("sp_ax_open", "Open Privacy & Security…"),
     ]
@@ -79,6 +79,24 @@ struct StartPanelStringsTests {
         }
         #expect(try #require(shellCatalogValue(strings, "sp_ax_off", "zh-Hans")).contains("“隐私与安全性”"))
         #expect(try #require(shellCatalogValue(strings, "sp_ax_off", "ja")).contains("「プライバシーとセキュリティ」"))
+    }
+
+    /// F-a1-1 (owner ruling (a)): macOS 27.2 renamed the list (it is no longer "Accessibility" in
+    /// System Settings), so the description names only System Settings > Privacy & Security; the rest of
+    /// each sentence is unchanged.
+    @Test("F-a1-1: sp_ax_d points at System Settings > Privacy & Security and names no list below it, in three languages")
+    func axDescriptionStopsAtPrivacyAndSecurity() throws {
+        let strings = try shellCatalogStrings()
+        let en = try #require(shellCatalogValue(strings, "sp_ax_d", "en"))
+        let zh = try #require(shellCatalogValue(strings, "sp_ax_d", "zh-Hans"))
+        let ja = try #require(shellCatalogValue(strings, "sp_ax_d", "ja"))
+        #expect(en.hasSuffix("You can allow access in System Settings > Privacy & Security."))
+        #expect(zh.hasSuffix("可在“系统设置 > 隐私与安全性”中授权。"))
+        #expect(ja.hasSuffix("「システム設定 > プライバシーとセキュリティ」で許可できます。"))
+        for value in [en, zh, ja] {
+            #expect(value.components(separatedBy: " > ").count == 2, "one step: \(value)")
+        }
+        #expect(UIStrings.startPanelPreciseNote == en, "the source's default value matches the catalog")
     }
 
     @Test("every reason key the launcher and the result codes produce has its own sentence; only unknowns fall back")

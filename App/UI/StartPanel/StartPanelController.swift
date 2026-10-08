@@ -146,7 +146,16 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
             if lastFailures != oldValue { onLastFailureChange?() }
         }
     }
+    /// a-1c (owner ruling (3)): each host's latest SENT launch (`AppLauncher.Request.id`). Only that
+    /// launch's failure or timeout may wait as a late failure; an earlier launch's outcome that lands
+    /// after a later send is dropped. Written where a send clears the waiting failure, emptied with it
+    /// at the session's end.
+    private(set) var latestSentID: [HostID: Int] = [:]
     private(set) var shownLastFailure: LastFailure?
+    /// F-a1-9: the anchor of the current open. A refresh that changes the content's height places the
+    /// panel again at it, so a Dock-anchored panel grows away from the Dock (its Dock-side edge stays
+    /// `dockGap` outside the Dock) and a status-item panel grows down from under the menu bar.
+    private var shownAnchor: PanelAnchor?
     private var shownAt: Date?
     private var lastAutomaticClose: Date?
     private var outsideClickMonitor: Any?
@@ -351,6 +360,7 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
             shownLastFailure = lastFailures.removeValue(forKey: host)
         }
         render()
+        shownAnchor = anchor
         let frame = placedFrame(for: anchor)
         panel.setFrame(frame, display: true)
         installCloseTriggers()
@@ -381,6 +391,7 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
             break
         }
         shownLastFailure = nil
+        shownAnchor = nil
         rowErrors = [:]
         runFieldError = nil
         inlineAnnouncement = nil
@@ -399,6 +410,7 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
                 runFieldPending = nil
                 // After `cancelAll`, which reports no outcome, so no late failure can land behind this.
                 lastFailures = [:]
+                latestSentID = [:]
             }
             close(.sessionEnded)
             return
@@ -410,6 +422,11 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
                 itemRows.first { $0.view === view }?.row.item.key
             }
             render()
+            // F-a1-9: an inline reason (or its removal) changed the content's height; without this the
+            // window kept its top edge and grew down over the Dock icon.
+            if let shownAnchor {
+                panel.setFrame(placedFrame(for: shownAnchor), display: true)
+            }
             if let focusedKey, let row = itemRows.first(where: { $0.row.item.key == focusedKey && $0.view.isEnabled }) {
                 panel.makeFirstResponder(row.view)
             }
@@ -668,7 +685,10 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
         switch launcher.launch(program: row.item.program, arguments: row.item.arguments, origin: .row(row.item.id)) {
         case .sent(let request):
             pendingByKey[row.item.key] = request.id
-            if let host = request.host { lastFailures.removeValue(forKey: host) }
+            if let host = request.host {
+                lastFailures.removeValue(forKey: host)
+                latestSentID[host] = request.id
+            }
         case .refused(let key):
             if let key { rowErrors[row.item.key] = key }
         case .notLive:
@@ -685,7 +705,10 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
         switch launcher.launch(text: runField.stringValue, origin: .runField) {
         case .sent(let request):
             runFieldPending = request.id
-            if let host = request.host { lastFailures.removeValue(forKey: host) }
+            if let host = request.host {
+                lastFailures.removeValue(forKey: host)
+                latestSentID[host] = request.id
+            }
         case .refused(let key):
             runFieldError = key
         case .notLive:
@@ -695,17 +718,20 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
     }
 
     /// A Dock menu item: sent at once; the menu has closed, so the outcome is a late one. A send
-    /// supersedes the host's waiting failure, as a send from the panel does.
+    /// supersedes the host's waiting failure, as a send from the panel does, and becomes the host's
+    /// latest send.
     func launchFromDockMenu(_ item: LaunchItem) {
         if case .sent(let request) = launcher.launch(program: item.program, arguments: item.arguments, origin: .dockMenu),
            let host = request.host {
             lastFailures.removeValue(forKey: host)
+            latestSentID[host] = request.id
         }
     }
 
     /// One launch ended (`AppLauncher.onOutcome`). Success writes Recent -- the only writer of
     /// Recent -- and closes the panel the launch came from; a failure or a timeout shows its reason
-    /// where it was asked for while the panel is open, and otherwise waits for the next open.
+    /// where it was asked for while the panel is open, and otherwise waits for the next open -- if it
+    /// is the host's latest send (a-1c (3)).
     func handle(_ request: AppLauncher.Request, _ outcome: AppLauncher.Outcome) {
         let key = LaunchItem(displayName: "", program: request.command.program, arguments: request.command.arguments, date: Date()).key
         if pendingByKey[key] == request.id { pendingByKey[key] = nil }
@@ -740,7 +766,9 @@ final class StartPanelController: NSObject, NSWindowDelegate, NSTextFieldDelegat
             runFieldError = reasonKey
             inlineAnnouncement = (nil, reasonKey)
         default:
-            if let host = request.host {
+            // a-1c (owner ruling (3)): only the host's latest sent launch may wait; an earlier one whose
+            // outcome lands after a later send is dropped -- no write, no callback.
+            if let host = request.host, latestSentID[host] == request.id {
                 lastFailures[host] = LastFailure(reasonKey: reasonKey, programName: programName)
             }
         }

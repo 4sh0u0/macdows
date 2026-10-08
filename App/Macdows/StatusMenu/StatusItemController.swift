@@ -121,6 +121,11 @@ final class StatusItemController: NSObject, NSMenuDelegate, NSMenuItemValidation
     /// being live. The App's own record (`SessionReading.liveSince`) wins when it supplies one.
     private(set) var liveSince: Date?
     private var terminationObserver: NSObjectProtocol?
+    /// Design note §6: true while the start panel this item's Run… opened is showing -- what the
+    /// button's highlight follows (`setPanelHighlight(_:)`).
+    private(set) var panelHighlightWanted = false
+    /// F-a1-8: this item's menu finishing its tracking, observed from `install()`.
+    private var menuEndObserver: NSObjectProtocol?
 
     override init() {
         super.init()
@@ -179,6 +184,11 @@ final class StatusItemController: NSObject, NSMenuDelegate, NSMenuItemValidation
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.uninstall() }
         }
+        menuEndObserver = NotificationCenter.default.addObserver(
+            forName: NSMenu.didEndTrackingNotification, object: menu, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reapplyPanelHighlightAfterMenu() }
+        }
     }
 
     /// Takes the status item out of the menu bar (on App termination).
@@ -187,6 +197,10 @@ final class StatusItemController: NSObject, NSMenuDelegate, NSMenuItemValidation
             NotificationCenter.default.removeObserver(terminationObserver)
         }
         terminationObserver = nil
+        if let menuEndObserver {
+            NotificationCenter.default.removeObserver(menuEndObserver)
+        }
+        menuEndObserver = nil
         if let statusItem {
             statusItem.statusBar?.removeStatusItem(statusItem)
         }
@@ -332,10 +346,34 @@ final class StatusItemController: NSObject, NSMenuDelegate, NSMenuItemValidation
     /// forwards the panel's `onStatusItemAnchorChange` here. Applied on the next turn, after the menu
     /// that sent Run… has finished tracking (which resets the button's highlight itself); both
     /// directions go through the same queue, so their order is kept.
+    ///
+    /// F-a1-8 (in person, macOS 27.2: no highlight at all): the next turn alone did not hold, so the
+    /// wanted state is also applied again 50 ms after this item's menu ends tracking
+    /// (`reapplyPanelHighlightAfterMenu`), and each application sets both the button's highlight and
+    /// its cell's highlighted flag. Not verifiable offline (no status item in tests): the next
+    /// in-person batch checks it.
     func setPanelHighlight(_ on: Bool) {
+        panelHighlightWanted = on
         DispatchQueue.main.async { [weak self] in
-            self?.statusItem?.button?.highlight(on)
+            self?.applyPanelHighlight(on)
         }
+    }
+
+    /// F-a1-8: after the menu's own teardown has reset the button, set the wanted state again (read
+    /// when the block runs, so a panel closed in between is not highlighted back).
+    private func reapplyPanelHighlightAfterMenu() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
+            guard let self else { return }
+            self.applyPanelHighlight(self.panelHighlightWanted)
+        }
+    }
+
+    /// The one place the button's highlight is written: the button's own call and its cell's flag,
+    /// on and off alike.
+    private func applyPanelHighlight(_ on: Bool) {
+        guard let button = statusItem?.button else { return }
+        button.highlight(on)
+        (button.cell as? NSButtonCell)?.isHighlighted = on
     }
 
     /// The status item button's frame on screen, the start panel's anchor.

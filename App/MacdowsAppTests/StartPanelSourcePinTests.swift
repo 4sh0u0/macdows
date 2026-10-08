@@ -341,14 +341,42 @@ struct StartPanelSourcePinTests {
     }
 
     /// Gate r1 m-3 (i): the status item's button is highlighted through the panel's own callback.
-    @Test("m-3 (i): the App forwards the panel's status-item anchor to the status item's highlight")
+    /// RE-WRITTEN by the a-1 in-person fold (F-a1-8: on macOS 27.2 the next-turn highlight showed
+    /// nothing): the wanted state is applied on the next turn AND again 50 ms after the status item's
+    /// menu ends tracking, and each application sets the button's highlight and its cell's flag. The
+    /// status item is never created offline, so this is source only; whether the button now stays lit
+    /// is the next in-person batch's. `.highlight(` stays exactly 1 -- not 2 -- because both paths go
+    /// through the one writer `applyPanelHighlight(_:)` (declared once, called twice).
+    @Test("m-3 (i) / F-a1-8: the panel's status-item anchor reaches one highlight writer, on the next turn and 50 ms after the menu ends")
     func statusItemHighlightWiring() throws {
         let delegate = pinCode(try pinSource("App/Macdows/AppDelegate.swift"))
         #expect(pinCount("startPanel.onStatusItemAnchorChange = { [weak self] highlighted in "
                          + "self?.statusItemController.setPanelHighlight(highlighted) }", delegate) == 1)
         let status = pinCode(try pinSource("App/Macdows/StatusMenu/StatusItemController.swift"))
-        #expect(pinCount("self?.statusItem?.button?.highlight(on)", status) == 1)
-        #expect(pinCount(".highlight(", status) == 1)
+        #expect(pinCount("func setPanelHighlight(_ on: Bool) { panelHighlightWanted = on "
+                         + "DispatchQueue.main.async { [weak self] in self?.applyPanelHighlight(on) } }", status) == 1)
+        #expect(pinCount("private func applyPanelHighlight(_ on: Bool) { guard let button = statusItem?.button else { return } "
+                         + "button.highlight(on) (button.cell as? NSButtonCell)?.isHighlighted = on }", status) == 1)
+        #expect(pinCount("private func reapplyPanelHighlightAfterMenu() { "
+                         + "DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in "
+                         + "guard let self else { return } self.applyPanelHighlight(self.panelHighlightWanted) } }", status) == 1)
+        #expect(pinCount(".highlight(", status) == 1, "one highlight call, in the one writer")
+        #expect(pinCount("isHighlighted = ", status) == 1)
+        #expect(pinCount("applyPanelHighlight(", status) == 3, "declared once, called from the next turn and after the menu")
+        #expect(pinCount("private(set) var panelHighlightWanted = false", status) == 1)
+        #expect(pinCount("panelHighlightWanted = ", status) == 2, "its declaration and setPanelHighlight: the only writer")
+        // The menu-end observer: this item's own menu, registered in install(), removed in uninstall().
+        let install = try #require(status.range(of: "func install() {"))
+        let uninstall = try #require(status.range(of: "func uninstall() {"))
+        let installBody = try #require(braced(status, from: install.lowerBound))
+        let uninstallBody = try #require(braced(status, from: uninstall.lowerBound))
+        #expect(pinCount("NSMenu.didEndTrackingNotification", status) == 1)
+        #expect(pinCount("menuEndObserver = NotificationCenter.default.addObserver( forName: NSMenu.didEndTrackingNotification, "
+                         + "object: menu, queue: .main ) { [weak self] _ in MainActor.assumeIsolated { self?.reapplyPanelHighlightAfterMenu() } }",
+                         String(installBody)) == 1)
+        #expect(pinCount("if let menuEndObserver { NotificationCenter.default.removeObserver(menuEndObserver) } menuEndObserver = nil",
+                         String(uninstallBody)) == 1)
+        #expect(pinCount("reapplyPanelHighlightAfterMenu()", status) == 2, "declared once, called from the observer")
         for file in try launchPathSources() {
             #expect(pinCount("StatusItemController", file.code) == 0, "\(file.path): the panel does not reach the status item")
         }

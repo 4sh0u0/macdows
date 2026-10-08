@@ -241,7 +241,7 @@ enum UIStrings {
     static var startPanelPathTooLong: String { String(localized: "sp_r_long", defaultValue: "The path is too long.", comment: "Start panel: refused before sending") }
     static var startPanelPathAndArgumentsTooLong: String { String(localized: "sp_r_args_long", defaultValue: "The path and arguments are too long together.", comment: "Start panel: refused before sending") }
     static var startPanelPrecise: String { String(localized: "sp_ax", defaultValue: "Precise Dock positioning", comment: "Settings, General: the start panel checkbox") }
-    static var startPanelPreciseNote: String { String(localized: "sp_ax_d", defaultValue: "Uses Accessibility to find the Macdows icon in the Dock. Without access, the panel opens where you clicked. You can allow access in System Settings > Privacy & Security > Accessibility.", comment: "Settings, General: the start panel checkbox, explained") }
+    static var startPanelPreciseNote: String { String(localized: "sp_ax_d", defaultValue: "Uses Accessibility to find the Macdows icon in the Dock. Without access, the panel opens where you clicked. You can allow access in System Settings > Privacy & Security.", comment: "Settings, General: the start panel checkbox, explained") }
     static var startPanelNotAuthorized: String { String(localized: "sp_ax_off", defaultValue: "Accessibility access isn’t allowed yet. Allow Macdows in Privacy & Security to open the panel at its Dock icon.", comment: "Settings, General: the checkbox is on but access is not granted") }
     static var startPanelOpenPrivacy: String { String(localized: "sp_ax_open", defaultValue: "Open Privacy & Security…", comment: "Settings, General: open the Accessibility list in System Settings") }
 

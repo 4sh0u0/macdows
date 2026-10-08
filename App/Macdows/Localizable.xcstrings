@@ -5513,19 +5513,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Uses Accessibility to find the Macdows icon in the Dock. Without access, the panel opens where you clicked. You can allow access in System Settings > Privacy & Security > Accessibility."
+            "value" : "Uses Accessibility to find the Macdows icon in the Dock. Without access, the panel opens where you clicked. You can allow access in System Settings > Privacy & Security."
           }
         },
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "アクセシビリティを使って Dock 内の Macdows アイコンを探します。許可されていない場合は、クリックした位置にパネルを開きます。「システム設定 > プライバシーとセキュリティ > アクセシビリティ」で許可できます。"
+            "value" : "アクセシビリティを使って Dock 内の Macdows アイコンを探します。許可されていない場合は、クリックした位置にパネルを開きます。「システム設定 > プライバシーとセキュリティ」で許可できます。"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "使用辅助功能查找 Dock 中的 Macdows 图标。未获授权时，面板在你点按的位置打开。可在“系统设置 > 隐私与安全性 > 辅助功能”中授权。"
+            "value" : "使用辅助功能查找 Dock 中的 Macdows 图标。未获授权时，面板在你点按的位置打开。可在“系统设置 > 隐私与安全性”中授权。"
           }
         }
       }
