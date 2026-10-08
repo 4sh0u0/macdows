@@ -50,10 +50,12 @@ struct ShellReconnectPresenterTests {
     private static func shell(
         _ state: ReconnectDriver.State,
         note: String? = nil,
+        failure: String? = nil,
         language: String = "en",
         connected: ShellReconnectPresenter.ConnectedSummary = summary
     ) throws -> ShellReconnectPresenter.Shell {
-        ShellReconnectPresenter.shell(for: state, connected: connected, displayNote: note, text: try .catalog(language))
+        ShellReconnectPresenter.shell(for: state, connected: connected, displayNote: note, lastLaunchFailure: failure,
+                                      text: try .catalog(language))
     }
 
     // MARK: - D-1: the reconnect states
@@ -225,7 +227,9 @@ struct ShellReconnectPresenterTests {
         #expect(keys == ["st_connecting", "st_conn", "st_off", "dg_bar", "s_live_bar", "s_wait", "s_re", "s_gx", "s_gr", "cf_bar_c",
                          // UI slice ④ commit 2: the banners and the Remote windows note.
                          "d_retry_b", "d_gx_t", "d_gx_b", "d_gr_t", "d_gr_b", "wn_retry", "wn_gx", "wn_gr", "dg_u_t", "dg_u_b",
-                         "dg_u_x"])
+                         "dg_u_x",
+                         // ADR-0025 a-1b: the late launch failure on the live line (a key the start panel added).
+                         "sp_last_fail"])
         let specifier = try Regex(#"%(?:\d\$)?(?:lld|d|@)"#)
         for key in keys {
             let en = shellCatalogValue(strings, key, "en") ?? ""
@@ -272,6 +276,63 @@ struct ShellReconnectPresenterTests {
     @Test("no display note adds no trailing newline")
     func noNoteAddsNothing() throws {
         #expect(!(try Self.shell(.live)).statusLine.hasSuffix("\n"))
+    }
+
+    // MARK: - ADR-0025 R-7 (a-1b): the last launch failure
+
+    /// P1. While live, a late launch failure follows the state's line on its own line, as
+    /// `sp_last_fail` around the reason the caller resolved -- in each language, the catalog's value.
+    @Test("a-1b P1: live + a failure: st_conn, a newline, sp_last_fail around the reason, in three languages")
+    func liveCarriesTheLastLaunchFailure() throws {
+        for (language, cell) in zip(["en", "zh-Hans", "ja"], [
+            "Connected\nThe last launch did not succeed: R",
+            "已连接\n上次启动未成功：R",
+            "接続済み\n前回の起動は成功しませんでした：R",
+        ]) {
+            #expect(try Self.shell(.live, failure: "R", language: language).statusLine == cell, "\(language)")
+        }
+        let reason = "Windows did not reply. If the program doesn’t open, try again."
+        #expect(try Self.shell(.live, failure: reason).statusLine == "Connected\nThe last launch did not succeed: " + reason)
+    }
+
+    /// P2. Every other state ignores it: the connection is the news there, and the panel keeps the
+    /// value for the next live line. The whole shell is identical to the one without a failure.
+    @Test("a-1b P2: every non-live state (every give-up cause too) is unchanged by a failure, with or without a note")
+    func nonLiveStatesIgnoreTheFailure() throws {
+        let states = Self.everyState().filter { $0 != .live } + Self.everyGiveUpCause().map { ReconnectDriver.State.gaveUp($0) }
+        #expect(states.count == 8)
+        for state in states {
+            for language in ["en", "zh-Hans", "ja"] {
+                #expect(try Self.shell(state, failure: "R", language: language) == Self.shell(state, language: language), "\(state) \(language)")
+                #expect(try Self.shell(state, note: "N", failure: "R", language: language) == Self.shell(state, note: "N", language: language),
+                        "\(state) \(language) with a note")
+            }
+        }
+    }
+
+    /// P3. With a display note too, the order is the state, the failure, the note.
+    @Test("a-1b P3: live + a failure + a note: state line, failure, note, in that order")
+    func theFailureSitsBetweenTheStateAndTheNote() throws {
+        let note = "Display change: this session's desktop size is unaffected."
+        #expect(try Self.shell(.live, note: note, failure: "R").statusLine
+                == "Connected\nThe last launch did not succeed: R\n" + note)
+        #expect(try Self.shell(.live, note: note, failure: "R", language: "ja").statusLine
+                == "接続済み\n前回の起動は成功しませんでした：R\n" + note)
+    }
+
+    /// P5. The status bar and the Connect button never read the failure, in any state: a launch
+    /// failure says nothing about the connection.
+    @Test("a-1b P5: the status bar and Connect are the same with and without a failure, in every state")
+    func theBarAndTheButtonIgnoreTheFailure() throws {
+        for state in Self.everyState() {
+            let plain = try Self.shell(state)
+            let failed = try Self.shell(state, failure: "R")
+            #expect(failed.statusBar == plain.statusBar, "\(state)")
+            #expect(failed.connectEnabled == plain.connectEnabled, "\(state)")
+        }
+        let degraded = ShellReconnectPresenter.ConnectedSummary(windows: 2, liveSince: Date(), inputDegraded: true)
+        #expect(try Self.shell(.live, failure: "R", connected: degraded).statusBar == "Connected · 2 windows · since 12:03 · some features unavailable")
+        #expect(!(try Self.shell(.live)).statusLine.contains("\n"), "no failure, no note: one line")
     }
 
     // MARK: - the two mappings, named

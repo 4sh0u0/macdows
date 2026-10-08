@@ -212,4 +212,60 @@ enum UIStrings {
     static var removeBody: String { String(localized: "rm_b", defaultValue: "Macdows removes this host, its password saved in your Keychain and its pinned certificate fingerprint.", comment: "Remove alert: body (slice 1)") }
     static var removeConfirm: String { String(localized: "rm_ok", defaultValue: "Remove", comment: "Remove alert: destructive button (slice 1)") }
     static var removeFailed: String { String(localized: "rm_err", defaultValue: "Macdows could not remove this host’s Keychain items, so the host was kept.", comment: "Remove alert: failure (slice 1)") }
+
+    // MARK: Start panel (ADR-0025 §5.1 as amended by owner ruling ㋯; design note 2026-10-07 §4)
+    // Twenty-five `sp_*` keys. `sp_gaveup` is not one of them: a give-up tears the session down, so
+    // the panel has no give-up state (§10 item 1 (b)). Reused, never re-keyed: `si_open`,
+    // `st_conn`, `st_connecting`, `st_off`, `si_retry`.
+    static var startPanelTitle: String { String(localized: "sp_title", defaultValue: "Start panel", comment: "Start panel: its name (VoiceOver) and the Settings row label") }
+    static var startPanelPinned: String { String(localized: "sp_pinned", defaultValue: "Pinned", comment: "Start panel: section header") }
+    static var startPanelRecent: String { String(localized: "sp_recent", defaultValue: "Recent", comment: "Start panel: section header") }
+    static var startPanelRun: String { String(localized: "sp_run", defaultValue: "Run…", comment: "Start panel, Dock menu and status menu: run a program (the Run field's VoiceOver name)") }
+    static var startPanelRunPlaceholder: String { String(localized: "sp_run_ph", defaultValue: "Program path or name", comment: "Start panel: Run field placeholder") }
+    static var startPanelPin: String { String(localized: "sp_pin", defaultValue: "Pin", comment: "Start panel: row menu, pin a recent program") }
+    static var startPanelUnpin: String { String(localized: "sp_unpin", defaultValue: "Unpin", comment: "Start panel: row menu, unpin a pinned program") }
+    static var startPanelForget: String { String(localized: "sp_forget", defaultValue: "Remove from Recent", comment: "Start panel: row menu, drop a recent program") }
+    static var startPanelEmpty: String { String(localized: "sp_empty", defaultValue: "Programs you run appear here.", comment: "Start panel: no pinned or recent programs yet") }
+    static var startPanelWaiting: String { String(localized: "sp_wait", defaultValue: "Reconnecting. You can launch programs once connected.", comment: "Start panel: header status while reconnecting") }
+    static func startPanelLastFailure(_ reason: String) -> String {
+        String(format: Bundle.main.localizedString(forKey: "sp_last_fail", value: "The last launch did not succeed: %@", table: nil), reason)
+    }
+    static var startPanelHookNotLoaded: String { String(localized: "sp_r_hook", defaultValue: "Windows is not ready to start programs yet. Try again in a moment.", comment: "Start panel: launch result 1") }
+    static var startPanelDecodeFailed: String { String(localized: "sp_r_decode", defaultValue: "Windows could not read the program name.", comment: "Start panel: launch result 2") }
+    static var startPanelNotAllowed: String { String(localized: "sp_r_allow", defaultValue: "This program is not allowed on the remote PC.", comment: "Start panel: launch result 3") }
+    static var startPanelNotFound: String { String(localized: "sp_r_nf", defaultValue: "The program was not found on the remote PC. Check the path.", comment: "Start panel: launch result 5") }
+    static var startPanelFailed: String { String(localized: "sp_r_fail", defaultValue: "Windows could not start the program.", comment: "Start panel: launch result 6") }
+    static var startPanelLocked: String { String(localized: "sp_r_locked", defaultValue: "The remote session is locked.", comment: "Start panel: launch result 7") }
+    static var startPanelUnknownResult: String { String(localized: "sp_r_unknown", defaultValue: "Windows returned an unknown result.", comment: "Start panel: any other launch result") }
+    static var startPanelTimedOut: String { String(localized: "sp_r_timeout", defaultValue: "Windows did not reply. If the program doesn’t open, try again.", comment: "Start panel: no launch result within the timeout") }
+    static var startPanelPathTooLong: String { String(localized: "sp_r_long", defaultValue: "The path is too long.", comment: "Start panel: refused before sending") }
+    static var startPanelPathAndArgumentsTooLong: String { String(localized: "sp_r_args_long", defaultValue: "The path and arguments are too long together.", comment: "Start panel: refused before sending") }
+    static var startPanelPrecise: String { String(localized: "sp_ax", defaultValue: "Precise Dock positioning", comment: "Settings, General: the start panel checkbox") }
+    static var startPanelPreciseNote: String { String(localized: "sp_ax_d", defaultValue: "Uses Accessibility to find the Macdows icon in the Dock. Without access, the panel opens where you clicked. You can allow access in System Settings > Privacy & Security.", comment: "Settings, General: the start panel checkbox, explained") }
+    static var startPanelNotAuthorized: String { String(localized: "sp_ax_off", defaultValue: "Accessibility access isn’t allowed yet. Allow Macdows in Privacy & Security to open the panel at its Dock icon.", comment: "Settings, General: the checkbox is on but access is not granted") }
+    static var startPanelOpenPrivacy: String { String(localized: "sp_ax_open", defaultValue: "Open Privacy & Security…", comment: "Settings, General: open the Accessibility list in System Settings") }
+
+    /// The `sp_r_*` key -> its sentence, for the keys `ExecResultCode.reasonKey`,
+    /// `AppLauncher.reasonKey(for:)` and the timeout produce. A key outside the table reads as the
+    /// unknown result.
+    static func startPanelReason(forKey key: String) -> String {
+        switch key {
+        case "sp_r_hook": startPanelHookNotLoaded
+        case "sp_r_decode": startPanelDecodeFailed
+        case "sp_r_allow": startPanelNotAllowed
+        case "sp_r_nf": startPanelNotFound
+        case "sp_r_fail": startPanelFailed
+        case "sp_r_locked": startPanelLocked
+        case "sp_r_timeout": startPanelTimedOut
+        case "sp_r_long": startPanelPathTooLong
+        case "sp_r_args_long": startPanelPathAndArgumentsTooLong
+        default: startPanelUnknownResult
+        }
+    }
+
+    /// Reused keys, same default values as their first users (`StatusItemController`).
+    static var openMacdows: String { String(localized: "si_open", defaultValue: "Open Macdows", comment: "Status menu: bring Macdows to the front") }
+    static func reconnectingTo(_ host: String) -> String {
+        String(format: Bundle.main.localizedString(forKey: "si_retry", value: "Reconnecting to %@", table: nil), host)
+    }
 }

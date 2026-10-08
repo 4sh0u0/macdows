@@ -884,6 +884,24 @@ typedef NS_ENUM(NSInteger, CRPublishedSurfaceMiss) {
 /// the initializer's `program`.
 - (void)executeProgram:(NSString *)program;
 
+/// ADR-0025 (the Dock start panel's launch path, a-1): launches `program` with `arguments` in the
+/// already-connected session -- the same RAIL ClientExecute over the same outbound lane as
+/// `-executeProgram:`, and just as fire-and-forget: silently dropped if the RAIL channel isn't
+/// connected yet, the outcome arriving later as an ExecResult event whose `program` echoes what
+/// the server ran. A separate method rather than an argument added to `-executeProgram:`, which
+/// stays the unattended knob's program-only send, body unchanged (ADR-0025 §2, S-5).
+///
+/// `program` is a full Windows path or a bare name and `arguments` the rest of the command line,
+/// both passed through verbatim: no quoting, no expansion, flags always 0. nil or empty
+/// `arguments` sends the program alone, byte-for-byte the payload `-executeProgram:` sends. The
+/// two share the execute payload's one text buffer (crdpq.h, `crdpq_cmd_execute_t`), so their
+/// UTF-8 byte counts plus one separator may not exceed 255. An empty `program`, a NUL inside
+/// either string, or a pair over that limit is REFUSED -- nothing is sent, never a truncated
+/// command -- with one WARN line that reports a byte count and never either string (ADR-0025
+/// §3.2 S-2). Callers that want to tell the user why should check first: MacdowsCore's
+/// `RunCommandParser` applies the same limit.
+- (void)launchProgram:(NSString *)program arguments:(nullable NSString *)arguments;
+
 /// W2 (docs/plans/phase2.md §2 W2 task item 4): posts a RAIL ClientSystemCommand for
 /// `windowId` onto the outbound lane -- already-existing plumbing (`crb_outbound_visitor`
 /// has handled `CRDPQ_CMD_SYS_COMMAND` since it was implemented, this method is simply the

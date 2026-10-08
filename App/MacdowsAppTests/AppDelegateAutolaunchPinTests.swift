@@ -421,6 +421,26 @@ struct AppDelegateAutolaunchPinTests {
     /// `connectTapped`, `drainTick`, `tearDownSession`, `endSessionTapped` and
     /// `applicationWillTerminate` are unchanged. It now folds to 50608 characters, +38.
     ///
+    /// RE-FROZEN by ADR-0025 a-1 commit 2 (the Dock start panel): `beginSession` hands the new
+    /// registry's ExecResult forward (`onExecResult`, S-4) to the start panel's launcher;
+    /// `applyReconnectState` re-reads the panel after the status item; `sessionPresenceChanged`
+    /// re-reads it first thing, so every session end closes it (the teardown keeps its seven steps);
+    /// `startPanelReading()` is new beside `statusItemReading()`; the reopen gained its has-session
+    /// clause (R-7; the no-session clause is word for word as before, see
+    /// `AppDelegateChainPinTests.hostsWindowLifecycle`) and `applicationDockMenu(_:)` its one-line
+    /// forward. `connectTapped`, `drainTick`, `tearDownSession`, `endSessionTapped` and
+    /// `applicationWillTerminate` are unchanged; no `@objc` was added. It folded to 52179
+    /// characters, +1571.
+    ///
+    /// RE-FROZEN by ADR-0025 a-1b (R-7: a late launch failure also reaches the Hosts window's status
+    /// line): `applyShell` hands the presenter one more argument, the start panel's waiting failure
+    /// for the chain's host (`lastLaunchFailure: startPanel.lastLaunchFailureReason(for: chainHost)`),
+    /// and its doc comment says so in three lines. The panel's change callback that also calls
+    /// `applyShell` is wired in `applicationDidFinishLaunching`, before `connectTapped`, so outside
+    /// this region. `connectTapped`, `drainTick`, `tearDownSession`, `endSessionTapped`,
+    /// `sessionPresenceChanged` and `applicationWillTerminate` are unchanged; no `@objc` was added.
+    /// It now folds to 52545 characters, +366.
+    ///
     /// The "net folded edit" above is the folded-length delta for each re-freeze, which is what the
     /// length chain below already checks; it is not a token-by-token added/removed count -- those
     /// depend on the diff algorithm and separator convention used to produce them, so this pin does
@@ -436,9 +456,9 @@ struct AppDelegateAutolaunchPinTests {
     /// expected to re-freeze this constant in the same commit that makes the edit, and the length
     /// below is here so that such a re-freeze can be sanity-checked (a length that MOVED by the size
     /// of the edit is a re-freeze; a length that moved by 22638 is a needle that stopped matching).
-    private static let foldedTailLength = 50608
+    private static let foldedTailLength = 52545
     private static let foldedTailSHA256 =
-        "62e37a8e73ce3817c583d7b8a6cd12dbe29608e7aa303a8edf06f0c9a4f5a6f6"
+        "40ac0323d87858f9f623971fdcc7aa51988653b088ea401a0610ccf892d3cdff"
 
     @Test("connectTapped to end-of-file is byte-identical to its last deliberate freeze")
     func theRestOfTheFileIsUnchanged() throws {
@@ -501,6 +521,7 @@ struct AppDelegateAutolaunchPinTests {
         // (a′) gate r1 m-7: file-reading CALL shapes, not names.
         var fileReaders = 0
         var readsInStore = 0
+        var readsInLaunchItems = 0
         for directory in ["App/Macdows", "App/UI", "App/Security", "App/SessionControl", "App/RemoteWindowRendering"] {
             let root = repoRoot().appendingPathComponent(directory)
             guard let walker = FileManager.default.enumerator(atPath: root.path) else { continue }
@@ -514,6 +535,15 @@ struct AppDelegateAutolaunchPinTests {
                     let store = try autolaunchIndex(of: "final class HostRecordStore", in: code)
                     let read = try autolaunchIndex(of: "Data(contentsOf: fileURL)", in: code)
                     #expect(store < read, "the one read is HostRecordStore's")
+                } else if path == "App/UI/StartPanel/LaunchItemStore.swift" {
+                    // ADR-0025 R-6 (a-1 commit 2): the App's second and last file read -- the start
+                    // panel's own `launch-items.json`, beside `hosts.json`, holding display names,
+                    // programs, arguments and times and nothing that signs in. Admitted by exact path
+                    // and the same shape as the host store's: one read, inside its own store class.
+                    readsInLaunchItems = count
+                    let store = try autolaunchIndex(of: "final class LaunchItemStore", in: code)
+                    let read = try autolaunchIndex(of: "Data(contentsOf: fileURL)", in: code)
+                    #expect(store < read, "the one read is LaunchItemStore's")
                 } else {
                     fileReaders += count
                     #expect(count == 0, "\(path) calls a file-reading API")
@@ -522,6 +552,7 @@ struct AppDelegateAutolaunchPinTests {
         }
         #expect(fileReaders == 0)
         #expect(readsInStore == 1, "HostRecordStore reads its own JSON once")
+        #expect(readsInLaunchItems == 1, "LaunchItemStore reads its own JSON once")
 
         // (b)
         let code = try Self.code()

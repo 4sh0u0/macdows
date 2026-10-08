@@ -74,6 +74,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// never per session; it reads the session through `statusItemReading()` and is handed the
 	/// registry by `registry`'s `didSet`.
 	private let statusItemController = StatusItemController()
+	/// ADR-0025 a-1: the Dock start panel with its launcher, its launch lists and the Dock menu.
+	/// App-resident like the status item: built with this delegate, it reads the session through
+	/// `startPanelReading()` and sends through the current session.
+	private let startPanel = StartPanelController()
 	/// The address the current session was opened to, for the status item's rows and the Remote
 	/// tray section's header (adr/0023 D-4). Read only while `session` is set.
 	private var statusItemHost: String?
@@ -154,7 +158,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		)
 		mainWindow.installSessionControls(stack, title: label, status: status, connect: button, disconnect: endButton)
 		mainWindow.onHostsChanged = { [weak self] in
-			self?.statusItemController.refresh()
+			guard let self else { return }
+			self.statusItemController.refresh()
+			// ADR-0025 R-6: a removed host takes its start-panel programs along.
+			self.startPanel.hostsChanged(remaining: self.hostStore.records.map(\.id))
 		}
 		mainWindow.onSessionPresenceChange = { [weak self] present in
 			self?.sessionPresenceChanged(present)
@@ -184,6 +191,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			self?.statusItemReading() ?? .noSession
 		}
 		statusItemController.install()
+
+		// ADR-0025 a-1: the start panel reads what the status item reads, launches through the current
+		// session, and its Open Macdows is the status item's. The status item's Run… opens it under the
+		// status item; a Dock click opens it at the icon (`applicationShouldHandleReopen` below).
+		startPanel.reading = { [weak self] in
+			self?.startPanelReading() ?? .noSession
+		}
+		startPanel.launcher.sender = { [weak self] in
+			self?.session
+		}
+		startPanel.onOpenMacdows = { [weak self] in
+			self?.mainWindow.showHosts(nil)
+		}
+		statusItemController.onRun = { [weak self] buttonFrame in
+			self?.startPanel.showFromStatusItem(buttonFrame: buttonFrame)
+		}
+		startPanel.onStatusItemAnchorChange = { [weak self] highlighted in
+			self?.statusItemController.setPanelHighlight(highlighted)
+		}
+		// ADR-0025 R-7 (a-1b): a launch that failed after the panel closed is on the Hosts window's
+		// status line too. `applyShell` stays that line's one writer and reads the failure itself;
+		// this only makes it write at once when the failure is recorded or cleared, rather than at the
+		// next drain. `session != nil` is load-bearing: the session's end clears the failures as well,
+		// and `applyShell(.live)` with no session would write the connected line back over the end's
+		// own line and disable Connect.
+		startPanel.onLastFailureChange = { [weak self] in
+			guard let self, self.session != nil else { return }
+			self.applyShell(for: self.reconnectDriver?.state ?? .live)
+		}
 
 		// M1/W1 deliverable 2: the screen-parameter observer's *observable* half. The provider
 		// already logs every change (Console.app, category "DisplayTopology"); this puts the same
@@ -531,6 +567,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			topologyProvider: StaticDisplayTopologyProvider(displayTopology.sessionSnapshot)
 		)
 		registry = newRegistry
+		// ADR-0025 S-4: the registry's one ExecResult forward goes to the start panel's launcher.
+		newRegistry.onExecResult = { [weak self] execResult, rawResult, program in
+			self?.startPanel.handleExecResult(execResult: execResult, rawResult: rawResult, program: program)
+		}
 		// adr/0019 §2 lane D: arm the reconnect driver for THIS connection. Built here rather than
 		// at launch because it is made out of the two objects the lines above just created, and
 		// armed before `newSession.start()` below, so no event can be posted before there is an
@@ -716,6 +756,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// adr/0022 D-6 / adr/0023 D-4: the status item's rows and Remote tray section follow the
 		// driver's state, including while its menu is open.
 		statusItemController.refresh()
+		// ADR-0025: the start panel follows the same state in place; a give-up closes it.
+		startPanel.refresh()
 		if case .gaveUp = state {
 			// This app's half of "the driver has stopped trying": end the session for real, so the
 			// button `ShellReconnectPresenter` has just enabled can actually start a new one.
@@ -894,11 +936,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// UI slice ④: the status bar is written here too, because the drain tick calls this and the
 	/// bar's live text carries the window count; `applyHostsWindow` writes the same text on a state
 	/// change, from the same presenter function.
+	///
+	/// ADR-0025 R-7 (a-1b): the line also carries the start panel's waiting late launch failure for
+	/// the chain's host; the presenter shows it only while live. The panel's change callback calls
+	/// this too, so the line follows a failure being recorded or cleared without waiting for a tick.
 	private func applyShell(for state: ReconnectDriver.State) {
 		let shell = ShellReconnectPresenter.shell(
 			for: state,
 			connected: connectedSummary(),
-			displayNote: lastDisplayChangeNote
+			displayNote: lastDisplayChangeNote,
+			lastLaunchFailure: startPanel.lastLaunchFailureReason(for: chainHost)
 		)
 		statusLabel.stringValue = shell.statusLine
 		connectButton.isEnabled = shell.connectEnabled
@@ -918,6 +965,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	private func statusItemReading() -> StatusItemController.SessionReading {
 		StatusItemController.SessionReading(
 			hasSession: session != nil, state: reconnectDriver?.state, host: statusItemHost, liveSince: liveSince
+		)
+	}
+
+	/// What the start panel shows (ADR-0025): the status item's three facts and the chain's host
+	/// record, whose programs the panel lists. Read, never written.
+	private func startPanelReading() -> StartPanelController.Reading {
+		StartPanelController.Reading(
+			hasSession: session != nil, state: reconnectDriver?.state, host: chainHost,
+			hostTitle: chainHost.flatMap(hostStore.record)?.title ?? statusItemHost ?? ""
 		)
 	}
 
@@ -968,6 +1024,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	/// session beginning or ending, by any path. An end outside a drain is the End-session press or
 	/// termination; one inside a drain is reviewed after it (`drainThenReview`).
 	private func sessionPresenceChanged(_ present: Bool) {
+		// ADR-0025: every session begins and ends here (`session`'s didSet, synchronously), so the
+		// start panel re-reads here -- an end closes it and drops its pending launches -- and the
+		// teardown keeps its seven steps.
+		startPanel.refresh()
 		guard !present, !isDraining else { return }
 		if let host = chainHost, chainReachedLive {
 			hostStore.note(endingByGiveUp ? .connectionLost : .disconnectedByUser, for: host)
@@ -1200,12 +1260,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		false
 	}
 
-	/// A Dock-icon click (or `open`) with no window on screen brings the Hosts window back.
+	/// A Dock-icon click (or `open`). ADR-0025 R-7: with a session, a click the Dock sent opens or
+	/// closes the start panel and AppKit's own reopen action is suppressed (`false`, probe R4). With
+	/// no session -- a give-up has none -- and for a reopen from anywhere else (R-1′), the Hosts
+	/// window comes back when no window is on screen, exactly as before.
 	func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+		if session != nil, startPanel.toggleForDockReopen() {
+			return false
+		}
 		if !flag {
 			mainWindow.showHosts(nil)
 		}
 		return true
+	}
+
+	/// ADR-0025 R-1 (a-0): the Dock icon's menu, built (and acted on) by the start panel's Dock menu
+	/// controller.
+	func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+		startPanel.dockMenu.makeMenu()
 	}
 
 	func applicationWillTerminate(_ notification: Notification) {

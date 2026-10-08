@@ -30,12 +30,16 @@ struct StatusItemControllerTests {
         menu.items.filter { !$0.isHidden }.map { $0.isSeparatorItem ? "---" : $0.title }
     }
 
-    @Test("the menu, top to bottom, with no session (UI-1 spec §6.3)")
+    /// RE-WRITTEN by ADR-0025 a-1 (R-8, design note §9): Run… sits directly above Open Macdows, in
+    /// the same group (no new section), visible in every state and enabled only with a session.
+    @Test("the menu, top to bottom, with no session (UI-1 spec §6.3, ADR-0025 R-8)")
     func menuWithNoSession() {
         let controller = StatusItemController()
         #expect(Self.visibleTitles(controller.menu) == [
-            "Not connected", "---", "Connect to", "Disconnect", "---", "Open Macdows", "Settings…", "---", "Quit Macdows",
+            "Not connected", "---", "Connect to", "Disconnect", "---", "Run…", "Open Macdows", "Settings…", "---", "Quit Macdows",
         ])
+        #expect(!controller.runItem.isEnabled, "no session: Run… is disabled")
+        #expect(!controller.validateMenuItem(controller.runItem))
         #expect(controller.detailRow.isHidden)
         #expect(controller.oneSessionItem.isHidden)
         #expect(controller.statusItem == nil, "nothing is put in the menu bar before install()")

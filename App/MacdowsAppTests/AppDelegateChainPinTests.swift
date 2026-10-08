@@ -101,9 +101,22 @@ struct AppDelegateChainPinTests {
         let code = try Self.code()
         #expect(chainOccurrences(
             of: "func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }", in: code) == 1)
+        // RE-WRITTEN by ADR-0025 a-1 (R-7, owner 2026-10-07; as amended by ruling ㋯ §10-1 (b)): the
+        // reopen's NO-SESSION clause is still this pin's UI-6 gate r1 I-2 contract, word for word --
+        // no visible window brings the Hosts window back, and AppKit is answered true. What is new is
+        // the clause in front of it: with a session, a reopen the Dock sent toggles the start panel
+        // and answers false (probe R4: false keeps AppKit from restoring minimised windows). A
+        // reopen the panel does not take -- not sent by the Dock (R-1′), or no panel for the state --
+        // falls through to the old clause unchanged, and a give-up has no session at all.
         #expect(chainOccurrences(
             of: "func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { "
+                + "if session != nil, startPanel.toggleForDockReopen() { return false } "
                 + "if !flag { mainWindow.showHosts(nil) } return true }", in: code) == 1)
+        #expect(chainOccurrences(of: "if !flag { mainWindow.showHosts(nil) } return true }", in: code) == 1,
+                "the no-session clause, verbatim, once")
+        #expect(chainOccurrences(of: "startPanel.toggleForDockReopen()", in: code) == 1, "the panel takes the reopen in one place")
+        #expect(chainOccurrences(of: "func applicationDockMenu(_ sender: NSApplication) -> NSMenu? { startPanel.dockMenu.makeMenu() }",
+                                 in: code) == 1, "R-1: the Dock menu is a one-line forward")
         #expect(chainOccurrences(of: "MainMenu.bindShowHosts(in: NSApp.mainMenu, to: mainWindow)", in: code) == 1)
         #expect(chainOccurrences(of: "statusItemController.onOpenMacdows = { [weak self] in self?.mainWindow.showHosts(nil) }", in: code) == 1)
         let created = try #require(code.range(of: "mainWindow = MainWindowController("))

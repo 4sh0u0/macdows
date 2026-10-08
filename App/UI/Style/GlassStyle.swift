@@ -107,6 +107,51 @@ enum GlassStyle {
             return material
         }
     }
+
+    /// ADR-0025 / start-panel design note §5: the start panel's background with `content` inside --
+    /// the panel is a functional layer, so it gets glass on 26 (`NSGlassEffectView`, Regular, corner
+    /// radius 16, no tint; one glass layer, nothing inside it is glass). On 14–25 an
+    /// `NSVisualEffectView` with the `.menu` material, `.behindWindow` blending and an `.active`
+    /// state, rounded by a `maskImage`: the panel floats over other apps and is usually not in the
+    /// active window, so the banner's `.withinWindow` + `.followsWindowActiveState` would render it
+    /// flat. `.menu` because the Dock menu and the status menu open beside it.
+    static func panelBackground(containing content: NSView) -> NSView {
+        content.translatesAutoresizingMaskIntoConstraints = false
+        if #available(macOS 26, *), !forceLegacyMaterial {
+            let glass = NSGlassEffectView()
+            glass.style = .regular
+            glass.cornerRadius = StartPanelPolicy.cornerRadius
+            glass.contentView = content
+            return glass
+        } else {
+            let material = NSVisualEffectView()
+            material.material = .menu
+            material.blendingMode = .behindWindow
+            material.state = .active
+            material.maskImage = roundedMask(radius: StartPanelPolicy.cornerRadius)
+            material.addSubview(content)
+            NSLayoutConstraint.activate([
+                content.leadingAnchor.constraint(equalTo: material.leadingAnchor),
+                content.trailingAnchor.constraint(equalTo: material.trailingAnchor),
+                content.topAnchor.constraint(equalTo: material.topAnchor),
+                content.bottomAnchor.constraint(equalTo: material.bottomAnchor),
+            ])
+            return material
+        }
+    }
+
+    /// A stretchable rounded-rectangle mask (`NSVisualEffectView.maskImage`'s documented use).
+    private static func roundedMask(radius: CGFloat) -> NSImage {
+        let edge = radius * 2 + 1
+        let image = NSImage(size: NSSize(width: edge, height: edge), flipped: false) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+            return true
+        }
+        image.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
+        image.resizingMode = .stretch
+        return image
+    }
 }
 
 extension View {

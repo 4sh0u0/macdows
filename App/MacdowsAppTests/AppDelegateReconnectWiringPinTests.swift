@@ -347,6 +347,12 @@ struct AppDelegateReconnectWiringPinTests {
     /// (`session?.currentGeneration` 1 -> 0 here); `eventCount`'s bookkeeping and its two resets are
     /// kept (the drain tick's gate reads it; `theDisplayNoteIsClearedByTheReconnect` holds them).
     ///
+    /// RE-FROZEN by ADR-0025 a-1b (R-7): the presenter also gets the start panel's waiting late
+    /// launch failure for the chain's host -- the same host the panel's launches are recorded under
+    /// (`startPanelReading()` hands it `chainHost`) -- and shows it on the line while live. Passing
+    /// `nil` there would leave every presenter test green and the line without the failure, so the
+    /// argument is part of the needle and spelled once in the file.
+    ///
     /// MUST-RED for: replacing any argument with a literal, reading the window count or the moment
     /// from somewhere other than the current registry / the App's one record, dropping an
     /// assignment, and a second summary builder.
@@ -358,7 +364,8 @@ struct AppDelegateReconnectWiringPinTests {
                 + "let shell = ShellReconnectPresenter.shell( "
                 + "for: state, "
                 + "connected: connectedSummary(), "
-                + "displayNote: lastDisplayChangeNote "
+                + "displayNote: lastDisplayChangeNote, "
+                + "lastLaunchFailure: startPanel.lastLaunchFailureReason(for: chainHost) "
                 + ") "
                 + "statusLabel.stringValue = shell.statusLine "
                 + "connectButton.isEnabled = shell.connectEnabled "
@@ -375,6 +382,7 @@ struct AppDelegateReconnectWiringPinTests {
         // a second, possibly disagreeing, description of the same session.
         #expect(occurrences(of: "registry?.windowSnapshots().count", in: stripped) == 1)
         #expect(occurrences(of: "session?.currentGeneration", in: stripped) == 0)
+        #expect(occurrences(of: "lastLaunchFailure:", in: stripped) == 1, "the failure reaches the presenter in one place")
     }
 
     /// UI slice ④ (UI-1 spec §4.1 "since 12:03"): the handshake moment has ONE record in the App,
