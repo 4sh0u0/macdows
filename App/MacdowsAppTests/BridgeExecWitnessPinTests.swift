@@ -218,6 +218,98 @@ struct BridgeExecWitnessPinTests {
     }
 }
 
+// MARK: - F-ja-4 lane E: the work-area sysparam, in its own block right after X-C's
+//
+// The vendored start command reports the WHOLE desktop as the RAIL work area; the bridge now sends
+// one more sysparam carrying only the real work area, right after it, on every ARC_COMPLETED (the
+// upstream X11 client's order since 3.31.0). It must NOT be folded into X-C's block -- the pin above
+// holds the start command and that block's closing brace immediately after the frozen carrier line --
+// so it is its own block with X-C's condition plus "the four edges are not all zero", placed AFTER
+// X-C's. These pins hold the send to one call in that one place (mutants M1: the block deleted, M2:
+// the block moved above X-C's), and the work area to one read on the connect path.
+extension BridgeExecWitnessPinTests {
+
+    /// X-C's block condition, as far as both blocks share it.
+    private static let arcCompletedCondition =
+        "if ((orderInfo->fieldFlags & WINDOW_ORDER_FIELD_DESKTOP_ARC_COMPLETED) && p->rail"
+    private static let workAreaCondition = arcCompletedCondition
+        + " && (p->workArea.left | p->workArea.top | p->workArea.right | p->workArea.bottom) != 0) {"
+    /// The one INFO line: the ARC_COMPLETED marker and the four numbers, nothing else.
+    private static let workAreaInfo =
+        "WLog_INFO(TAG, \"ClientSystemParam work-area arc-completed %u,%u,%u,%u\", "
+        + "(unsigned)p->workArea.left, (unsigned)p->workArea.top, "
+        + "(unsigned)p->workArea.right, (unsigned)p->workArea.bottom);"
+    private static let monitoredDesktopSignature = "static BOOL crb_monitored_desktop(rdpContext *context,"
+
+    @Test("W9 one work-area sysparam, sent from its own ARC_COMPLETED block right after X-C's")
+    func theWorkAreaFollowsTheStartCommandBlock() throws {
+        let raw = try Self.raw()
+        let code = try Self.code()
+        // Exactly one send and one work-area mask in the whole file, both inside crb_monitored_desktop.
+        #expect(bridgeOccurrences(of: "ClientSystemParam(", in: code) == 1)
+        #expect(bridgeOccurrences(of: "ClientSystemParam(", in: raw) == 1, "no comment quotes the call either")
+        #expect(bridgeOccurrences(of: "SPI_MASK_SET_WORK_AREA", in: code) == 1)
+        let body = try bridgeCodeOnly(Self.functionBody(Self.monitoredDesktopSignature, in: raw))
+        #expect(bridgeOccurrences(of: "ClientSystemParam(", in: body) == 1)
+        #expect(bridgeOccurrences(of: "SPI_MASK_SET_WORK_AREA", in: body) == 1)
+
+        // Two blocks share X-C's condition: X-C's own, unchanged, and the work area's.
+        #expect(bridgeOccurrences(of: Self.arcCompletedCondition, in: body) == 2)
+        #expect(bridgeOccurrences(of: Self.arcCompletedCondition + ") {", in: body) == 1, "X-C's block, unchanged")
+        #expect(bridgeOccurrences(of: Self.workAreaCondition, in: body) == 1)
+        // The work-area block opens immediately after X-C's block closes (comments in between fold
+        // to one space).
+        #expect(body.contains("client_rail_server_start_cmd(p->rail); } " + Self.workAreaCondition))
+        // And in literal order: X-C's block, the work-area condition, the send, the function's end.
+        let xCBlock = try Self.index(of: Self.arcCompletedCondition + ") {", in: body)
+        let startCommand = try Self.index(of: "client_rail_server_start_cmd(p->rail); }", in: body)
+        let condition = try Self.index(of: Self.workAreaCondition, in: body)
+        let send = try Self.index(of: "ClientSystemParam(", in: body)
+        let end = try Self.index(of: "return TRUE; }", in: body)
+        #expect(xCBlock < startCommand)
+        #expect(startCommand < condition)
+        #expect(condition < send)
+        #expect(send < end)
+
+        // The sysparam carries the work-area mask alone, filled from the per-connection copy.
+        #expect(body.contains(
+            "RAIL_SYSPARAM_ORDER workAreaParam; memset(&workAreaParam, 0, sizeof(workAreaParam)); "
+                + "workAreaParam.params = SPI_MASK_SET_WORK_AREA; workAreaParam.workArea = p->workArea; "
+                + "const UINT rc = p->rail->ClientSystemParam(p->rail, &workAreaParam);"))
+        // One INFO line, four numbers; a failure is a WARN with the return code.
+        #expect(bridgeOccurrences(of: Self.workAreaInfo, in: code) == 1)
+        #expect(bridgeOccurrences(of: "\"ClientSystemParam work-area arc-completed %u,%u,%u,%u\"", in: raw) == 1)
+        #expect(body.contains("if (rc == CHANNEL_RC_OK) " + Self.workAreaInfo + " else WLog_WARN(TAG, "))
+        // X-C stays the last WLog before the start command (re-checked here because this block
+        // added WLog calls to the same function).
+        let lastWLog = try #require(body[..<startCommand].range(of: "WLog_", options: .backwards))
+        #expect(body[lastWLog.lowerBound...].hasPrefix(Self.xC))
+    }
+
+    @Test("the four work-area properties are read once, at pre-connect, and validated into the context")
+    func theWorkAreaIsReadOnceAtPreConnect() throws {
+        let raw = try Self.raw()
+        let code = try Self.code()
+        let preConnect = try bridgeCodeOnly(Self.functionBody("static BOOL crb_pre_connect(freerdp *instance)", in: raw))
+        for edge in ["Left", "Top", "Right", "Bottom"] {
+            #expect(bridgeOccurrences(of: "session.workArea\(edge)", in: code) == 1, "read once: \(edge)")
+            #expect(bridgeOccurrences(of: "session.workArea\(edge)", in: preConnect) == 1, "on the connect path: \(edge)")
+        }
+        // Declared once in the per-connection context; cleared, then filled only from a non-empty
+        // TS_RECTANGLE_16 -- the UINT16 casts come after the range check.
+        #expect(bridgeOccurrences(of: "RECTANGLE_16 workArea;", in: code) == 1)
+        #expect(preConnect.contains(
+            "memset(&p->workArea, 0, sizeof(p->workArea)); if ((left | top | right | bottom) != 0) { "
+                + "if (right > UINT16_MAX || bottom > UINT16_MAX || left >= right || top >= bottom) { WLog_WARN(TAG, "))
+        #expect(preConnect.contains(
+            "else { p->workArea.left = (UINT16)left; p->workArea.top = (UINT16)top; "
+                + "p->workArea.right = (UINT16)right; p->workArea.bottom = (UINT16)bottom; }"))
+        // The context's copy is written nowhere else.
+        #expect(bridgeOccurrences(of: "p->workArea.left =", in: code) == 1)
+        #expect(bridgeOccurrences(of: "memset(&p->workArea,", in: code) == 1)
+    }
+}
+
 // MARK: - ADR-0025 a-1: -launchProgram:arguments: and the EXECUTE branch's argument split
 //
 // The Dock start panel launches through a NEW bridge method (ADR-0025 §2: a new name, so no pin

@@ -545,6 +545,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			newSession.advertisedDesktopScaleFactor = advertised.desktopScaleFactor
 			newSession.advertisedDeviceScaleFactor = advertised.deviceScaleFactor
 		}
+		// F-ja-4 lane E (owner rulings 2026-10-22): the RAIL work area, from the SAME frozen snapshot --
+		// the primary's visibleFrame (menu bar and Dock excluded) in remote pixels, MacdowsCore's one
+		// statement of it. CRSession sends it after every start command on ARC_COMPLETED, so the server
+		// snaps / maximises / restores inside it rather than under the menu bar. The else arm ZEROES all
+		// four ("send nothing"): this path is also reached with a session that already started once
+		// (after Trust / Replace), and a value left from an earlier freeze would otherwise be sent. Not
+		// followed mid-session -- a Dock or menu-bar change waits for the next freeze, like the size.
+		if let workArea = displayTopology.sessionSnapshot?.workAreaInRemotePixels {
+			newSession.workAreaLeft = UInt32(workArea.left)
+			newSession.workAreaTop = UInt32(workArea.top)
+			newSession.workAreaRight = UInt32(workArea.right)
+			newSession.workAreaBottom = UInt32(workArea.bottom)
+		} else {
+			newSession.workAreaLeft = 0
+			newSession.workAreaTop = 0
+			newSession.workAreaRight = 0
+			newSession.workAreaBottom = 0
+		}
 		// A staleness verdict belongs to the session it was computed against, and the line above
 		// just started a new one against a fresh snapshot.
 		lastDisplayChangeNote = nil

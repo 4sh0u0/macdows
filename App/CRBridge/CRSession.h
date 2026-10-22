@@ -496,6 +496,29 @@ typedef void (^CRProcessLogLineSink)(NSInteger level, NSString *tag, NSString *m
 @property (nonatomic) uint32_t advertisedDesktopScaleFactor;
 @property (nonatomic) uint32_t advertisedDeviceScaleFactor;
 
+/// F-ja-4 lane E: the RAIL work area this client reports to the server (`SPI_SET_WORK_AREA`, a
+/// TS_RECTANGLE_16: left / top / right / bottom, right and bottom EXCLUSIVE). Same contract as
+/// `desktopWidth`: the unit is REMOTE DESKTOP PIXELS, set all four before `-start` (the connect
+/// path reads them once on T_rdp; unsynchronized afterwards). All four 0 (the default) means "send
+/// nothing": the server then keeps the work area the vendored start command reports, which is the
+/// WHOLE desktop `(0, 0, desktopWidth, desktopHeight)` -- the pre-lane wire, byte for byte.
+///
+/// When set, every ARC_COMPLETED sends one sysparam carrying only this work area, right after the
+/// start command (whose own sysparam reports the whole desktop first), so the server snaps,
+/// maximises and restores RemoteApp windows inside it instead of under the Mac menu bar and Dock --
+/// the same path the upstream X11 client takes since FreeRDP 3.31.0. A value that is not a
+/// non-empty TS_RECTANGLE_16 (right <= left, bottom <= top, or an edge past 65535) is refused at
+/// connect with a WARN and nothing is sent. Validation against the desktop is the caller's: the
+/// App and window-smoke assign MacdowsCore's `DisplayTopology.workAreaInRemotePixels` from the same
+/// topology freeze the desktop size comes from (the primary display's `visibleFrame`, clipped to
+/// the desktop), and zero all four when that freeze has no usable display -- a reconnect reuses
+/// this object, so a previous freeze's values would otherwise reach the next `-start`. A mid-session
+/// Dock or menu-bar change is NOT followed (adr/0015 §5.A.3's discipline, owner ruling 2026-10-22).
+@property (nonatomic) uint32_t workAreaLeft;
+@property (nonatomic) uint32_t workAreaTop;
+@property (nonatomic) uint32_t workAreaRight;
+@property (nonatomic) uint32_t workAreaBottom;
+
 /// Command-line arguments for the initial `program` launch — MS-RDPERP's Exec order
 /// `RemoteApplicationArguments`, carried via FreeRDP's `RemoteApplicationCmdLine` setting
 /// (the vendored RAIL channel reads that setting itself when it sends the connect-time

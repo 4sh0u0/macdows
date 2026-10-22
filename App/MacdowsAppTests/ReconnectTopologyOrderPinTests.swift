@@ -218,14 +218,23 @@ struct ReconnectTopologyOrderPinTests {
 
     /// C-8 (shape half). `ReconnectTopologyRefresh` freezes ONCE — which is the §5.A.4 invariant
     /// and is invisible to a runtime test on a layout that does not change between two reads — and
-    /// its no-usable-display arm zeroes the advertised pair while leaving the desktop pair alone,
-    /// which is unreachable from a host that has a display.
+    /// its no-usable-display arms zero the advertised pair AND the work area's four edges while
+    /// leaving the desktop pair alone, which is unreachable from a host that has a display.
+    ///
+    /// F-ja-4 lane E, a DECLARED update of this pin (it was
+    /// `theProductRefreezeReadsOnceAndZeroesOnlyTheAdvertisedPair`, "zeroes only the advertised
+    /// pair"): the re-take now assigns a fourth thing from the same freeze, the RAIL work area, and
+    /// its `else` arm zeroes all four edges for the advertised pair's reason — a reused `CRSession`
+    /// would otherwise send the previous freeze's work area on the next `-start`. What is still
+    /// zeroed NOWHERE is the desktop pair. The old assertions all stand unchanged; the work-area
+    /// assertions are added.
     ///
     /// MUST-RED for: a second `freezeSessionSnapshot()`, zeroing the desktop pair (§5.A.6 forbids
-    /// sending `0 x 0`), dropping the advertised-pair zeroing (a reused `CRSession` would carry
-    /// the previous freeze's pair into the next `-start`), and marking the result discardable —
-    /// discarding it is the defect this lane removes.
-    @Test func theProductRefreezeReadsOnceAndZeroesOnlyTheAdvertisedPair() throws {
+    /// sending `0 x 0`), dropping the advertised-pair zeroing or the work-area zeroing (a reused
+    /// `CRSession` would carry the previous freeze's values into the next `-start`; mutant M5),
+    /// resolving the work area against the live `currentTopology` instead of the frozen snapshot,
+    /// and marking the result discardable — discarding it is the defect lane C removed.
+    @Test func theProductRefreezeReadsOnceAndZeroesTheAdvertisedPairAndTheWorkArea() throws {
         let text = try source(Self.refreshPath)
         #expect(occurrences(of: "let desktop = topology.freezeSessionSnapshot()", in: text) == 1)
         #expect(occurrences(of: "topology.freezeSessionSnapshot()", in: text) == 1,
@@ -236,6 +245,14 @@ struct ReconnectTopologyOrderPinTests {
         #expect(occurrences(of: "session.advertisedDeviceScaleFactor = 0", in: text) == 1)
         #expect(occurrences(of: "session.desktopWidth = 0", in: text) == 0)
         #expect(occurrences(of: "session.desktopHeight = 0", in: text) == 0)
+        // F-ja-4 lane E: the work area, from the same snapshot, zeroed edge by edge in its else arm.
+        #expect(occurrences(of: "if let workArea = topology.sessionSnapshot?.workAreaInRemotePixels {", in: text) == 1,
+                "the work area resolves against the snapshot that freeze took")
+        #expect(occurrences(of: ".workAreaInRemotePixels", in: text) == 1,
+                "one read (the doc comments name it in backticks, without the member dot)")
+        for edge in ["Left", "Top", "Right", "Bottom"] {
+            #expect(occurrences(of: "session.workArea\(edge) = 0", in: text) == 1, "zeroed: \(edge)")
+        }
         #expect(occurrences(of: "return StaticDisplayTopologyProvider(topology.sessionSnapshot) } }",
                             in: text) == 1,
                 "the returned seam is a static snapshot of THIS freeze, and it is the last statement")
@@ -253,6 +270,14 @@ struct ReconnectTopologyOrderPinTests {
     ///
     /// MUST-RED for: moving either assignment block above the freeze, and for inserting anything
     /// between the freeze and the desktop pair.
+    ///
+    /// F-ja-4 lane E, a DECLARED update of this pin: the needle used to end at the advertised
+    /// block's opening line; it now runs on through the WHOLE body to the return, so the work-area
+    /// block is held in the same contiguous shape — after the advertised pair, before the return,
+    /// both arms intact. That additionally makes red: moving the work-area block above the freeze
+    /// (it would read the PREVIOUS session's snapshot, exactly MU7's hazard), dropping its zeroing
+    /// arm (mutant M5), and inserting anything between the blocks. The old needle is a prefix of
+    /// the new one, so everything it held is still held.
     @Test func theProductRefreezeFreezesBeforeItReadsTheSnapshot() throws {
         let text = try source(Self.refreshPath)
         #expect(occurrences(
@@ -260,9 +285,24 @@ struct ReconnectTopologyOrderPinTests {
                 + "if let desktop { "
                 + "session.desktopWidth = UInt32(clamping: desktop.width) "
                 + "session.desktopHeight = UInt32(clamping: desktop.height) } "
-                + "if let scale = topology.sessionSnapshot?.rasterScale,",
+                + "if let scale = topology.sessionSnapshot?.rasterScale, "
+                + "let advertised = ScaleAdvertisement.productDefault(rasterScale: scale) { "
+                + "session.advertisedDesktopScaleFactor = advertised.desktopScaleFactor "
+                + "session.advertisedDeviceScaleFactor = advertised.deviceScaleFactor "
+                + "} else { "
+                + "session.advertisedDesktopScaleFactor = 0 "
+                + "session.advertisedDeviceScaleFactor = 0 } "
+                + "if let workArea = topology.sessionSnapshot?.workAreaInRemotePixels { "
+                + "session.workAreaLeft = UInt32(workArea.left) "
+                + "session.workAreaTop = UInt32(workArea.top) "
+                + "session.workAreaRight = UInt32(workArea.right) "
+                + "session.workAreaBottom = UInt32(workArea.bottom) "
+                + "} else { "
+                + "session.workAreaLeft = 0 session.workAreaTop = 0 "
+                + "session.workAreaRight = 0 session.workAreaBottom = 0 } "
+                + "return StaticDisplayTopologyProvider(topology.sessionSnapshot) } }",
             in: text) == 1,
-            "freeze, then the desktop pair, then the advertised pair -- as one contiguous shape")
+            "freeze, the desktop pair, the advertised pair, the work area, the return -- as one contiguous shape")
     }
 
     /// GATE r1 m-5, as lane D left it. Lane C shipped `ReconnectTopologyRefresh` in the same
@@ -323,5 +363,48 @@ struct ReconnectTopologyOrderPinTests {
         }
         #expect(occurrences(of: "ScaleAdvertisement.productDefault(rasterScale: scale)", in: appDelegate) == 1)
         #expect(occurrences(of: "ScaleAdvertisement.productDefault(rasterScale: scale)", in: refresh) == 1)
+    }
+
+    /// F-ja-4 lane E (W8, the shape half). The work area is assigned at the three connect moments
+    /// this tree has -- the App's connect path, the product re-take, and window-smoke's freeze -- and
+    /// all three spell it the same way: MacdowsCore's `workAreaInRemotePixels` of the FROZEN
+    /// snapshot, all four edges, and a zeroing `else` arm (each of the three can meet a `CRSession`
+    /// that already started once). A same-spelling pin, like the one above; the runtime half is
+    /// `ReconnectTopologyRefreshTests`' sentinels.
+    ///
+    /// MUST-RED for: a connect path that leaves the edges alone when there is no work area (mutant
+    /// M5's App-side twin), any of the three resolving against the live layout, and the fixture
+    /// going back to a value of its own instead of the product function.
+    @Test func theWorkAreaIsSpelledTheSameAtEveryConnectMoment() throws {
+        let appDelegate = try source("App/Macdows/AppDelegate.swift")
+        let refresh = try source(Self.refreshPath)
+        let fixture = try source(Self.fixturePath)
+        for edge in [("Left", "left"), ("Top", "top"), ("Right", "right"), ("Bottom", "bottom")] {
+            let assign = "workArea\(edge.0) = UInt32(workArea.\(edge.1))"
+            let zero = "workArea\(edge.0) = 0"
+            for (name, text) in [("connect path", appDelegate), ("reconnect path", refresh), ("fixture", fixture)] {
+                #expect(occurrences(of: assign, in: text) == 1, "\(name): \(assign)")
+                #expect(occurrences(of: zero, in: text) == 1, "\(name): \(zero)")
+            }
+        }
+        #expect(occurrences(
+            of: "if let workArea = displayTopology.sessionSnapshot?.workAreaInRemotePixels {", in: appDelegate) == 1)
+        // The fixture goes through the same product function, behind its knob, from the same frozen
+        // snapshot, and the knob's off switch is the literal "0".
+        #expect(occurrences(
+            of: "if let workArea = WorkAreaKnob.resolve(enabled: workAreaKnobEnabled, topology: displayTopology.sessionSnapshot) {",
+            in: fixture) == 1)
+        #expect(occurrences(of: "return topology?.workAreaInRemotePixels", in: fixture) == 1)
+        #expect(occurrences(
+            of: "let workAreaKnobEnabled = WorkAreaKnob.isEnabled(ProcessInfo.processInfo.environment[\"WINDOW_SMOKE_WORK_AREA\"])",
+            in: fixture) == 1)
+        #expect(occurrences(of: "raw != \"0\"", in: fixture) == 1)
+        // One call, after the freeze's if / else, in the one freeze function.
+        #expect(occurrences(of: "applyWorkArea(to: session, reason: reason) return desktop }", in: fixture) == 1)
+        #expect(occurrences(of: "applyWorkArea(to:", in: fixture) == 1)
+        // Nobody reads it from the live layout.
+        for (name, text) in [("connect path", appDelegate), ("reconnect path", refresh), ("fixture", fixture)] {
+            #expect(occurrences(of: "currentTopology?.workAreaInRemotePixels", in: text) == 0, "\(name)")
+        }
     }
 }
