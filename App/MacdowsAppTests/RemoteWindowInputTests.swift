@@ -15,10 +15,20 @@ import Testing
 //    `TISCopyCurrentKeyboardInputSource` read of its own, and
 //    `RemoteWindowKeyEquivalentTests.theSeamDeclarationCallsTheLiveRead` pins the declaration's
 //    source. What stays unpinned is the live read's answer for any source other than the one the
-//    test runner's user session has active (a test cannot select an input source), and what
-//    `interpretKeyEvents` then does with a key (it needs a live input context), so the IME-lane
-//    tests assert only "no scancode key event". Tests that leave the seam alone run with the live
-//    read; their keys (Return, Escape) take the scancode lane whatever it says.
+//    test runner's user session has active (a test cannot select an input source). Tests that
+//    leave the seam alone run with the live read; their keys (Return, Escape, on a view composing
+//    nothing) take the scancode lane whatever it says.
+//  * The hand-off to the input method goes through `RemoteWindowContentView.handOffToInputMethod`
+//    (F-ja-2′ B-6's seam), so what an input method does with a key IS drivable: the B-1 / B-6
+//    tests below set a stand-in that consumes the key, confirms the composition, or gives the key
+//    back through `doCommand(by:)` as AppKit's key bindings do, and put AppKit's hand-off back in a
+//    `defer`. That the default is AppKit's hand-off is pinned by source
+//    (`RemoteWindowKeyEquivalentTests.theHandOffSeamIsTheOnlyInterpretKeyEventsCall`). Tests that
+//    leave this seam alone get the live input context, which works on a windowless view: measured
+//    2026-10-22 on the test runner's com.apple.keylayout.ABC source, "a" came back as
+//    `insertText("a")`, ⌃A as `doCommand(moveToBeginningOfParagraph:)`, Delete as
+//    `doCommand(deleteBackward:)`, ⌃O as two commands. What a real CJK input method makes of a key
+//    is not drivable here (a test cannot select an input source).
 //  * A keyUp follows its keyDown's lane through the view's ledger (gate r1 I-1), so the ledger
 //    tests drive a down and its up on ONE view (`makeSteppedView`), each step with its own
 //    input-source answer.
@@ -54,6 +64,47 @@ struct RemoteWindowInputTests {
         return try body()
     }
 
+    /// An input method stand-in for F-ja-2′ B-6's seam: called with the view and the key it is handed.
+    private typealias InputMethod = (RemoteWindowContentView, NSEvent) -> Void
+
+    /// F-ja-2′ B-6's seam, set to `inputMethod` for the length of `body`; AppKit's hand-off goes back
+    /// in a `defer`, whatever `body` does.
+    private static func withInputMethod<T>(_ inputMethod: @escaping InputMethod, _ body: () throws -> T) rethrows -> T {
+        let live = RemoteWindowContentView.handOffToInputMethod
+        RemoteWindowContentView.handOffToInputMethod = inputMethod
+        defer { RemoteWindowContentView.handOffToInputMethod = live }
+        return try body()
+    }
+
+    /// An input method that takes every key it is handed (composes, edits, confirms, cancels) and
+    /// gives none back -- the IME-lane outcome without the live input context's say.
+    private static func consumes() -> InputMethod {
+        { _, _ in }
+    }
+
+    /// An input method that gives every key back: AppKit's key bindings turn it into `commands`, one
+    /// `doCommand(by:)` each, in order (⌃O is two).
+    private static func givesBack(_ commands: Selector...) -> InputMethod {
+        { view, _ in commands.forEach { view.doCommand(by: $0) } }
+    }
+
+    /// An input method that confirms the composition with `text`, as one does on Return.
+    private static func confirms(_ text: String) -> InputMethod {
+        { view, _ in view.insertText(text, replacementRange: noRange) }
+    }
+
+    /// A hand-off that must not happen.
+    private static func neverHandedOff() -> InputMethod {
+        { _, event in Issue.record("keyCode \(event.keyCode) was handed to the input method") }
+    }
+
+    private static let noRange = NSRange(location: NSNotFound, length: 0)
+
+    /// Puts `view` mid-composition, as an input method's `setMarkedText` call does.
+    private static func compose(_ view: RemoteWindowContentView, _ marked: String = "わた") {
+        view.setMarkedText(marked, selectedRange: noRange, replacementRange: noRange)
+    }
+
     private static func key(
         _ charactersIgnoringModifiers: String, characters: String? = nil, keyCode: UInt16,
         _ flags: NSEvent.ModifierFlags, type: NSEvent.EventType = .keyDown
@@ -75,6 +126,13 @@ struct RemoteWindowInputTests {
                 view.keyDown(with: event)
             }
         }
+    }
+
+    /// `deliver(_:to:asciiCapable:)` with F-ja-2′ B-6's seam set to `inputMethod` as well.
+    private static func deliver(
+        _ event: NSEvent, to view: RemoteWindowContentView, asciiCapable: Bool, inputMethod: @escaping InputMethod
+    ) {
+        withInputMethod(inputMethod) { deliver(event, to: view, asciiCapable: asciiCapable) }
     }
 
     /// What a fresh windowless view reports for `event` (delivered as `keyDown` or `keyUp` by its
@@ -132,7 +190,9 @@ struct RemoteWindowInputTests {
     /// adr/0011 §1: Return (keyCode 36) is an always-scancode key, so `keyDown` emits the
     /// MRDPView-style reconciliation `.flagsChanged` FIRST (masked to
     /// `.deviceIndependentFlagsMask`) and then the `.keyDown` itself, with the event's
-    /// characters carried verbatim -- regardless of the live input source.
+    /// characters carried verbatim -- regardless of the live input source, when nothing is being
+    /// composed (a fresh view composes nothing; F-ja-2′ B-1 hands Return to the input method while
+    /// it composes, `composingHandsEveryKeyToTheInputMethod`).
     @Test func keyDownOnAlwaysScancodeKeyEmitsFlagsThenKeyDown() throws {
         let (view, events) = Self.makeView()
         // .shift plus a junk low bit that is NOT device-independent -- the mask must strip it.
@@ -383,17 +443,24 @@ struct RemoteWindowInputTests {
 
     /// The F-a1-5 row is Command only: a Control chord keeps today's fork (an input method does use
     /// some Control chords) -- the IME lane under a CJK source, the scancode lane under an ASCII one.
+    /// The CJK half fixes F-ja-2′ B-6's seam to an input method that consumes the key: this test pins
+    /// the fork, not what the input method then does. Left at AppKit's hand-off, the windowless
+    /// view's input context gives ⌃A back as `doCommand(moveToBeginningOfParagraph:)` (measured
+    /// 2026-10-22), and B-6 rightly sends a key given back down the scancode lane
+    /// (`aKeyTheInputMethodGivesBackTakesTheScancodeLane`).
     @Test("F-a1-5 is Command only: ⌃A keeps today's fork")
     func controlChordKeepsTodaysFork() throws {
         let event = try Self.key("a", characters: "\u{1}", keyCode: 0, .control)
-        let cjk = Self.reported(event, asciiCapable: false)
+        let cjk = Self.withInputMethod(Self.consumes()) { Self.reported(event, asciiCapable: false) }
         #expect(!Self.hasScancodeKey(cjk), "\(cjk)")
         let ascii = Self.reported(event, asciiCapable: true)
         #expect(ascii.contains { if case .keyDown(0, _, "a") = $0 { true } else { false } }, "\(ascii)")
     }
 
-    /// adr/0011 §1's always-scancode carve-out does not depend on the source: the Return keyDown and
-    /// Escape keyUp pinned above report the same two events with the seam fixed to a CJK source.
+    /// adr/0011 §1's always-scancode carve-out does not depend on the source when nothing is being
+    /// composed: the Return keyDown and Escape keyUp pinned above report the same two events with the
+    /// seam fixed to a CJK source, on fresh views that compose nothing (F-ja-2′ B-1 suspends the
+    /// carve-out only while the input method composes, `composingHandsEveryKeyToTheInputMethod`).
     @Test("the always-scancode carve-out holds under a CJK source: Return down, Escape up")
     func alwaysScancodeKeysTakeTheScancodeLaneUnderACJKSource() throws {
         let enter = try Self.key("\r", keyCode: 36, [])
@@ -436,7 +503,10 @@ struct RemoteWindowInputTests {
 
     /// The ledger only adds a reason to forward: a plain keyUp under a CJK source whose keyDown this
     /// view never sent down the scancode lane is dropped, as before -- with no keyDown at all, and
-    /// after a keyDown that took the IME lane.
+    /// after a keyDown that took the IME lane. Since F-ja-2′ B-1 the two drops have different
+    /// reasons: the bare release by the input-source fork (neither ledger holds 0), the second by the
+    /// input-method ledger (the keyDown was handed to the input method and, left at AppKit's
+    /// hand-off, came back as `insertText("a")`, not as a command) -- which the fork would drop too.
     @Test("gate r1 I-1: a plain keyUp with no scancode keyDown recorded is still dropped under a CJK source")
     func aPlainKeyUpWithoutARecordedDownIsStillDropped() throws {
         let (view, drain) = Self.makeSteppedView()
@@ -504,7 +574,301 @@ struct RemoteWindowInputTests {
         #expect(Self.hasKeyUp(15, in: up), "\(up)")
     }
 
+    // MARK: - F-ja-2′ B-1: while composing, every key goes to the input method
+
+    /// Records the key codes an input-method stand-in is handed.
+    private final class HandOffLog {
+        var keyCodes: [UInt16] = []
+    }
+
+    /// Whether `events` holds `.unicodeText`.
+    private static func hasUnicodeText(_ events: [RemoteWindowInputEvent]) -> Bool {
+        events.contains { if case .unicodeText = $0 { true } else { false } }
+    }
+
+    /// F-ja-2′ B-1 (owner in person 2026-10-22: Japanese source, regedit's address bar, nothing ever
+    /// appeared): while composing under a CJK source, Return / Escape / Tab / the arrows / Delete /
+    /// the F keys are the input method's keys -- confirm, cancel, move through candidates, edit,
+    /// convert. Each is handed to it and nothing but the alignment reaches the registry: no
+    /// `.keyDown`, no `.keyUp`, no `.unicodeText` (the stand-in consumes the key). Before B-1 the
+    /// always-scancode keys among them went out as scancodes and the composition was never confirmed.
+    @Test(
+        "F-ja-2′ B-1: composing under a CJK source, Return / Escape / Tab / Left / Delete / F1 go to the input method and only the alignment is reported",
+        arguments: [
+            (UInt16(36), "\r"), (UInt16(53), "\u{1b}"), (UInt16(48), "\t"),
+            (UInt16(123), "\u{F702}"), (UInt16(51), "\u{7f}"), (UInt16(122), "\u{F704}"),
+        ]
+    )
+    func composingHandsEveryKeyToTheInputMethod(keyCode: UInt16, character: String) throws {
+        let event = try Self.key(character, keyCode: keyCode, [])
+        let (view, events) = Self.makeView()
+        Self.compose(view)
+        let log = HandOffLog()
+        Self.deliver(event, to: view, asciiCapable: false, inputMethod: { _, handed in log.keyCodes.append(handed.keyCode) })
+        let seen = events()
+        #expect(log.keyCodes == [keyCode], "handed: \(log.keyCodes)")
+        try #require(seen.count == 1, "\(seen)")
+        guard case .flagsChanged = seen[0] else {
+            Issue.record("the one event was \(seen[0]), expected the alignment .flagsChanged")
+            return
+        }
+        #expect(!Self.hasScancodeKey(seen) && !Self.hasUnicodeText(seen), "\(seen)")
+    }
+
+    /// F-ja-2′ B-1's other half: with nothing composed the always-scancode keys keep adr/0011 §1's
+    /// carve-out under a CJK source -- alignment, then `.keyDown` with the characters verbatim, and
+    /// the input method is never handed them. (Delete, the sixth key above, is not an always-scancode
+    /// key: with nothing composed it goes to the input method too, and comes back through
+    /// `doCommand(by:)`, `aKeyTheInputMethodGivesBackTakesTheScancodeLane`.)
+    @Test(
+        "F-ja-2′ B-1: nothing composed, Return / Escape / Tab / Left / F1 still take the scancode lane under a CJK source",
+        arguments: [
+            (UInt16(36), "\r"), (UInt16(53), "\u{1b}"), (UInt16(48), "\t"),
+            (UInt16(123), "\u{F702}"), (UInt16(122), "\u{F704}"),
+        ]
+    )
+    func nothingComposedKeepsTheAlwaysScancodeCarveOut(keyCode: UInt16, character: String) throws {
+        let event = try Self.key(character, keyCode: keyCode, [])
+        let (view, events) = Self.makeView()
+        Self.deliver(event, to: view, asciiCapable: false, inputMethod: Self.neverHandedOff())
+        let seen = events()
+        try #require(seen.count == 2, "\(seen)")
+        guard case .flagsChanged = seen[0], case .keyDown(keyCode, character, character) = seen[1] else {
+            Issue.record("keyCode \(keyCode) with nothing composed reported \(seen)")
+            return
+        }
+    }
+
+    /// F-ja-2′ B-1, the up half: a Return the input method took keeps its release off the wire too,
+    /// through the input-method ledger -- by its own flags Return's keyUp takes the scancode lane, so
+    /// without the ledger the server would get an Enter-up with no Enter-down. Both ways the input
+    /// method can take it: consumed with the composition still open, and confirmed (the stand-in
+    /// commits, as one does on Return, so the release arrives with nothing composed).
+    @Test("F-ja-2′ B-1: the keyUp of a Return the input method took is dropped, the composition confirmed or not", arguments: [false, true])
+    func aReturnTheInputMethodTookKeepsItsReleaseOffTheWire(confirmed: Bool) throws {
+        let (view, drain) = Self.makeSteppedView()
+        Self.compose(view)
+        let inputMethod = confirmed ? Self.confirms("私") : Self.consumes()
+        Self.deliver(try Self.key("\r", keyCode: 36, []), to: view, asciiCapable: false, inputMethod: inputMethod)
+        let down = drain()
+        #expect(!Self.hasScancodeKey(down), "\(down)")
+        #expect(Self.hasUnicodeText(down) == confirmed, "\(down)")
+        #expect(view.hasMarkedText() == !confirmed)
+
+        Self.deliver(try Self.key("\r", keyCode: 36, [], type: .keyUp), to: view, asciiCapable: false, inputMethod: Self.neverHandedOff())
+        let up = drain()
+        try #require(up.count == 1, "only the alignment: \(up)")
+        guard case .flagsChanged = up[0] else {
+            Issue.record("the one event was \(up[0]), expected the alignment .flagsChanged")
+            return
+        }
+    }
+
+    /// F-ja-2′ B-1, a scancode record wins over an input-method one: Return confirms the composition
+    /// (handed to the input method), then, held, auto-repeats with nothing composed -- that repeat
+    /// takes the scancode lane and puts Return on the wire, so the one release must reach it too,
+    /// although the first press is in the input-method ledger.
+    @Test("F-ja-2′ B-1: a Return held past its confirmation repeats down the scancode lane, and its keyUp follows the repeat")
+    func aReturnHeldPastItsConfirmationReleasesOnTheWire() throws {
+        let (view, drain) = Self.makeSteppedView()
+        Self.compose(view)
+        let press = try Self.key("\r", keyCode: 36, [])
+        Self.deliver(press, to: view, asciiCapable: false, inputMethod: Self.confirms("私"))
+        let confirmed = drain()
+        #expect(!Self.hasScancodeKey(confirmed) && !view.hasMarkedText(), "\(confirmed)")
+        Self.deliver(press, to: view, asciiCapable: false, inputMethod: Self.neverHandedOff())
+        let repeated = drain()
+        #expect(Self.hasKeyDown(36, in: repeated), "\(repeated)")
+        Self.deliver(try Self.key("\r", keyCode: 36, [], type: .keyUp), to: view, asciiCapable: false)
+        let released = drain()
+        #expect(Self.hasKeyUp(36, in: released), "\(released)")
+        // gate r1 m-1 (mutant G1): that release consumed BOTH ledgers' entries for 36, so a later bare
+        // Return keyUp with no press recorded anywhere is judged by today's guard (always-scancode)
+        // and reaches the wire -- a leftover input-method entry would have swallowed it.
+        Self.deliver(try Self.key("\r", keyCode: 36, [], type: .keyUp), to: view, asciiCapable: false)
+        let bare = drain()
+        #expect(Self.hasKeyUp(36, in: bare), "\(bare)")
+    }
+
+    /// F-ja-2′ B-1 keeps F-a1-5: a Command chord takes the scancode lane mid-composition too -- the
+    /// alignment carrying Command, then `.keyDown(13)`, the shape
+    /// `commandChordTakesTheScancodeLaneUnderACJKSource` pins with nothing composed -- and the input
+    /// method is never handed it.
+    @Test("F-ja-2′ B-1: ⌘W mid-composition under a CJK source still takes the scancode lane")
+    func aCommandChordMidCompositionStillTakesTheScancodeLane() throws {
+        let (view, events) = Self.makeView()
+        Self.compose(view)
+        Self.deliver(try Self.key("w", keyCode: 13, .command), to: view, asciiCapable: false, inputMethod: Self.neverHandedOff())
+        let seen = events()
+        try #require(seen.count == 2, "\(seen)")
+        guard case .flagsChanged(let flags) = seen[0], case .keyDown(13, "w", "w") = seen[1] else {
+            Issue.record("⌘W mid-composition reported \(seen)")
+            return
+        }
+        #expect(flags.contains(.command))
+    }
+
+    /// F-ja-2′ B-1's composition test lives inside the IME fork: under an ASCII-capable source,
+    /// marked text left behind (an input method that never called `unmarkText`) does not pull Return
+    /// into the input method -- it takes the scancode lane, and the input method is never handed it.
+    @Test("F-ja-2′ B-1: under an ASCII-capable source, marked text left behind does not hand Return to the input method")
+    func leftoverMarkedTextUnderAnASCIISourceDoesNotTakeTheInputMethodLane() throws {
+        let (view, events) = Self.makeView()
+        Self.compose(view, "x")
+        Self.deliver(try Self.key("\r", keyCode: 36, []), to: view, asciiCapable: true, inputMethod: Self.neverHandedOff())
+        let seen = events()
+        try #require(seen.count == 2, "\(seen)")
+        guard case .flagsChanged = seen[0], case .keyDown(36, "\r", "\r") = seen[1] else {
+            Issue.record("Return under an ASCII source with leftover marked text reported \(seen)")
+            return
+        }
+    }
+
+    // MARK: - F-ja-2′ B-6: a key the input method gives back takes the scancode lane
+
+    /// F-ja-2′ B-6 (owner in person 2026-10-22: Japanese source, nothing composed, Delete only
+    /// beeped): the input method does not want the Delete, AppKit's key bindings turn it into
+    /// `deleteBackward:` and call `doCommand(by:)` -- which now sends the key down the scancode lane:
+    /// exactly the alignment and `.keyDown(51, "\u{7f}", "\u{7f}")`. Its keyUp is forwarded: the
+    /// fallback recorded 51 in the scancode ledger (under a CJK source a plain Delete-up with no
+    /// record is dropped).
+    @Test("F-ja-2′ B-6: a Delete the input method gives back under a CJK source goes down the scancode lane, its keyUp after it")
+    func aKeyTheInputMethodGivesBackTakesTheScancodeLane() throws {
+        let (view, drain) = Self.makeSteppedView()
+        let inputMethod = Self.givesBack(#selector(NSResponder.deleteBackward(_:)))
+        Self.deliver(try Self.key("\u{7f}", keyCode: 51, []), to: view, asciiCapable: false, inputMethod: inputMethod)
+        let down = drain()
+        try #require(down.count == 2, "\(down)")
+        guard case .flagsChanged = down[0], case .keyDown(51, "\u{7f}", "\u{7f}") = down[1] else {
+            Issue.record("a Delete given back reported \(down)")
+            return
+        }
+
+        Self.deliver(try Self.key("\u{7f}", keyCode: 51, [], type: .keyUp), to: view, asciiCapable: false, inputMethod: Self.neverHandedOff())
+        let up = drain()
+        try #require(up.count == 2, "\(up)")
+        guard case .flagsChanged = up[0], case .keyUp(51, "\u{7f}", "\u{7f}") = up[1] else {
+            Issue.record("the keyUp of a Delete given back reported \(up)")
+            return
+        }
+    }
+
+    /// F-ja-2′ B-6: the fallback sends the event being interpreted -- its key code and both character
+    /// fields, verbatim -- not one made up from the command (the stand-in gives back
+    /// `insertNewline:`, which belongs to neither key) and not `NSApp.currentEvent`. ⌃A's three
+    /// fields all differ from each other's and from Return's.
+    @Test(
+        "F-ja-2′ B-6: the key given back is the original event, field by field",
+        arguments: [
+            (UInt16(51), "\u{7f}", "\u{7f}", NSEvent.ModifierFlags()),
+            (UInt16(0), "\u{1}", "a", NSEvent.ModifierFlags.control),
+        ]
+    )
+    func theKeyGivenBackIsTheOriginalEvent(
+        keyCode: UInt16, characters: String, charactersIgnoringModifiers: String, flags: NSEvent.ModifierFlags
+    ) throws {
+        let event = try Self.key(charactersIgnoringModifiers, characters: characters, keyCode: keyCode, flags)
+        let (view, events) = Self.makeView()
+        Self.deliver(event, to: view, asciiCapable: false, inputMethod: Self.givesBack(#selector(NSResponder.insertNewline(_:))))
+        let keyDowns: [(UInt16, String, String)] = events().compactMap {
+            if case .keyDown(let code, let chars, let charsIM) = $0 { (code, chars, charsIM) } else { nil }
+        }
+        try #require(keyDowns.count == 1, "\(events())")
+        #expect(keyDowns[0].0 == event.keyCode)
+        #expect(keyDowns[0].1 == event.characters)
+        #expect(keyDowns[0].2 == event.charactersIgnoringModifiers)
+    }
+
+    /// F-ja-2′ B-6, once per key: AppKit's standard bindings give ⌃O back as TWO commands
+    /// (`insertNewlineIgnoringFieldEditor:` then `moveBackward:`, measured 2026-10-22). One physical
+    /// press puts one `.keyDown` on the wire, not a press and a repeat; its keyUp follows, once.
+    @Test("F-ja-2′ B-6: a key given back as two commands (⌃O) goes down the scancode lane once")
+    func aKeyGivenBackAsTwoCommandsIsSentOnce() throws {
+        let (view, drain) = Self.makeSteppedView()
+        let inputMethod = Self.givesBack(
+            #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)), #selector(NSResponder.moveBackward(_:))
+        )
+        Self.deliver(try Self.key("o", characters: "\u{f}", keyCode: 31, .control), to: view, asciiCapable: false, inputMethod: inputMethod)
+        let down = drain()
+        try #require(down.count == 2, "\(down)")
+        guard case .flagsChanged = down[0], case .keyDown(31, "\u{f}", "o") = down[1] else {
+            Issue.record("⌃O given back as two commands reported \(down)")
+            return
+        }
+        Self.deliver(try Self.key("o", characters: "\u{f}", keyCode: 31, [], type: .keyUp), to: view, asciiCapable: false)
+        let up = drain()
+        #expect(up.filter { if case .keyUp(31, _, _) = $0 { true } else { false } }.count == 1, "\(up)")
+    }
+
+    /// F-ja-2′ B-6 only answers a command for the key being handed over: `doCommand(by:)` called on
+    /// its own -- on a fresh view, and on a view that has just handed a key to an input method that
+    /// consumed it -- sends nothing (it goes to `NSResponder`, as before) and does not crash.
+    @Test("F-ja-2′ B-6: doCommand(by:) outside a hand-off sends nothing")
+    func doCommandOutsideAHandOffSendsNothing() throws {
+        let (view, drain) = Self.makeSteppedView()
+        view.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+        let fresh = drain()
+        #expect(fresh.isEmpty, "\(fresh)")
+
+        Self.deliver(try Self.key("a", keyCode: 0, []), to: view, asciiCapable: false, inputMethod: Self.consumes())
+        _ = drain()
+        view.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+        let after = drain()
+        #expect(after.isEmpty, "after a consumed hand-off: \(after)")
+    }
+
+    /// F-ja-2′ B-6 does not depend on the composition: a Return handed to the input method
+    /// mid-composition that the input method lets through (`insertNewline:`) goes down the scancode
+    /// lane like any key given back, and so does its keyUp.
+    @Test("F-ja-2′ B-6: a Return the input method lets through mid-composition reaches the wire")
+    func aReturnLetThroughMidCompositionReachesTheWire() throws {
+        let (view, drain) = Self.makeSteppedView()
+        Self.compose(view)
+        Self.deliver(
+            try Self.key("\r", keyCode: 36, []), to: view, asciiCapable: false,
+            inputMethod: Self.givesBack(#selector(NSResponder.insertNewline(_:)))
+        )
+        let down = drain()
+        try #require(down.count == 2, "\(down)")
+        guard case .flagsChanged = down[0], case .keyDown(36, "\r", "\r") = down[1] else {
+            Issue.record("a Return let through reported \(down)")
+            return
+        }
+        Self.deliver(try Self.key("\r", keyCode: 36, [], type: .keyUp), to: view, asciiCapable: false)
+        let up = drain()
+        #expect(Self.hasKeyUp(36, in: up), "\(up)")
+    }
+
+    /// F-ja-2′ B-6 through AppKit's own hand-off (the seam left at its default): the windowless
+    /// view's live input context gives a Delete with nothing composed back as `deleteBackward:`
+    /// (measured 2026-10-22 on the runner's ABC source), and it reaches the registry as
+    /// `.keyDown(51)`. The one runtime test of the default hand-off (the source pin is
+    /// `RemoteWindowKeyEquivalentTests.theHandOffSeamIsTheOnlyInterpretKeyEventsCall`). It rests on
+    /// AppKit's standard key binding for Delete and on the runner's live source not keeping the key;
+    /// an input method composing nothing has nothing to delete and is expected to give it back too.
+    @Test("F-ja-2′ B-6: through AppKit's own hand-off, an empty Delete under a CJK source reaches the wire")
+    func anEmptyDeleteThroughAppKitsHandOffReachesTheWire() throws {
+        let seen = Self.reported(try Self.key("\u{7f}", keyCode: 51, []), asciiCapable: false)
+        // gate r1 m-3: this is the one test that depends on the runner's live input source, so a red
+        // names that source; under a CJK source read the lane's U-1 (an input method that hands the
+        // key back asynchronously) before anything else.
+        #expect(
+            Self.hasKeyDown(51, in: seen),
+            "\(seen); active input source \(Self.liveInputSourceID()); if this runner's source is a CJK input method, read F-ja-2′ U-1 first"
+        )
+    }
+
     // MARK: - gate r1 m-3: the seam's default is the live read
+
+    /// gate r1 m-3 (F-ja-2′): the active input source's `kTISPropertyInputSourceID`, for the failure
+    /// message of the one test that depends on it; "<unreadable>" when it cannot be read.
+    private static func liveInputSourceID() -> String {
+        guard let source = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+              let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else {
+            return "<unreadable>"
+        }
+        return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
+    }
 
     /// What `TISCopyCurrentKeyboardInputSource` says right now, read here independently of the
     /// product's own read; an unreadable source or property counts as ASCII-capable, as the

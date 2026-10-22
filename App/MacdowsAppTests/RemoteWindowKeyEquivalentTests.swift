@@ -348,7 +348,7 @@ struct RemoteWindowKeyEquivalentTests {
         #expect(keyEquivalentOccurrences(of: "commandKeyMapper.localKeyEquivalent()", in: String(arm)) == 1, "\(arm)")
     }
 
-    // MARK: - F-a1-5's input-source seam (gate r1 m-3)
+    // MARK: - F-a1-5's input-source seam (gate r1 m-3) and F-ja-2′ B-6's hand-off seam
 
     private static let input = "App/RemoteWindowRendering/RemoteWindowInput.swift"
 
@@ -367,5 +367,26 @@ struct RemoteWindowKeyEquivalentTests {
         #expect(!lines.contains { $0.contains("F-a1-5's test seam") }, "a line comment survived the strip")
         let declaration = try #require(lines.first { $0.contains(label) })
         #expect(declaration.contains("isCurrentInputSourceASCIICapable()"), "\(declaration)")
+    }
+
+    /// F-ja-2′ B-6: the hand-off seam's declaration is the one place the file hands a key to the
+    /// input method -- `interpretKeyEvents([` appears once in its code, on that line -- so the App,
+    /// which never sets the seam, reaches AppKit's input context, and `handleKeyDown` cannot hand a
+    /// key over past the seam (and past the bookkeeping `doCommand(by:)`'s fallback reads). The
+    /// runtime tests set a stand-in, so only this pin sees the default. Same per-line strip as above.
+    @Test("F-ja-2′ B-6: the input-method hand-off seam's declaration is the file's one interpretKeyEvents call")
+    func theHandOffSeamIsTheOnlyInterpretKeyEventsCall() throws {
+        let url = keyEquivalentRepoRoot().appendingPathComponent(Self.input)
+        let text = try String(contentsOf: url, encoding: .utf8)
+        let call = "interpretKeyEvents(["
+        let label = "static var handOffToInputMethod"
+        let code = keyEquivalentCodeOnly(text)
+        #expect(keyEquivalentOccurrences(of: call, in: code) == 1, "the input method is not handed keys in one place")
+        #expect(keyEquivalentOccurrences(of: label, in: code) == 1, "the seam is not declared once")
+        let lines = text.split(separator: "\n").map { keyEquivalentCodeOnly(String($0)) }
+        #expect(!lines.contains { $0.contains("F-ja-2′ B-6's test seam") }, "a line comment survived the strip")
+        let declaration = try #require(lines.first { $0.contains(label) })
+        #expect(declaration.contains("interpretKeyEvents([event])"), "\(declaration)")
+        #expect(lines.filter { $0.contains(call) } == [declaration], "the call is not on the seam's declaration line")
     }
 }
