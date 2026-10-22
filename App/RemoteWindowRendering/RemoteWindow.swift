@@ -1,6 +1,7 @@
 import AppKit
 import IOSurface
 import MacdowsCore
+import os
 
 /// Identifies one `RemoteWindow`. Deliberately keyed by `windowId` **and** `generation`,
 /// not `windowId` alone — after a reconnect the RDP server is free to reuse the same
@@ -1203,6 +1204,14 @@ final class RemoteWindow {
         contentRectDroppedWhileSuppressed = nil
     }
 
+    /// F-ja-3 diagnostics only: one debug line before an end applies a rect.
+    private static let logger = Logger(subsystem: "dev.haru.macdows", category: "RemoteWindowRendering")
+
+    private static func logEndApply(snapBack: Bool, gate: Bool, serverRect: Bool, dropped: Bool, frame: NSRect) {
+        logger.debug(
+            "F-ja-3 end-apply snapBack=\(snapBack, privacy: .public) gate=\(gate, privacy: .public) serverRect=\(serverRect, privacy: .public) dropped=\(dropped, privacy: .public) frame=(\(Double(frame.origin.x), privacy: .public),\(Double(frame.origin.y), privacy: .public),\(Double(frame.width), privacy: .public),\(Double(frame.height), privacy: .public))")
+    }
+
     /// The matching `isMoveSizeStart == false` transition: "release + treat like settle"
     /// (task item 4's own instruction) -- reports the current frame exactly like a native
     /// drag settling, in case whatever the server's own gesture left this window at
@@ -1228,14 +1237,17 @@ final class RemoteWindow {
         geometryAuthoritySuppressionCount = max(0, geometryAuthoritySuppressionCount - 1)
         guard reportSettle else {
             if snapBack {
+                let diagDropped = contentRectDroppedWhileSuppressed != nil
                 contentRectDroppedWhileSuppressed = nil
                 if hasClearedFirstFrameGate, let serverRect = pendingContentRect {
+                    Self.logEndApply(snapBack: true, gate: hasClearedFirstFrameGate, serverRect: true, dropped: diagDropped, frame: window.frame)
                     applyContentRectNow(serverRect)
                 }
                 return
             }
             if hasClearedFirstFrameGate, let dropped = contentRectDroppedWhileSuppressed {
                 contentRectDroppedWhileSuppressed = nil
+                Self.logEndApply(snapBack: false, gate: hasClearedFirstFrameGate, serverRect: pendingContentRect != nil, dropped: true, frame: window.frame)
                 applyContentRectNow(dropped)
             }
             return

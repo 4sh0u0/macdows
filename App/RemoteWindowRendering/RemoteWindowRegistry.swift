@@ -434,6 +434,8 @@ final class RemoteWindowRegistry {
         /// nothing mid-loop. Kept here so every end of this move unmarks exactly these
         /// (`stopFollowing(_:)`), whatever was attached or detached in between.
         let followingChildren: Set<UInt32>
+        /// F-ja-3 diagnostics only: motions seen for this move, to rate-limit the debug lines.
+        var steps: Int = 0
 
         /// The frame origin that keeps the grab point under `pointer`.
         func origin(forPointer pointer: NSPoint) -> NSPoint {
@@ -1047,9 +1049,17 @@ final class RemoteWindowRegistry {
             Self.logger.debug(
                 "ServerLocalMoveSize windowId=\(event.windowId, privacy: .public) isMoveSizeStart=\(event.isMoveSizeStart, privacy: .public) moveSizeType=\(event.moveSizeType, privacy: .public)")
         }
-        guard let window = windows[event.windowId] else { return }
+        guard let window = windows[event.windowId] else {
+            Self.logger.debug("F-ja-3 LMS for unknown windowId=\(event.windowId, privacy: .public)")
+            return
+        }
         let windowId = event.windowId
         if event.isMoveSizeStart {
+            let diagFrameOrigin = window.window.frame.origin
+            let diagLeftDown = leftButtonDown[windowId] != nil
+            let diagChildren = attachedChildOwner.filter { $0.value == windowId }.count
+            Self.logger.debug(
+                "F-ja-3 LMS start windowId=\(windowId, privacy: .public) type=\(event.moveSizeType, privacy: .public) posX=\(event.moveSizePosX, privacy: .public) posY=\(event.moveSizePosY, privacy: .public) leftDown=\(diagLeftDown, privacy: .public) engaged=\(event.moveSizeType == Self.railMoveSizeTypeMove && diagLeftDown, privacy: .public) children=\(diagChildren, privacy: .public) frameOrigin=(\(Double(diagFrameOrigin.x), privacy: .public),\(Double(diagFrameOrigin.y), privacy: .public))")
             if event.moveSizeType == Self.railMoveSizeTypeMove, let down = leftButtonDown[windowId] {
                 let origin = window.window.frame.origin
                 let children = Set(attachedChildOwner.filter { $0.value == windowId }.keys)
@@ -1065,6 +1075,8 @@ final class RemoteWindowRegistry {
         } else {
             let heldMove = localMoves.removeValue(forKey: windowId)
             let endedAfterUp = localMovesAwaitingEnd.remove(windowId) != nil
+            Self.logger.debug(
+                "F-ja-3 LMS end windowId=\(windowId, privacy: .public) path=\(heldMove != nil ? "held" : (endedAfterUp ? "afterUp" : "plain"), privacy: .public)")
             if let heldMove {
                 // Ended while held (I-1): snap back. The children are unmarked AFTER it, so the
                 // frame each one is compared at is where the snap-back carried it (F-6): after a
@@ -1969,11 +1981,28 @@ final class RemoteWindowRegistry {
             // waiting for that up, not for this motion (`pressedMouseButtons`).
             if let move = localMoves[windowId] {
                 let pointer = pointerLocation()
-                if pressedMouseButtons() & 1 == 0 {
+                let buttons = pressedMouseButtons()
+                localMoves[windowId]?.steps += 1
+                let diagStep = localMoves[windowId]?.steps ?? 0
+                let diagLostUp = buttons & 1 == 0
+                let diagWanted = diagStep <= 3 || diagStep % 32 == 0 || diagLostUp
+                if buttons & 1 == 0 {
+                    if diagWanted {
+                        let requested = move.origin(forPointer: pointer)
+                        let frameNow = windows[windowId]?.window.frame.origin ?? .zero
+                        Self.logger.debug(
+                            "F-ja-3 move windowId=\(windowId, privacy: .public) step=\(diagStep, privacy: .public) buttons=\(buttons, privacy: .public) lostUp=\(diagLostUp, privacy: .public) pointer=(\(Double(pointer.x), privacy: .public),\(Double(pointer.y), privacy: .public)) requested=(\(Double(requested.x), privacy: .public),\(Double(requested.y), privacy: .public)) frameAfter=(\(Double(frameNow.x), privacy: .public),\(Double(frameNow.y), privacy: .public))")
+                    }
                     endLocalMoveWithButtonUp(windowId: windowId, move: move, pointer: pointer)
                     return
                 }
                 windows[windowId]?.moveLocally(toOrigin: move.origin(forPointer: pointer))
+                if diagWanted {
+                    let requested = move.origin(forPointer: pointer)
+                    let frameAfter = windows[windowId]?.window.frame.origin ?? .zero
+                    Self.logger.debug(
+                        "F-ja-3 move windowId=\(windowId, privacy: .public) step=\(diagStep, privacy: .public) buttons=\(buttons, privacy: .public) lostUp=\(diagLostUp, privacy: .public) pointer=(\(Double(pointer.x), privacy: .public),\(Double(pointer.y), privacy: .public)) requested=(\(Double(requested.x), privacy: .public),\(Double(requested.y), privacy: .public)) frameAfter=(\(Double(frameAfter.x), privacy: .public),\(Double(frameAfter.y), privacy: .public))")
+                }
                 return
             }
             let now = CFAbsoluteTimeGetCurrent()
@@ -2013,8 +2042,12 @@ final class RemoteWindowRegistry {
             // or middle click mid-drag is forwarded as ordinary input and leaves the move alone.
             if button == .left {
                 if down {
+                    Self.logger.debug(
+                        "F-ja-3 left-down windowId=\(windowId, privacy: .public) point=(\(Double(screenPoint.x), privacy: .public),\(Double(screenPoint.y), privacy: .public))")
                     leftButtonDown[windowId] = screenPoint
                 } else if let move = localMoves[windowId] {
+                    Self.logger.debug(
+                        "F-ja-3 real-up windowId=\(windowId, privacy: .public) eventPoint=(\(Double(screenPoint.x), privacy: .public),\(Double(screenPoint.y), privacy: .public)) step=\(move.steps, privacy: .public)")
                     endLocalMoveWithButtonUp(windowId: windowId, move: move, pointer: pointerLocation())
                     return
                 } else {
