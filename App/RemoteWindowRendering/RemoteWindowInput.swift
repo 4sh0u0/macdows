@@ -137,6 +137,22 @@ final class RemoteWindowContentView: NSView {
     /// codes; and clearing it would bring I-1 back for a key whose release arrives after a focus
     /// round trip.
     private var scancodeDownKeyCodes: Set<UInt16> = []
+    /// F-ja-2′ B-1: the key codes whose keyDown went to the input method (`handOffToInputMethod`)
+    /// and stayed there, and whose keyUp has not arrived yet. `keyUp(with:)` drops a release
+    /// recorded here: its keyDown never reached the wire, and a Return that confirmed a composition
+    /// would otherwise put an Enter-up with no Enter-down on the server (Return's own lane, by its
+    /// flags, is the scancode one). Inserted for every keyDown handed to the input method (an
+    /// auto-repeat re-inserts the same code); `doCommand(by:)` takes a code out when the input method
+    /// gives its key back (B-6), and `scancodeDownKeyCodes` gets it instead. Never cleared -- not on
+    /// `resignFirstResponder`, not on `.focusLost` -- for `scancodeDownKeyCodes`'s reasons: a stale
+    /// entry can drop at most one release of a key whose press the server never saw; the set is
+    /// bounded by the keyboard's key codes; and clearing it would forward, after a focus round
+    /// trip, the release of a key the input method kept.
+    private var inputMethodDownKeyCodes: Set<UInt16> = []
+    /// F-ja-2′ B-6: the keyDown `handleKeyDown` is handing to the input method right now -- set just
+    /// before `handOffToInputMethod` runs and cleared when it returns -- so `doCommand(by:)` can tell
+    /// a command the input method fell back to for THAT key from any other call.
+    private var eventHandedToInputMethod: NSEvent?
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -316,15 +332,25 @@ final class RemoteWindowContentView: NSView {
         // produces zero transitions), so this is always safe to send.
         reportModifierAlignment(for: event)
 
-        // adr/0011 §1's mixing rule: modifier/function/arrow/Enter/Tab/Esc keys and (F-a1-5)
-        // every Command chord always go scancode regardless of input source
-        // (`takesScancodeLane`); everything else defers to whether the *current* input source
-        // is ASCII-capable -- a non-ASCII-capable (CJK/合成型) source hands its work back via
-        // NSTextInputClient (insertText:/setMarkedText: below), not scancodes.
-        if !Self.takesScancodeLane(event), !Self.inputSourceIsASCIICapable() {
-            interpretKeyEvents([event])
+        // adr/0011 §1's mixing rule, as `takesInputMethodLane` decides it: a key the input method
+        // takes is handed to it, and a non-ASCII-capable (CJK/合成型) source hands its work back
+        // via NSTextInputClient (insertText:/setMarkedText: below) or, for a key it does not want,
+        // through `doCommand(by:)` (F-ja-2′ B-6); every other key goes down the scancode lane.
+        if takesInputMethodLane(event) {
+            // F-ja-2′ B-1: this key went to the input method, so its keyUp follows it there --
+            // unless `doCommand(by:)` sends it down the scancode lane after all.
+            inputMethodDownKeyCodes.insert(event.keyCode)
+            eventHandedToInputMethod = event
+            defer { eventHandedToInputMethod = nil }
+            Self.handOffToInputMethod(self, event)
             return
         }
+        sendScancodeKeyDown(event)
+    }
+
+    /// The scancode lane's keyDown, as `handleKeyDown` sends it and as `doCommand(by:)` sends a key
+    /// the input method gave back: the event's own key code and characters, verbatim.
+    private func sendScancodeKeyDown(_ event: NSEvent) {
         // gate r1 I-1: this key went down the scancode lane, so its keyUp must follow it there.
         scancodeDownKeyCodes.insert(event.keyCode)
         onEvent?(.keyDown(
@@ -332,6 +358,29 @@ final class RemoteWindowContentView: NSView {
             characters: event.characters ?? "",
             charactersIgnoringModifiers: event.charactersIgnoringModifiers ?? ""
         ))
+    }
+
+    /// F-ja-2′ B-6: where a key the input method did not want comes back -- AppKit's key bindings
+    /// turn it into a command and call this (measured on a windowless view, 2026-10-22: Delete
+    /// gives `deleteBackward:`, ⌃A `moveToBeginningOfParagraph:`, ⌃O two commands,
+    /// `insertNewlineIgnoringFieldEditor:` then `moveBackward:`). `NSResponder`'s default walks the
+    /// responder chain and beeps, so under a CJK source a Delete with nothing composed reached
+    /// nobody (owner in person 2026-10-22). Called while `handleKeyDown` hands a key to the input
+    /// method, this sends THAT key down the scancode lane: the original event -- its own key code
+    /// and characters, not `NSApp.currentEvent` and not one made up from the selector -- as
+    /// `handleKeyDown` would have sent it (the alignment `.flagsChanged` already went out, before
+    /// the hand-off), its key code moved from `inputMethodDownKeyCodes` to `scancodeDownKeyCodes` so
+    /// the keyUp follows it, and no `super` (no beep). Once per hand-off: a binding that names
+    /// several commands (⌃O) still puts one key on the wire, not a repeat -- the code leaves
+    /// `inputMethodDownKeyCodes` with the first, and its absence is what turns the rest away.
+    /// Called at any other time: `super`, as before, and nothing is sent.
+    override func doCommand(by selector: Selector) {
+        guard let event = eventHandedToInputMethod else {
+            super.doCommand(by: selector)
+            return
+        }
+        guard inputMethodDownKeyCodes.remove(event.keyCode) != nil else { return }
+        sendScancodeKeyDown(event)
     }
 
     override func keyUp(with event: NSEvent) {
@@ -346,11 +395,17 @@ final class RemoteWindowContentView: NSView {
         // keys and, F-a1-5, every Command chord) and, gate r1 I-1, a key whose keyDown took the
         // scancode lane (`scancodeDownKeyCodes`): the keyUp follows its keyDown, whatever its own
         // flags and the source now say -- Command released before the letter, or the input source
-        // switched between down and up. The entry is consumed before the guard, whichever way the
-        // guard goes.
+        // switched between down and up. F-ja-2′ B-1, the other way round: a key whose keyDown went
+        // to the input method and stayed there (`inputMethodDownKeyCodes`) is dropped whatever its
+        // own lane would be -- a Return, Escape or arrow that the input method took while composing
+        // must not put a release with no press on the server. Both entries are consumed before the
+        // decision, whichever way it goes; a scancode record wins (an auto-repeat that went down the
+        // scancode lane after the composition ended put the key on the wire).
         let recorded = scancodeDownKeyCodes.remove(event.keyCode) != nil
-        guard Self.takesScancodeLane(event) || Self.inputSourceIsASCIICapable() || recorded else {
-            return
+        let handedToInputMethod = inputMethodDownKeyCodes.remove(event.keyCode) != nil
+        if !recorded {
+            guard !handedToInputMethod else { return }
+            guard Self.takesScancodeLane(event) || Self.inputSourceIsASCIICapable() else { return }
         }
         onEvent?(.keyUp(
             macKeyCode: event.keyCode,
@@ -363,32 +418,59 @@ final class RemoteWindowContentView: NSView {
         onEvent?(.flagsChanged(modifierFlags: event.modifierFlags.intersection(.deviceIndependentFlagsMask)))
     }
 
-    /// adr/0011 §1's table, with one row added by F-a1-5: an event takes the scancode lane,
-    /// whatever the input source, when its key is an always-scancode key (below) OR its
-    /// modifier flags contain Command. A Command chord is `CommandKeyMapper`'s lane (adr/0011
+    /// adr/0011 §1's table, with one row added by F-a1-5, as `keyUp(with:)` reads it for a release
+    /// that neither ledger below records: such a keyUp takes the scancode lane, whatever the input
+    /// source, when its key is an always-scancode key (below) OR its modifier flags contain Command
+    /// (gate r1 m-9 of F-ja-2′: for a keyDown this is no longer the whole rule -- see
+    /// `takesInputMethodLane`). A Command chord is `CommandKeyMapper`'s lane (adr/0011
     /// §3), never text input: an input method does not handle ⌘W / ⌘C / ⌘V / ⌘Z, so handing
     /// one to `interpretKeyEvents` under a non-ASCII-capable source swallowed it -- no
     /// `.keyDown` reached the mapper, already withheld by the alignment `.flagsChanged`, and the
     /// chord did nothing (F-a1-5, owner in person 2026-10-08: ⌘W on a remote Notepad window).
     /// Control and Option chords keep the input-source fork (an input method does use some
-    /// Control chords). A keyDown's lane is decided here (adr/0011 §1: "判据在 keyDown 捕获时求值");
-    /// `keyUp(with:)` asks the same question of its own event but also follows its keyDown through
-    /// `scancodeDownKeyCodes` (gate r1 I-1), since Command may be released before the letter and the
-    /// release's flags no longer carry it.
+    /// Control chords). Since F-ja-2′ B-1 a keyDown's lane is decided by `takesInputMethodLane`
+    /// (adr/0011 §1: "判据在 keyDown 捕获时求值"), which suspends the always-scancode half of this
+    /// rule while the input method composes; `keyUp(with:)` asks this question of its own event, but
+    /// first follows its keyDown through `scancodeDownKeyCodes` (gate r1 I-1), since Command may be
+    /// released before the letter and the release's flags no longer carry it, and through
+    /// `inputMethodDownKeyCodes` (F-ja-2′ B-1), since a Return the input method took has a scancode
+    /// lane by its flags alone.
     private static func takesScancodeLane(_ event: NSEvent) -> Bool {
         isAlwaysScancodeKey(macKeyCode: event.keyCode) || event.modifierFlags.contains(.command)
     }
 
+    /// adr/0011 §1's table as amended by F-a1-5 and F-ja-2′ B-1: whether a keyDown goes to the input
+    /// method (`handOffToInputMethod`) instead of the scancode lane. In order:
+    ///  1. A Command chord never does (F-a1-5), composing or not: ⌘W mid-composition is still ⌘W.
+    ///  2. Under an ASCII-capable source no key does, marked text left behind included: the
+    ///     composition test below only suspends the always-scancode carve-out INSIDE the IME fork,
+    ///     so an input method that never called `unmarkText` cannot pull ASCII typing into it.
+    ///  3. While the input method composes (`hasMarkedText()`), every other key does: Return / Enter
+    ///     confirm, Escape cancels, Tab and the arrows move through candidates, the F keys convert --
+    ///     the input method's keys now. Sending them as scancodes left the composition unconfirmed
+    ///     forever and put an Enter on the remote window instead (F-ja-2′ B-1, owner in person
+    ///     2026-10-22: Japanese source, regedit's address bar, nothing ever appeared).
+    ///  4. Nothing composed: the always-scancode keys keep the scancode lane (adr/0011 §1's
+    ///     carve-out); every other key goes to the input method.
+    private func takesInputMethodLane(_ event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command) { return false }
+        if Self.inputSourceIsASCIICapable() { return false }
+        if hasMarkedText() { return true }
+        return !Self.isAlwaysScancodeKey(macKeyCode: event.keyCode)
+    }
+
     /// adr/0011 §1's table: "修饰键、功能键、方向键、Enter/Tab/Esc——无论输入源" always take the
-    /// scancode path. Modifier keys never reach this method at all (AppKit delivers them as
-    /// `flagsChanged:`, not `keyDown:`/`keyUp:`), so this only needs to name the rest:
-    /// function keys, arrows, Return/Enter, Tab, Escape. Standard, stable AppKit virtual
-    /// keycodes (physical position, not layout-dependent -- same numbering space
-    /// `CommandKeyMapper`'s fixed-VK table uses). Deliberately does NOT include Delete/
-    /// ForwardDelete: adr/0011 §2 says marked text is tracked "以维持输入法状态与退格"
-    /// (backspace included) -- backspace needs to reach `interpretKeyEvents` while
-    /// composing so it can edit the marked (not-yet-committed) text, exactly like every
-    /// other Cocoa text-input client.
+    /// scancode path when nothing is being composed (F-ja-2′ B-1: while the input method composes,
+    /// `takesInputMethodLane` hands them to it). Modifier keys never reach this method at all
+    /// (AppKit delivers them as `flagsChanged:`, not `keyDown:`/`keyUp:`), so this only needs to
+    /// name the rest: function keys, arrows, Return/Enter, Tab, Escape, and the navigation block.
+    /// Standard, stable AppKit virtual keycodes (physical position, not layout-dependent -- same
+    /// numbering space `CommandKeyMapper`'s fixed-VK table uses). Deliberately does NOT include
+    /// Delete (51; ForwardDelete, 117, is in the navigation row): adr/0011 §2 says marked text is
+    /// tracked "以维持输入法状态与退格" (backspace included) -- backspace needs to reach the input
+    /// method while composing so it can edit the marked (not-yet-committed) text, exactly like
+    /// every other Cocoa text-input client; with nothing composed the input method gives it back
+    /// through `doCommand(by:)` (F-ja-2′ B-6).
     private static func isAlwaysScancodeKey(macKeyCode: UInt16) -> Bool {
         switch macKeyCode {
         case 36, 76: return true // Return, numpad Enter
@@ -402,13 +484,22 @@ final class RemoteWindowContentView: NSView {
         }
     }
 
-    /// F-a1-5's test seam: where `handleKeyDown` and `keyUp(with:)` read whether the current
-    /// input source is ASCII-capable. The App never sets it, so the live read below is what
-    /// runs; a test sets a fixed answer and restores this default in a `defer`, which makes the
-    /// input-source fork assertable without depending on the test runner's own keyboard
-    /// settings (the shape of `GlassStyle.forceLegacyMaterial`, a process-global static seam the
-    /// App never sets).
+    /// F-a1-5's test seam: where `handleKeyDown` (through `takesInputMethodLane`) and
+    /// `keyUp(with:)` read whether the current input source is ASCII-capable. The App never sets
+    /// it, so the live read below is what runs; a test sets a fixed answer and restores this
+    /// default in a `defer`, which makes the input-source fork assertable without depending on the
+    /// test runner's own keyboard settings (the shape of `GlassStyle.forceLegacyMaterial`, a
+    /// process-global static seam the App never sets).
     static var inputSourceIsASCIICapable: () -> Bool = { RemoteWindowContentView.isCurrentInputSourceASCIICapable() }
+
+    /// F-ja-2′ B-6's test seam, the shape of `inputSourceIsASCIICapable` above: where
+    /// `handleKeyDown` hands a key to the input method. The App never sets it, so the default --
+    /// AppKit's own hand-off to the view's input context -- is what runs; a test sets a stand-in
+    /// (one that consumes the key, or one that gives it back through `doCommand(by:)` as AppKit's
+    /// key bindings do for a key the input method does not want) and restores this default in a
+    /// `defer`, since what the live input context does with a key depends on the runner's input
+    /// source and on what the input method makes of it.
+    static var handOffToInputMethod: (RemoteWindowContentView, NSEvent) -> Void = { view, event in view.interpretKeyEvents([event]) }
 
     /// adr/0011 §1/§2: whether the *currently active* keyboard input source is ASCII-
     /// capable (`TISCopyCurrentKeyboardInputSource`'s `kTISPropertyInputSourceIsASCIICapable`
