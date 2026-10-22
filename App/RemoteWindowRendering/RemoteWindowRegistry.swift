@@ -426,7 +426,9 @@ final class RemoteWindowRegistry {
         /// The pointer's offset from the window's frame origin at the left-down that started the
         /// drag, in AppKit screen points (bottom-left origin). Taken from the LOCAL down point,
         /// not from the order's `posX/posY`: those are measured from the outer RAIL rect, which
-        /// includes the border column this client does not draw.
+        /// includes the border column this client does not draw. F-ja-3: when the start finds no
+        /// down recorded on any window but the left button still held, from the pointer at the
+        /// start instead (`handleLocalMoveSize`), for the same reason.
         let grabOffset: NSPoint
         /// Gate r1 m-4: the windows attached to the dragged one as `addChildWindow` children when
         /// the move started. AppKit carries them along with every placement, so each was marked
@@ -434,6 +436,8 @@ final class RemoteWindowRegistry {
         /// nothing mid-loop. Kept here so every end of this move unmarks exactly these
         /// (`stopFollowing(_:)`), whatever was attached or detached in between.
         let followingChildren: Set<UInt32>
+        /// F-ja-3 diagnostics only: motions seen for this move, to rate-limit the debug lines.
+        var steps: Int = 0
 
         /// The frame origin that keeps the grab point under `pointer`.
         func origin(forPointer pointer: NSPoint) -> NSPoint {
@@ -450,8 +454,11 @@ final class RemoteWindowRegistry {
     /// any other end (today's settle). Same lifetime as `localMoves`.
     private var localMovesAwaitingEnd: Set<UInt32> = []
     /// F-a1-6: per window, the screen point of the last left-down not yet followed by a left-up.
-    /// A local move starts only while this holds an entry: a start that arrives after the up was
-    /// already sent (the round trip lost the race) must not move a window nobody is dragging.
+    /// A local move starts from this entry when there is one. Without one it starts only while this
+    /// table is empty and the OS still reports the left button held (F-ja-3's fallback,
+    /// `handleLocalMoveSize`; the OS state is global, and an entry on another window means the
+    /// press is there): a start that arrives after the up (the round trip lost the race, the
+    /// button is released) must not move a window nobody is dragging.
     private var leftButtonDown: [UInt32: NSPoint] = [:]
     /// MS-RDPERP 2.2.2.7.2 `RAIL_WMSZ_MOVE`: the `MoveSizeType` of a mouse move. Types 1-8 (the
     /// resize edges) and 10-11 (`RAIL_WMSZ_KEYMOVE`/`KEYSIZE`) keep the suppression-only handling.
@@ -459,17 +466,20 @@ final class RemoteWindowRegistry {
     /// F-a1-6: the pointer's current screen position, read while a local move is in flight --
     /// a mouse event's own `screenPoint` is converted with the window's CURRENT frame, so after a
     /// local move it carries the frame delta of every event still queued behind that move and
-    /// would make the window chase its own motion. Read at exactly two places in `handleInput`
-    /// (the move and the up). A seam for the tests, the shape of `onWindowMoveSent`; the App
-    /// never sets it.
+    /// would make the window chase its own motion. Read at exactly three places: two in
+    /// `handleInput` (the move and the up), and F-ja-3's fallback in `handleLocalMoveSize` (a start
+    /// with no left-down recorded on any window while the button is held takes the pointer as its
+    /// grab point).
+    /// A seam for the tests, the shape of `onWindowMoveSent`; the App never sets it.
     var pointerLocation: () -> NSPoint = { NSEvent.mouseLocation }
     /// F-a1-6, gate r1 m-3: the mouse buttons the OS reports as held right now (bit 0 = left),
     /// read while a local move is in flight. If the left-up never reached this window (taken by
     /// Mission Control, an app switch or a modal), the next motion finds bit 0 clear and ends the
     /// move as that up would have (`handleInput`); otherwise the window would follow the bare
-    /// pointer and `applyZOrder` would stay off until the next click. Read at exactly one place
-    /// in `handleInput` (the move). A seam for the tests, the shape of `pointerLocation`; the App
-    /// never sets it.
+    /// pointer and `applyZOrder` would stay off until the next click. Read at exactly two places:
+    /// the move in `handleInput`, and F-ja-3's fallback in `handleLocalMoveSize` (a start that finds
+    /// no left-down recorded on any window engages only while bit 0 is set). A seam for the tests,
+    /// the shape of `pointerLocation`; the App never sets it.
     var pressedMouseButtons: () -> Int = { NSEvent.pressedMouseButtons }
 
     private static let logger = Logger(subsystem: "dev.haru.macdows", category: "RemoteWindowRendering")
@@ -1019,7 +1029,8 @@ final class RemoteWindowRegistry {
     /// stays explicitly out of scope for this slice -- logged verbatim, not interpreted.
     ///
     /// F-a1-6 interprets exactly one type, `RAIL_WMSZ_MOVE` (9), and only while the left button
-    /// is held on that window: the start records the grab offset, marks the window's attached
+    /// is held -- on that window by its recorded left-down, or (F-ja-3's fallback, below) with no
+    /// left-down recorded on any window: the start records the grab offset, marks the window's attached
     /// children as riding along (gate r1 m-4, `LocalMove.followingChildren`), and the client then
     /// moves the window itself (`handleInput`). The end of a move this client ended with the
     /// button-up releases the suppression WITHOUT a settle -- the server placed the window from
@@ -1036,8 +1047,36 @@ final class RemoteWindowRegistry {
     /// difference, chosen so a cancel stays a cancel. Either way the local window is no longer
     /// displaced from the server's, so later clicks land where they look; the rest of that
     /// gesture is forwarded as ordinary input. Every other start and end (types 1-8 and 10-11, a
-    /// start after the up, an end with no local move) is the suppression-only handling above,
-    /// unchanged.
+    /// start after the up with the left button released or held elsewhere -- F-ja-3 below -- and
+    /// an end with no local move) is the suppression-only handling above, unchanged.
+    ///
+    /// F-ja-3, the start's fallback (2026-10-22 in-person batch 2: 2x display, session 200 %).
+    /// F-a1-6 engaged a move only from the window's recorded left-down, and the start can find that
+    /// record already gone while the user is still holding the title bar: on regedit just opened,
+    /// its content still largely black, the left-down at 14:40:29.961 was recorded, a left-up the
+    /// server never answered (its end came only with the next press) cleared it, the start at
+    /// 29.978 logged `leftDown=false engaged=false`, and the window stood still for 6.8 s (to the
+    /// next press at 36.735); the second press failed the same way (36.761), the third engaged
+    /// (38.160); at 1x all six engaged. FreeRDP's X11 client relies on no local record at all
+    /// (`client/X11/xf_rail.c`, `xf_rail_server_local_move_size`, derives its grab point from the
+    /// order's posX/posY). So the grab point is now: the recorded left-down when there is one --
+    /// unchanged, the record wins over the pointer; otherwise, when NO window has a recorded
+    /// left-down (`leftButtonDown.isEmpty`) and the OS still reports the left button held
+    /// (`pressedMouseButtons`, bit 0), the pointer itself (`pointerLocation`) -- the user is
+    /// holding the title bar right now, so the window does not jump when the move engages, and
+    /// then follows; otherwise none, and the start is the suppression-only one above (the button
+    /// was released -- the round trip lost the race -- or it is held somewhere else). Why the
+    /// empty table (fix lane gate r1 I-1): `NSEvent.pressedMouseButtons` is global state, bit 0 is
+    /// set by a press on any target, so a late start for this window must not engage while the
+    /// user is pressing another Macdows window -- and such a press is recorded there. Batch 2's two
+    /// failing starts found the table empty (only 327940 had been pressed, and its record was
+    /// gone), so they engage under this condition. A press outside Macdows (another app, the
+    /// desktop) records nothing and still reaches the fallback: a registered residual. The pointer
+    /// and not posX/posY, for the reason
+    /// `LocalMove.grabOffset` gives. Only `RAIL_WMSZ_MOVE` (9) ever engages, and a start for a
+    /// window that already has a move in flight still replaces it (re-basing on a second start is
+    /// a registered follow-up). Where the clearing up comes from is not known and this does not
+    /// guess it: `sendMouseButton`'s debug lines say whether each button event reached the wire.
     private func handleLocalMoveSize(_ event: CRDPEvent) {
         if !loggedFirstLocalMoveSize {
             loggedFirstLocalMoveSize = true
@@ -1047,17 +1086,43 @@ final class RemoteWindowRegistry {
             Self.logger.debug(
                 "ServerLocalMoveSize windowId=\(event.windowId, privacy: .public) isMoveSizeStart=\(event.isMoveSizeStart, privacy: .public) moveSizeType=\(event.moveSizeType, privacy: .public)")
         }
-        guard let window = windows[event.windowId] else { return }
+        guard let window = windows[event.windowId] else {
+            Self.logger.debug("F-ja-3 LMS for unknown windowId=\(event.windowId, privacy: .public)")
+            return
+        }
         let windowId = event.windowId
         if event.isMoveSizeStart {
-            if event.moveSizeType == Self.railMoveSizeTypeMove, let down = leftButtonDown[windowId] {
+            // The grab point (F-ja-3, see the doc comment): a move type only; the recorded left-down
+            // first; with no record on ANY window, the pointer while the OS still reports the left
+            // button held; otherwise none (suppression only).
+            let down = leftButtonDown[windowId]
+            let grab: NSPoint?
+            if event.moveSizeType != Self.railMoveSizeTypeMove {
+                grab = nil
+            } else if let down {
+                grab = down
+            } else if leftButtonDown.isEmpty, pressedMouseButtons() & 1 != 0 {
+                grab = pointerLocation()
+            } else {
+                grab = nil
+            }
+            let diagFrameOrigin = window.window.frame.origin
+            let diagLeftDown = down != nil
+            let diagFallback = grab != nil && down == nil
+            let diagGrabX = grab.map { Double($0.x) } ?? .nan
+            let diagGrabY = grab.map { Double($0.y) } ?? .nan
+            let diagDowns = leftButtonDown.count
+            let diagChildren = attachedChildOwner.filter { $0.value == windowId }.count
+            Self.logger.debug(
+                "F-ja-3 LMS start windowId=\(windowId, privacy: .public) type=\(event.moveSizeType, privacy: .public) posX=\(event.moveSizePosX, privacy: .public) posY=\(event.moveSizePosY, privacy: .public) leftDown=\(diagLeftDown, privacy: .public) downs=\(diagDowns, privacy: .public) engaged=\(grab != nil, privacy: .public) fallback=\(diagFallback, privacy: .public) grabX=\(diagGrabX, privacy: .public) grabY=\(diagGrabY, privacy: .public) children=\(diagChildren, privacy: .public) frameOrigin=(\(Double(diagFrameOrigin.x), privacy: .public),\(Double(diagFrameOrigin.y), privacy: .public))")
+            if let grab {
                 let origin = window.window.frame.origin
                 let children = Set(attachedChildOwner.filter { $0.value == windowId }.keys)
                 for childId in children {
                     windows[childId]?.beginFollowingOwnerLocalMove()
                 }
                 localMoves[windowId] = LocalMove(
-                    grabOffset: NSPoint(x: down.x - origin.x, y: down.y - origin.y), followingChildren: children)
+                    grabOffset: NSPoint(x: grab.x - origin.x, y: grab.y - origin.y), followingChildren: children)
                 // A parked trailing move would fire into the middle of the drag.
                 pendingTrailingMove.removeValue(forKey: windowId)
             }
@@ -1065,6 +1130,8 @@ final class RemoteWindowRegistry {
         } else {
             let heldMove = localMoves.removeValue(forKey: windowId)
             let endedAfterUp = localMovesAwaitingEnd.remove(windowId) != nil
+            Self.logger.debug(
+                "F-ja-3 LMS end windowId=\(windowId, privacy: .public) path=\(heldMove != nil ? "held" : (endedAfterUp ? "afterUp" : "plain"), privacy: .public) posX=\(event.moveSizePosX, privacy: .public) posY=\(event.moveSizePosY, privacy: .public)")
             if let heldMove {
                 // Ended while held (I-1): snap back. The children are unmarked AFTER it, so the
                 // frame each one is compared at is where the snap-back carried it (F-6): after a
@@ -1969,11 +2036,28 @@ final class RemoteWindowRegistry {
             // waiting for that up, not for this motion (`pressedMouseButtons`).
             if let move = localMoves[windowId] {
                 let pointer = pointerLocation()
-                if pressedMouseButtons() & 1 == 0 {
+                let buttons = pressedMouseButtons()
+                localMoves[windowId]?.steps += 1
+                let diagStep = localMoves[windowId]?.steps ?? 0
+                let diagLostUp = buttons & 1 == 0
+                let diagWanted = diagStep <= 3 || diagStep % 32 == 0 || diagLostUp
+                if buttons & 1 == 0 {
+                    if diagWanted {
+                        let requested = move.origin(forPointer: pointer)
+                        let frameNow = windows[windowId]?.window.frame.origin ?? .zero
+                        Self.logger.debug(
+                            "F-ja-3 move windowId=\(windowId, privacy: .public) step=\(diagStep, privacy: .public) buttons=\(buttons, privacy: .public) lostUp=\(diagLostUp, privacy: .public) pointer=(\(Double(pointer.x), privacy: .public),\(Double(pointer.y), privacy: .public)) requested=(\(Double(requested.x), privacy: .public),\(Double(requested.y), privacy: .public)) frameAfter=(\(Double(frameNow.x), privacy: .public),\(Double(frameNow.y), privacy: .public))")
+                    }
                     endLocalMoveWithButtonUp(windowId: windowId, move: move, pointer: pointer)
                     return
                 }
                 windows[windowId]?.moveLocally(toOrigin: move.origin(forPointer: pointer))
+                if diagWanted {
+                    let requested = move.origin(forPointer: pointer)
+                    let frameAfter = windows[windowId]?.window.frame.origin ?? .zero
+                    Self.logger.debug(
+                        "F-ja-3 move windowId=\(windowId, privacy: .public) step=\(diagStep, privacy: .public) buttons=\(buttons, privacy: .public) lostUp=\(diagLostUp, privacy: .public) pointer=(\(Double(pointer.x), privacy: .public),\(Double(pointer.y), privacy: .public)) requested=(\(Double(requested.x), privacy: .public),\(Double(requested.y), privacy: .public)) frameAfter=(\(Double(frameAfter.x), privacy: .public),\(Double(frameAfter.y), privacy: .public))")
+                }
                 return
             }
             let now = CFAbsoluteTimeGetCurrent()
@@ -2013,8 +2097,12 @@ final class RemoteWindowRegistry {
             // or middle click mid-drag is forwarded as ordinary input and leaves the move alone.
             if button == .left {
                 if down {
+                    Self.logger.debug(
+                        "F-ja-3 left-down windowId=\(windowId, privacy: .public) point=(\(Double(screenPoint.x), privacy: .public),\(Double(screenPoint.y), privacy: .public))")
                     leftButtonDown[windowId] = screenPoint
                 } else if let move = localMoves[windowId] {
+                    Self.logger.debug(
+                        "F-ja-3 real-up windowId=\(windowId, privacy: .public) eventPoint=(\(Double(screenPoint.x), privacy: .public),\(Double(screenPoint.y), privacy: .public)) step=\(move.steps, privacy: .public)")
                     endLocalMoveWithButtonUp(windowId: windowId, move: move, pointer: pointerLocation())
                     return
                 } else {
@@ -2379,9 +2467,20 @@ final class RemoteWindowRegistry {
     /// The one place a mouse button event reaches the wire -- `handleInput`'s `.mouseButton` and a
     /// local move's up (`endLocalMoveWithButtonUp`) -- with `onMouseButtonSent` right after the
     /// send. ADR-0015 §5.A.6: no topology -> skip the conversion and the send, do not substitute
-    /// one.
+    /// one. F-ja-3 diagnostics: one debug line per call -- `button-send` with the wire point just
+    /// before the send, or `button-skip` with the local point when the conversion fails -- so a
+    /// live log says whether the up that cleared a left-down record ever reached the server.
     private func sendMouseButton(_ button: RemoteWindowMouseButton, down: Bool, at screenPoint: NSPoint, windowId: UInt32) {
-        guard let point = remotePoint(from: screenPoint) else { return }
+        let diagButton = crMouseButton(for: button).rawValue
+        guard let point = remotePoint(from: screenPoint) else {
+            Self.logger.debug(
+                "F-ja-3 button-skip windowId=\(windowId, privacy: .public) button=\(diagButton, privacy: .public) down=\(down, privacy: .public) point=(\(Double(screenPoint.x), privacy: .public),\(Double(screenPoint.y), privacy: .public))")
+            return
+        }
+        let diagX = Int32(point.x)
+        let diagY = Int32(point.y)
+        Self.logger.debug(
+            "F-ja-3 button-send windowId=\(windowId, privacy: .public) button=\(diagButton, privacy: .public) down=\(down, privacy: .public) remote=(\(diagX, privacy: .public),\(diagY, privacy: .public))")
         session.send(crMouseButton(for: button), down: down, atX: Int32(point.x), y: Int32(point.y))
         onMouseButtonSent?(windowId, crMouseButton(for: button), down, Int32(point.x), Int32(point.y))
     }
@@ -2550,6 +2649,9 @@ final class RemoteWindowRegistry {
         let top = Int32(sent.top.rounded())
         let right = Int32(sent.right.rounded())
         let bottom = Int32(sent.bottom.rounded())
+        // F-ja-3 diagnostics: the moment a settle pushes a rect back to the server.
+        Self.logger.debug(
+            "F-ja-3 client-window-move windowId=\(windowId, privacy: .public) wr=(\(left, privacy: .public),\(top, privacy: .public),\(right, privacy: .public),\(bottom, privacy: .public))")
         session.sendWindowMove(windowId, left: left, top: top, right: right, bottom: bottom)
         // Team-lead review round 4 (2026-08-23): a MacdowsCoreTests-level offline
         // reproduction of this exact call's own math (using this round's real-host numbers)
