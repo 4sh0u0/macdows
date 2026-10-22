@@ -220,6 +220,15 @@ final class DisplayTopologyProvider: DisplayTopologyProviding {
                 "no usable display at connect -- desktopWidth/Height deliberately NOT set (adr/0015 §5.A.6: 0x0 would fall back to FreeRDP's 1024x768 desktop, CRSession.h:285-286)"
             )
         }
+        // F-ja-4 lane E, diagnostics only: the work area this same freeze derives (the connect path
+        // assigns it to the four work-area properties of the session it starts). Its own line, so the line above
+        // keeps its archived text; numbers only.
+        if let topology {
+            let workArea = topology.workAreaInRemotePixels?.wireFields ?? "none"
+            Self.logger.notice(
+                "session work area frozen at connect: wa=\(workArea, privacy: .public) remote px (F-ja-4 lane E: primary visibleFrame; mid-session changes are not followed)"
+            )
+        }
         return sessionDesktopSize
     }
 
@@ -341,11 +350,11 @@ final class DisplayTopologyProvider: DisplayTopologyProviding {
         return topology
     }
 
-    /// The pure shape of the adapter: four fields per screen, then `MacdowsCore`'s failable
+    /// The pure shape of the adapter: five fields per screen, then `MacdowsCore`'s failable
     /// initializer. Takes the screen list as a parameter rather than reading it, so that the read
     /// point stays singular and this mapping is inspectable in isolation.
     ///
-    /// Three mapping decisions, none of them this lane's to make:
+    /// Four mapping decisions; the first three are not F-ja-4's to make:
     ///
     /// * **`origin`/`size` are `NSScreen.frame` verbatim, in mac points** -- ADR §2 rule 1's
     ///   `(originPt, sizePt, scale, isPrimary)`. No normalisation, no rounding: AppKit's frames
@@ -373,6 +382,11 @@ final class DisplayTopologyProvider: DisplayTopologyProviding {
     ///   `backingPixelsPerPoint` carries the same number but means something different (what the
     ///   Mac renders at); M1 records it and applies it nowhere, because applying it is the
     ///   `DesktopScaleFactor` question ADR §8 assigns to W3 and this milestone forbids.
+    /// * **`visibleFrame` is `NSScreen.visibleFrame` verbatim** (F-ja-4 lane E, owner ruling
+    ///   2026-10-22: the work area excludes the menu bar AND the Dock). Read here, in the same
+    ///   pass as the frame, so it is frozen with the rest of the snapshot and §5.A.5's single read
+    ///   point stays single; `anchorScreens()` reads the same property for local panel placement
+    ///   and is unrelated. Its only consumer is `DisplayTopology.workAreaInRemotePixels`.
     static func topology(of screens: [NSScreen]) -> DisplayTopology? {
         DisplayTopology(displays: screens.enumerated().map { index, screen in
             DisplayTopology.Display(
@@ -382,7 +396,11 @@ final class DisplayTopologyProvider: DisplayTopologyProviding {
                     remotePixelsPerPoint: Double(screen.backingScaleFactor),
                     backingPixelsPerPoint: Double(screen.backingScaleFactor)
                 ),
-                isPrimary: index == 0
+                isPrimary: index == 0,
+                visibleFrame: MacRect(
+                    x: Double(screen.visibleFrame.origin.x), y: Double(screen.visibleFrame.origin.y),
+                    width: Double(screen.visibleFrame.width), height: Double(screen.visibleFrame.height)
+                )
             )
         })
     }

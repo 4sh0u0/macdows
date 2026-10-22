@@ -49,6 +49,13 @@ struct DisplayTopologyProviderTests {
     /// ADR 0015 §2 rule 1: the adapter maps four fields per screen, verbatim -- frame origin
     /// and size in mac points, `backingScaleFactor` into BOTH scale ratios (§3's answer P),
     /// and `isPrimary` == "index 0", explicitly not `NSScreen.main`.
+    ///
+    /// F-ja-4 lane E adds the fifth: `visibleFrame` is `NSScreen.visibleFrame` verbatim, all four
+    /// components. Unlike the origin / primary / scale family above, this one DOES discriminate on
+    /// the project's one-display hardware whenever the menu bar or the Dock takes space (the
+    /// owner Mac: frame (0,0,2560,1440), visibleFrame (0,90,2560,1320)) -- mapping `frame` into it
+    /// goes red here. On a screen with neither (visibleFrame == frame) it degenerates like the
+    /// others.
     @Test func adapterMapsEachScreenFieldForField() throws {
         let screens = NSScreen.screens
         guard !screens.isEmpty else { return } // headless: registered boundary, see file header
@@ -63,6 +70,10 @@ struct DisplayTopologyProviderTests {
             #expect(display.scale.remotePixelsPerPoint == Double(screen.backingScaleFactor))
             #expect(display.scale.backingPixelsPerPoint == Double(screen.backingScaleFactor))
             #expect(display.isPrimary == (index == 0))
+            #expect(display.visibleFrame == MacRect(
+                x: Double(screen.visibleFrame.origin.x), y: Double(screen.visibleFrame.origin.y),
+                width: Double(screen.visibleFrame.width), height: Double(screen.visibleFrame.height)
+            ))
         }
     }
 

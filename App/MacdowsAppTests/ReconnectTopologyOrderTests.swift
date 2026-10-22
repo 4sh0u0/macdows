@@ -218,6 +218,31 @@ struct ReconnectTopologyOrderTests {
     }
 }
 
+/// F-ja-4 lane E: the four work-area properties as one array, so "assigned from the snapshot" and
+/// "left as the sentinel" read as one comparison.
+@MainActor
+private func workAreaEdges(of session: CRSession) -> [UInt32] {
+    [session.workAreaLeft, session.workAreaTop, session.workAreaRight, session.workAreaBottom]
+}
+
+/// What `refreeze` must have assigned for `snapshot`: the product work area's four edges, or all
+/// zero when there is none (no usable display, or nothing sendable).
+private func expectedWorkAreaEdges(for snapshot: DisplayTopology?) -> [UInt32] {
+    guard let area = snapshot?.workAreaInRemotePixels else { return [0, 0, 0, 0] }
+    return [UInt32(area.left), UInt32(area.top), UInt32(area.right), UInt32(area.bottom)]
+}
+
+/// Sentinel work-area edges no layout produces (right < left), so "assigned" and "left alone" differ.
+private let workAreaSentinel: [UInt32] = [4001, 4002, 3, 4]
+
+@MainActor
+private func setWorkAreaSentinel(on session: CRSession) {
+    session.workAreaLeft = workAreaSentinel[0]
+    session.workAreaTop = workAreaSentinel[1]
+    session.workAreaRight = workAreaSentinel[2]
+    session.workAreaBottom = workAreaSentinel[3]
+}
+
 @MainActor
 @Suite("ReconnectTopologyRefresh — one read fixes three things (adr/0019 §2 lane C)")
 struct ReconnectTopologyRefreshTests {
@@ -236,6 +261,11 @@ struct ReconnectTopologyRefreshTests {
     /// catches it on a static layout), resolving the advertised scale against `currentTopology`
     /// instead of the frozen snapshot, and returning the live provider instead of a static
     /// snapshot of it.
+    ///
+    /// F-ja-4 lane E extends the sentinels to the work area's four edges: on a host with a display
+    /// they must be overwritten with the snapshot's `workAreaInRemotePixels` (or zeroed when it has
+    /// none); headless, zeroed (the `else` arm, W8). MUST-RED additionally for a `refreeze` that
+    /// never assigns the work area, and -- headless -- for one whose `else` arm leaves it alone.
     @Test func refreezeAssignsDesktopAndScaleFromOneRead() throws {
         let session = CRSession(host: "", user: "", passwordBytes: Data(), program: "")
         // Values no layout can produce, so "left alone" and "assigned" are distinguishable.
@@ -243,6 +273,7 @@ struct ReconnectTopologyRefreshTests {
         session.desktopHeight = 222
         session.advertisedDesktopScaleFactor = 999
         session.advertisedDeviceScaleFactor = 888
+        setWorkAreaSentinel(on: session)
         let provider = DisplayTopologyProvider(notificationCenter: NotificationCenter())
 
         let returned = try #require(
@@ -269,6 +300,9 @@ struct ReconnectTopologyRefreshTests {
                 #expect(session.advertisedDesktopScaleFactor == 0)
                 #expect(session.advertisedDeviceScaleFactor == 0)
             }
+            // And the work area is the SAME snapshot's (F-ja-4 lane E).
+            #expect(workAreaEdges(of: session) == expectedWorkAreaEdges(for: snapshot))
+            #expect(workAreaEdges(of: session) != workAreaSentinel, "the work-area sentinel must have been overwritten")
         } else {
             // Headless host: adr/0015 §5.A.6 — nothing is sent, so the desktop pair keeps the
             // (now stale) value it had, and the advertised pair is zeroed because a reused
@@ -277,6 +311,8 @@ struct ReconnectTopologyRefreshTests {
             #expect(session.desktopHeight == 222)
             #expect(session.advertisedDesktopScaleFactor == 0)
             #expect(session.advertisedDeviceScaleFactor == 0)
+            // The work area is zeroed for the same reason (F-ja-4 lane E, W8).
+            #expect(workAreaEdges(of: session) == [0, 0, 0, 0])
             #expect(returned.currentTopology == nil)
         }
     }
@@ -306,6 +342,7 @@ struct ReconnectTopologyRefreshTests {
         session.desktopHeight = 222
         session.advertisedDesktopScaleFactor = 777
         session.advertisedDeviceScaleFactor = 666
+        setWorkAreaSentinel(on: session)
 
         let second = try #require(ReconnectTopologyRefresh.refreeze(session: session, topology: provider))
 
@@ -324,10 +361,13 @@ struct ReconnectTopologyRefreshTests {
                 #expect(session.advertisedDesktopScaleFactor == 0)
                 #expect(session.advertisedDeviceScaleFactor == 0)
             }
+            #expect(workAreaEdges(of: session) == expectedWorkAreaEdges(for: snapshot),
+                    "the work-area sentinel must have been overwritten from the second freeze")
         } else {
             #expect(session.desktopWidth == 111, "adr/0015 §5.A.6: nothing is sent, so nothing is assigned")
             #expect(session.advertisedDesktopScaleFactor == 0, "the advertised pair is zeroed on every call")
             #expect(session.advertisedDeviceScaleFactor == 0)
+            #expect(workAreaEdges(of: session) == [0, 0, 0, 0], "so is the work area (F-ja-4 lane E)")
         }
     }
 

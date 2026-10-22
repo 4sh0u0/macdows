@@ -2870,6 +2870,38 @@ enum WindowSmokeGateSelfTest {
             "labPinRefusalHasItsOwnExitCode: the refusal exit code is distinct from pass / fail / missing credentials / boundary refusal, and the refusal line carries no key=value"
         )
 
+        // --- F-ja-4 lane E: WINDOW_SMOKE_WORK_AREA -----------------------------------------------
+        expect(
+            WorkAreaKnob.isEnabled(nil) && WorkAreaKnob.isEnabled("") && WorkAreaKnob.isEnabled("1")
+                && WorkAreaKnob.isEnabled("off") && WorkAreaKnob.isEnabled(" 0") && !WorkAreaKnob.isEnabled("0"),
+            "workAreaKnobDefaultsOn: unset, empty, 1 and any other value keep the product work area; only the literal 0 forces it off"
+        )
+        if let insetTopology = DisplayTopology(displays: [
+            DisplayTopology.Display(
+                origin: MacPoint(x: 0, y: 0), size: MacSize(width: 1920, height: 1080), scale: .unscaled,
+                isPrimary: true, visibleFrame: MacRect(x: 0, y: 90, width: 1920, height: 960)
+            ),
+        ]) {
+            let on = WorkAreaKnob.resolve(enabled: true, topology: insetTopology)
+            expect(
+                on == insetTopology.workAreaInRemotePixels && on?.wireFields == "0,30,1920,990"
+                    && WorkAreaKnob.resolve(enabled: false, topology: insetTopology) == nil
+                    && WorkAreaKnob.resolve(enabled: true, topology: nil) == nil,
+                "workAreaResolvesThroughTheProductFunction: on = DisplayTopology.workAreaInRemotePixels of the frozen topology (1080-pt primary, menu bar 30, Dock 90 -> 0,30,1920,990); forced off or no topology = nothing"
+            )
+        } else {
+            expect(false, "workAreaResolvesThroughTheProductFunction: could not build the inset fixture topology")
+        }
+        let offLine = WorkAreaKnob.evidenceLine(reason: "connect", enabled: false, assigned: [0, 0, 0, 0])
+        let onLine = WorkAreaKnob.evidenceLine(reason: "connect", enabled: true, assigned: [0, 30, 2560, 1350])
+        let noneLine = WorkAreaKnob.evidenceLine(reason: "connect", enabled: true, assigned: [0, 0, 0, 0])
+        expect(
+            offLine.hasPrefix("[work-area] connect: WINDOW_SMOKE_WORK_AREA=0") && offLine.contains("NOT sent")
+                && onLine.hasPrefix("[work-area] connect: assigned 0,30,2560,1350 remote px") && !onLine.contains("NOT sent")
+                && noneLine.contains("assigned 0,0,0,0, NOT sent"),
+            "workAreaEvidenceLineSaysWhatWasAssigned: forced off names the knob and says NOT sent; on prints the four assigned numbers; nothing to resolve says NOT sent"
+        )
+
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
         // rev-L9 M-4: `Scripts/run-window-smoke.command:192-193` records `DONE exit=<rc>` via `launcher_done` and its callers
         // read that line as the whole verdict. A `WINDOW_SMOKE_SELFTEST=1` leaked into the
@@ -3116,6 +3148,49 @@ let advertisedScaleKnob: AdvertisedScaleKnob.Parsed = {
     }
     return parsed
 }()
+
+/// WINDOW_SMOKE_WORK_AREA (F-ja-4 lane E; fixture-only, the App target never reads it): whether this
+/// run reports the RAIL work area to the server. DEFAULT ON, and on means the PRODUCT value: the
+/// session frozen topology's `DisplayTopology.workAreaInRemotePixels` (the primary's `visibleFrame` in
+/// remote pixels, owner ruling 2026-10-22), assigned to the same four `CRSession` properties the App
+/// assigns -- the fixture measures what ships. `0` -- the literal string, nothing else, the same rule as
+/// `WINDOW_SMOKE_EXTRA_APPS_RETRY` -- forces it off: all four stay 0, the bridge sends nothing, and the
+/// server keeps the start command's whole-desktop work area (the pre-lane wire, e.g. the 2026-09-21
+/// `wa=0,0,2560,1440` baseline). Every freeze prints one `[work-area]` line built from the values READ
+/// BACK from the session, never from the knob. Note: `WINDOW_SMOKE_DECLARED_DESKTOP` does not change
+/// this value (it is derived from the REAL frozen topology), so a mis-declaration run that must
+/// reproduce the pre-lane wire sets this knob to 0 as well.
+enum WorkAreaKnob {
+    /// Only the literal `"0"` disables; unset, empty, `"1"` and anything else leave the product default on.
+    static func isEnabled(_ raw: String?) -> Bool {
+        raw != "0"
+    }
+
+    /// What to assign: the product function's value of `topology` (the session's frozen snapshot), or
+    /// nothing when forced off or when there is no usable display / no sendable work area.
+    static func resolve(enabled: Bool, topology: DisplayTopology?) -> WorkAreaInRemotePixels? {
+        guard enabled else { return nil }
+        return topology?.workAreaInRemotePixels
+    }
+
+    /// The per-freeze evidence line, from the four values ASSIGNED (read back from the session).
+    static func evidenceLine(reason: String, enabled: Bool, assigned: [UInt32]) -> String {
+        let fields = assigned.map(String.init).joined(separator: ",")
+        if !enabled {
+            return "[work-area] \(reason): WINDOW_SMOKE_WORK_AREA=0 -- forced off, assigned \(fields), NOT sent "
+                + "(the server keeps the start command's whole-desktop work area, the pre-lane wire)"
+        }
+        if assigned.allSatisfy({ $0 == 0 }) {
+            return "[work-area] \(reason): product work area resolves to nothing (no usable display, or an empty "
+                + "work area) -- assigned \(fields), NOT sent"
+        }
+        return "[work-area] \(reason): assigned \(fields) remote px -- the bridge sends it after every start command "
+            + "(F-ja-4 lane E, product default: primary visibleFrame via DisplayTopology.workAreaInRemotePixels)"
+    }
+}
+
+/// See `WorkAreaKnob`. Read here, beside the other knobs, before anything touches host.env or a socket.
+let workAreaKnobEnabled = WorkAreaKnob.isEnabled(ProcessInfo.processInfo.environment["WINDOW_SMOKE_WORK_AREA"])
 
 // Three MacdowsCore rules and no local copy of any of them: MacdowsPaths says WHERE host.env
 // is, EnvFile.parse says HOW it is read, EnvFile.value says WHICH of the environment variable
@@ -5359,7 +5434,32 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                     + (advertisedScaleKnob == .unset ? "" : " Advertised-scale pair cleared (WINDOW_SMOKE_ADVERTISED_SCALE set, nothing to resolve against): NOT advertising.")
             )
         }
+        applyWorkArea(to: session, reason: reason)
         return desktop
+    }
+
+    /// F-ja-4 lane E: the work area from THIS freeze's snapshot, through the product function
+    /// (`WorkAreaKnob.resolve` -> `DisplayTopology.workAreaInRemotePixels`), unless
+    /// `WINDOW_SMOKE_WORK_AREA=0`. Both arms assign all four properties: cycle mode reuses one
+    /// `CRSession`, so a value left from an earlier freeze would otherwise reach the next `-start`
+    /// (the App's connect path and `ReconnectTopologyRefresh.refreeze` zero for the same reason). Its
+    /// own `[work-area]` line, so the frozen `[topology]` lines keep their text.
+    private func applyWorkArea(to session: CRSession, reason: String) {
+        if let workArea = WorkAreaKnob.resolve(enabled: workAreaKnobEnabled, topology: displayTopology.sessionSnapshot) {
+            session.workAreaLeft = UInt32(workArea.left)
+            session.workAreaTop = UInt32(workArea.top)
+            session.workAreaRight = UInt32(workArea.right)
+            session.workAreaBottom = UInt32(workArea.bottom)
+        } else {
+            session.workAreaLeft = 0
+            session.workAreaTop = 0
+            session.workAreaRight = 0
+            session.workAreaBottom = 0
+        }
+        print(WorkAreaKnob.evidenceLine(
+            reason: reason, enabled: workAreaKnobEnabled,
+            assigned: [session.workAreaLeft, session.workAreaTop, session.workAreaRight, session.workAreaBottom]
+        ))
     }
 
     /// The M1 measurement summaries — F2's `[gfx] target=` (`docs/plans/phase3.md:132`) and F1's

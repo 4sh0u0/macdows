@@ -423,6 +423,14 @@ typedef struct
      * seq=1. Both touched on T_rdp only after -start. */
     BOOL keyWitness;
     uint32_t keyWitnessSeq;
+
+    /* F-ja-4 lane E: the work area crb_monitored_desktop reports after the start command on every
+     * ARC_COMPLETED (CRSession.h's workAreaLeft/Top/Right/Bottom contract). Written once per
+     * connection, by crb_pre_connect on T_rdp -- the four properties validated into a
+     * TS_RECTANGLE_16, or all zero for "send nothing" -- and read only by crb_monitored_desktop,
+     * also on T_rdp. freerdp_client_context_new() allocates this struct zero-filled, and
+     * crb_pre_connect writes every field on both of its paths. */
+    RECTANGLE_16 workArea;
 } CRBridgeContext;
 
 /* Only the RDPGFX wrappers need this: gdi_graphics_pipeline_init() claims
@@ -993,6 +1001,30 @@ static BOOL crb_monitored_desktop(rdpContext *context, const WINDOW_ORDER_INFO *
         p->arcCompletedStartCmdSends++;
         WLog_INFO(TAG, "ClientRailServerStartCmd arc-completed send=%u", (unsigned)p->arcCompletedStartCmdSends);
         client_rail_server_start_cmd(p->rail);
+    }
+    /* F-ja-4 lane E: the real work area, right after the start command. That command's own
+     * sysparam reports the WHOLE desktop as the work area (client_rails.c:48-60), so without this
+     * the server snaps, maximises and restores RemoteApp windows with their title bar under the
+     * Mac menu bar. One sysparam carrying only the work-area mask, the same order the upstream X11
+     * client sends after the start command since 3.31.0 (xf_rail.c, xf_rail_send_workarea). Its
+     * own block, AFTER X-C's: the carrier line there must stay immediately followed by the start
+     * command and that block's closing brace. Every ARC_COMPLETED sends it again, so the server
+     * sees two work-area changes per ARC_COMPLETED, the start command's and this one (U-4).
+     * Nothing is sent when crb_pre_connect left all four edges zero. */
+    if ((orderInfo->fieldFlags & WINDOW_ORDER_FIELD_DESKTOP_ARC_COMPLETED) && p->rail &&
+        (p->workArea.left | p->workArea.top | p->workArea.right | p->workArea.bottom) != 0)
+    {
+        RAIL_SYSPARAM_ORDER workAreaParam;
+        memset(&workAreaParam, 0, sizeof(workAreaParam));
+        workAreaParam.params = SPI_MASK_SET_WORK_AREA;
+        workAreaParam.workArea = p->workArea;
+        const UINT rc = p->rail->ClientSystemParam(p->rail, &workAreaParam);
+        if (rc == CHANNEL_RC_OK)
+            WLog_INFO(TAG, "ClientSystemParam work-area arc-completed %u,%u,%u,%u",
+                      (unsigned)p->workArea.left, (unsigned)p->workArea.top,
+                      (unsigned)p->workArea.right, (unsigned)p->workArea.bottom);
+        else
+            WLog_WARN(TAG, "ClientSystemParam work-area arc-completed send failed rc=%u", (unsigned)rc);
     }
     return TRUE;
 }
@@ -2044,6 +2076,37 @@ static BOOL crb_pre_connect(freerdp *instance)
         if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopScaleFactor, session.advertisedDesktopScaleFactor) ||
             !freerdp_settings_set_uint32(settings, FreeRDP_DeviceScaleFactor, session.advertisedDeviceScaleFactor))
             return FALSE;
+    }
+    /* F-ja-4 lane E: the work area, read here once per connection (CRSession.h's contract for the
+     * four properties, the same as desktopWidth's) and copied into the context, where
+     * crb_monitored_desktop sends it after every start command. All four zero = send nothing.
+     * Anything else must be a non-empty TS_RECTANGLE_16 -- the wire edges are UINT16 and a cast
+     * would silently wrap -- or it is refused here, loudly, and nothing is sent. This never fails
+     * the connection: without it the server keeps the start command's whole-desktop work area,
+     * which is the pre-lane behaviour. */
+    {
+        const uint32_t left = session.workAreaLeft;
+        const uint32_t top = session.workAreaTop;
+        const uint32_t right = session.workAreaRight;
+        const uint32_t bottom = session.workAreaBottom;
+        memset(&p->workArea, 0, sizeof(p->workArea));
+        if ((left | top | right | bottom) != 0)
+        {
+            if (right > UINT16_MAX || bottom > UINT16_MAX || left >= right || top >= bottom)
+            {
+                WLog_WARN(TAG,
+                          "work area %u,%u,%u,%u is not a non-empty TS_RECTANGLE_16 -- not sending it "
+                          "(the server keeps the start command's whole-desktop work area)",
+                          (unsigned)left, (unsigned)top, (unsigned)right, (unsigned)bottom);
+            }
+            else
+            {
+                p->workArea.left = (UINT16)left;
+                p->workArea.top = (UINT16)top;
+                p->workArea.right = (UINT16)right;
+                p->workArea.bottom = (UINT16)bottom;
+            }
+        }
     }
     if (!freerdp_settings_set_string(settings, FreeRDP_RemoteApplicationProgram, session.program.UTF8String))
         return FALSE;

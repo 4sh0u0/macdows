@@ -217,6 +217,8 @@ public struct DisplayTopology: Equatable, Sendable {
     /// One display in the local (Mac) screen layout: origin, size, scale, and whether it is
     /// the primary -- exactly the four fields ADR §2 rule 1 specifies, and the shape W4 fills
     /// in when it wires `MONITOR_ATTRIBUTES` (ADR §8: fill fields, do not change the model).
+    /// F-ja-4 lane E adds a fifth, `visibleFrame`, which none of the ADR §2-§4 derivations read
+    /// (its only consumer is `DisplayTopology.workAreaInRemotePixels`).
     ///
     /// COORDINATE SPACE, stated once so no consumer has to guess: `origin` and `size` are in
     /// **macOS screen space** -- bottom-left origin, Y up, the primary display's bottom-left
@@ -242,11 +244,33 @@ public struct DisplayTopology: Equatable, Sendable {
         /// topology has exactly one (enforced by `DisplayTopology.init(displays:)`).
         public var isPrimary: Bool
 
-        public init(origin: MacPoint, size: MacSize, scale: DisplayScale, isPrimary: Bool) {
+        /// F-ja-4 lane E: this display's `NSScreen.visibleFrame` -- the frame minus the menu bar
+        /// and the Dock -- in the same mac screen space and unit as `frameInPoints`. Read at the
+        /// same single `NSScreen` read as the other four fields (adr/0015 §5.A.5), so it is frozen
+        /// with them. Its one consumer is `DisplayTopology.workAreaInRemotePixels`, and only the
+        /// PRIMARY's value is consumed; the flip anchor, the union and the desktop size never read
+        /// it, which is what keeps every pre-lane number byte-identical.
+        ///
+        /// Defaults to `frameInPoints` (see `init`), so a display described without one has no
+        /// menu bar and no Dock -- the work area then equals the whole desktop, which is exactly
+        /// what the wire carried before this lane.
+        public var visibleFrame: MacRect
+
+        /// - Parameter visibleFrame: `nil` (the default) means "the whole frame", i.e.
+        ///   `MacRect(origin, size)`; every fixture written before F-ja-4 lane E takes that path.
+        public init(
+            origin: MacPoint,
+            size: MacSize,
+            scale: DisplayScale,
+            isPrimary: Bool,
+            visibleFrame: MacRect? = nil
+        ) {
             self.origin = origin
             self.size = size
             self.scale = scale
             self.isPrimary = isPrimary
+            self.visibleFrame = visibleFrame
+                ?? MacRect(x: origin.x, y: origin.y, width: size.width, height: size.height)
         }
 
         /// This display's frame in mac screen space (points) -- `origin` and `size` as one rect.
@@ -507,6 +531,95 @@ public struct DisplayTopology: Equatable, Sendable {
         guard displays.indices.contains(index) else { return nil }
         return WindowGeometry.windowsRect(from: displays[index].frameInPoints, in: self)
     }
+
+    // MARK: - The RAIL work area (F-ja-4 lane E)
+
+    /// The work area this client reports to the RAIL server (`SPI_SET_WORK_AREA`), in remote
+    /// pixels: **the primary display's `visibleFrame`**, flipped into Windows space by the same
+    /// `WindowGeometry` conversion every other remote rect goes through, clipped to the desktop,
+    /// and rounded INWARD to whole pixels. The fourth quantity derived from the connect-time
+    /// freeze, beside the desktop size, the flip anchor and the advertised scale; it changes none
+    /// of them.
+    ///
+    /// WHY IT EXISTS. The server's work area is not a property of the server: the vendored
+    /// `client_rail_server_start_cmd` reports `(0, 0, DesktopWidth, DesktopHeight)` -- the whole
+    /// desktop, menu bar and Dock included -- on every ARC_COMPLETED, so Windows snaps, maximises
+    /// and restores remote windows with their title bar at y = 0, under the Mac menu bar. The
+    /// upstream X11 client has sent the real work area right after the start command since
+    /// FreeRDP 3.31.0; the bridge now does the same with this value.
+    ///
+    /// The four rules, each of which a test pins:
+    ///
+    /// * **Primary only.** Today's server has exactly one synthesised monitor covering the union,
+    ///   so a second display's work area has nowhere to go (a W4 gap, like the negative
+    ///   extension). The primary is chosen by `isPrimary`, never by position in `displays`.
+    /// * **The existing flip, not a new formula.** `left = minX·s`, `top = (H − maxY)·s`,
+    ///   `right = maxX·s`, `bottom = (H − minY)·s`, with `s = rasterScale` and `H` the primary's
+    ///   height -- exactly `WindowGeometry.windowsRect(from:in:)`.
+    /// * **Clipped to `[0, desktopSizeInRemotePixels]`.** TS_RECTANGLE_16 is unsigned, and a work
+    ///   area outside the desktop the server was told about describes nothing it can use.
+    /// * **Rounded inward** (left / top up, right / bottom down): at a fractional scale the result
+    ///   must never claim a pixel row that is partly under the menu bar or the Dock. At 1x and 2x
+    ///   with integer point coordinates no rounding happens at all.
+    ///
+    /// `nil` when the clipped, rounded rectangle is empty or not finite -- a value that cannot be
+    /// sent. The caller then sends nothing, and the server keeps the start command's whole-desktop
+    /// work area, i.e. today's wire. When `visibleFrame == frame` (the default) the result is
+    /// exactly `(0, 0, desktopWidth, desktopHeight)` on a single display at an integer scale: the
+    /// same numbers the start command itself sends. Gate r1 m-1 of the F-ja-4 lane names the two
+    /// cases where it is not: with several displays the result is the primary display's frame, not
+    /// the union the desktop covers, and a fractional scale rounds inward by one pixel (1365x768 at
+    /// 1.5 gives 2047 where the desktop is 2048).
+    public var workAreaInRemotePixels: WorkAreaInRemotePixels? {
+        let flipped = WindowGeometry.windowsRect(from: primary.visibleFrame, in: self)
+        let desktop = desktopSizeInRemotePixels
+        let maxX = Double(desktop.width)
+        let maxY = Double(desktop.height)
+
+        func clipped(_ value: Double, to upper: Double) -> Double {
+            Swift.min(Swift.max(value, 0), upper)
+        }
+
+        let left = clipped(flipped.x, to: maxX).rounded(.up)
+        let top = clipped(flipped.y, to: maxY).rounded(.up)
+        let right = clipped(flipped.x + flipped.width, to: maxX).rounded(.down)
+        let bottom = clipped(flipped.y + flipped.height, to: maxY).rounded(.down)
+
+        guard left.isFinite, top.isFinite, right.isFinite, bottom.isFinite,
+              right > left, bottom > top
+        else { return nil }
+        // In range by construction: every value is clipped into [0, desktop extent], and the
+        // desktop extent is at most `DesktopSizeInRemotePixels.maxExtentInRemotePixels` (65535).
+        return WorkAreaInRemotePixels(
+            left: UInt16(left), top: UInt16(top), right: UInt16(right), bottom: UInt16(bottom)
+        )
+    }
+}
+
+/// A RAIL work area in remote pixels, shaped like the wire's TS_RECTANGLE_16: four unsigned
+/// 16-bit edges, right and bottom EXCLUSIVE. Produced only by
+/// `DisplayTopology.workAreaInRemotePixels` (the initializer is internal), which guarantees
+/// `left < right <= desktopWidth` and `top < bottom <= desktopHeight`.
+public struct WorkAreaInRemotePixels: Equatable, Sendable {
+    public let left: UInt16
+    public let top: UInt16
+    /// Exclusive.
+    public let right: UInt16
+    /// Exclusive.
+    public let bottom: UInt16
+
+    init(left: UInt16, top: UInt16, right: UInt16, bottom: UInt16) {
+        self.left = left
+        self.top = top
+        self.right = right
+        self.bottom = bottom
+    }
+
+    /// `left,top,right,bottom` -- four integers and three commas, nothing else, in the order and
+    /// shape the host-side sampler prints the server's view (`wa=0,30,2560,1350`). The log field
+    /// for this value; `DisplayTopology.description` and `Display.description` are deliberately
+    /// NOT extended (archived oslog lines depend on their exact text).
+    public var wireFields: String { "\(left),\(top),\(right),\(bottom)" }
 }
 
 extension DisplayTopology.Display: CustomStringConvertible {

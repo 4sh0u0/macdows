@@ -29,6 +29,7 @@ import MacdowsCore
 /// desktop size the server is told about, and the advertised scale pair. adr/0015 §5.A.4 requires
 /// all three to come from the SAME read -- that is the whole invariant, and it is why this is one
 /// function with one freeze in it rather than three call sites that each look up what they need.
+/// F-ja-4 lane E adds a fourth from the same read, the RAIL work area (step 4 below).
 @MainActor
 enum ReconnectTopologyRefresh {
 
@@ -55,10 +56,17 @@ enum ReconnectTopologyRefresh {
     /// 3. The advertised scale pair — ADR-0018 U-1 (owner ruled D), resolved from the SAME frozen
     ///    snapshot the desktop size came from. Both fields are assigned together because
     ///    `CRSession` sets neither setting unless both are non-zero.
+    /// 4. The work area — F-ja-4 lane E (owner rulings 2026-10-22: the primary's `visibleFrame`;
+    ///    not followed mid-session), MacdowsCore's `workAreaInRemotePixels` of the SAME frozen
+    ///    snapshot, all four edges assigned together. `CRSession` sends it after every start
+    ///    command on ARC_COMPLETED; all four zero means it sends nothing and the server keeps the
+    ///    start command's whole-desktop work area.
     ///
     /// THE ONE ADDITION OVER THE CONNECT PATH, and the reason it is not a divergence: the `else`
-    /// arm ZEROES the advertised pair. A fresh connect builds a fresh `CRSession`, so "assign
-    /// nothing" and "assign zero" are the same state there. A reconnect reuses one
+    /// arm ZEROES the advertised pair. (The work area's `else` arm zeroes its four edges for the
+    /// same reason, and there the connect path zeroes too -- it can be reached with a session that
+    /// already started once, after a certificate confirmation.) A fresh connect builds a fresh
+    /// `CRSession`, so "assign nothing" and "assign zero" are the same state there. A reconnect reuses one
     /// (`-restartForReconnectPreparing:` restarts the session it is called on), so a pair left
     /// over from an earlier freeze would be read by the next `-start` while the current layout
     /// resolves to nothing at all. `Tools/window-smoke` registered exactly this on its own cycle
@@ -66,8 +74,9 @@ enum ReconnectTopologyRefresh {
     /// deliberately NOT zeroed alongside it — §5.A.6 forbids sending `0 x 0`, and zeroing the two
     /// is what sending `0 x 0` looks like from here.
     ///
-    /// - Parameter session: the session about to be restarted. Only the three settings the connect
-    ///   path assigns are touched; nothing is started, stopped or sent.
+    /// - Parameter session: the session about to be restarted. Only the settings the connect path
+    ///   assigns are touched (desktop pair, advertised pair, work area); nothing is started,
+    ///   stopped or sent.
     /// - Parameter topology: the App's resident provider — the project's single `NSScreen` reader.
     /// - Returns: `StaticDisplayTopologyProvider` over the snapshot just frozen, for
     ///   `RemoteWindowRegistry.prepareForReconnect(refreezingTopologyWith:)` to install. A static
@@ -111,6 +120,17 @@ enum ReconnectTopologyRefresh {
         } else {
             session.advertisedDesktopScaleFactor = 0
             session.advertisedDeviceScaleFactor = 0
+        }
+        if let workArea = topology.sessionSnapshot?.workAreaInRemotePixels {
+            session.workAreaLeft = UInt32(workArea.left)
+            session.workAreaTop = UInt32(workArea.top)
+            session.workAreaRight = UInt32(workArea.right)
+            session.workAreaBottom = UInt32(workArea.bottom)
+        } else {
+            session.workAreaLeft = 0
+            session.workAreaTop = 0
+            session.workAreaRight = 0
+            session.workAreaBottom = 0
         }
         return StaticDisplayTopologyProvider(topology.sessionSnapshot)
     }
