@@ -892,7 +892,8 @@ struct RemoteWindowRegistryLocalMoveTests {
     /// `TS_RAIL_ORDER_LOCALMOVESIZE` with the fields this suite chooses, under the bridge's own
     /// property names (`App/CRBridge/CRSession.h`); the same getter-override construct as
     /// `WindowOrderStub`. `posX/posY` are fixed: the registry takes the grab offset from the local
-    /// down point and must not read them.
+    /// down point -- or, with no recorded down and the left button held (F-ja-3, L10), from the
+    /// pointer at the start -- and must not read them (only its debug line logs them).
     private final class LMSStub: CRDPEvent {
         private let id: UInt32
         private let start: Bool
@@ -962,8 +963,12 @@ struct RemoteWindowRegistryLocalMoveTests {
 
     private final class PointerBox {
         var point = NSPoint.zero
-        /// What the `pressedMouseButtons` seam reports: bit 0, the left button, held -- every drag
-        /// below holds it, and only the lost-up case (F4) clears it.
+        /// What the `pressedMouseButtons` seam reports: bit 0, the left button, held. Every drag
+        /// below holds it, and the lost-up case (F4) clears it mid-drag. F-ja-3: the default 1 also
+        /// means a type-9 start that finds no left-down recorded on any window engages through the
+        /// start's fallback, so a case whose start must not engage states the OS's real button
+        /// state itself -- 0 after a real up (L3, L7, L8, L10b), 2 for a right-button press (F3c) --
+        /// and the fallback cases (L10, L10c, L10d, L10e) set 1 explicitly.
         var buttons = 1
     }
 
@@ -1189,7 +1194,8 @@ struct RemoteWindowRegistryLocalMoveTests {
     /// L3. The round-trip race: the user released before the server's start arrived. The up
     /// already went to the server, so no local move begins -- the window must not follow a pointer
     /// nobody is dragging with; moves are forwarded as ordinary input and the end is today's
-    /// settle.
+    /// settle. F-ja-3: the pressed-buttons seam reports the button released, as the OS does after a
+    /// real up -- a start that finds no record but the button still held is L10's case.
     @Test func anLmsStartAfterTheUpStartsNoLocalMove() throws {
         let h = try Self.makeHarness()
         defer { h.registry.closeWindowsForSessionEnd() }
@@ -1198,6 +1204,7 @@ struct RemoteWindowRegistryLocalMoveTests {
         let down = Self.offset(before.origin, 100, 500)
         try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
         try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: window)
+        h.pointer.buttons = 0
         h.registry.handle(LMSStub(windowId: 621, start: true, type: Self.moveType))
         #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 621))
         #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 621) == 1, "the start still suppresses")
@@ -1331,6 +1338,9 @@ struct RemoteWindowRegistryLocalMoveTests {
         try Self.send(.mouseButton(.left, down: false, screenPoint: after), to: window)
         #expect(h.wire.ups.count == 1 && h.wire.ups.first?.x == expectedMove.x && h.wire.ups.first?.y == expectedMove.y)
 
+        // F-ja-3: released, and the OS says so -- only a record the up failed to clear could engage
+        // this start (with bit 0 still set the fallback would, whatever the record).
+        h.pointer.buttons = 0
         h.registry.handle(LMSStub(windowId: 671, start: true, type: Self.moveType))
         #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 671), "the up did not clear the held button")
         h.registry.handle(LMSStub(windowId: 671, start: false, type: Self.moveType))
@@ -1381,6 +1391,11 @@ struct RemoteWindowRegistryLocalMoveTests {
     @Test func deleteAndSessionEndClearTheMove() throws {
         let h = try Self.makeHarness()
         defer { h.registry.closeWindowsForSessionEnd() }
+        // F-ja-3: the pressed-buttons seam reports nothing held for the whole case, so only a
+        // recorded left-down can engage a start here -- with bit 0 set the fallback would engage
+        // every start below whether or not the record survived, and hide a prune bug either way. No
+        // motion goes in while a move is in flight, so the lost-up check never reads it.
+        h.pointer.buttons = 0
         let dragged = try Self.makeWindow(h, id: 661)
         _ = try Self.makeWindow(h, id: 662)
         _ = try Self.makeWindow(h, id: 663)
@@ -1483,6 +1498,9 @@ struct RemoteWindowRegistryLocalMoveTests {
         let origin = window.frame.origin
         let down = Self.offset(origin, 100, 500)
 
+        // F-ja-3: the OS reports the right button held (bit 1) and the left one not, so neither the
+        // record nor the fallback may engage; bit 0 set here would be L10's case.
+        h.pointer.buttons = 2
         try Self.send(.mouseButton(.right, down: true, screenPoint: down), to: window)
         h.registry.handle(LMSStub(windowId: 693, start: true, type: Self.moveType))
         #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 693), "a right-button down armed a move")
@@ -1490,6 +1508,7 @@ struct RemoteWindowRegistryLocalMoveTests {
         try Self.send(.mouseButton(.right, down: false, screenPoint: down), to: window)
         try #require(h.wire.windowMoves == [693], "the unhandled end is today's settle")
 
+        h.pointer.buttons = 1
         try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
         h.registry.handle(LMSStub(windowId: 693, start: true, type: Self.moveType))
         try #require(h.registry.debugLocalMoveIsActive(forWindowId: 693))
@@ -1762,6 +1781,174 @@ struct RemoteWindowRegistryLocalMoveTests {
         #expect(h.wire.windowMoves == [684, 684], "the prune left the child marked")
     }
 
+    // MARK: F-ja-3, the start's fallback
+
+    /// L10 (F-ja-3; the 2026-10-22 in-person batch 2, where the start found the window's left-down
+    /// record already cleared and the window stood still for 6.8 s). No left-down is recorded on
+    /// any window -- none is sent at all here -- but the OS reports the left button held when the
+    /// server's start arrives: the move engages with the POINTER as its grab point (offset =
+    /// pointer - origin), so
+    /// the start itself places nothing and each later motion moves the window by the pointer's own
+    /// delta. The up ends it as any local move's up: one more placement, exactly one left-up at the
+    /// pointer, and the window parked awaiting the server's end -- which the end witnesses by
+    /// settling nothing (an end with neither a move nor an awaiting entry is today's settle, L10b).
+    @Test func aStartWithTheButtonHeldButNoRecordEngagesAtThePointer() throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 701)
+        let origin = window.frame.origin
+        let grab = Self.offset(origin, 100, 500)
+        h.pointer.buttons = 1
+        h.pointer.point = grab
+        h.registry.handle(LMSStub(windowId: 701, start: true, type: Self.moveType))
+        #expect(h.registry.debugLocalMoveIsActive(forWindowId: 701), "the fallback did not engage")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 701) == 1)
+        #expect(window.frame.origin == origin, "the start itself moved the window")
+
+        h.pointer.point = Self.offset(grab, 30, -20)
+        try Self.send(.mouseMoved(screenPoint: grab), to: window)
+        #expect(window.frame.origin == Self.offset(origin, 30, -20), "the grab offset is not pointer - origin: \(window.frame.origin)")
+        h.pointer.point = Self.offset(grab, 50, 10)
+        try Self.send(.mouseMoved(screenPoint: grab), to: window)
+        #expect(window.frame.origin == Self.offset(origin, 50, 10))
+        #expect(h.wire.moves.isEmpty, "pointer motion went to the wire mid-move: \(h.wire.moves)")
+
+        let release = Self.offset(grab, 52, 12)
+        h.pointer.point = release
+        try Self.send(.mouseButton(.left, down: false, screenPoint: Self.offset(grab, 45, 5)), to: window)
+        #expect(window.frame.origin == Self.offset(origin, 52, 12), "the up places the window once more")
+        let expectedUp = Self.remote(release, h.topology)
+        #expect(h.wire.buttons.count == 1 && h.wire.ups.count == 1 && h.wire.ups.first?.button == .left
+                && h.wire.ups.first?.x == expectedUp.x && h.wire.ups.first?.y == expectedUp.y,
+                "exactly one left-up, at the pointer: \(h.wire.buttons)")
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 701))
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 701) == 1, "held until the server's end")
+
+        h.registry.handle(LMSStub(windowId: 701, start: false, type: Self.moveType))
+        #expect(h.wire.windowMoves.isEmpty, "the end settled: the up did not park the window awaiting it")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 701) == 0)
+        #expect(window.frame.origin == Self.offset(origin, 52, 12))
+    }
+
+    /// L10b. The same start with no record and the button NOT held (bit 0 clear): the round trip
+    /// lost the race and nobody is dragging -- no move engages, the start only suppresses, a motion
+    /// goes to the wire at its own point and leaves the window alone, and the end is today's
+    /// settle, exactly once.
+    @Test func aStartWithTheButtonReleasedAndNoRecordStartsNoLocalMove() throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 702)
+        let before = window.frame
+        h.pointer.buttons = 0
+        h.pointer.point = Self.offset(before.origin, 100, 500)
+        h.registry.handle(LMSStub(windowId: 702, start: true, type: Self.moveType))
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 702), "a released button engaged a move")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 702) == 1, "the start still suppresses")
+
+        h.pointer.point = Self.offset(before.origin, 140, 540)
+        let hover = Self.offset(before.origin, 105, 505)
+        try Self.send(.mouseMoved(screenPoint: hover), to: window)
+        let expected = Self.remote(hover, h.topology)
+        #expect(h.wire.moves.count == 1 && h.wire.moves.first?.x == expected.x && h.wire.moves.first?.y == expected.y,
+                "\(h.wire.moves)")
+        #expect(window.frame == before)
+
+        h.registry.handle(LMSStub(windowId: 702, start: false, type: Self.moveType))
+        #expect(h.wire.windowMoves == [702], "today's settle, once")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 702) == 0)
+        #expect(h.wire.buttons.isEmpty)
+    }
+
+    /// L10c. The record wins over the pointer (F-a1-6's path, unchanged): a left-down was recorded
+    /// at `down`, and when the start arrives the pointer is elsewhere with the button still held.
+    /// The grab offset is the recorded down's (`down - origin`), so the next motion places the
+    /// window at `origin + (pointer - down)`, not at `origin + (pointer - pointerAtStart)`.
+    @Test func theRecordedDownWinsOverThePointer() throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 703)
+        let origin = window.frame.origin
+        let down = Self.offset(origin, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: down), to: window)
+        h.pointer.buttons = 1
+        h.pointer.point = Self.offset(down, 17, -9)
+        h.registry.handle(LMSStub(windowId: 703, start: true, type: Self.moveType))
+        try #require(h.registry.debugLocalMoveIsActive(forWindowId: 703))
+        #expect(window.frame.origin == origin, "the start itself moved the window")
+
+        h.pointer.point = Self.offset(down, 40, 25)
+        try Self.send(.mouseMoved(screenPoint: down), to: window)
+        #expect(window.frame.origin == Self.offset(origin, 40, 25),
+                "the grab offset did not come from the recorded down: \(window.frame.origin)")
+
+        try Self.send(.mouseButton(.left, down: false, screenPoint: down), to: window)
+        h.registry.handle(LMSStub(windowId: 703, start: false, type: Self.moveType))
+        #expect(h.wire.windowMoves.isEmpty)
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 703) == 0)
+    }
+
+    /// L10d. The fallback is for `RAIL_WMSZ_MOVE` only: with no record and the button held, a start
+    /// of every other type -- the resize edges 1-8 (L4's `RAIL_WMSZ_TOP` among them) and the
+    /// keyboard move / size 10-11 -- engages nothing and only suppresses; each end is today's
+    /// settle.
+    @Test func theFallbackIsForTheMoveTypeOnly() throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let window = try Self.makeWindow(h, id: 704)
+        let before = window.frame
+        h.pointer.buttons = 1
+        h.pointer.point = Self.offset(before.origin, 100, 513)
+        let others = (UInt16(1)...11).filter { $0 != Self.moveType }
+        try #require(others.count == 10 && others.contains(Self.resizeTopType))
+        for type in others {
+            h.registry.handle(LMSStub(windowId: 704, start: true, type: type))
+            #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 704), "type \(type) engaged a local move")
+            #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 704) == 1, "type \(type)")
+            h.registry.handle(LMSStub(windowId: 704, start: false, type: type))
+        }
+        #expect(h.wire.windowMoves == Array(repeating: UInt32(704), count: others.count), "\(h.wire.windowMoves)")
+        #expect(window.frame == before)
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 704) == 0)
+    }
+
+    /// L10e (fix lane gate r1 I-1). The OS's pressed-buttons state is global: bit 0 is set by a press
+    /// on ANY target. Window B holds a recorded left-down (the user is pressing B), window A has
+    /// none, and a type-9 start for A arrives late with bit 0 set: the fallback must not engage A,
+    /// because the press it sees is B's. A's start only suppresses and its end is today's settle,
+    /// exactly once; A does not move. B is untouched: its record still engages B's own start, with
+    /// B's down as the grab point.
+    @Test func aPressOnAnotherWindowDoesNotEngageALateStart() throws {
+        let h = try Self.makeHarness()
+        defer { h.registry.closeWindowsForSessionEnd() }
+        let windowA = try Self.makeWindow(h, id: 705)
+        let windowB = try Self.makeWindow(h, id: 706)
+        let beforeA = windowA.frame
+        let originB = windowB.frame.origin
+        let downB = Self.offset(originB, 100, 500)
+        try Self.send(.mouseButton(.left, down: true, screenPoint: downB), to: windowB)
+        h.pointer.buttons = 1
+        h.pointer.point = downB
+
+        h.registry.handle(LMSStub(windowId: 705, start: true, type: Self.moveType))
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 705), "a press on another window engaged A's late start")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 705) == 1, "the start still suppresses")
+        #expect(!h.registry.debugLocalMoveIsActive(forWindowId: 706))
+        h.registry.handle(LMSStub(windowId: 705, start: false, type: Self.moveType))
+        #expect(h.wire.windowMoves == [705], "A's end is today's settle, once: \(h.wire.windowMoves)")
+        #expect(h.registry.debugGeometrySuppressionCount(forWindowId: 705) == 0)
+        #expect(windowA.frame == beforeA)
+
+        h.registry.handle(LMSStub(windowId: 706, start: true, type: Self.moveType))
+        #expect(h.registry.debugLocalMoveIsActive(forWindowId: 706), "B's record did not engage B's start")
+        h.pointer.point = Self.offset(downB, 30, -20)
+        try Self.send(.mouseMoved(screenPoint: downB), to: windowB)
+        #expect(windowB.frame.origin == Self.offset(originB, 30, -20))
+        #expect(windowA.frame == beforeA, "B's drag moved A")
+        try Self.send(.mouseButton(.left, down: false, screenPoint: downB), to: windowB)
+        h.registry.handle(LMSStub(windowId: 706, start: false, type: Self.moveType))
+        #expect(h.wire.windowMoves == [705], "B's handled end settled: \(h.wire.windowMoves)")
+    }
+
     // MARK: L9, source
 
     private static func registryCode() throws -> String {
@@ -1801,14 +1988,32 @@ struct RemoteWindowRegistryLocalMoveTests {
         return nil
     }
 
-    /// L9. The pointer seam is read at exactly the two places the rule names -- the move and the
-    /// up, both inside `handleInput` -- the window is placed locally from exactly two places (the
-    /// move, and since gate r1's fold `endLocalMoveWithButtonUp`, which the real up and the lost
-    /// up (m-3) share), and the live pointer read exists once, as the seam's default. A third read
-    /// (say, in the LMS start) or a second live read would bypass the seam the behaviour cases
-    /// drive. The same for m-3's pressed-buttons seam: read once, in the move, live once as its
-    /// default. And every mouse button event reaches the wire through ONE send, a local move's up
-    /// included -- the lost up is not a second, hand-copied send.
+    /// L9. The pointer and pressed-buttons seams are read at exactly the places the rules name. The
+    /// pointer, three reads: the move and the up, both inside `handleInput`, and the LMS start's
+    /// fallback inside `handleLocalMoveSize`. The pressed buttons, two: m-3's lost-up check in the
+    /// move, and that same fallback. Each live read exists once, as its seam's default, so every
+    /// read goes through the seams the behaviour cases drive.
+    ///
+    /// CHANGED BY F-ja-3 -- the counts, not the pin. It used to count two pointer reads and one
+    /// buttons read and said a third read "(say, in the LMS start)" would bypass the seam. That
+    /// third read is now the rule: the 2026-10-22 in-person batch 2 (2x display, session 200 %,
+    /// regedit just opened) logged the left-down at 14:40:29.961, the server's start at 29.978 with
+    /// `leftDown=false engaged=false` -- a left-up had cleared the record in between, and the
+    /// server never answered it (its end came with the next press, 36.759) -- and the window stood
+    /// still for 6.8 s; the second press failed the same way (36.761), the third engaged (38.160).
+    /// FreeRDP's X11 client depends on no local record. So a type-9 start with no record and the
+    /// left button held takes the pointer as its grab point (L10-L10d drive it through these same
+    /// seams). The fallback is pinned as ONE statement -- the buttons test and the pointer read in
+    /// the same `else if`, behind `leftButtonDown.isEmpty` (fix lane gate r1 I-1: the OS's button
+    /// state is global, so a recorded press on another window must keep this window's late start
+    /// suppression-only; L10e) -- with each read exactly once in `handleLocalMoveSize` and the counts
+    /// inside `handleInput` unchanged, so a read anywhere else (another start-time read, one in the
+    /// end, a second live read) is still red.
+    ///
+    /// Unchanged: the window is placed locally from exactly two places (the move, and since gate
+    /// r1's fold `endLocalMoveWithButtonUp`, which the real up and the lost up (m-3) share), and
+    /// every mouse button event reaches the wire through ONE send, a local move's up included --
+    /// the lost up is not a second, hand-copied send.
     @Test func thePointerIsReadOnlyByTheInputPath() throws {
         let code = try Self.registryCode()
         let input = try #require(Self.body(
@@ -1816,8 +2021,18 @@ struct RemoteWindowRegistryLocalMoveTests {
         #expect(input.contains("case .mouseMoved(let screenPoint):") && input.contains("case .scrollWheel("),
                 "the slice is not handleInput's body")
         #expect(!input.contains("private func "), "the slice runs past handleInput")
-        #expect(Self.occurrences(of: "pointerLocation()", in: code) == 2)
+        #expect(Self.occurrences(of: "pointerLocation()", in: code) == 3)
         #expect(Self.occurrences(of: "pointerLocation()", in: input) == 2)
+        let start = try #require(Self.body(of: "private func handleLocalMoveSize(_ event: CRDPEvent) {", in: code))
+        #expect(start.contains("window.beginServerAnnouncedMoveResize()") && start.contains("localMovesAwaitingEnd.remove(windowId)"),
+                "the slice is not handleLocalMoveSize's body")
+        #expect(!start.contains("private func "), "the slice runs past handleLocalMoveSize")
+        #expect(Self.occurrences(of: "pointerLocation()", in: start) == 1)
+        #expect(Self.occurrences(of: "pressedMouseButtons()", in: start) == 1)
+        #expect(Self.occurrences(
+                    of: "} else if leftButtonDown.isEmpty, pressedMouseButtons() & 1 != 0 { grab = pointerLocation() } else {",
+                    in: start) == 1,
+                "the fallback's two reads are not one else-if behind the empty-table test")
         let endAtUp = try #require(Self.body(
             of: "private func endLocalMoveWithButtonUp(windowId: UInt32, move: LocalMove, pointer: NSPoint) {", in: code))
         #expect(!endAtUp.contains("private func ") && endAtUp.contains("localMovesAwaitingEnd.insert(windowId)"),
@@ -1830,7 +2045,7 @@ struct RemoteWindowRegistryLocalMoveTests {
         #expect(Self.occurrences(of: "endLocalMoveWithButtonUp(", in: code) == 3, "the declaration and the two calls")
         #expect(Self.occurrences(of: "NSEvent.mouseLocation", in: code) == 1)
         #expect(Self.occurrences(of: "var pointerLocation: () -> NSPoint = { NSEvent.mouseLocation }", in: code) == 1)
-        #expect(Self.occurrences(of: "pressedMouseButtons()", in: code) == 1)
+        #expect(Self.occurrences(of: "pressedMouseButtons()", in: code) == 2)
         #expect(Self.occurrences(of: "pressedMouseButtons()", in: input) == 1)
         #expect(Self.occurrences(of: "NSEvent.pressedMouseButtons", in: code) == 1)
         #expect(Self.occurrences(of: "var pressedMouseButtons: () -> Int = { NSEvent.pressedMouseButtons }", in: code) == 1)

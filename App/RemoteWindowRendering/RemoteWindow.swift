@@ -287,7 +287,22 @@ final class RemoteWindow {
     /// currentTopDownWindowIds()` reads this to exclude gate-held windows from Z-order
     /// application -- see that method's own doc comment for why `NSApp.orderedWindows`
     /// alone was confirmed live to be insufficient ground truth for "on screen."
-    private(set) var hasClearedFirstFrameGate = false
+    ///
+    /// F-ja-3 diagnostics (owner ruling 2 of 2026-10-22: the large black areas regedit showed
+    /// while a title-bar press failed to engage): one debug line when the gate clears -- false to
+    /// true only, from either writer (`present`, `firstFrameTimeoutFired`) -- with whether the
+    /// timeout cleared it and the frame at that moment, so a live log places the first frame
+    /// against the LMS start lines.
+    private(set) var hasClearedFirstFrameGate = false {
+        didSet {
+            guard hasClearedFirstFrameGate, !oldValue else { return }
+            let diagWindowId = key.windowId
+            let diagTimedOut = firstFrameTimedOut
+            let diagFrame = window.frame
+            Self.logger.debug(
+                "F-ja-3 first-frame windowId=\(diagWindowId, privacy: .public) timedOut=\(diagTimedOut, privacy: .public) frame=(\(Double(diagFrame.origin.x), privacy: .public),\(Double(diagFrame.origin.y), privacy: .public),\(Double(diagFrame.width), privacy: .public),\(Double(diagFrame.height), privacy: .public))")
+        }
+    }
     /// The RAIL server's last-requested show-state for this window (see `setVisible`),
     /// captured even while gated so the correct state can be applied the instant the gate
     /// clears. Irrelevant once `hasClearedFirstFrameGate` is true -- `setVisible` applies
@@ -1105,7 +1120,18 @@ final class RemoteWindow {
     /// `ServerLocalMoveSize` modality, neither plausible against a window the gate has never
     /// let on screen -- but this keeps the check exactly where it always was rather than
     /// assuming that invariant elsewhere).
+    ///
+    /// F-ja-3 diagnostics: one debug line on entry, before either guard -- the frame before, the
+    /// requested content rect, and whether the suppression drops it -- so a live log says when a
+    /// server rect changed (or did not change) the window. No gate field: every caller runs only
+    /// once the first-frame gate has cleared (fix lane gate r1 m-4), and the `first-frame` line
+    /// records that transition.
     private func applyContentRectNow(_ contentRect: NSRect) {
+        let diagWindowId = key.windowId
+        let diagFrame = window.frame
+        let diagSuppressed = isLocalGeometrySuppressed
+        Self.logger.debug(
+            "F-ja-3 apply-rect windowId=\(diagWindowId, privacy: .public) frameBefore=(\(Double(diagFrame.origin.x), privacy: .public),\(Double(diagFrame.origin.y), privacy: .public),\(Double(diagFrame.width), privacy: .public),\(Double(diagFrame.height), privacy: .public)) content=(\(Double(contentRect.origin.x), privacy: .public),\(Double(contentRect.origin.y), privacy: .public),\(Double(contentRect.width), privacy: .public),\(Double(contentRect.height), privacy: .public)) suppressed=\(diagSuppressed, privacy: .public)")
         guard !isLocalGeometrySuppressed else {
             contentRectDroppedWhileSuppressed = contentRect
             return
@@ -1204,7 +1230,9 @@ final class RemoteWindow {
         contentRectDroppedWhileSuppressed = nil
     }
 
-    /// F-ja-3 diagnostics only: one debug line before an end applies a rect.
+    /// F-ja-3 diagnostics only: the debug lines before an end applies a rect (`end-apply`), on
+    /// every `applyContentRectNow` (`apply-rect`), and when the first-frame gate clears
+    /// (`first-frame`).
     private static let logger = Logger(subsystem: "dev.haru.macdows", category: "RemoteWindowRendering")
 
     private static func logEndApply(snapBack: Bool, gate: Bool, serverRect: Bool, dropped: Bool, frame: NSRect) {
