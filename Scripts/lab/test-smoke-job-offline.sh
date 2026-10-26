@@ -46,14 +46,17 @@
 #      branch is not taken; the osascript shim records into a run-long trace that is never reset,
 #      and the "never reached" assertion at the end covers the whole run.
 #
-# Eleven mutation proofs (M1 gate bypassed, M2 key whitelist bypassed, M3 overlap guard removed,
+# Fifteen mutation proofs (M1 gate bypassed, M2 key whitelist bypassed, M3 overlap guard removed,
 # M4 the window closed before the DONE line is written, M5 the overlap guard reading the process
 # table instead of the capture's own pid line, M6 the manifest reading the template's batch instead
 # of the run's, M7 the missing-artefact count removed, M8 the batch override appended without a
 # separating newline, M9 the manifest's freshness check removed so a previous run's leftovers are
 # gathered as this batch's, M10 the start stamp put back to one fixed name so a second checkpoint
 # overwrites the stamp of the run already in flight, M11 the host-written snapshot report judged by
-# its mtime instead of by the clear-then-present proof) copy the script under test with one guard
+# its mtime instead of by the clear-then-present proof, M12 WINDOW_SMOKE_WORK_AREA dropped from the
+# managed-variable list so an inherited knob reaches the child, M13 the WORK_AREA=0 mapping line
+# deleted, M14 the WORK_AREA shape check disabled, M15 the job-key clearing moved back after the
+# subshell that sources the job, so an exported key reaches it) copy the script under test with one guard
 # removed and require the case that claims to pin it to FAIL against the mutant. A pin that would
 # also pass against the broken code pins nothing.
 #
@@ -861,6 +864,33 @@ else
 	fail "$CASE: wrong verdicts:$bad"
 fi
 
+# 10d. WORK_AREA, the F-ja-4 lane E knob (WINDOW_SMOKE_WORK_AREA), holds to the same 0|1 domain as
+#      EDGE_PROFILE and MOVE_KEEP and is refused with its own message, for the reason 10b gives.
+#      BOTH accepted values are run, not only one: this key's default is 1 (the product work area)
+#      and 0 is the value that changes the child, so a wrapper that admitted only its default would
+#      be the one that cannot turn the knob off -- and, as in 10c, a wrapper that does not know the
+#      key at all would refuse every value through the LINE GRAMMAR and leave the reject half green.
+#      (M14 pins the shape check.)
+begin '10d WORK_AREA is 0 or 1'
+bad="$(reject_values WORK_AREA '2' 'yes' '01' 'true')"
+reset_run
+job_base
+job_override 'WORK_AREA=2'
+run_smoke "$SBLAB/smoke-job.command" ""
+grep -qF 'WORK_AREA must be 0 or 1' "$SMOKELOG" || bad="$bad [2 -> the refusal does not name WORK_AREA]"
+for accepted in 0 1; do
+	reset_run
+	job_base
+	job_override "WORK_AREA=$accepted"
+	run_smoke "$SBLAB/smoke-job.command" ""
+	if [ "$(last_line)" != 'DONE exit=0' ]; then bad="$bad [$accepted -> $(last_line), expected DONE exit=0]"; fi
+done
+if [ -z "$bad" ]; then
+	pass "$CASE: 0 and 1 are accepted; 2, yes, 01 and true are each refused with a line that names WORK_AREA (an EMPTY value is not an error: like an absent key it means the default 1, the product work area)"
+else
+	fail "$CASE: wrong verdicts:$bad"
+fi
+
 begin '11 EXTRA_APPS charset'
 # shellcheck disable=SC2016  # the literals are the values under test
 bad="$(reject_values EXTRA_APPS 'notepad calc' 'notepad|calc' 'note$pad' 'note.pad')"
@@ -1032,14 +1062,19 @@ begin '21 the happy path environment'
 job_base
 job_override 'MOVE=1' 'MAXIMIZE=1' 'TRAY=1' 'TRAY_CLICK=1' "EXTRA_APPS='notepad;calc'" \
 	"MOVE_TARGET='Notepad|记事本'" "APP='C:\Windows\System32\notepad.exe'" "APP_ARGS='C:\rdp-lab\seed.txt'" \
-	'DISPLAY_LOOKS_LIKE=1280x720' 'REQUIRE_SYMBOL=WINDOW_SMOKE_ADVERTISED_SCALE'
+	'DISPLAY_LOOKS_LIKE=1280x720' 'REQUIRE_SYMBOL=WINDOW_SMOKE_ADVERTISED_SCALE' 'WORK_AREA=0' \
+	'EDGE_PROFILE=1' 'MOVE_KEEP=1'
 run_smoke "$SBLAB/smoke-job.command" ""
 reasons=''
 [ "$(child_calls)" = '1' ] || reasons="$reasons launcher-calls=$(child_calls);"
 [ "$(child_env "WINDOW_SMOKE_LOG=$SBEVIDENCE/labtest/window-smoke-labtest.log")" = '1' ] || reasons="$reasons WINDOW_SMOKE_LOG;"
+# Each key at the value that REACHES the child: 1 for the switches, EDGE_PROFILE and MOVE_KEEP (the
+# last two joined this case with lane smoke-wa gate r1 m-5 -- the case's claim had been missing them
+# since their own lanes), and 0 for WORK_AREA, whose default 1 leaves the knob unset.
 for expected in 'WINDOW_SMOKE_MOVE=1' 'WINDOW_SMOKE_MAXIMIZE=1' 'WINDOW_SMOKE_TRAY=1' \
 	'WINDOW_SMOKE_TRAY_CLICK=1' 'WINDOW_SMOKE_EXTRA_APPS=notepad;calc' 'WINDOW_SMOKE_MOVE_TARGET=Notepad|记事本' \
-	'WINDOW_SMOKE_APP=C:\Windows\System32\notepad.exe' 'WINDOW_SMOKE_APP_ARGS=C:\rdp-lab\seed.txt'; do
+	'WINDOW_SMOKE_APP=C:\Windows\System32\notepad.exe' 'WINDOW_SMOKE_APP_ARGS=C:\rdp-lab\seed.txt' \
+	'WINDOW_SMOKE_WORK_AREA=0' 'WINDOW_SMOKE_EDGE_PROFILE=1' 'WINDOW_SMOKE_MOVE_KEEP=1'; do
 	[ "$(child_env "$expected")" = '1' ] || reasons="$reasons missing[$expected];"
 done
 for forbidden in WIN_HOST WIN_USER WIN_PASS; do
@@ -1065,10 +1100,12 @@ run_smoke "$SBLAB/smoke-job.command" ""
 reasons=''
 # WINDOW_SMOKE_MOVE_KEEP is in this list although job_base carries no MOVE_KEEP line at all:
 # that is the "key absent" arm -- a key the job file never mentions must leave the child's
-# environment exactly as a key set to 0 does.
+# environment exactly as a key set to 0 does. WINDOW_SMOKE_WORK_AREA is here for the same reason
+# with the opposite spelling: job_base carries no WORK_AREA line, which means the default 1, and
+# the default is expressed by the knob's ABSENCE (case 22d holds the four shapes of that key).
 for forbidden in WINDOW_SMOKE_MOVE WINDOW_SMOKE_MAXIMIZE WINDOW_SMOKE_TRAY WINDOW_SMOKE_TRAY_CLICK \
 	WINDOW_SMOKE_EXTRA_APPS WINDOW_SMOKE_MOVE_TARGET WINDOW_SMOKE_APP WINDOW_SMOKE_APP_ARGS \
-	WINDOW_SMOKE_MOVE_KEEP; do
+	WINDOW_SMOKE_MOVE_KEEP WINDOW_SMOKE_WORK_AREA; do
 	if child_has_var "$forbidden"; then reasons="$reasons $forbidden;"; fi
 done
 if [ -z "$reasons" ] && [ "$(child_calls)" = '1' ]; then
@@ -1076,6 +1113,29 @@ if [ -z "$reasons" ] && [ "$(child_calls)" = '1' ]; then
 else
 	fail "$CASE: present in the child:$reasons (launcher calls=$(child_calls))"
 fi
+
+# The inherited-variable arms of 22b / 22c / 22d as one call: the wrapper (or a mutant copy) run with
+# ONE extra variable in its OWN environment, which is what a knob -- or a job KEY -- left exported in
+# the shell that opened Terminal looks like. Same sandbox environment as run_smoke otherwise. Used by 22b, 22c, 22d, M12 and M15,
+# so each case and its mutation proof run the identical arm.
+run_smoke_inheriting() { # <wrapper-path> <NAME=value>
+	env -i \
+		HOME="$SBHOME" \
+		PATH="$SB/bin:$PATH" \
+		TMPDIR="$SBTMP" \
+		TERM_PROGRAM= \
+		LABTEST_TRACE="$LABTEST_TRACE" \
+		LABTEST_REFUSED_TRACE="$LABTEST_REFUSED_TRACE" \
+		LABTEST_SMOKE_LOG="$SMOKELOG" \
+		LABTEST_TAG_LOG="$SBRUNTIME/smoke-labtest.log" \
+		LABTEST_OSASCRIPT_EXPECTED="$OSASCRIPT_EXPECTED" \
+		LABTEST_DISPLAY_TEXT="$DISPLAY_TEXT" \
+		LABTEST_CHILD_RC=0 \
+		LABTEST_CHILD_LEAK=0 \
+		MACDOWS_LAB_BOUNDARY_FILE= \
+		"$2" \
+		bash "$1" >/dev/null 2>&1
+}
 
 # 22b. EDGE_PROFILE's mapping, in all three of the shapes that can go wrong. The knob is
 #      MEASUREMENT ONLY in the child (it prints [edge] lines and changes nothing else), so what
@@ -1122,8 +1182,18 @@ env -i \
 	bash "$SBLAB/smoke-job.command" >/dev/null 2>&1
 if child_has_var WINDOW_SMOKE_EDGE_PROFILE; then reasons="$reasons INHERITED-KNOB-REACHED-THE-CHILD;"; fi
 [ "$(child_calls)" = '1' ] || reasons="$reasons inherited-launcher-calls=$(child_calls);"
+# And the inherited JOB KEY (lane smoke-wa gate r1 m-1): EDGE_PROFILE=1 exported in the wrapper's own
+# environment, the job silent. The key is not a WINDOW_SMOKE_* name, so SMOKE_MANAGED_VARS cannot
+# strip it; what keeps it out is the wrapper clearing every key BEFORE the subshell that sources the
+# job. Without that, the subshell reads the exported value as the job's. (M15 pins the clearing.)
+reset_run
+job_base
+run_smoke_inheriting "$SBLAB/smoke-job.command" 'EDGE_PROFILE=1'
+if child_has_var WINDOW_SMOKE_EDGE_PROFILE; then reasons="$reasons INHERITED-JOB-KEY-ARMED-THE-CHILD;"; fi
+grep -qF 'edge_profile=0' "$SMOKELOG" || reasons="$reasons inherited-job-key-not-default-in-the-run-line;"
+[ "$(child_calls)" = '1' ] || reasons="$reasons inherited-job-key-launcher-calls=$(child_calls);"
 if [ -z "$reasons" ]; then
-	pass "$CASE: EDGE_PROFILE=1 puts WINDOW_SMOKE_EDGE_PROFILE=1 in the child and edge_profile=1 in the run line, 0 leaves the variable absent, and a knob inherited from the launching shell is stripped -- the child's environment is a function of the job file alone"
+	pass "$CASE: EDGE_PROFILE=1 puts WINDOW_SMOKE_EDGE_PROFILE=1 in the child and edge_profile=1 in the run line, 0 leaves the variable absent, and a knob inherited from the launching shell is stripped -- and an exported job key in the launching shell does not arm it either: the child's environment is a function of the job file alone"
 else
 	fail "$CASE:$reasons"
 	note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
@@ -1177,8 +1247,73 @@ env -i \
 	bash "$SBLAB/smoke-job.command" >/dev/null 2>&1
 if child_has_var WINDOW_SMOKE_MOVE_KEEP; then reasons="$reasons INHERITED-KNOB-REACHED-THE-CHILD;"; fi
 [ "$(child_calls)" = '1' ] || reasons="$reasons inherited-launcher-calls=$(child_calls);"
+# And the inherited JOB KEY, as in 22b: MOVE_KEEP=1 exported in the wrapper's own environment, the
+# job silent -- measured by gate r1 (m-1) to arm the keep before the clearing moved ahead of the
+# subshell. (M15 pins the clearing.)
+reset_run
+job_base
+run_smoke_inheriting "$SBLAB/smoke-job.command" 'MOVE_KEEP=1'
+if child_has_var WINDOW_SMOKE_MOVE_KEEP; then reasons="$reasons INHERITED-JOB-KEY-ARMED-THE-CHILD;"; fi
+grep -qF 'move_keep=0' "$SMOKELOG" || reasons="$reasons inherited-job-key-not-default-in-the-run-line;"
+[ "$(child_calls)" = '1' ] || reasons="$reasons inherited-job-key-launcher-calls=$(child_calls);"
 if [ -z "$reasons" ]; then
-	pass "$CASE: MOVE_KEEP=1 puts WINDOW_SMOKE_MOVE_KEEP=1 in the child and move_keep=1 in the run line, 0 and an absent key both leave the variable absent, and a knob inherited from the launching shell is stripped"
+	pass "$CASE: MOVE_KEEP=1 puts WINDOW_SMOKE_MOVE_KEEP=1 in the child and move_keep=1 in the run line, 0 and an absent key both leave the variable absent, and a knob inherited from the launching shell is stripped -- and an exported job key in the launching shell does not arm it either"
+else
+	fail "$CASE:$reasons"
+	note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
+fi
+
+# 22d. WORK_AREA's mapping, in the four shapes 22b / 22c hold the other two job-armed knobs to --
+#      with the direction reversed. The child's work-area knob is default ON and reads only the
+#      literal "0" as off (main.swift WorkAreaKnob.isEnabled), so here it is 0 that puts the variable
+#      in the child (WINDOW_SMOKE_WORK_AREA=0, the pre-lane whole-desktop wire), while 1 and an absent
+#      key leave it ABSENT (the product work area, like ADVERTISED_SCALE=D). The inherited arm is the
+#      one that matters most for this knob: before it joined SMOKE_MANAGED_VARS, a
+#      WINDOW_SMOKE_WORK_AREA=0 left in the launching shell reached the child and turned the product
+#      work area off for a run whose job file says nothing about it. (M12 pins the managed-variable
+#      entry, M13 the mapping line, M15 the clearing that keeps an exported WORK_AREA key out.)
+begin '22d WORK_AREA maps to the child knob, and only the job file can disarm it'
+reasons=''
+job_base
+job_override 'WORK_AREA=0'
+run_smoke "$SBLAB/smoke-job.command" ""
+[ "$(child_env 'WINDOW_SMOKE_WORK_AREA=0')" = '1' ] || reasons="$reasons zero-not-mapped;"
+[ "$(last_line)" = 'DONE exit=0' ] || reasons="$reasons zero-last-line=[$(last_line)];"
+grep -qF 'work_area=0' "$SMOKELOG" || reasons="$reasons zero-not-in-the-run-line;"
+# 1 is the default and is expressed by ABSENCE.
+reset_run
+job_base
+job_override 'WORK_AREA=1'
+run_smoke "$SBLAB/smoke-job.command" ""
+if child_has_var WINDOW_SMOKE_WORK_AREA; then reasons="$reasons one-reached-the-child;"; fi
+[ "$(child_calls)" = '1' ] || reasons="$reasons one-launcher-calls=$(child_calls);"
+grep -qF 'work_area=1' "$SMOKELOG" || reasons="$reasons one-not-in-the-run-line;"
+# The key absent entirely: the same child environment as 1, and the run line still says 1.
+reset_run
+job_base
+run_smoke "$SBLAB/smoke-job.command" ""
+if child_has_var WINDOW_SMOKE_WORK_AREA; then reasons="$reasons absent-reached-the-child;"; fi
+[ "$(child_calls)" = '1' ] || reasons="$reasons absent-launcher-calls=$(child_calls);"
+grep -qF 'work_area=1' "$SMOKELOG" || reasons="$reasons absent-not-in-the-run-line;"
+# And the inherited knob: WINDOW_SMOKE_WORK_AREA=0 in the WRAPPER's own environment, the job at its
+# default. The managed-variable list is what removes it.
+reset_run
+job_base
+run_smoke_inheriting "$SBLAB/smoke-job.command" 'WINDOW_SMOKE_WORK_AREA=0'
+if child_has_var WINDOW_SMOKE_WORK_AREA; then reasons="$reasons INHERITED-KNOB-REACHED-THE-CHILD;"; fi
+[ "$(child_calls)" = '1' ] || reasons="$reasons inherited-launcher-calls=$(child_calls);"
+# And the inherited JOB KEY (gate r1 m-1, the arm this lane's own default jobs walk on: the two
+# tracked siblings deliberately do not write WORK_AREA). WORK_AREA=0 exported in the wrapper's own
+# environment, the job silent: the job's default 1 must stand, so nothing reaches the child and the
+# run line says work_area=1. (M15 pins the clearing before the subshell.)
+reset_run
+job_base
+run_smoke_inheriting "$SBLAB/smoke-job.command" 'WORK_AREA=0'
+if child_has_var WINDOW_SMOKE_WORK_AREA; then reasons="$reasons INHERITED-JOB-KEY-DISARMED-THE-CHILD;"; fi
+grep -qF 'work_area=1' "$SMOKELOG" || reasons="$reasons inherited-job-key-not-default-in-the-run-line;"
+[ "$(child_calls)" = '1' ] || reasons="$reasons inherited-job-key-launcher-calls=$(child_calls);"
+if [ -z "$reasons" ]; then
+	pass "$CASE: WORK_AREA=0 puts WINDOW_SMOKE_WORK_AREA=0 in the child and work_area=0 in the run line, 1 and an absent key both leave the variable absent (the product work area) with work_area=1 in the run line, and a WINDOW_SMOKE_WORK_AREA=0 inherited from the launching shell is stripped -- and an exported job key in the launching shell does not disarm it either"
 else
 	fail "$CASE:$reasons"
 	note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
@@ -1441,13 +1576,14 @@ for jobfile in "$LAB"/jobs/smoke-*.env; do
 	# the job file's own assignments never touch the suite's variables. Declared empty first so
 	# a key a template stops carrying cannot be read as the PREVIOUS template's value.
 	j_tag=''; j_batch=''; j_looks=''; j_scale=''; j_move=''; j_extra=''; j_target=''; j_sym=''
-	j_keep=''
+	j_keep=''; j_wa=''
 	eval "$(
 		# shellcheck source=/dev/null
 		. "$jobfile" >/dev/null 2>&1
-		printf 'j_tag=%q; j_batch=%q; j_looks=%q; j_scale=%q; j_move=%q; j_extra=%q; j_target=%q; j_sym=%q; j_keep=%q\n' \
+		printf 'j_tag=%q; j_batch=%q; j_looks=%q; j_scale=%q; j_move=%q; j_extra=%q; j_target=%q; j_sym=%q; j_keep=%q; j_wa=%q\n' \
 			"${TAG:-}" "${BATCH:-}" "${DISPLAY_LOOKS_LIKE:-}" "${ADVERTISED_SCALE:-}" \
-			"${MOVE:-0}" "${EXTRA_APPS:-}" "${MOVE_TARGET:-}" "${REQUIRE_SYMBOL:-}" "${MOVE_KEEP:-0}"
+			"${MOVE:-0}" "${EXTRA_APPS:-}" "${MOVE_TARGET:-}" "${REQUIRE_SYMBOL:-}" "${MOVE_KEEP:-0}" \
+			"${WORK_AREA:-1}"
 	)"
 	reasons=''
 	if [ -n "$j_sym" ]; then
@@ -1493,6 +1629,13 @@ for jobfile in "$LAB"/jobs/smoke-*.env; do
 	else
 		child_has_var WINDOW_SMOKE_MOVE_KEEP && reasons="$reasons MOVE_KEEP-armed-without-the-key;"
 	fi
+	# WORK_AREA, the other way round: 0 is the one value that reaches the child (the -wa0 baselines);
+	# the default 1 -- every other tracked job, none of which writes the key -- leaves it absent.
+	if [ "$j_wa" = '0' ]; then
+		[ "$(child_env 'WINDOW_SMOKE_WORK_AREA=0')" = '1' ] || reasons="$reasons WORK_AREA=0-not-mapped;"
+	else
+		child_has_var WINDOW_SMOKE_WORK_AREA && reasons="$reasons WORK_AREA-disarmed-without-WORK_AREA=0;"
+	fi
 	if [ -n "$j_extra" ] && [ "$(child_env "WINDOW_SMOKE_EXTRA_APPS=$j_extra")" != '1' ]; then reasons="$reasons EXTRA_APPS;"; fi
 	if [ -n "$j_target" ] && [ "$(child_env "WINDOW_SMOKE_MOVE_TARGET=$j_target")" != '1' ]; then reasons="$reasons MOVE_TARGET;"; fi
 	[ "$(child_env "WINDOW_SMOKE_LOG=$SBEVIDENCE/$j_batch/window-smoke-$j_tag.log")" = '1' ] || reasons="$reasons WINDOW_SMOKE_LOG;"
@@ -1508,7 +1651,7 @@ printf '%s\n' "$mainswift_saved" > "$MAINSWIFT" || exit 1
 # One verdict for the case, and a floor on the count: jobs/ shrinking to nothing must not read as
 # "all tracked jobs passed".
 if [ "$jobs_total" -ge 2 ] && [ "$jobs_ok" -eq "$jobs_total" ]; then
-	pass "$CASE: all $jobs_total tracked smoke templates arm the preflights they name, map ADVERTISED_SCALE and MOVE_KEEP as declared and drive the legs they declare"
+	pass "$CASE: all $jobs_total tracked smoke templates arm the preflights they name, map ADVERTISED_SCALE, MOVE_KEEP and WORK_AREA as declared and drive the legs they declare"
 else
 	fail "$CASE: $jobs_ok of $jobs_total tracked smoke jobs drove the run they describe (failed:${jobs_failed:- none}; total<2 means jobs/ shrank)"
 fi
@@ -2934,9 +3077,109 @@ else
 	fail "$CASE: could not build the mutant (the snapshot freshness proof moved?)"
 fi
 
+# Rewrites the ONE line of <file> that is EXACTLY <line> (a string comparison, no regex) to
+# <replacement>, or deletes it when <replacement> is empty; prints the result. For the WORK_AREA
+# mutants, whose target lines are full of quotes, dollars and a literal backslash-n that a sed
+# pattern would have to escape three ways. ENVIRON rather than `awk -v`, because -v processes
+# backslash escapes -- and does so differently in BSD awk and in gawk / mawk.
+mutate_line() { # <file> <exact line> <replacement line, or empty to delete>
+	MUT_TARGET="$2" MUT_REPLACEMENT="$3" awk '
+		$0 == ENVIRON["MUT_TARGET"] { if (ENVIRON["MUT_REPLACEMENT"] != "") print ENVIRON["MUT_REPLACEMENT"]; next }
+		{ print }' "$1"
+}
+
+# M12. WINDOW_SMOKE_WORK_AREA dropped from SMOKE_MANAGED_VARS (the state the wrapper was in before
+#      this lane): a WINDOW_SMOKE_WORK_AREA=0 left in the launching shell then reaches the child of a
+#      job that says nothing about the work area -- i.e. case 22d's inherited arm bites.
+begin 'M12 work-area managed-variable mutant'
+MUTANT_WAVARS="$SBLAB/labtest-mutant-wavars.command"
+if sed "/^SMOKE_MANAGED_VARS=/s/ WINDOW_SMOKE_WORK_AREA'\$/'/" "$SBLAB/smoke-job.command" > "$MUTANT_WAVARS" \
+	&& ! cmp -s "$MUTANT_WAVARS" "$SBLAB/smoke-job.command" && bash -n "$MUTANT_WAVARS"; then
+	job_base
+	run_smoke_inheriting "$MUTANT_WAVARS" 'WINDOW_SMOKE_WORK_AREA=0'
+	if [ "$(child_env 'WINDOW_SMOKE_WORK_AREA=0')" = '1' ] && [ "$(child_calls)" = '1' ]; then
+		pass "$CASE: detected -- the inherited WINDOW_SMOKE_WORK_AREA=0 reaches the child of a default job (case 22d's inherited arm pins the managed-variable entry)"
+	else
+		fail "$CASE: NOT detected -- case 22d would pass against a wrapper that lets the launching shell's work-area knob through"
+		note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
+	fi
+else
+	fail "$CASE: could not build the mutant (SMOKE_MANAGED_VARS moved, or no longer ends in WINDOW_SMOKE_WORK_AREA?)"
+fi
+
+# M13. The WORK_AREA=0 mapping line deleted: a job that asks for the pre-lane baseline then runs the
+#      product work area and says WORK_AREA=0 in its run line -- i.e. case 22d's =0 arm bites.
+begin 'M13 work-area mapping mutant'
+MUTANT_WAMAP="$SBLAB/labtest-mutant-wamap.command"
+if mutate_line "$SBLAB/smoke-job.command" \
+	"            if [ \"\$WORK_AREA\" = '0' ]; then CHILD_ENV+=('WINDOW_SMOKE_WORK_AREA=0'); fi" '' > "$MUTANT_WAMAP" \
+	&& ! cmp -s "$MUTANT_WAMAP" "$SBLAB/smoke-job.command" && bash -n "$MUTANT_WAMAP"; then
+	job_base
+	job_override 'WORK_AREA=0'
+	run_smoke "$MUTANT_WAMAP" ""
+	if ! child_has_var WINDOW_SMOKE_WORK_AREA && [ "$(child_calls)" = '1' ]; then
+		pass "$CASE: detected -- WORK_AREA=0 never reaches the child, so the baseline job would measure the product work area (case 22d's =0 arm pins the mapping)"
+	else
+		fail "$CASE: NOT detected -- case 22d would pass against a wrapper that ignores WORK_AREA=0"
+		note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
+	fi
+else
+	fail "$CASE: could not build the mutant (the WORK_AREA mapping line moved?)"
+fi
+
+# M14. The WORK_AREA shape check disabled (its condition -> `elif false`): a value outside 0|1 is
+#      then accepted and silently means the default -- i.e. case 10d's reject half bites.
+begin 'M14 work-area shape-check mutant'
+MUTANT_WASHAPE="$SBLAB/labtest-mutant-washape.command"
+if mutate_line "$SBLAB/smoke-job.command" \
+	"        elif ! printf '%s\\n' \"\$WORK_AREA\" | grep -qE '^[01]\$'; then" '        elif false; then' > "$MUTANT_WASHAPE" \
+	&& ! cmp -s "$MUTANT_WASHAPE" "$SBLAB/smoke-job.command" && bash -n "$MUTANT_WASHAPE"; then
+	job_base
+	job_override 'WORK_AREA=2'
+	run_smoke "$MUTANT_WASHAPE" ""
+	if [ "$(last_line)" = 'DONE exit=0' ] && [ "$(child_calls)" = '1' ]; then
+		pass "$CASE: detected -- WORK_AREA=2 runs (DONE exit=0) instead of being refused (case 10d pins the shape check)"
+	else
+		fail "$CASE: NOT detected -- case 10d would pass against a wrapper without the WORK_AREA shape check"
+		note "last line: [$(last_line)] launcher calls=$(child_calls)"
+	fi
+else
+	fail "$CASE: could not build the mutant (the WORK_AREA shape check moved?)"
+fi
+
+# M15. The key clearing put back AFTER the subshell that sources the job (where it was at main
+#      27f09ef): the subshell then inherits whatever job key the launching shell exported, and a job
+#      that does not write the key reads that value as its own -- i.e. the inherited-job-key arms of
+#      22b, 22c and 22d bite, all three. The mutant moves the three clearing lines and nothing else.
+begin 'M15 key-clearing-after-the-subshell mutant'
+MUTANT_CLEAR="$SBLAB/labtest-mutant-clear.command"
+if awk '
+	index($0, "        TAG=\"\"; BATCH=\"\";") == 1 || index($0, "        TRAY=\"\"; TRAY_CLICK=\"\";") == 1 ||
+		index($0, "        REQUIRE_SYMBOL=\"\"; EDGE_PROFILE=\"\";") == 1 { held = held $0 "\n"; n++; next }
+	{ print }
+	index($0, "        JOB_KEYS=\"$( . ") == 1 { printf "%s", held; placed = n; held = "" }
+	END { if (n != 3 || placed != 3) exit 1 }' "$SBLAB/smoke-job.command" > "$MUTANT_CLEAR" \
+	&& ! cmp -s "$MUTANT_CLEAR" "$SBLAB/smoke-job.command" && bash -n "$MUTANT_CLEAR"; then
+	leaked=''
+	for arm in 'EDGE_PROFILE=1 WINDOW_SMOKE_EDGE_PROFILE=1' 'MOVE_KEEP=1 WINDOW_SMOKE_MOVE_KEEP=1' \
+		'WORK_AREA=0 WINDOW_SMOKE_WORK_AREA=0'; do
+		reset_run
+		job_base
+		run_smoke_inheriting "$MUTANT_CLEAR" "${arm%% *}"
+		if [ "$(child_env "${arm#* }")" = '1' ]; then leaked="$leaked ${arm%% *}"; fi
+	done
+	if [ "$leaked" = ' EDGE_PROFILE=1 MOVE_KEEP=1 WORK_AREA=0' ]; then
+		pass "$CASE: detected -- each exported job key ($leaked ) reaches the child of a job that does not write it (the inherited-job-key arms of 22b / 22c / 22d pin the clearing)"
+	else
+		fail "$CASE: NOT detected for every arm -- leaked only [$leaked ]; 22b / 22c / 22d would pass against a wrapper that clears the keys after the subshell"
+	fi
+else
+	fail "$CASE: could not build the mutant (the three clearing lines or the subshell line moved?)"
+fi
+
 # Every case must have reported: a case that neither passed nor failed would otherwise vanish from
 # the tally with exit 0. Placed after the LAST case on purpose.
-EXPECTED_CASES=87
+EXPECTED_CASES=93
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi
