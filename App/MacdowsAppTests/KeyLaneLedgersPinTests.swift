@@ -9,6 +9,9 @@ import Testing
 // section; this file pins the wiring that makes the App's views share it: the view's injectable
 // property, the window's hand-over, and the registry's one instance at its one creation point --
 // by source (the call shapes) and by behaviour (identity of the instance the views end up with).
+// Since lane-session-reset it also pins that the registry empties the instance at its session
+// reset (`closeAllWindows()`, after `wireHeldModifiers = []`) and nowhere else: not when the window
+// table empties mid-session, not on a `.focusLost` reaching the registry.
 
 private func keyLaneLedgersRepoRoot() -> URL {
     URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -87,6 +90,43 @@ struct KeyLaneLedgersPinTests {
             of: "RemoteWindow( key: key, contentRect: contentRect, title: state.title, firstFrameTimeout: firstFrameTimeout, keyLedgers: keyLedgers)",
             in: code
         ) == 1)
+    }
+
+    /// The text between `signature`'s opening brace and its matching closing brace in `code`, braces
+    /// counted on the stripped text (the shape of `RemoteWindowLocalGeometrySyncTests.body(of:in:)`).
+    private static func body(of signature: String, in code: String) -> Substring? {
+        guard let open = code.range(of: signature) else { return nil }
+        var depth = 1
+        var index = open.upperBound
+        while index < code.endIndex {
+            if code[index] == "{" {
+                depth += 1
+            } else if code[index] == "}" {
+                depth -= 1
+                if depth == 0 { return code[open.upperBound..<index] }
+            }
+            index = code.index(after: index)
+        }
+        return nil
+    }
+
+    /// The session reset empties the ledgers, at the one point `wireHeldModifiers` is emptied
+    /// without a flush: `keyLedgers.reset()` appears once in the registry, inside `closeAllWindows()`,
+    /// after that function's `wireHeldModifiers = []`, in the same body as its
+    /// `commandKeyMapper.reset()`. Kills lane-session-reset M1 (the call deleted), M2 (moved before
+    /// `wireHeldModifiers = []`) and M3 (moved out into `closeWindowsForSessionEnd()` -- the behaviour
+    /// test below stays green for that one, since the entry routes through `closeAllWindows()`).
+    /// The four session-reset callers all route through `closeAllWindows()`
+    /// (`RemoteWindowRegistrySessionEndPinTests`).
+    @Test("RemoteWindowRegistry.swift: closeAllWindows() resets the ledgers once, after wireHeldModifiers = []")
+    func theSessionResetResetsTheLedgers() throws {
+        let code = try keyLaneLedgersCode(Self.registry)
+        #expect(keyLaneLedgersOccurrences(of: "keyLedgers.reset()", in: code) == 1)
+        let body = try #require(Self.body(of: "private func closeAllWindows() {", in: code))
+        let reset = try #require(body.range(of: "keyLedgers.reset()"), "not inside closeAllWindows()")
+        let wire = try #require(body.range(of: "wireHeldModifiers = []"))
+        #expect(wire.upperBound <= reset.lowerBound, "after wireHeldModifiers = []")
+        #expect(body.contains("commandKeyMapper.reset()"), "the same body as commandKeyMapper.reset()")
     }
 }
 
@@ -189,4 +229,89 @@ struct KeyLaneLedgersInjectionTests {
             registry.closeWindowsForSessionEnd()
         }
     }
+
+    /// The session reset empties the registry's instance: entries recorded through a window it
+    /// created are gone once `closeWindowsForSessionEnd()` -- one of the four routes into
+    /// `closeAllWindows()` -- has run (lane-session-reset M1: the reset call deleted; also the only
+    /// test that catches the gate's G3 -- a `#if false` decoy carrying the call while the real
+    /// function dropped it -- which every source pin above passes).
+    @Test("the session reset empties the registry's ledgers")
+    func theSessionResetEmptiesTheRegistrysLedgers() throws {
+        let registry = try makeKeyLaneRegistry()
+        autoreleasepool {
+            registry.handle(KeyLaneWindowCreateStub(windowId: 611))
+        }
+        let view = try #require(registry.window(forWindowId: 611)?.contentView as? RemoteWindowContentView)
+        view.keyLedgers.scancodeDown.insert(15)
+        view.keyLedgers.inputMethodDown.insert(36)
+        try #require(!registry.keyLedgersAreEmpty(), "setup: the entries are in the registry's instance")
+
+        autoreleasepool {
+            registry.closeWindowsForSessionEnd()
+        }
+        #expect(registry.keyLedgersAreEmpty())
+        #expect(view.keyLedgers.scancodeDown.isEmpty && view.keyLedgers.inputMethodDown.isEmpty)
+    }
+
+    /// Only the session reset empties the ledgers (gate r1 I-1). The window table emptying
+    /// mid-session is not a session reset: the last window is deleted while a key is still down, and
+    /// a new window may appear before the release -- a clear here (the F-a1-6 `windows.didSet`
+    /// precedent, the shape B-1 gate r1 (f-1) named; gate variant G4) would drop that release under a
+    /// CJK source and leave the key held on the server. Entries recorded through the deleted window
+    /// survive its delete.
+    @Test("deleting the last window mid-session leaves the ledgers alone")
+    func theLastWindowDeleteKeepsTheLedgers() throws {
+        let registry = try makeKeyLaneRegistry()
+        autoreleasepool {
+            registry.handle(KeyLaneWindowCreateStub(windowId: 631))
+        }
+        let view = try #require(registry.window(forWindowId: 631)?.contentView as? RemoteWindowContentView)
+        view.keyLedgers.scancodeDown.insert(15)
+        view.keyLedgers.inputMethodDown.insert(36)
+        autoreleasepool {
+            registry.handle(KeyLaneWindowDeleteStub(windowId: 631))
+        }
+        try #require(registry.window(forWindowId: 631) == nil, "setup: the window table emptied mid-session")
+        #expect(view.keyLedgers.scancodeDown == [15] && view.keyLedgers.inputMethodDown == [36])
+        #expect(!registry.keyLedgersAreEmpty())
+        autoreleasepool {
+            registry.closeWindowsForSessionEnd()
+        }
+    }
+
+    /// Only the session reset empties the ledgers (gate r1 I-1): a `.focusLost` reaching the registry
+    /// releases the held modifiers and nothing else -- a clear there (gate variant G6) would bring
+    /// I-1 back for a key released after a focus round trip. `theLedgerSurvivesLosingFirstResponder`
+    /// covers the view on its own; this one goes through the registry's `.focusLost` branch.
+    @Test("a focus loss reaching the registry leaves the ledgers alone")
+    func aFocusLossReachingTheRegistryKeepsTheLedgers() throws {
+        let registry = try makeKeyLaneRegistry()
+        autoreleasepool {
+            registry.handle(KeyLaneWindowCreateStub(windowId: 641))
+        }
+        let view = try #require(registry.window(forWindowId: 641)?.contentView as? RemoteWindowContentView)
+        view.keyLedgers.scancodeDown.insert(15)
+        view.keyLedgers.inputMethodDown.insert(36)
+        try #require(view.onEvent != nil, "setup: the registry is wired to the view")
+        view.onEvent?(.focusLost)
+        #expect(view.keyLedgers.scancodeDown == [15] && view.keyLedgers.inputMethodDown == [36])
+        autoreleasepool {
+            registry.closeWindowsForSessionEnd()
+        }
+    }
+}
+
+/// A `.windowDelete` order for one window id, generation 0 -- the registry's delete path with no
+/// server (the same "复制一份" shape as `KeyLaneWindowCreateStub` above).
+private final class KeyLaneWindowDeleteStub: CRDPEvent {
+    private let id: UInt32
+
+    init(windowId: UInt32) {
+        id = windowId
+        super.init()
+    }
+
+    override var kind: CRDPEventKind { .windowDelete }
+    override var generation: UInt32 { 0 }
+    override var windowId: UInt32 { id }
 }
