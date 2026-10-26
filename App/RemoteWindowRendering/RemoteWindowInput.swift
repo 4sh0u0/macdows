@@ -104,6 +104,62 @@ struct LocalKeyEquivalent: Hashable {
     }
 }
 
+/// F-ja-2′ B-1 gate r1 m-2: the two ledgers a keyUp follows its keyDown's lane by -- `scancodeDown`
+/// (gate r1 I-1) and `inputMethodDown` (B-1) -- kept at SESSION level, not per view. There is one
+/// physical keyboard, so a press and its release are facts about the session, whichever remote
+/// window is key when each of them arrives: the reasoning W4c review H1 applied to the modifier
+/// state (`RemoteWindowRegistry`'s `heldModifierKeys` / `wireHeldModifiers`). Ledgers held per view
+/// lost a key whose focus moved while it was held: R pressed with ⌘ in window X under a CJK source
+/// went down the scancode lane, focus moved to window Y, and Y's keyUp -- with no record of its own
+/// -- was dropped by the input-source fork, leaving R held on the server; or Y held a stale
+/// input-method entry for the same key code and swallowed the release.
+///
+/// `RemoteWindowRegistry` holds one instance and hands it to every `RemoteWindow` it creates, which
+/// gives it to its content view (`RemoteWindowContentView.keyLedgers`); a view constructed on its
+/// own (tests, any use with no registry) makes one of its own, which is the single-view semantics
+/// unchanged. A view never clears it -- not on `resignFirstResponder`, not on `.focusLost`: the
+/// ledgers are the session's, not the view's (each member's doc says why clearing would be wrong).
+/// The registry's instance lives as long as the registry.
+@MainActor
+final class KeyLaneLedgers {
+    /// gate r1 I-1: the key codes whose keyDown took the scancode lane (for any reason: an
+    /// always-scancode key, a Command chord, or an ASCII-capable source) and whose keyUp has not been
+    /// forwarded yet. `RemoteWindowContentView.keyUp(with:)` forwards a release whose down is
+    /// recorded here even when the release on its own would take the IME lane -- ⌘R under a CJK
+    /// source with Command released first sent R down, and its bare keyUp must reach the wire or R
+    /// stays held on the server (`CommandKeyMapper`'s passthrough Command-up releases LWIN only; the
+    /// registry's modifier ledger and `.focusLost` cover modifiers only). Inserted for every scancode
+    /// keyDown (an auto-repeat re-inserts the same code), consumed by the matching keyUp in whichever
+    /// view sharing this instance receives it. Not cleared on a focus change: a stale entry can
+    /// forward at most one release of a key the server does not hold, a no-op there; the set is
+    /// bounded by the keyboard's key codes; and clearing it would bring I-1 back for a key whose
+    /// release arrives after a focus round trip or in another window.
+    var scancodeDown: Set<UInt16> = []
+    /// F-ja-2′ B-1: the key codes whose keyDown went to the input method
+    /// (`RemoteWindowContentView.handOffToInputMethod`) and stayed there, and whose keyUp has not
+    /// arrived yet. `keyUp(with:)` drops a release recorded here: its keyDown never reached the wire,
+    /// and a Return that confirmed a composition would otherwise put an Enter-up with no Enter-down
+    /// on the server (Return's own lane, by its flags, is the scancode one). Inserted for every
+    /// keyDown handed to the input method (an auto-repeat re-inserts the same code); the view's
+    /// `doCommand(by:)` takes a code out when the input method gives its key back (B-6), and
+    /// `scancodeDown` gets it instead. Not cleared on a focus change, for `scancodeDown`'s reasons:
+    /// every keyDown a view of the session sends to either lane is recorded here or in
+    /// `scancodeDown`, and a scancode record wins over this entry at the release, so a stale entry
+    /// can drop only a release whose press never reached the wire (a key pressed while a Mac window
+    /// was key and released in a remote one, or a reserved key equivalent the menu took); the set is
+    /// bounded by the keyboard's key codes; and clearing it would forward, after a focus round trip,
+    /// the release of a key the input method kept.
+    var inputMethodDown: Set<UInt16> = []
+
+    /// Empties both ledgers. No production caller yet: the registry's session-reset call is the
+    /// registered micro-lane (adr/0019 §4 risk 2, the R-4 pin on `closeAllWindows()`); S4 drives
+    /// it offline.
+    func reset() {
+        scancodeDown = []
+        inputMethodDown = []
+    }
+}
+
 /// W4c: `RemoteWindow`'s content view. Captures the full range of mouse/keyboard/scroll
 /// input AppKit can deliver to a plain view and reports each as a `RemoteWindowInputEvent`
 /// via `onEvent`, set once by `RemoteWindow` at construction time — this class holds no
@@ -124,31 +180,14 @@ final class RemoteWindowContentView: NSView {
     /// `hasMarkedText()`/`markedRange()`) internally consistent -- deliberately never drawn
     /// (the inline marked-text overlay is Phase 2's documented v1 gap, adr/0011 §2/§6).
     private var markedText = ""
-    /// gate r1 I-1: the key codes whose keyDown took the scancode lane (for any reason: an
-    /// always-scancode key, a Command chord, or an ASCII-capable source) and whose keyUp has not
-    /// been forwarded yet. `keyUp(with:)` forwards a release whose down is recorded here even when
-    /// the release on its own would take the IME lane -- ⌘R under a CJK source with Command released
-    /// first sent R down, and its bare keyUp must reach the wire or R stays held on the server
-    /// (`CommandKeyMapper`'s passthrough Command-up releases LWIN only; the registry's ledger and
-    /// `.focusLost` cover modifiers only). Inserted for every scancode keyDown (an auto-repeat
-    /// re-inserts the same code), consumed by the matching keyUp. Never cleared -- not on
-    /// `resignFirstResponder`, not on `.focusLost`: a stale entry can forward at most one release of
-    /// a key the server does not hold, a no-op there; the set is bounded by the keyboard's key
-    /// codes; and clearing it would bring I-1 back for a key whose release arrives after a focus
-    /// round trip.
-    private var scancodeDownKeyCodes: Set<UInt16> = []
-    /// F-ja-2′ B-1: the key codes whose keyDown went to the input method (`handOffToInputMethod`)
-    /// and stayed there, and whose keyUp has not arrived yet. `keyUp(with:)` drops a release
-    /// recorded here: its keyDown never reached the wire, and a Return that confirmed a composition
-    /// would otherwise put an Enter-up with no Enter-down on the server (Return's own lane, by its
-    /// flags, is the scancode one). Inserted for every keyDown handed to the input method (an
-    /// auto-repeat re-inserts the same code); `doCommand(by:)` takes a code out when the input method
-    /// gives its key back (B-6), and `scancodeDownKeyCodes` gets it instead. Never cleared -- not on
-    /// `resignFirstResponder`, not on `.focusLost` -- for `scancodeDownKeyCodes`'s reasons: a stale
-    /// entry can drop at most one release of a key whose press the server never saw; the set is
-    /// bounded by the keyboard's key codes; and clearing it would forward, after a focus round
-    /// trip, the release of a key the input method kept.
-    private var inputMethodDownKeyCodes: Set<UInt16> = []
+    /// F-ja-2′ B-1 gate r1 m-2: where this view records the lane each keyDown took, so its keyUp can
+    /// follow it -- `scancodeDown` (gate r1 I-1) and `inputMethodDown` (B-1), see `KeyLaneLedgers`.
+    /// Session-level: `RemoteWindow` replaces this default with the instance its
+    /// `RemoteWindowRegistry` hands every window it creates, so a key pressed in one remote window and
+    /// released in another is still judged by the lane its press took. The default, a ledger of this
+    /// view's own, is what a view constructed on its own uses (tests, any use with no registry): the
+    /// single-view semantics, unchanged. This view never clears it.
+    var keyLedgers: KeyLaneLedgers = KeyLaneLedgers()
     /// F-ja-2′ B-6: the keyDown `handleKeyDown` is handing to the input method right now -- set just
     /// before `handOffToInputMethod` runs and cleared when it returns -- so `doCommand(by:)` can tell
     /// a command the input method fell back to for THAT key from any other call.
@@ -339,7 +378,7 @@ final class RemoteWindowContentView: NSView {
         if takesInputMethodLane(event) {
             // F-ja-2′ B-1: this key went to the input method, so its keyUp follows it there --
             // unless `doCommand(by:)` sends it down the scancode lane after all.
-            inputMethodDownKeyCodes.insert(event.keyCode)
+            keyLedgers.inputMethodDown.insert(event.keyCode)
             eventHandedToInputMethod = event
             defer { eventHandedToInputMethod = nil }
             Self.handOffToInputMethod(self, event)
@@ -352,7 +391,7 @@ final class RemoteWindowContentView: NSView {
     /// the input method gave back: the event's own key code and characters, verbatim.
     private func sendScancodeKeyDown(_ event: NSEvent) {
         // gate r1 I-1: this key went down the scancode lane, so its keyUp must follow it there.
-        scancodeDownKeyCodes.insert(event.keyCode)
+        keyLedgers.scancodeDown.insert(event.keyCode)
         onEvent?(.keyDown(
             macKeyCode: event.keyCode,
             characters: event.characters ?? "",
@@ -369,17 +408,18 @@ final class RemoteWindowContentView: NSView {
     /// method, this sends THAT key down the scancode lane: the original event -- its own key code
     /// and characters, not `NSApp.currentEvent` and not one made up from the selector -- as
     /// `handleKeyDown` would have sent it (the alignment `.flagsChanged` already went out, before
-    /// the hand-off), its key code moved from `inputMethodDownKeyCodes` to `scancodeDownKeyCodes` so
-    /// the keyUp follows it, and no `super` (no beep). Once per hand-off: a binding that names
-    /// several commands (⌃O) still puts one key on the wire, not a repeat -- the code leaves
-    /// `inputMethodDownKeyCodes` with the first, and its absence is what turns the rest away.
-    /// Called at any other time: `super`, as before, and nothing is sent.
+    /// the hand-off), its key code moved from `keyLedgers.inputMethodDown` to `keyLedgers.scancodeDown`
+    /// so the keyUp follows it (in whichever view of the session it arrives), and no `super` (no
+    /// beep). Once per hand-off: a binding that names several commands (⌃O) still puts one key on the
+    /// wire, not a repeat -- the code leaves `keyLedgers.inputMethodDown` with the first, and its
+    /// absence is what turns the rest away. Called at any other time: `super`, as before, and nothing
+    /// is sent.
     override func doCommand(by selector: Selector) {
         guard let event = eventHandedToInputMethod else {
             super.doCommand(by: selector)
             return
         }
-        guard inputMethodDownKeyCodes.remove(event.keyCode) != nil else { return }
+        guard keyLedgers.inputMethodDown.remove(event.keyCode) != nil else { return }
         sendScancodeKeyDown(event)
     }
 
@@ -393,16 +433,17 @@ final class RemoteWindowContentView: NSView {
         // committed string ever crosses the wire for that path) -- no scancode keyUp for
         // it either, except for the same carve-out (`takesScancodeLane`: the always-scancode
         // keys and, F-a1-5, every Command chord) and, gate r1 I-1, a key whose keyDown took the
-        // scancode lane (`scancodeDownKeyCodes`): the keyUp follows its keyDown, whatever its own
+        // scancode lane (`keyLedgers.scancodeDown`): the keyUp follows its keyDown, whatever its own
         // flags and the source now say -- Command released before the letter, or the input source
         // switched between down and up. F-ja-2′ B-1, the other way round: a key whose keyDown went
-        // to the input method and stayed there (`inputMethodDownKeyCodes`) is dropped whatever its
+        // to the input method and stayed there (`keyLedgers.inputMethodDown`) is dropped whatever its
         // own lane would be -- a Return, Escape or arrow that the input method took while composing
         // must not put a release with no press on the server. Both entries are consumed before the
         // decision, whichever way it goes; a scancode record wins (an auto-repeat that went down the
-        // scancode lane after the composition ended put the key on the wire).
-        let recorded = scancodeDownKeyCodes.remove(event.keyCode) != nil
-        let handedToInputMethod = inputMethodDownKeyCodes.remove(event.keyCode) != nil
+        // scancode lane after the composition ended put the key on the wire). The ledgers are the
+        // session's (B-1 gate r1 m-2), so the press may have arrived at another remote window.
+        let recorded = keyLedgers.scancodeDown.remove(event.keyCode) != nil
+        let handedToInputMethod = keyLedgers.inputMethodDown.remove(event.keyCode) != nil
         if !recorded {
             guard !handedToInputMethod else { return }
             guard Self.takesScancodeLane(event) || Self.inputSourceIsASCIICapable() else { return }
@@ -419,7 +460,7 @@ final class RemoteWindowContentView: NSView {
     }
 
     /// adr/0011 §1's table, with one row added by F-a1-5, as `keyUp(with:)` reads it for a release
-    /// that neither ledger below records: such a keyUp takes the scancode lane, whatever the input
+    /// that neither of `keyLedgers`' ledgers records: such a keyUp takes the scancode lane, whatever the input
     /// source, when its key is an always-scancode key (below) OR its modifier flags contain Command
     /// (gate r1 m-9 of F-ja-2′: for a keyDown this is no longer the whole rule -- see
     /// `takesInputMethodLane`). A Command chord is `CommandKeyMapper`'s lane (adr/0011
@@ -431,9 +472,9 @@ final class RemoteWindowContentView: NSView {
     /// Control chords). Since F-ja-2′ B-1 a keyDown's lane is decided by `takesInputMethodLane`
     /// (adr/0011 §1: "判据在 keyDown 捕获时求值"), which suspends the always-scancode half of this
     /// rule while the input method composes; `keyUp(with:)` asks this question of its own event, but
-    /// first follows its keyDown through `scancodeDownKeyCodes` (gate r1 I-1), since Command may be
+    /// first follows its keyDown through `keyLedgers.scancodeDown` (gate r1 I-1), since Command may be
     /// released before the letter and the release's flags no longer carry it, and through
-    /// `inputMethodDownKeyCodes` (F-ja-2′ B-1), since a Return the input method took has a scancode
+    /// `keyLedgers.inputMethodDown` (F-ja-2′ B-1), since a Return the input method took has a scancode
     /// lane by its flags alone.
     private static func takesScancodeLane(_ event: NSEvent) -> Bool {
         isAlwaysScancodeKey(macKeyCode: event.keyCode) || event.modifierFlags.contains(.command)

@@ -529,7 +529,16 @@ final class RemoteWindow {
     ///   `Self.defaultFirstFrameTimeout` so every pre-existing caller (tests, any future
     ///   caller that doesn't yet know about the popup tier) keeps Phase 2 W0③'s original
     ///   behavior unchanged.
-    init(key: RemoteWindowKey, contentRect: NSRect, title: String, firstFrameTimeout: TimeInterval = RemoteWindow.defaultFirstFrameTimeout) {
+    /// - Parameter keyLedgers: F-ja-2′ B-1 gate r1 m-2 -- the session's key-lane ledgers, handed to
+    ///   the content view (`RemoteWindowContentView.keyLedgers`). `RemoteWindowRegistry` passes the
+    ///   one instance it holds, so every window of the session records presses and judges releases
+    ///   against the same two ledgers. Defaults to a ledger of this window's own, so every other
+    ///   caller (tests) keeps the single-view semantics.
+    init(
+        key: RemoteWindowKey, contentRect: NSRect, title: String,
+        firstFrameTimeout: TimeInterval = RemoteWindow.defaultFirstFrameTimeout,
+        keyLedgers: KeyLaneLedgers = KeyLaneLedgers()
+    ) {
         self.key = key
         self.firstFrameTimeout = firstFrameTimeout
 
@@ -573,6 +582,7 @@ final class RemoteWindow {
         layer.isOpaque = true
 
         let contentView = RemoteWindowContentView(frame: NSRect(origin: .zero, size: contentRect.size))
+        contentView.keyLedgers = keyLedgers
         contentView.wantsLayer = true
         contentView.layer = layer
         win.contentView = contentView
