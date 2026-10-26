@@ -29,9 +29,12 @@ import Testing
 //    `insertText("a")`, ⌃A as `doCommand(moveToBeginningOfParagraph:)`, Delete as
 //    `doCommand(deleteBackward:)`, ⌃O as two commands. What a real CJK input method makes of a key
 //    is not drivable here (a test cannot select an input source).
-//  * A keyUp follows its keyDown's lane through the view's ledger (gate r1 I-1), so the ledger
+//  * A keyUp follows its keyDown's lane through the ledgers (gate r1 I-1, F-ja-2′ B-1), so the ledger
 //    tests drive a down and its up on ONE view (`makeSteppedView`), each step with its own
-//    input-source answer.
+//    input-source answer. The ledgers are the session's (`KeyLaneLedgers`, B-1 gate r1 m-2): a view
+//    built here keeps its own default instance, which is the single-view case; the m-2 tests drive
+//    the down and the up on TWO views sharing one instance, as `RemoteWindowRegistry` builds them
+//    (`makeSteppedView(sharing:)`), each next to its per-view control.
 //  * Mouse coverage is left-button only: `NSEvent.mouseEvent(...)` offers no way to set
 //    `buttonNumber`, so `otherMouseDown`'s `buttonNumber == 2` middle-vs-side-button gate is
 //    not synthesizable headless. `scrollWheel`'s `deltaX/deltaY` are likewise not settable on
@@ -153,6 +156,14 @@ struct RemoteWindowInputTests {
             defer { box.events.removeAll() }
             return box.events
         })
+    }
+
+    /// `makeSteppedView()` with its key-lane ledgers replaced by `ledgers` -- what `RemoteWindow` does
+    /// with the instance `RemoteWindowRegistry` hands it (B-1 gate r1 m-2).
+    private static func makeSteppedView(sharing ledgers: KeyLaneLedgers) -> (RemoteWindowContentView, () -> [RemoteWindowInputEvent]) {
+        let (view, drain) = makeSteppedView()
+        view.keyLedgers = ledgers
+        return (view, drain)
     }
 
     /// Whether `events` holds `.keyDown` for `keyCode`.
@@ -856,6 +867,159 @@ struct RemoteWindowInputTests {
             Self.hasKeyDown(51, in: seen),
             "\(seen); active input source \(Self.liveInputSourceID()); if this runner's source is a CJK input method, read F-ja-2′ U-1 first"
         )
+    }
+
+    // MARK: - F-ja-2′ B-1 gate r1 m-2: the key-lane ledgers are the session's
+
+    /// Whether both of `ledgers` are empty.
+    private static func isEmpty(_ ledgers: KeyLaneLedgers) -> Bool {
+        ledgers.scancodeDown.isEmpty && ledgers.inputMethodDown.isEmpty
+    }
+
+    /// S1 + S5. Gate r1 I-1's ⌘R across two windows: under a CJK source ⌘R's keyDown in window A
+    /// takes the scancode lane (R held on the server), focus moves to window B, and Command released
+    /// first, R's bare keyUp arrives at B. B finds the press in the ledgers it shares with A and
+    /// forwards the release: the empty alignment, then `.keyUp(15)`. The entry is used once: a second
+    /// R keyUp, back at A, is dropped by today's guard.
+    @Test("B-1 gate r1 m-2: ⌘R pressed in window A, R released in window B, reaches the wire once (shared ledgers, CJK source)")
+    func aReleaseInAnotherWindowFollowsThePressThroughTheSharedLedgers() throws {
+        let ledgers = KeyLaneLedgers()
+        let (a, drainA) = Self.makeSteppedView(sharing: ledgers)
+        let (b, drainB) = Self.makeSteppedView(sharing: ledgers)
+        Self.deliver(try Self.key("r", keyCode: 15, .command), to: a, asciiCapable: false)
+        let down = drainA()
+        #expect(Self.hasKeyDown(15, in: down), "\(down)")
+        #expect(ledgers.scancodeDown == [15], "the press is recorded in the shared instance: \(ledgers.scancodeDown)")
+
+        let release = try Self.key("r", keyCode: 15, [], type: .keyUp)
+        Self.deliver(release, to: b, asciiCapable: false)
+        let up = drainB()
+        try #require(up.count == 2, "\(up)")
+        guard case .flagsChanged(let flags) = up[0], flags.isEmpty, case .keyUp(15, "r", "r") = up[1] else {
+            Issue.record("R's keyUp in window B reported \(up), expected the empty alignment then .keyUp(15)")
+            return
+        }
+        #expect(Self.isEmpty(ledgers), "B's release consumed the entry: \(ledgers.scancodeDown) \(ledgers.inputMethodDown)")
+
+        Self.deliver(release, to: a, asciiCapable: false)
+        let again = drainA()
+        #expect(!Self.hasScancodeKey(again) && again.count == 1, "the entry is used once: \(again)")
+    }
+
+    /// S1's control, the defect B-1 gate r1 m-2 names: with a ledger per view (two views built on their
+    /// own, each with its default instance) the same ⌘R sequence leaves B with no record, and R's
+    /// bare keyUp is dropped by the input-source fork -- R stays held on the server.
+    @Test("B-1 gate r1 m-2, the defect: with a ledger per view, R released in window B is dropped (CJK source)")
+    func perViewLedgersDropAReleaseWhoseFocusMoved() throws {
+        let (a, drainA) = Self.makeSteppedView()
+        let (b, drainB) = Self.makeSteppedView()
+        #expect(a.keyLedgers !== b.keyLedgers, "views built on their own each keep their own ledgers")
+        Self.deliver(try Self.key("r", keyCode: 15, .command), to: a, asciiCapable: false)
+        let down = drainA()
+        #expect(Self.hasKeyDown(15, in: down), "\(down)")
+
+        Self.deliver(try Self.key("r", keyCode: 15, [], type: .keyUp), to: b, asciiCapable: false)
+        let up = drainB()
+        #expect(!Self.hasScancodeKey(up) && up.count == 1, "only the alignment: \(up)")
+    }
+
+    /// S2. F-ja-2′ B-1 across two windows: window A composes, its Return goes to the input method
+    /// (consumed) -- no keyDown on the wire -- and the Return keyUp arrives at window B, composing
+    /// nothing. B finds the input-method entry in the shared ledgers and drops the release: no
+    /// keyUp without its keyDown.
+    @Test("B-1 gate r1 m-2: a Return the input method took in window A has its keyUp dropped in window B (shared ledgers)")
+    func aReleaseInAnotherWindowFollowsAnInputMethodPress() throws {
+        let ledgers = KeyLaneLedgers()
+        let (a, drainA) = Self.makeSteppedView(sharing: ledgers)
+        let (b, drainB) = Self.makeSteppedView(sharing: ledgers)
+        Self.compose(a)
+        Self.deliver(try Self.key("\r", keyCode: 36, []), to: a, asciiCapable: false, inputMethod: Self.consumes())
+        let down = drainA()
+        #expect(!Self.hasScancodeKey(down), "\(down)")
+        #expect(ledgers.inputMethodDown == [36], "the hand-off is recorded in the shared instance: \(ledgers.inputMethodDown)")
+
+        Self.deliver(try Self.key("\r", keyCode: 36, [], type: .keyUp), to: b, asciiCapable: false, inputMethod: Self.neverHandedOff())
+        let up = drainB()
+        try #require(up.count == 1, "only the alignment: \(up)")
+        guard case .flagsChanged = up[0] else {
+            Issue.record("the one event was \(up[0]), expected the alignment .flagsChanged")
+            return
+        }
+        #expect(Self.isEmpty(ledgers), "\(ledgers.scancodeDown) \(ledgers.inputMethodDown)")
+    }
+
+    /// S2's control, the defect: with a ledger per view, B has no input-method entry, and by its own
+    /// flags Return's keyUp takes the scancode lane -- an Enter-up with no Enter-down reaches the wire.
+    @Test("B-1 gate r1 m-2, the defect: with a ledger per view, the keyUp of a Return the input method took reaches the wire from window B")
+    func perViewLedgersForwardAReleaseWhosePressTheInputMethodTook() throws {
+        let (a, drainA) = Self.makeSteppedView()
+        let (b, drainB) = Self.makeSteppedView()
+        Self.compose(a)
+        Self.deliver(try Self.key("\r", keyCode: 36, []), to: a, asciiCapable: false, inputMethod: Self.consumes())
+        let down = drainA()
+        #expect(!Self.hasScancodeKey(down), "\(down)")
+
+        Self.deliver(try Self.key("\r", keyCode: 36, [], type: .keyUp), to: b, asciiCapable: false, inputMethod: Self.neverHandedOff())
+        let up = drainB()
+        #expect(Self.hasKeyUp(36, in: up), "\(up)")
+    }
+
+    /// S3. F-ja-2′ B-6 across two windows: window A hands an empty-state Delete to the input method,
+    /// which gives it back (`deleteBackward:`); `doCommand(by:)` sends it down the scancode lane and
+    /// moves 51 from the shared input-method ledger to the shared scancode ledger -- one entry, in
+    /// one ledger, of the one instance. Its keyUp at window B is forwarded and consumes it.
+    @Test("B-1 gate r1 m-2: a Delete given back in window A moves to the shared scancode ledger and its keyUp in window B reaches the wire")
+    func aKeyGivenBackMovesWithinTheSharedLedgers() throws {
+        let ledgers = KeyLaneLedgers()
+        let (a, drainA) = Self.makeSteppedView(sharing: ledgers)
+        let (b, drainB) = Self.makeSteppedView(sharing: ledgers)
+        let inputMethod = Self.givesBack(#selector(NSResponder.deleteBackward(_:)))
+        Self.deliver(try Self.key("\u{7f}", keyCode: 51, []), to: a, asciiCapable: false, inputMethod: inputMethod)
+        let down = drainA()
+        try #require(down.count == 2, "\(down)")
+        guard case .flagsChanged = down[0], case .keyDown(51, "\u{7f}", "\u{7f}") = down[1] else {
+            Issue.record("a Delete given back in window A reported \(down)")
+            return
+        }
+        #expect(a.keyLedgers === ledgers)
+        #expect(ledgers.inputMethodDown.isEmpty, "no input-method entry left behind: \(ledgers.inputMethodDown)")
+        #expect(ledgers.scancodeDown == [51], "\(ledgers.scancodeDown)")
+
+        Self.deliver(try Self.key("\u{7f}", keyCode: 51, [], type: .keyUp), to: b, asciiCapable: false, inputMethod: Self.neverHandedOff())
+        let up = drainB()
+        try #require(up.count == 2, "\(up)")
+        guard case .flagsChanged = up[0], case .keyUp(51, "\u{7f}", "\u{7f}") = up[1] else {
+            Issue.record("the Delete keyUp in window B reported \(up)")
+            return
+        }
+        #expect(Self.isEmpty(ledgers), "\(ledgers.scancodeDown) \(ledgers.inputMethodDown)")
+    }
+
+    /// S4. `reset()` empties both ledgers: after ⌘R (scancode entry 15) and a composing Return taken
+    /// by the input method (input-method entry 36) in window A, a reset leaves nothing, and window B
+    /// judges both releases by today's guard -- R's dropped (a letter under a CJK source), Return's
+    /// forwarded (an always-scancode key with no record either way).
+    @Test("B-1 gate r1 m-2: reset() empties both shared ledgers, and the releases fall back to today's guard")
+    func resetEmptiesBothSharedLedgers() throws {
+        let ledgers = KeyLaneLedgers()
+        let (a, drainA) = Self.makeSteppedView(sharing: ledgers)
+        let (b, drainB) = Self.makeSteppedView(sharing: ledgers)
+        Self.deliver(try Self.key("r", keyCode: 15, .command), to: a, asciiCapable: false)
+        Self.compose(a)
+        Self.deliver(try Self.key("\r", keyCode: 36, []), to: a, asciiCapable: false, inputMethod: Self.consumes())
+        _ = drainA()
+        try #require(ledgers.scancodeDown == [15] && ledgers.inputMethodDown == [36],
+                     "setup: \(ledgers.scancodeDown) \(ledgers.inputMethodDown)")
+
+        ledgers.reset()
+        #expect(Self.isEmpty(ledgers), "\(ledgers.scancodeDown) \(ledgers.inputMethodDown)")
+
+        Self.deliver(try Self.key("r", keyCode: 15, [], type: .keyUp), to: b, asciiCapable: false)
+        let letter = drainB()
+        #expect(!Self.hasScancodeKey(letter) && letter.count == 1, "R's release is judged by today's guard: \(letter)")
+        Self.deliver(try Self.key("\r", keyCode: 36, [], type: .keyUp), to: b, asciiCapable: false, inputMethod: Self.neverHandedOff())
+        let enter = drainB()
+        #expect(Self.hasKeyUp(36, in: enter), "Return's release is judged by today's guard: \(enter)")
     }
 
     // MARK: - gate r1 m-3: the seam's default is the live read

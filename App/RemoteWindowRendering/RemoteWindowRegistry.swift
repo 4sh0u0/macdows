@@ -383,6 +383,17 @@ final class RemoteWindowRegistry {
     /// (passthrough), or as nothing at all (still withheld) — releasing based on physical
     /// truth instead of this ledger would send the WRONG scancode's RELEASE.
     private var wireHeldModifiers: ModifierKeySet = []
+    /// F-ja-2′ B-1 gate r1 m-2: *session-level* key-lane ledgers -- one physical keyboard, one
+    /// pair of ledgers, not per window, the same move W4c review H1 made for the modifier state
+    /// above. Each content view used to keep its own `scancodeDown` / `inputMethodDown` sets, so a
+    /// key pressed while window A was key and released while window B was key instead was judged
+    /// by B's ledgers, which never recorded the press: under a CJK source R of ⌘R (Command released
+    /// first) was dropped and stayed held on the server, and a stale input-method entry in B could
+    /// swallow a release whose press went out on the wire. Handed to every `RemoteWindow` this
+    /// registry creates (`handleWindowOrder`'s `RemoteWindow(...keyLedgers:)` call), which hands
+    /// it to its content view; the view does all the reading and writing (`KeyLaneLedgers`' doc).
+    /// Lives as long as this registry.
+    private let keyLedgers = KeyLaneLedgers()
     /// adr/0011 §3: the Cmd<->Ctrl remap state machine — one session-level instance,
     /// mirroring `heldModifierKeys`'/`wireHeldModifiers`' own "one physical keyboard, one
     /// tracked state" precedent. Pure `MacdowsCore` logic; this registry only feeds it
@@ -1410,6 +1421,15 @@ final class RemoteWindowRegistry {
         wireHeldModifiers.isEmpty
     }
 
+    /// F-ja-2′ B-1 gate r1 m-2, test-facing: whether both of the session's key-lane ledgers
+    /// (`keyLedgers`) are empty. Read-only, and only the emptiness predicate, for
+    /// `wireHeldModifiersIsEmpty()`'s reasons: what a test asserts through it is "the windows this
+    /// registry created write into this instance" (a key recorded through one of them makes this
+    /// false), not which key codes the ledgers hold.
+    func keyLedgersAreEmpty() -> Bool {
+        keyLedgers.scancodeDown.isEmpty && keyLedgers.inputMethodDown.isEmpty
+    }
+
     /// Diagnostics only (Tools/window-smoke's `[tray]` summary line, phase2.md §4 W6
     /// acceptance) -- thin passthrough to `trayStatusController.diagnostics()`, same
     /// "Registry exposes, controller/state owns" split `zOrderDiagnostics()` above already
@@ -1594,7 +1614,9 @@ final class RemoteWindowRegistry {
             // discriminator (NOT `WS_POPUP`; see `StyleTranslator`'s own doc comment for why
             // that would be wrong -- e.g. the About dialog IS `WS_POPUP` but still titled).
             let firstFrameTimeout = chrome.titled ? RemoteWindow.defaultFirstFrameTimeout : RemoteWindow.popupFirstFrameTimeout
-            let window = RemoteWindow(key: key, contentRect: contentRect, title: state.title, firstFrameTimeout: firstFrameTimeout)
+            let window = RemoteWindow(
+                key: key, contentRect: contentRect, title: state.title, firstFrameTimeout: firstFrameTimeout,
+                keyLedgers: keyLedgers)
             window.onInput = { [weak self] event in
                 self?.handleInput(windowId: windowId, event: event)
             }
