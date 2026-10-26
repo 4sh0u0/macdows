@@ -339,6 +339,18 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 /// `+[CRSession setProcessLogLineSink:]`).
 typedef void (^CRProcessLogLineSink)(NSInteger level, NSString *tag, NSString *message) NS_SWIFT_SENDABLE;
 
+/// F-ja-4 m-3: what `+[CRSession clampWorkAreaLeft:top:right:bottom:toDesktopWidth:height:]`
+/// returns -- the four work-area edges after the clamp (remote desktop pixels, right and bottom
+/// exclusive, the same unit as the four `workArea*` properties), and whether any of them moved.
+typedef struct {
+    uint32_t left;
+    uint32_t top;
+    uint32_t right;
+    uint32_t bottom;
+    /// YES when at least one edge was pulled in to the desktop; the connect path logs a WARN then.
+    BOOL changed;
+} CRWorkAreaClamp;
+
 /// One RDP/RAIL/RDPGFX session bridging a remote Windows host into this process, per
 /// adr/0005. `CRSession.mm`'s implementation links FreeRDP and CRDPQueue's C API
 /// directly; none of that leaks across this header — it stays pure Objective-C so Swift
@@ -427,6 +439,22 @@ typedef void (^CRProcessLogLineSink)(NSInteger level, NSString *tag, NSString *m
             acceptedFingerprint:(nullable NSString *)accepted
                       rejection:(CRCertificateRejection *_Nullable *_Nullable)rejection;
 
+/// F-ja-4 m-3 (lane E gate r1): the clamp the connect path applies to the four work-area
+/// properties before it validates them -- pure arithmetic, no FreeRDP, callable offline. With a
+/// desktop to clamp into (`width` and `height` both non-zero) each edge is pulled in to it: `left`
+/// and `right` to at most `width`, `top` and `bottom` to at most `height`, and `changed` says
+/// whether any edge moved. A zero `width` or `height` returns the four edges as given with
+/// `changed == NO`: there is no desktop to clamp into (the App always sets both). All four zero
+/// comes back all four zero -- "send nothing" stays "send nothing". It does NOT judge emptiness: a
+/// pair of edges clamped together (`left >= right`, `top >= bottom`) is returned as it is, and the
+/// connect path's own non-empty TS_RECTANGLE_16 check refuses it like any other empty rectangle.
++ (CRWorkAreaClamp)clampWorkAreaLeft:(uint32_t)left
+                                 top:(uint32_t)top
+                               right:(uint32_t)right
+                              bottom:(uint32_t)bottom
+                      toDesktopWidth:(uint32_t)width
+                              height:(uint32_t)height;
+
 /// ADR-0024 D-4 (Y-b): the trust snapshot the certificate callback judges against -- the ONE
 /// SHA-256 fingerprint (canonical, 64 hex digits) this connection may accept, or nil to accept
 /// none. Set on T_main before `-start` (the callback reads it on T_rdp, after the thread was
@@ -506,12 +534,21 @@ typedef void (^CRProcessLogLineSink)(NSInteger level, NSString *tag, NSString *m
 /// When set, every ARC_COMPLETED sends one sysparam carrying only this work area, right after the
 /// start command (whose own sysparam reports the whole desktop first), so the server snaps,
 /// maximises and restores RemoteApp windows inside it instead of under the Mac menu bar and Dock --
-/// the same path the upstream X11 client takes since FreeRDP 3.31.0. A value that is not a
-/// non-empty TS_RECTANGLE_16 (right <= left, bottom <= top, or an edge past 65535) is refused at
-/// connect with a WARN and nothing is sent. Validation against the desktop is the caller's: the
-/// App and window-smoke assign MacdowsCore's `DisplayTopology.workAreaInRemotePixels` from the same
-/// topology freeze the desktop size comes from (the primary display's `visibleFrame`, clipped to
-/// the desktop), and zero all four when that freeze has no usable display -- a reconnect reuses
+/// the same path the upstream X11 client takes since FreeRDP 3.31.0.
+///
+/// At connect the four edges are first CLAMPED into the advertised desktop -- `desktopWidth` /
+/// `desktopHeight`, when both are non-zero (with either at 0 the connect path leaves FreeRDP's own
+/// desktop default and clamps nothing) -- by `+clampWorkAreaLeft:top:right:bottom:toDesktopWidth:height:`:
+/// left and right to at most `desktopWidth`, top and bottom to at most `desktopHeight`. A clamp that
+/// moved any edge is logged as one WARN carrying only numbers (the edges as given, the desktop, the
+/// edges as clamped). Then a value that is not a non-empty TS_RECTANGLE_16 (right <= left,
+/// bottom <= top, or an edge past 65535) -- a rectangle the clamp emptied included -- is refused with
+/// a WARN and nothing is sent. For the App the clamp is a no-op: it assigns MacdowsCore's
+/// `DisplayTopology.workAreaInRemotePixels` from the same topology freeze the desktop size comes from
+/// (the primary display's `visibleFrame`, already clipped to that desktop). The clamp exists for a
+/// caller whose advertised desktop is SMALLER than the real one -- today window-smoke under
+/// `WINDOW_SMOKE_DECLARED_DESKTOP`, whose work area is still derived from the real topology (lane E
+/// gate r1 m-3). Callers zero all four when the freeze has no usable display -- a reconnect reuses
 /// this object, so a previous freeze's values would otherwise reach the next `-start`. A mid-session
 /// Dock or menu-bar change is NOT followed (adr/0015 §5.A.3's discipline, owner ruling 2026-10-22).
 @property (nonatomic) uint32_t workAreaLeft;

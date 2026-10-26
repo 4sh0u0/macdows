@@ -2080,15 +2080,36 @@ static BOOL crb_pre_connect(freerdp *instance)
     /* F-ja-4 lane E: the work area, read here once per connection (CRSession.h's contract for the
      * four properties, the same as desktopWidth's) and copied into the context, where
      * crb_monitored_desktop sends it after every start command. All four zero = send nothing.
-     * Anything else must be a non-empty TS_RECTANGLE_16 -- the wire edges are UINT16 and a cast
-     * would silently wrap -- or it is refused here, loudly, and nothing is sent. This never fails
-     * the connection: without it the server keeps the start command's whole-desktop work area,
-     * which is the pre-lane behaviour. */
+     * First (lane E gate r1 m-3) the four edges are clamped into the ADVERTISED desktop -- the
+     * desktopWidth / desktopHeight this function sent above, when both are non-zero -- by the pure
+     * class method the offline tests drive. For the App that is a no-op (MacdowsCore derives the
+     * work area from the same freeze as the desktop and clips it to that desktop); it bites for a
+     * caller that advertises a desktop smaller than the real one, e.g. window-smoke under
+     * WINDOW_SMOKE_DECLARED_DESKTOP, and says so with one WARN of numbers. The clamped edges then
+     * go through the unchanged check: anything but all-zero must be a non-empty TS_RECTANGLE_16 --
+     * the wire edges are UINT16 and a cast would silently wrap; a rectangle the clamp emptied is
+     * refused here like any other -- or it is refused, loudly, and nothing is sent. This never
+     * fails the connection: without it the server keeps the start command's whole-desktop work
+     * area, which is the pre-lane behaviour. */
     {
-        const uint32_t left = session.workAreaLeft;
-        const uint32_t top = session.workAreaTop;
-        const uint32_t right = session.workAreaRight;
-        const uint32_t bottom = session.workAreaBottom;
+        const uint32_t rawLeft = session.workAreaLeft;
+        const uint32_t rawTop = session.workAreaTop;
+        const uint32_t rawRight = session.workAreaRight;
+        const uint32_t rawBottom = session.workAreaBottom;
+        const CRWorkAreaClamp clamped = [CRSession clampWorkAreaLeft:rawLeft top:rawTop right:rawRight bottom:rawBottom
+                                                      toDesktopWidth:session.desktopWidth height:session.desktopHeight];
+        if (clamped.changed)
+        {
+            WLog_WARN(TAG,
+                      "work area %u,%u,%u,%u exceeds the advertised desktop %ux%u -- clamped to %u,%u,%u,%u (F-ja-4 m-3)",
+                      (unsigned)rawLeft, (unsigned)rawTop, (unsigned)rawRight, (unsigned)rawBottom,
+                      (unsigned)session.desktopWidth, (unsigned)session.desktopHeight,
+                      (unsigned)clamped.left, (unsigned)clamped.top, (unsigned)clamped.right, (unsigned)clamped.bottom);
+        }
+        const uint32_t left = clamped.left;
+        const uint32_t top = clamped.top;
+        const uint32_t right = clamped.right;
+        const uint32_t bottom = clamped.bottom;
         memset(&p->workArea, 0, sizeof(p->workArea));
         if ((left | top | right | bottom) != 0)
         {
@@ -2804,6 +2825,28 @@ static BOOL crb_attach_process_log_callbacks(wLog *log)
     if (rejection)
         *rejection = found;
     return verdict;
+}
+
+/* F-ja-4 m-3: CRSession.h's contract, in full. No emptiness check on purpose -- crb_pre_connect's
+ * TS_RECTANGLE_16 check owns that, for clamped and unclamped values alike. The all-zero "send
+ * nothing" needs no branch of its own: every edge only ever moves DOWN to the desktop, so zero
+ * stays zero and `changed` stays NO. */
++ (CRWorkAreaClamp)clampWorkAreaLeft:(uint32_t)left
+                                 top:(uint32_t)top
+                               right:(uint32_t)right
+                              bottom:(uint32_t)bottom
+                      toDesktopWidth:(uint32_t)width
+                              height:(uint32_t)height
+{
+    CRWorkAreaClamp out = {left, top, right, bottom, NO};
+    if (width == 0 || height == 0)
+        return out;
+    out.left = left < width ? left : width;
+    out.top = top < height ? top : height;
+    out.right = right < width ? right : width;
+    out.bottom = bottom < height ? bottom : height;
+    out.changed = (out.left != left || out.top != top || out.right != right || out.bottom != bottom) ? YES : NO;
+    return out;
 }
 
 /* ADR-0024 D-2: FreeRDP takes the password as a NUL-terminated string and keeps its own copy

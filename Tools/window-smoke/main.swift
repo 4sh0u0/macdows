@@ -2892,14 +2892,29 @@ enum WindowSmokeGateSelfTest {
         } else {
             expect(false, "workAreaResolvesThroughTheProductFunction: could not build the inset fixture topology")
         }
-        let offLine = WorkAreaKnob.evidenceLine(reason: "connect", enabled: false, assigned: [0, 0, 0, 0])
-        let onLine = WorkAreaKnob.evidenceLine(reason: "connect", enabled: true, assigned: [0, 30, 2560, 1350])
-        let noneLine = WorkAreaKnob.evidenceLine(reason: "connect", enabled: true, assigned: [0, 0, 0, 0])
+        let offLine = WorkAreaKnob.evidenceLine(reason: "connect", enabled: false, assigned: [0, 0, 0, 0], declaredDesktop: nil)
+        let onLine = WorkAreaKnob.evidenceLine(reason: "connect", enabled: true, assigned: [0, 30, 2560, 1350], declaredDesktop: nil)
+        let noneLine = WorkAreaKnob.evidenceLine(reason: "connect", enabled: true, assigned: [0, 0, 0, 0], declaredDesktop: nil)
         expect(
             offLine.hasPrefix("[work-area] connect: WINDOW_SMOKE_WORK_AREA=0") && offLine.contains("NOT sent")
                 && onLine.hasPrefix("[work-area] connect: assigned 0,30,2560,1350 remote px") && !onLine.contains("NOT sent")
                 && noneLine.contains("assigned 0,0,0,0, NOT sent"),
             "workAreaEvidenceLineSaysWhatWasAssigned: forced off names the knob and says NOT sent; on prints the four assigned numbers; nothing to resolve says NOT sent"
+        )
+        // Lane E gate r1 m-3: under a declared desktop the on line says the bridge clamps -- and only
+        // the on line, only when a declaration was read back; the numbers stay the assigned ones.
+        let declared = DeclaredDesktopOverride.Size(width: 1920, height: 1080)
+        let onDeclared = WorkAreaKnob.evidenceLine(reason: "connect", enabled: true, assigned: [0, 30, 2560, 1350], declaredDesktop: declared)
+        expect(
+            onDeclared.hasPrefix(onLine)
+                && onDeclared.hasSuffix(" -- WINDOW_SMOKE_DECLARED_DESKTOP is set (1920x1080 declared): at connect the bridge clamps this rectangle into the declared desktop if it reaches past it (then one WARN names the clamp); the wire value is the bridge's work-area INFO line")
+                && !onLine.contains("WINDOW_SMOKE_DECLARED_DESKTOP"),
+            "workAreaEvidenceLineNamesTheBridgeClampUnderADeclaredDesktop: with a declared desktop read back the on line keeps its assigned numbers and adds the clamp suffix naming the declaration; with none it carries no suffix"
+        )
+        expect(
+            WorkAreaKnob.evidenceLine(reason: "connect", enabled: false, assigned: [0, 0, 0, 0], declaredDesktop: declared) == offLine
+                && WorkAreaKnob.evidenceLine(reason: "connect", enabled: true, assigned: [0, 0, 0, 0], declaredDesktop: declared) == noneLine,
+            "workAreaEvidenceLineOffAndNothingArmsIgnoreTheDeclaredDesktop: the forced-off and resolves-to-nothing lines send nothing, so a declared desktop changes neither"
         )
 
         print("[selftest] overall: \(ok ? "PASS" : "FAIL")")
@@ -3157,9 +3172,16 @@ let advertisedScaleKnob: AdvertisedScaleKnob.Parsed = {
 /// `WINDOW_SMOKE_EXTRA_APPS_RETRY` -- forces it off: all four stay 0, the bridge sends nothing, and the
 /// server keeps the start command's whole-desktop work area (the pre-lane wire, e.g. the 2026-09-21
 /// `wa=0,0,2560,1440` baseline). Every freeze prints one `[work-area]` line built from the values READ
-/// BACK from the session, never from the knob. Note: `WINDOW_SMOKE_DECLARED_DESKTOP` does not change
-/// this value (it is derived from the REAL frozen topology), so a mis-declaration run that must
-/// reproduce the pre-lane wire sets this knob to 0 as well.
+/// BACK from the session, never from the knob. Note on `WINDOW_SMOKE_DECLARED_DESKTOP`: the value
+/// assigned here is still derived from the REAL frozen topology, so under a declared desktop smaller
+/// than the real one it can reach past what the server is told. Since lane E gate r1 m-3 the BRIDGE
+/// clamps it into the advertised (declared) desktop at connect, so a mis-declaration run now sends a
+/// work area inside its declared desktop, or none when the clamp empties it (the bridge's refusal
+/// WARN) -- the `[work-area]` line then says so, the bridge's WARN
+/// names the clamp when it had to clamp (none when the rectangle already fits), and the bridge's
+/// work-area INFO line is the value on the wire. A run that must
+/// reproduce the pre-lane wire exactly still sets this knob to 0 (through the wrapper: job key
+/// `WORK_AREA=0`).
 enum WorkAreaKnob {
     /// Only the literal `"0"` disables; unset, empty, `"1"` and anything else leave the product default on.
     static func isEnabled(_ raw: String?) -> Bool {
@@ -3174,7 +3196,16 @@ enum WorkAreaKnob {
     }
 
     /// The per-freeze evidence line, from the four values ASSIGNED (read back from the session).
-    static func evidenceLine(reason: String, enabled: Bool, assigned: [UInt32]) -> String {
+    /// `declaredDesktop` is the declared desktop the same freeze READ BACK from the session
+    /// (`declaredDesktopAssigned`: nil when `WINDOW_SMOKE_DECLARED_DESKTOP` is unset or nothing was
+    /// declared); when it is set and a work area was assigned, the line adds that the bridge clamps
+    /// the rectangle into it at connect if it reaches past it (lane E gate r1 m-3; the smoke does not
+    /// repeat the bridge's test, so the WARN is what says a clamp happened) -- the assigned numbers stay the
+    /// unclamped ones, because that is what was assigned. The off and "resolves to nothing" arms send
+    /// nothing, so there is nothing to clamp and they ignore it.
+    static func evidenceLine(
+        reason: String, enabled: Bool, assigned: [UInt32], declaredDesktop: DeclaredDesktopOverride.Size?
+    ) -> String {
         let fields = assigned.map(String.init).joined(separator: ",")
         if !enabled {
             return "[work-area] \(reason): WINDOW_SMOKE_WORK_AREA=0 -- forced off, assigned \(fields), NOT sent "
@@ -3184,8 +3215,12 @@ enum WorkAreaKnob {
             return "[work-area] \(reason): product work area resolves to nothing (no usable display, or an empty "
                 + "work area) -- assigned \(fields), NOT sent"
         }
-        return "[work-area] \(reason): assigned \(fields) remote px -- the bridge sends it after every start command "
+        let line = "[work-area] \(reason): assigned \(fields) remote px -- the bridge sends it after every start command "
             + "(F-ja-4 lane E, product default: primary visibleFrame via DisplayTopology.workAreaInRemotePixels)"
+        guard let declaredDesktop else { return line }
+        return line + " -- WINDOW_SMOKE_DECLARED_DESKTOP is set (\(declaredDesktop.width)x\(declaredDesktop.height) declared): "
+            + "at connect the bridge clamps this rectangle into the declared desktop if it reaches past it "
+            + "(then one WARN names the clamp); the wire value is the bridge's work-area INFO line"
     }
 }
 
@@ -5456,9 +5491,13 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             session.workAreaRight = 0
             session.workAreaBottom = 0
         }
+        // `declaredDesktopAssigned` is this freeze's own read-back (set, or reset to nil, by
+        // freezeAndApplyDesktopSize's if / else right before it calls this function), never the
+        // knob -- the same evidence rule as the four work-area values beside it.
         print(WorkAreaKnob.evidenceLine(
             reason: reason, enabled: workAreaKnobEnabled,
-            assigned: [session.workAreaLeft, session.workAreaTop, session.workAreaRight, session.workAreaBottom]
+            assigned: [session.workAreaLeft, session.workAreaTop, session.workAreaRight, session.workAreaBottom],
+            declaredDesktop: declaredDesktopAssigned
         ))
     }
 

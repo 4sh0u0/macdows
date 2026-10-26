@@ -308,6 +308,64 @@ extension BridgeExecWitnessPinTests {
         #expect(bridgeOccurrences(of: "p->workArea.left =", in: code) == 1)
         #expect(bridgeOccurrences(of: "memset(&p->workArea,", in: code) == 1)
     }
+
+    // MARK: lane E gate r1 m-3 -- the clamp into the advertised desktop
+    //
+    // `crb_pre_connect` clamps the four edges it read into the desktop it advertised, through the
+    // pure class method `WorkAreaClampTests` drives, BEFORE the validated copy the pin above holds.
+    // The order is the point: a clamp after the copy would let a rectangle the clamp empties reach
+    // the wire, because the non-empty check would have judged the unclamped edges (mutant MB5);
+    // and the copy must be fed the CLAMPED edges, not the raw reads (mutant MB1).
+
+    /// The pure function's declaration / definition, whitespace folded.
+    private static let clampSignature =
+        "+ (CRWorkAreaClamp)clampWorkAreaLeft:(uint32_t)left top:(uint32_t)top right:(uint32_t)right "
+        + "bottom:(uint32_t)bottom toDesktopWidth:(uint32_t)width height:(uint32_t)height"
+    /// Its one call: the four raw reads in, the advertised desktop pair as the bound.
+    private static let clampCall =
+        "const CRWorkAreaClamp clamped = [CRSession clampWorkAreaLeft:rawLeft top:rawTop right:rawRight "
+        + "bottom:rawBottom toDesktopWidth:session.desktopWidth height:session.desktopHeight];"
+    /// The clamp's WARN: numbers only.
+    private static let clampWarnFormat =
+        "\"work area %u,%u,%u,%u exceeds the advertised desktop %ux%u -- clamped to %u,%u,%u,%u (F-ja-4 m-3)\""
+
+    @Test("m-3 the work area is clamped into the advertised desktop at pre-connect, before the validated copy")
+    func theWorkAreaIsClampedBeforeTheValidatedCopy() throws {
+        let raw = try Self.raw()
+        let code = try Self.code()
+        let header = try String(contentsOf: bridgeRepoRoot().appendingPathComponent("App/CRBridge/CRSession.h"),
+                                encoding: .utf8)
+        // Declared once in the header, defined once in the bridge, called once -- from the connect
+        // path -- and nowhere else.
+        #expect(bridgeOccurrences(of: Self.clampSignature + ";", in: bridgeFolded(header)) == 1)
+        #expect(bridgeOccurrences(of: Self.clampSignature + " {", in: code) == 1)
+        #expect(bridgeOccurrences(of: "[CRSession clampWorkAreaLeft:", in: code) == 1)
+        #expect(bridgeOccurrences(of: "clampWorkAreaLeft:", in: code) == 2, "the definition and the one call")
+        let preConnect = try bridgeCodeOnly(Self.functionBody("static BOOL crb_pre_connect(freerdp *instance)", in: raw))
+        #expect(bridgeOccurrences(of: Self.clampCall, in: preConnect) == 1)
+
+        // In literal order inside crb_pre_connect: the four reads, the call, the WARN, the copy's
+        // memset -- and the edges the copy validates are the CLAMPED ones, handed over right before it.
+        let call = try Self.index(of: Self.clampCall, in: preConnect)
+        let memset = try Self.index(of: "memset(&p->workArea,", in: preConnect)
+        for edge in ["Left", "Top", "Right", "Bottom"] {
+            let read = try Self.index(of: "const uint32_t raw\(edge) = session.workArea\(edge);", in: preConnect)
+            #expect(read < call, "read before the clamp: \(edge)")
+        }
+        #expect(call < memset, "the clamp comes before the validated copy")
+        let warn = try Self.index(of: "if (clamped.changed) { WLog_WARN(TAG, " + Self.clampWarnFormat, in: preConnect)
+        #expect(call < warn)
+        #expect(warn < memset)
+        #expect(preConnect.contains(
+            "const uint32_t left = clamped.left; const uint32_t top = clamped.top; "
+                + "const uint32_t right = clamped.right; const uint32_t bottom = clamped.bottom; "
+                + "memset(&p->workArea, 0, sizeof(p->workArea));"), "the validated copy is fed the clamped edges")
+
+        // The WARN's format string exists once, and its statement prints numbers only.
+        #expect(bridgeOccurrences(of: Self.clampWarnFormat, in: raw) == 1)
+        let warnStatement = preConnect[warn...].prefix { $0 != ";" }
+        #expect(!warnStatement.contains("%s"), "the clamp WARN prints a string")
+    }
 }
 
 // MARK: - ADR-0025 a-1: -launchProgram:arguments: and the EXECUTE branch's argument split
