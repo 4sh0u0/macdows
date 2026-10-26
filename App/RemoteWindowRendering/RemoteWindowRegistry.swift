@@ -391,10 +391,14 @@ final class RemoteWindowRegistry {
     /// first) was dropped and stayed held on the server, and a stale input-method entry in B could
     /// swallow a release whose press went out on the wire. Handed to every `RemoteWindow` this
     /// registry creates (`handleWindowOrder`'s `RemoteWindow(...keyLedgers:)` call), which hands
-    /// it to its content view; the view does all the reading and writing (`KeyLaneLedgers`' doc).
-    /// Cleared on `closeAllWindows`, next to `wireHeldModifiers`, and nowhere else; not flushed there,
-    /// for the one reason the modifier ledgers are not: the connection the entries described is gone
-    /// (a `scancodeDown` entry is a key down on that wire, like a `wireHeldModifiers` bit).
+    /// it to its content view; the view does all the reading and writing of the two lane ledgers
+    /// (`KeyLaneLedgers`' doc). lane-focuslost-flush: the third, `wireDown`, is this registry's
+    /// alone -- `wireHeldModifiers`' twin for the non-modifier keys, written only at the one wire
+    /// exit (`sendKeyboardLaneEvent`) and flushed by `releaseAllHeldKeys()` on `.focusLost`.
+    /// All three are cleared on `closeAllWindows`, next to `wireHeldModifiers`, through `reset()`;
+    /// the two lane ledgers nowhere else. Not flushed there, for the one reason the modifier ledgers
+    /// are not: the connection the entries described is gone (a `wireDown` entry is a key down on
+    /// that wire, like a `wireHeldModifiers` bit).
     private let keyLedgers = KeyLaneLedgers()
     /// adr/0011 §3: the Cmd<->Ctrl remap state machine — one session-level instance,
     /// mirroring `heldModifierKeys`'/`wireHeldModifiers`' own "one physical keyboard, one
@@ -1423,13 +1427,23 @@ final class RemoteWindowRegistry {
         wireHeldModifiers.isEmpty
     }
 
-    /// F-ja-2′ B-1 gate r1 m-2, test-facing: whether both of the session's key-lane ledgers
-    /// (`keyLedgers`) are empty. Read-only, and only the emptiness predicate, for
+    /// F-ja-2′ B-1 gate r1 m-2, test-facing: whether all three of the session's key ledgers
+    /// (`keyLedgers`: the two lane ledgers and, since lane-focuslost-flush, the wire ledger
+    /// `wireDown`) are empty. Read-only, and only the emptiness predicate, for
     /// `wireHeldModifiersIsEmpty()`'s reasons: what a test asserts through it is "the windows this
     /// registry created write into this instance" (a key recorded through one of them makes this
     /// false) and "the session reset empties it", not which key codes the ledgers hold.
     func keyLedgersAreEmpty() -> Bool {
-        keyLedgers.scancodeDown.isEmpty && keyLedgers.inputMethodDown.isEmpty
+        keyLedgers.scancodeDown.isEmpty && keyLedgers.inputMethodDown.isEmpty && keyLedgers.wireDown.isEmpty
+    }
+
+    /// lane-focuslost-flush, `wireHeldModifiersIsEmpty()`'s twin for the non-modifier keys: whether
+    /// the wire ledger (`keyLedgers.wireDown`, the "which keys are ACTUALLY held down on the wire right
+    /// now" state `releaseAllHeldKeys()` reads) is currently empty. Read-only, and deliberately only
+    /// the emptiness predicate, for `wireHeldModifiersIsEmpty()`'s reasons: the assertion this exists
+    /// for is "no key is stuck", not "these specific codes are held".
+    func wireHeldKeysAreEmpty() -> Bool {
+        keyLedgers.wireDown.isEmpty
     }
 
     /// Diagnostics only (Tools/window-smoke's `[tray]` summary line, phase2.md §4 W6
@@ -2242,6 +2256,15 @@ final class RemoteWindowRegistry {
             // mechanism itself, not the "focus-addressed input" the gate exists to protect
             // against buffering/misdirecting -- it must fire immediately regardless of
             // whatever convergence is in flight.
+            //
+            // lane-focuslost-flush: the same goes for a non-modifier key held on the wire --
+            // its physical release may never reach this view either (Cmd-Tab to another Mac
+            // app, or another remote window taking key), and the server would keep it held.
+            // Keys first, then modifiers: the order a chord is let go in -- the key comes up
+            // while its modifiers are still down, so the server never sees it held under a
+            // modifier state it was not pressed with. The lane ledgers are left alone (see
+            // `releaseAllHeldKeys()`).
+            releaseAllHeldKeys()
             releaseAllHeldModifiers()
             // adr/0011 §3: abandon any in-flight Cmd gesture too -- its own internal state
             // (e.g. "a chord is open") would otherwise survive focus loss stale; the wire
@@ -2379,12 +2402,18 @@ final class RemoteWindowRegistry {
     /// HERE, regardless of source (the ordinary per-bit diff, or a `CommandKeyMapper`-
     /// translated Ctrl/LWIN/Shift event), updates `wireHeldModifiers` -- the ledger
     /// `releaseAllHeldModifiers()` below now reads from instead of physical truth.
+    /// lane-focuslost-flush: every `.keyDown` / `.keyUp` sent from HERE updates the wire ledger of
+    /// the non-modifier keys the same way (`keyLedgers.wireDown`, the code as it goes out) -- the
+    /// ledger `releaseAllHeldKeys()` below reads; nothing else in this registry writes it, apart
+    /// from that flush emptying it and the session reset.
     private func sendKeyboardLaneEvent(_ event: KeyboardLaneEvent) {
         switch event {
         case .keyDown(let macKeyCode):
             session.sendKeyDown(macKeyCode)
+            keyLedgers.wireDown.insert(macKeyCode)
         case .keyUp(let macKeyCode):
             session.sendKeyUp(macKeyCode)
+            keyLedgers.wireDown.remove(macKeyCode)
         case .modifierKey(let key, let down):
             session.send(Self.crModifierKey(for: key), down: down)
             if down {
@@ -2397,10 +2426,46 @@ final class RemoteWindowRegistry {
         }
     }
 
+    /// lane-focuslost-flush: `.focusLost`'s release of the non-modifier keys held on the wire -- the
+    /// twin of `releaseAllHeldModifiers()` below for the keys that are not modifiers, called just
+    /// before it. A key held on the wire when the window stops observing the keyboard (Cmd-Tab to
+    /// another Mac app, or another remote window taking key) may never have its physical release
+    /// reach it, and the server would keep the key held.
+    ///
+    /// adr/0011 §3's discipline, as for `wireHeldModifiers`: reads the WIRE ledger,
+    /// `keyLedgers.wireDown` (updated only where a key actually leaves this process,
+    /// `sendKeyboardLaneEvent`), never the capture-time lane ledgers -- a keyDown the gate buffered
+    /// and then dropped is in `scancodeDown` but never reached the wire, and must not get a release
+    /// here. Sorted, for a deterministic order; the ledger is emptied BEFORE the releases go out, as
+    /// `releaseAllHeldModifiers()` does. Sent straight to the session, not through
+    /// `sendKeyboardLaneEvent` and not through FocusAuthority's gate: the flush is the safety
+    /// mechanism itself (the `.focusLost` case's own comment).
+    ///
+    /// The lane ledgers (`scancodeDown` / `inputMethodDown`) are NOT touched. `.focusLost` is also
+    /// sent when focus moves from one remote window of this session to another
+    /// (`NSWindow.didResignKeyNotification`), and the key's physical release may still arrive at the
+    /// window that took key: its `scancodeDown` record forwards that release -- a second release of
+    /// a key the server already let go, a no-op there -- and B-1 m-2's cross-window shape stays as it
+    /// was. Clearing them would bring gate r1 I-1 back for that release.
+    private func releaseAllHeldKeys() {
+        let held = keyLedgers.wireDown.sorted()
+        keyLedgers.wireDown = []
+        for macKeyCode in held {
+            session.sendKeyUp(macKeyCode)
+        }
+    }
+
     /// Shared by `.focusLost` (immediate/ungated) and `.dropBufferedInput(...,
     /// withModifierRelease: true)` (also immediate/ungated -- see that effect's own doc
     /// comment) -- both need the exact same "release everything actually on the wire right
-    /// now" flow (W4c review H1).
+    /// now" flow (W4c review H1). On `.focusLost` it runs right after `releaseAllHeldKeys()`
+    /// (keys first, then modifiers). `.dropBufferedInput(..., withModifierRelease: true)` -- adr/0012
+    /// §2's hard rollback / epoch supersede -- still calls this one alone, and that is enough: both
+    /// come with a `.resignKey(target)` effect first, whose `NSWindow.resignKey()` posts didResignKey
+    /// synchronously and re-enters `.focusLost`, which flushes the keys (gate r1 PU1, pinned by F9;
+    /// there the modifiers go before the keys, harmless). The one residue is a target window the
+    /// server deleted mid-epoch (gate r1 PU1b) -- the same family as a deleted key window emitting
+    /// no `.focusLost` at all (writer U-2) -- registered, not decided here.
     ///
     /// adr/0011 §3: reads `wireHeldModifiers`, NOT `heldModifierKeys` -- this is the fix for
     /// a latent bug the ADR documents: `heldModifierKeys` used to double as both "physical
@@ -3744,9 +3809,10 @@ final class RemoteWindowRegistry {
         // adr/0011 §3: same "no flush, connection is gone" reasoning extends to the new
         // ledger and the Cmd remap state machine.
         wireHeldModifiers = []
-        // F-ja-2′ B-1 gate r1 m-2 (lane-session-reset): ... and to the session's key-lane ledgers. A
-        // scancodeDown entry is a key down on that wire, like a wireHeldModifiers bit, and the wire is
-        // gone, so there is nothing to send a release to. The next session starts with no key down.
+        // F-ja-2′ B-1 gate r1 m-2 (lane-session-reset): ... and to the session's key-lane ledgers --
+        // the two lane ledgers and, since lane-focuslost-flush, the wire ledger wireDown (a key down
+        // on that wire, like a wireHeldModifiers bit). The wire is gone, so there is nothing to send
+        // a release to; the next session starts with no key down.
         keyLedgers.reset()
         commandKeyMapper.reset()
         // adr/0011 §2: the degradation gate is per-CONNECTION -- the next connection

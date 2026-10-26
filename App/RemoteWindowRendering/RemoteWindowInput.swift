@@ -47,9 +47,11 @@ enum RemoteWindowInputEvent {
     /// `NSWindow` resigned key status (`RemoteWindow`'s own `NSWindow.didResignKeyNotification`
     /// observer), or this view itself resigned first responder within a still-key window
     /// (`resignFirstResponder()` below). `RemoteWindowRegistry` responds by unconditionally
-    /// releasing every modifier bit its session-level state currently has tracked as held,
+    /// releasing every non-modifier key its wire ledger (`KeyLaneLedgers.wireDown`) has on the
+    /// wire, then every modifier bit its session-level state currently has tracked as held,
     /// rather than waiting for a release event that might never arrive on this window
-    /// again — see `MacdowsCore.ModifierKeyTracker.releaseAll(_:)`.
+    /// again — see `MacdowsCore.ModifierKeyTracker.releaseAll(_:)` (lane-focuslost-flush: the
+    /// keys before the modifiers, as a chord is let go).
     case focusLost
     /// adr/0011 §1/§2: an already-composed IME commit string, from
     /// `RemoteWindowContentView`'s `NSTextInputClient -insertText:` conformance --
@@ -119,12 +121,23 @@ struct LocalKeyEquivalent: Hashable {
 /// own (tests, any use with no registry) makes one of its own, which is the single-view semantics
 /// unchanged. A view never clears it -- not on `resignFirstResponder`, not on `.focusLost`: the
 /// ledgers are the session's, not the view's (each member's doc says why clearing would be wrong).
-/// The registry empties its instance at its session reset (`closeAllWindows()`, next to
-/// `wireHeldModifiers`), and only there -- not when the window table empties mid-session, not on a
-/// `.focusLost` reaching the registry (`KeyLaneLedgersInjectionTests` pins both). No flush there,
-/// for the one reason the modifier ledgers have: the connection the entries described is gone, so
-/// there is nowhere to send a release (a `scancodeDown` entry IS a key down on that wire, like a
-/// `wireHeldModifiers` bit).
+///
+/// lane-focuslost-flush: the third member, `wireDown`, is the WIRE ledger of the non-modifier keys
+/// -- what is held on the wire, kept by the registry at its one wire exit and never read or written
+/// by a view (its doc). The two lane ledgers, `scancodeDown` and `inputMethodDown`, are capture-time
+/// records that pick the lane a release takes; the gate may buffer and then drop the keyDown they
+/// recorded, so they are not wire truth.
+///
+/// The registry empties all three at its session reset (`closeAllWindows()`, next to
+/// `wireHeldModifiers`, through `reset()`). No flush there, for the one reason the modifier ledgers
+/// have: the connection the entries described is gone, so there is nowhere to send a release (a
+/// `wireDown` entry IS a key down on that wire, like a `wireHeldModifiers` bit). The two lane
+/// ledgers are emptied there and only there -- not when the window table empties mid-session, not
+/// on a `.focusLost` reaching the registry (`KeyLaneLedgersInjectionTests` pins both). What a
+/// `.focusLost` reaching the registry does flush is `wireDown`: the ledger emptied, then a release
+/// for every key it held (`RemoteWindowRegistry.releaseAllHeldKeys()`). The lane ledgers stay as
+/// they are, so a physical release that still arrives, in this window or another, takes the lane
+/// its press took: one more release of a key the server already let go, a no-op there.
 @MainActor
 final class KeyLaneLedgers {
     /// gate r1 I-1: the key codes whose keyDown took the scancode lane (for any reason: an
@@ -132,13 +145,14 @@ final class KeyLaneLedgers {
     /// forwarded yet. `RemoteWindowContentView.keyUp(with:)` forwards a release whose down is
     /// recorded here even when the release on its own would take the IME lane -- ⌘R under a CJK
     /// source with Command released first sent R down, and its bare keyUp must reach the wire or R
-    /// stays held on the server (`CommandKeyMapper`'s passthrough Command-up releases LWIN only; the
-    /// registry's modifier ledger and `.focusLost` cover modifiers only). Inserted for every scancode
-    /// keyDown (an auto-repeat re-inserts the same code), consumed by the matching keyUp in whichever
-    /// view sharing this instance receives it. Not cleared on a focus change: a stale entry can
-    /// forward at most one release of a key the server does not hold, a no-op there; the set is
-    /// bounded by the keyboard's key codes; and clearing it would bring I-1 back for a key whose
-    /// release arrives after a focus round trip or in another window.
+    /// stays held on the server (`CommandKeyMapper`'s passthrough Command-up releases LWIN only;
+    /// `.focusLost` now releases the keys `wireDown` says are held; this ledger still only decides
+    /// the release's lane). Inserted for every scancode keyDown (an auto-repeat re-inserts the same
+    /// code), consumed by the matching keyUp in whichever view sharing this instance receives it.
+    /// Not cleared on a focus change: a stale entry can forward at most one release of a key the
+    /// server does not hold, a no-op there (after a `.focusLost` flush, exactly the release this
+    /// entry forwards); the set is bounded by the keyboard's key codes; and clearing it would bring
+    /// I-1 back for a key whose release arrives after a focus round trip or in another window.
     var scancodeDown: Set<UInt16> = []
     /// F-ja-2′ B-1: the key codes whose keyDown went to the input method
     /// (`RemoteWindowContentView.handOffToInputMethod`) and stayed there, and whose keyUp has not
@@ -155,11 +169,27 @@ final class KeyLaneLedgers {
     /// bounded by the keyboard's key codes; and clearing it would forward, after a focus round trip,
     /// the release of a key the input method kept.
     var inputMethodDown: Set<UInt16> = []
+    /// lane-focuslost-flush: the WIRE ledger -- the key codes whose keyDown has left this process
+    /// (`RemoteWindowRegistry.sendKeyboardLaneEvent`, its `.keyDown` case) and whose keyUp has not
+    /// (its `.keyUp` case), as they went out: after `IsoKeyCodeCorrection`, and after
+    /// `CommandKeyMapper`'s translation where that applies. adr/0011 §3's discipline for
+    /// `wireHeldModifiers` applied to the non-modifier keys: what is held on the wire only counts
+    /// once it went out. Kept by the registry at that one exit and nowhere else; a view never reads
+    /// or writes it. Unlike the two lane ledgers above -- recorded at capture time, consumed by the
+    /// release, deciding which lane the release takes -- this one decides what a focus loss must
+    /// release: a keyDown the gate buffered and then dropped is in `scancodeDown` but never here,
+    /// and a key the server holds is here whichever lane, window or translation its press came
+    /// through. A `.focusLost` reaching the registry empties it, then releases every code it held,
+    /// straight to the session and not through the gate (`releaseAllHeldKeys()`); the session reset
+    /// empties it with the other two through `reset()`, with no flush (the connection is gone).
+    var wireDown: Set<UInt16> = []
 
-    /// Empties both ledgers -- `RemoteWindowRegistry`'s session reset, and nothing else.
+    /// Empties all three ledgers -- `RemoteWindowRegistry`'s session reset, and nothing else (the
+    /// `.focusLost` flush empties `wireDown` on its own, and only `wireDown`).
     func reset() {
         scancodeDown = []
         inputMethodDown = []
+        wireDown = []
     }
 }
 
