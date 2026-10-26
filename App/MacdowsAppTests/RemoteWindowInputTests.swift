@@ -871,9 +871,11 @@ struct RemoteWindowInputTests {
 
     // MARK: - F-ja-2′ B-1 gate r1 m-2: the key-lane ledgers are the session's
 
-    /// Whether both of `ledgers` are empty.
+    /// Whether all three of `ledgers` are empty (the two lane ledgers and, since
+    /// lane-focuslost-flush, the wire ledger `wireDown`, which no view writes -- so it stays empty in
+    /// every test here that does not put a code in it by hand).
     private static func isEmpty(_ ledgers: KeyLaneLedgers) -> Bool {
-        ledgers.scancodeDown.isEmpty && ledgers.inputMethodDown.isEmpty
+        ledgers.scancodeDown.isEmpty && ledgers.inputMethodDown.isEmpty && ledgers.wireDown.isEmpty
     }
 
     /// S1 + S5. Gate r1 I-1's ⌘R across two windows: under a CJK source ⌘R's keyDown in window A
@@ -995,12 +997,14 @@ struct RemoteWindowInputTests {
         #expect(Self.isEmpty(ledgers), "\(ledgers.scancodeDown) \(ledgers.inputMethodDown)")
     }
 
-    /// S4. `reset()` empties both ledgers: after ⌘R (scancode entry 15) and a composing Return taken
-    /// by the input method (input-method entry 36) in window A, a reset leaves nothing, and window B
-    /// judges both releases by today's guard -- R's dropped (a letter under a CJK source), Return's
-    /// forwarded (an always-scancode key with no record either way).
-    @Test("B-1 gate r1 m-2: reset() empties both shared ledgers, and the releases fall back to today's guard")
-    func resetEmptiesBothSharedLedgers() throws {
+    /// S4. `reset()` empties all three ledgers: after ⌘R (scancode entry 15) and a composing Return
+    /// taken by the input method (input-method entry 36) in window A -- and R on the wire ledger, put
+    /// there by hand as the registry's wire exit would when ⌘R's keyDown went out (no view writes it;
+    /// lane-focuslost-flush) -- a reset leaves nothing, and window B judges both releases by today's
+    /// guard -- R's dropped (a letter under a CJK source), Return's forwarded (an always-scancode key
+    /// with no record either way). Lane-focuslost-flush mutant M6: `reset()` leaving `wireDown` alone.
+    @Test("B-1 gate r1 m-2: reset() empties all three shared ledgers, and the releases fall back to today's guard")
+    func resetEmptiesEverySharedLedger() throws {
         let ledgers = KeyLaneLedgers()
         let (a, drainA) = Self.makeSteppedView(sharing: ledgers)
         let (b, drainB) = Self.makeSteppedView(sharing: ledgers)
@@ -1008,11 +1012,13 @@ struct RemoteWindowInputTests {
         Self.compose(a)
         Self.deliver(try Self.key("\r", keyCode: 36, []), to: a, asciiCapable: false, inputMethod: Self.consumes())
         _ = drainA()
-        try #require(ledgers.scancodeDown == [15] && ledgers.inputMethodDown == [36],
-                     "setup: \(ledgers.scancodeDown) \(ledgers.inputMethodDown)")
+        ledgers.wireDown.insert(15)
+        try #require(ledgers.scancodeDown == [15] && ledgers.inputMethodDown == [36] && ledgers.wireDown == [15],
+                     "setup: \(ledgers.scancodeDown) \(ledgers.inputMethodDown) \(ledgers.wireDown)")
 
         ledgers.reset()
-        #expect(Self.isEmpty(ledgers), "\(ledgers.scancodeDown) \(ledgers.inputMethodDown)")
+        #expect(Self.isEmpty(ledgers), "\(ledgers.scancodeDown) \(ledgers.inputMethodDown) \(ledgers.wireDown)")
+        #expect(ledgers.wireDown.isEmpty, "\(ledgers.wireDown)")
 
         Self.deliver(try Self.key("r", keyCode: 15, [], type: .keyUp), to: b, asciiCapable: false)
         let letter = drainB()

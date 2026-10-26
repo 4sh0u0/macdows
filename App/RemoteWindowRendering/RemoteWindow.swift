@@ -616,10 +616,11 @@ final class RemoteWindow {
         // client can no longer reliably observe the physical keyboard's modifier state
         // (e.g. the user Cmd-Tabbed to a different Mac app while holding Shift) --
         // RemoteWindowRegistry responds to the resulting .focusLost event by releasing
-        // every modifier bit it currently has tracked as held (see
-        // MacdowsCore.ModifierKeyTracker.releaseAll(_:)), rather than leaving RDP's own
-        // modifier state stuck if the matching physical release never reaches this window
-        // again. [weak contentView] rather than capturing self strongly: this closure must
+        // every non-modifier key its wire ledger says is held (KeyLaneLedgers.wireDown,
+        // lane-focuslost-flush) and then every modifier bit it currently has tracked as held
+        // (see MacdowsCore.ModifierKeyTracker.releaseAll(_:)), rather than leaving RDP's own
+        // key or modifier state stuck if the matching physical release never reaches this
+        // window again. [weak contentView] rather than capturing self strongly: this closure must
         // not be what keeps a closed RemoteWindow's NSWindow alive.
         didResignKeyObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification, object: win, queue: .main
