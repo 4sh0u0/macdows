@@ -119,7 +119,12 @@ struct LocalKeyEquivalent: Hashable {
 /// own (tests, any use with no registry) makes one of its own, which is the single-view semantics
 /// unchanged. A view never clears it -- not on `resignFirstResponder`, not on `.focusLost`: the
 /// ledgers are the session's, not the view's (each member's doc says why clearing would be wrong).
-/// The registry's instance lives as long as the registry.
+/// The registry empties its instance at its session reset (`closeAllWindows()`, next to
+/// `wireHeldModifiers`), and only there -- not when the window table empties mid-session, not on a
+/// `.focusLost` reaching the registry (`KeyLaneLedgersInjectionTests` pins both). No flush there,
+/// for the one reason the modifier ledgers have: the connection the entries described is gone, so
+/// there is nowhere to send a release (a `scancodeDown` entry IS a key down on that wire, like a
+/// `wireHeldModifiers` bit).
 @MainActor
 final class KeyLaneLedgers {
     /// gate r1 I-1: the key codes whose keyDown took the scancode lane (for any reason: an
@@ -151,9 +156,7 @@ final class KeyLaneLedgers {
     /// the release of a key the input method kept.
     var inputMethodDown: Set<UInt16> = []
 
-    /// Empties both ledgers. No production caller yet: the registry's session-reset call is the
-    /// registered micro-lane (adr/0019 §4 risk 2, the R-4 pin on `closeAllWindows()`); S4 drives
-    /// it offline.
+    /// Empties both ledgers -- `RemoteWindowRegistry`'s session reset, and nothing else.
     func reset() {
         scancodeDown = []
         inputMethodDown = []

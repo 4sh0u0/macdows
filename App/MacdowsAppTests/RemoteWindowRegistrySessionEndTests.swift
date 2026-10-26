@@ -400,14 +400,17 @@ struct RemoteWindowRegistrySessionEndPinTests {
     /// The exact decommented-and-folded text of `closeAllWindows()`'s function body, produced by
     /// running this file's own `sessionEndCloseCodeOnly` over the `7a24b2e` baseline and matched
     /// byte-for-byte against the current file at gate r1 (516 characters both times) -- this
-    /// constant IS that verified string, not a fresh transcription of it.
+    /// constant IS that verified string, not a fresh transcription of it. Refrozen once since, by
+    /// F-ja-2′ B-1 gate r1 m-2 (2026-10-26, a lane of its own as adr/0019 §4 risk 2 asks of a change
+    /// to the cleared set): `keyLedgers.reset()` inserted after `wireHeldModifiers = []`, nothing
+    /// else moved (535 characters, the same strip run over the edited file).
     private static let closeAllWindowsBodyNeedle =
         "private func closeAllWindows() { for (_, window) in windows { window.close(via: session) }" +
         " windows.removeAll() geometry.removeAll() surfaceToWindow.removeAll()" +
         " surfaceMappedSize.removeAll() attachedChildOwner.removeAll() warnedUnresolvedOwner.removeAll()" +
         " trayStatusController.removeAll() desktopState = ServerDesktopState()" +
         " _ = focusAuthority.generationReset() heldModifierKeys = [] wireHeldModifiers = []" +
-        " commandKeyMapper.reset() unicodeInputGate.reset() lastMoveSentAt.removeAll()" +
+        " keyLedgers.reset() commandKeyMapper.reset() unicodeInputGate.reset() lastMoveSentAt.removeAll()" +
         " pendingTrailingMove.removeAll() }"
 
     /// R-4. None of R-2's other pins names every statement inside `closeAllWindows()`'s body, so

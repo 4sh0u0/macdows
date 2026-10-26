@@ -392,7 +392,9 @@ final class RemoteWindowRegistry {
     /// swallow a release whose press went out on the wire. Handed to every `RemoteWindow` this
     /// registry creates (`handleWindowOrder`'s `RemoteWindow(...keyLedgers:)` call), which hands
     /// it to its content view; the view does all the reading and writing (`KeyLaneLedgers`' doc).
-    /// Lives as long as this registry.
+    /// Cleared on `closeAllWindows`, next to `wireHeldModifiers`, and nowhere else; not flushed there,
+    /// for the one reason the modifier ledgers are not: the connection the entries described is gone
+    /// (a `scancodeDown` entry is a key down on that wire, like a `wireHeldModifiers` bit).
     private let keyLedgers = KeyLaneLedgers()
     /// adr/0011 §3: the Cmd<->Ctrl remap state machine — one session-level instance,
     /// mirroring `heldModifierKeys`'/`wireHeldModifiers`' own "one physical keyboard, one
@@ -1425,7 +1427,7 @@ final class RemoteWindowRegistry {
     /// (`keyLedgers`) are empty. Read-only, and only the emptiness predicate, for
     /// `wireHeldModifiersIsEmpty()`'s reasons: what a test asserts through it is "the windows this
     /// registry created write into this instance" (a key recorded through one of them makes this
-    /// false), not which key codes the ledgers hold.
+    /// false) and "the session reset empties it", not which key codes the ledgers hold.
     func keyLedgersAreEmpty() -> Bool {
         keyLedgers.scancodeDown.isEmpty && keyLedgers.inputMethodDown.isEmpty
     }
@@ -3742,6 +3744,10 @@ final class RemoteWindowRegistry {
         // adr/0011 §3: same "no flush, connection is gone" reasoning extends to the new
         // ledger and the Cmd remap state machine.
         wireHeldModifiers = []
+        // F-ja-2′ B-1 gate r1 m-2 (lane-session-reset): ... and to the session's key-lane ledgers. A
+        // scancodeDown entry is a key down on that wire, like a wireHeldModifiers bit, and the wire is
+        // gone, so there is nothing to send a release to. The next session starts with no key down.
+        keyLedgers.reset()
         commandKeyMapper.reset()
         // adr/0011 §2: the degradation gate is per-CONNECTION -- the next connection
         // re-reads `CRSession.unicodeInputSupported` (itself reset to NO at the top of
