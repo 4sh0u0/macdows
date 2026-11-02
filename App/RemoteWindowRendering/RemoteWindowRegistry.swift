@@ -498,6 +498,15 @@ final class RemoteWindowRegistry {
     /// no left-down recorded on any window engages only while bit 0 is set). A seam for the tests,
     /// the shape of `pointerLocation`; the App never sets it.
     var pressedMouseButtons: () -> Int = { NSEvent.pressedMouseButtons }
+    /// lane-delete-key-window: whether `window` is AppKit's key window right now, read at exactly one
+    /// place -- `handleWindowDelete`, which flushes the wire when the server deletes the key window
+    /// (its `close(via:)` removes the didResignKey observer first, so no `.focusLost` arrives). AppKit's
+    /// truth, not FocusAuthority's model: the authority does not read AppKit, and while it converges its
+    /// "current keyed" window may differ from the local key window; `.focusLost`'s own two sources
+    /// (didResignKey, the view's `resignFirstResponder`) are the same AppKit truth. A seam for the
+    /// tests, the shape of `pointerLocation`; the App never sets it. An xctest host never has a key
+    /// window, so without an injected seam the delete path behaves exactly as before this lane.
+    var isKeyWindow: (NSWindow) -> Bool = { $0.isKeyWindow }
 
     private static let logger = Logger(subsystem: "dev.haru.macdows", category: "RemoteWindowRendering")
     /// L1 (W4b review): logged once, not on every event, so a genuinely no-display
@@ -2002,10 +2011,12 @@ final class RemoteWindowRegistry {
             surfaceMappedSize.removeValue(forKey: sid)
         }
         surfaceToWindow = surfaceToWindow.filter { $0.value != windowId }
-        // heldModifierKeys is deliberately NOT touched here (W4c review H1) -- it is
-        // session-level, not per-window; a modifier held while this specific window closes
-        // is still physically held on the keyboard and may still need its RELEASE observed
-        // via whatever window next receives it, or via a .focusLost flush.
+        // heldModifierKeys and the wire ledgers (wireHeldModifiers, keyLedgers) are deliberately
+        // NOT cleared here (W4c review H1) -- they are session-level, not per-window. When the
+        // window being deleted is the key window, the `.focusLost` synthesized below flushes the
+        // wire (lane-delete-key-window); when it is not, nothing is touched: a key or modifier held
+        // while this specific window closes may still have its RELEASE observed via the current
+        // key window, or via the next .focusLost flush.
         lastMoveSentAt.removeValue(forKey: windowId)
         pendingTrailingMove.removeValue(forKey: windowId)
         warnedUnresolvedOwner.remove(windowId)
@@ -2030,6 +2041,24 @@ final class RemoteWindowRegistry {
             }
         }
 
+        // lane-delete-key-window: a third source of `.focusLost`, beside didResignKey and the
+        // view's resignFirstResponder. `close(via:)` removes its didResignKey observer before
+        // orderOut / close on purpose (see its doc), so AppKit's resign for THIS close never reaches
+        // the registry, and keys / modifiers held on the wire would stay held (and auto-repeat) on
+        // the server until some later focus loss -- e.g. Enter held while a dialog closes on its
+        // keydown. While the window is still in the table and still key, synthesize the same event
+        // through the same branch: keys, then modifiers, then the mapper reset (the `.focusLost`
+        // case's own comment is the reason). A window that is NOT key (a tooltip, a background
+        // window, another remote window being key) flushes nothing: a key held on the key window
+        // must not be cut by another window's delete -- `.focusLost` itself is only sent when THIS
+        // window loses key. Before `removeValue`, because the check reads `windows[windowId]`; the
+        // flush goes straight to the session, so before the close is as good as after. The lane
+        // ledgers stay as they are (the branch does not touch them); `closeAllWindows()` does not
+        // come through here, so the session reset still sends nothing; nothing is done in
+        // `windows.didSet` (gate G4: `removeAll()` goes through it too).
+        if let closing = windows[windowId], isKeyWindow(closing.window) {
+            handleInput(windowId: windowId, event: .focusLost)
+        }
         if let window = windows.removeValue(forKey: windowId) {
             window.close(via: session)
         }
@@ -2463,9 +2492,14 @@ final class RemoteWindowRegistry {
     /// §2's hard rollback / epoch supersede -- still calls this one alone, and that is enough: both
     /// come with a `.resignKey(target)` effect first, whose `NSWindow.resignKey()` posts didResignKey
     /// synchronously and re-enters `.focusLost`, which flushes the keys (gate r1 PU1, pinned by F9;
-    /// there the modifiers go before the keys, harmless). The one residue is a target window the
-    /// server deleted mid-epoch (gate r1 PU1b) -- the same family as a deleted key window emitting
-    /// no `.focusLost` at all (writer U-2) -- registered, not decided here.
+    /// there the modifiers go before the keys, harmless). The residue of a target window the server
+    /// deleted mid-epoch (gate r1 PU1b) is closed by `handleWindowDelete`: the epoch's own
+    /// `.makeKey(target)` (and the click that started it) made the target the local key window --
+    /// `activateLocally()` calls `makeKeyAndOrderFront` synchronously once the first-frame gate is
+    /// cleared -- so the deleted target gets the synthesized `.focusLost` there (lane-delete-key-window,
+    /// D8). What remains is a target that never became key (`activateLocally()` deferred by the
+    /// first-frame gate) and was deleted before it did: its buffered release is dropped by the
+    /// rollback and nothing flushes the key (lane-delete-key-window gate r1 I-1; registered, rare).
     ///
     /// adr/0011 §3: reads `wireHeldModifiers`, NOT `heldModifierKeys` -- this is the fix for
     /// a latent bug the ADR documents: `heldModifierKeys` used to double as both "physical
