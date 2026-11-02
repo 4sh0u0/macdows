@@ -51,7 +51,10 @@ enum RemoteWindowInputEvent {
     /// wire, then every modifier bit its session-level state currently has tracked as held,
     /// rather than waiting for a release event that might never arrive on this window
     /// again — see `MacdowsCore.ModifierKeyTracker.releaseAll(_:)` (lane-focuslost-flush: the
-    /// keys before the modifiers, as a chord is let go).
+    /// keys before the modifiers, as a chord is let go). A third source, synthesized by the
+    /// registry itself: `handleWindowDelete` sends this for the key window the server is
+    /// deleting, since `close(via:)` removes the didResignKey observer before closing and no
+    /// AppKit resign reaches the registry for that close (lane-delete-key-window).
     case focusLost
     /// adr/0011 §1/§2: an already-composed IME commit string, from
     /// `RemoteWindowContentView`'s `NSTextInputClient -insertText:` conformance --

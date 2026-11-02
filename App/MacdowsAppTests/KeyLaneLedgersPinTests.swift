@@ -225,6 +225,55 @@ struct KeyLaneLedgersPinTests {
             in: code
         ) == 1, "keyLedgersAreEmpty() reads all three ledgers")
     }
+
+    // MARK: lane-delete-key-window: the server deleting the key window flushes the wire
+
+    /// The seam is declared once with the live AppKit read as its default (lane mutant M5: a default of
+    /// `{ _ in true }`), and read once -- in the delete path's test.
+    @Test("RemoteWindowRegistry.swift: the isKeyWindow seam defaults to the live read and is read once")
+    func theKeyWindowSeamDefaultsToTheLiveRead() throws {
+        let code = try keyLaneLedgersCode(Self.registry)
+        #expect(keyLaneLedgersOccurrences(of: "var isKeyWindow: (NSWindow) -> Bool = { $0.isKeyWindow }", in: code) == 1)
+        #expect(keyLaneLedgersOccurrences(of: "var isKeyWindow:", in: code) == 1)
+        #expect(keyLaneLedgersOccurrences(of: "isKeyWindow(closing.window)", in: code) == 1)
+        #expect(keyLaneLedgersOccurrences(of: "isKeyWindow(", in: code) == 1, "the seam's one read")
+    }
+
+    /// `handleWindowDelete` synthesizes the one `.focusLost` -- through `handleInput`, the same branch
+    /// (lane mutant M6: the three statements inlined; M7: the key flush alone) -- only for the key
+    /// window (M2: the test dropped; M9: inverted), before the window's close (M4: moved after it),
+    /// and inside that function (M1: deleted; M3: moved into `windows.didSet`). `windows`' didSet keeps
+    /// its one statement (gate r1 G4: a flush there is a session-reset flush).
+    @Test("RemoteWindowRegistry.swift: handleWindowDelete synthesizes .focusLost for the key window, before its close")
+    func theKeyWindowDeleteSynthesizesTheFocusLoss() throws {
+        let code = try keyLaneLedgersCode(Self.registry)
+        let needle = "if let closing = windows[windowId], isKeyWindow(closing.window) { handleInput(windowId: windowId, event: .focusLost) }"
+        #expect(keyLaneLedgersOccurrences(of: needle, in: code) == 1)
+        let body = try #require(Self.body(of: "private func handleWindowDelete(windowId: UInt32) {", in: code))
+        let flush = try #require(body.range(of: needle), "the synthesized focus loss is not inside handleWindowDelete")
+        let close = try #require(body.range(of: "window.close(via: session)"))
+        #expect(flush.upperBound <= close.lowerBound, "the flush runs before the window's close")
+        #expect(!body.contains("#if"), "a conditional-compilation block inside handleWindowDelete (gate r1 Gii's decoy)")
+        #expect(keyLaneLedgersOccurrences(of: "handleInput(windowId: windowId, event: .focusLost)", in: code) == 1)
+        #expect(keyLaneLedgersOccurrences(of: "event: .focusLost", in: code) == 1)
+        #expect(keyLaneLedgersOccurrences(
+            of: "private var windows: [UInt32: RemoteWindow] = [:] { didSet { dropLocalMoveStateOfRemovedWindows() } }",
+            in: code
+        ) == 1)
+    }
+}
+
+/// lane-delete-key-window: makes window `windowId` the one `registry.isKeyWindow` answers true for
+/// (an xctest host never has a real key window), by identity of its `NSWindow` -- and only while the
+/// window is still in the registry's table: on a real host `isKeyWindow` is false once the window is
+/// closed, and the table is the offline stand-in for that (gate r1 I-2: a flush moved after the
+/// close, or a `#if false` decoy carrying the pinned needle, must fail D1-D9, not only the pins).
+@MainActor
+private func keyLaneMakeKey(_ windowId: UInt32, in registry: RemoteWindowRegistry) throws {
+    let window = try #require(registry.window(forWindowId: windowId), "setup: window \(windowId) is in the table")
+    registry.isKeyWindow = { [weak window, weak registry] in
+        $0 === window && registry?.window(forWindowId: windowId) != nil
+    }
 }
 
 // MARK: - Behaviour: which instance the views end up with
@@ -487,7 +536,9 @@ struct KeyLaneLedgersInjectionTests {
     /// a new window may appear before the release -- a clear here (the F-a1-6 `windows.didSet`
     /// precedent, the shape B-1 gate r1 (f-1) named; gate variant G4) would drop that release under a
     /// CJK source and leave the key held on the server. Entries recorded through the deleted window
-    /// survive its delete.
+    /// survive its delete. The wire ledgers are another matter: when the deleted window is the key
+    /// window, `handleWindowDelete` synthesizes a `.focusLost` that flushes them (lane-delete-key-window,
+    /// D1-D9), and the lane ledgers are left alone on that path too (D1).
     @Test("deleting the last window mid-session leaves the ledgers alone")
     func theLastWindowDeleteKeepsTheLedgers() throws {
         let registry = try makeKeyLaneRegistry()
@@ -732,6 +783,201 @@ struct KeyLaneLedgersInjectionTests {
         b.onEvent?(.mouseButton(.left, down: true, screenPoint: NSPoint(x: 410, y: 410)))
         #expect(spy.calls == [.keyDown(15), .keyUp(15)], "after the supersede: \(spy.calls)")
         #expect(registry.wireHeldKeysAreEmpty())
+        autoreleasepool { registry.closeWindowsForSessionEnd() }
+    }
+
+    // MARK: lane-delete-key-window: the server deletes the key window
+
+    /// D1. The server deleting the key window flushes the wire as a focus loss does: Shift and R held
+    /// on the wire, the window made key, a WindowDelete for it -- the spy gets R's release, then
+    /// Shift's, both wire ledgers are empty, the lane ledger keeps R (lane mutants M1, M7, M8, M9).
+    @Test("D1: deleting the key window flushes the keys, then the modifiers, and keeps the lane ledgers")
+    func deletingTheKeyWindowFlushesTheWire() throws {
+        let (spy, registry, view) = try makeKeyLaneSpyRegistry(window: 801)
+        try openKeyLaneGate(801, of: view, in: registry, spy: spy)
+        keyLaneDeliver(try keyLaneKey(.flagsChanged, keyCode: 56, "", .shift), to: view)
+        keyLaneDeliver(try keyLaneKey(.keyDown, keyCode: 15, "r", characters: "R", .shift), to: view)
+        try #require(spy.calls == [.modifier(.shift, down: true), .keyDown(15)], "setup: \(spy.calls)")
+        try keyLaneMakeKey(801, in: registry)
+
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 801)) }
+        #expect(Array(spy.calls.dropFirst(2)) == [.keyUp(15), .modifier(.shift, down: false)], "\(spy.calls)")
+        #expect(registry.wireHeldKeysAreEmpty())
+        #expect(registry.wireHeldModifiersIsEmpty())
+        #expect(view.keyLedgers.scancodeDown == [15], "the lane ledger is not the flush's: \(view.keyLedgers.scancodeDown)")
+        #expect(registry.window(forWindowId: 801) == nil)
+        autoreleasepool { registry.closeWindowsForSessionEnd() }
+    }
+
+    /// D2. Deleting a window that is not key flushes nothing: R held through A, A key, B deleted -- the
+    /// spy is unchanged and R is still on the wire; then A itself is deleted and R is released. The
+    /// test is "is the deleted window the key one", not "is there a key window" (lane mutant M2).
+    @Test("D2: deleting a window that is not key leaves the wire alone")
+    func deletingANonKeyWindowFlushesNothing() throws {
+        let spy = KeyLaneSpySession(host: "", user: "", passwordBytes: Data(), program: "")
+        let registry = try makeKeyLaneRegistry(session: spy)
+        let a = try makeKeyLaneWindow(811, in: registry)
+        _ = try makeKeyLaneWindow(812, in: registry)
+        try openKeyLaneGate(811, of: a, in: registry, spy: spy)
+        keyLaneDeliver(try keyLaneKey(.keyDown, keyCode: 15, "r"), to: a)
+        try #require(spy.calls == [.keyDown(15)], "setup: \(spy.calls)")
+        try keyLaneMakeKey(811, in: registry)
+
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 812)) }
+        #expect(spy.calls == [.keyDown(15)], "a non-key window's delete flushed: \(spy.calls)")
+        #expect(!registry.wireHeldKeysAreEmpty())
+        #expect(registry.window(forWindowId: 811) != nil)
+
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 811)) }
+        #expect(spy.calls == [.keyDown(15), .keyUp(15)], "\(spy.calls)")
+        #expect(registry.wireHeldKeysAreEmpty())
+        autoreleasepool { registry.closeWindowsForSessionEnd() }
+    }
+
+    /// D3. Two keys held, one released, then the key window deleted: only the other one is released.
+    @Test("D3: deleting the key window after releasing one of two held keys releases the other only")
+    func deletingTheKeyWindowReleasesTheStillHeldKey() throws {
+        let (spy, registry, view) = try makeKeyLaneSpyRegistry(window: 821)
+        try openKeyLaneGate(821, of: view, in: registry, spy: spy)
+        keyLaneDeliver(try keyLaneKey(.keyDown, keyCode: 15, "r"), to: view)
+        keyLaneDeliver(try keyLaneKey(.keyDown, keyCode: 49, " "), to: view)
+        keyLaneDeliver(try keyLaneKey(.keyUp, keyCode: 15, "r"), to: view)
+        try #require(spy.calls == [.keyDown(15), .keyDown(49), .keyUp(15)], "setup: \(spy.calls)")
+        try keyLaneMakeKey(821, in: registry)
+
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 821)) }
+        #expect(spy.calls == [.keyDown(15), .keyDown(49), .keyUp(15), .keyUp(49)], "\(spy.calls)")
+        #expect(registry.wireHeldKeysAreEmpty())
+        autoreleasepool { registry.closeWindowsForSessionEnd() }
+    }
+
+    /// D4. Nothing held, nothing sent; and a flush already done is not repeated: C's delete flushes R
+    /// once, a second key window D deleted afterwards sends nothing more.
+    @Test("D4: deleting the key window with nothing held sends nothing, and a second delete does not flush again")
+    func deletingTheKeyWindowWithNothingHeldSendsNothing() throws {
+        let spy = KeyLaneSpySession(host: "", user: "", passwordBytes: Data(), program: "")
+        let registry = try makeKeyLaneRegistry(session: spy)
+        let a = try makeKeyLaneWindow(831, in: registry)
+        try openKeyLaneGate(831, of: a, in: registry, spy: spy)
+        try keyLaneMakeKey(831, in: registry)
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 831)) }
+        #expect(spy.calls.isEmpty, "\(spy.calls)")
+
+        let c = try makeKeyLaneWindow(832, in: registry)
+        try openKeyLaneGate(832, of: c, in: registry, spy: spy)
+        keyLaneDeliver(try keyLaneKey(.keyDown, keyCode: 15, "r"), to: c)
+        try keyLaneMakeKey(832, in: registry)
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 832)) }
+        try #require(spy.calls == [.keyDown(15), .keyUp(15)], "setup: \(spy.calls)")
+
+        _ = try makeKeyLaneWindow(833, in: registry)
+        try keyLaneMakeKey(833, in: registry)
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 833)) }
+        #expect(spy.calls == [.keyDown(15), .keyUp(15)], "a second delete flushed again: \(spy.calls)")
+        autoreleasepool { registry.closeWindowsForSessionEnd() }
+    }
+
+    /// D5. A key captured but never sent (the gate is closed) gets no release when the key window is
+    /// deleted: it is in the lane ledger, not on the wire ledger.
+    @Test("D5: deleting the key window does not release a key that never reached the wire")
+    func deletingTheKeyWindowSkipsAKeyNeverSent() throws {
+        let (spy, registry, view) = try makeKeyLaneSpyRegistry(window: 841)
+        keyLaneDeliver(try keyLaneKey(.keyDown, keyCode: 15, "r"), to: view)
+        try #require(view.keyLedgers.scancodeDown.contains(15) && registry.wireHeldKeysAreEmpty(), "setup")
+        try keyLaneMakeKey(841, in: registry)
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 841)) }
+        #expect(!spy.calls.contains(.keyUp(15)), "\(spy.calls)")
+        autoreleasepool { registry.closeWindowsForSessionEnd() }
+    }
+
+    /// D6. The session reset after a key-window delete still sends nothing (F5 on this path).
+    @Test("D6: the session reset after a key-window delete sends nothing")
+    func theSessionResetAfterAKeyWindowDeleteSendsNothing() throws {
+        let spy = KeyLaneSpySession(host: "", user: "", passwordBytes: Data(), program: "")
+        let registry = try makeKeyLaneRegistry(session: spy)
+        let a = try makeKeyLaneWindow(851, in: registry)
+        let b = try makeKeyLaneWindow(852, in: registry)
+        try openKeyLaneGate(851, of: a, in: registry, spy: spy)
+        keyLaneDeliver(try keyLaneKey(.keyDown, keyCode: 15, "r"), to: a)
+        try keyLaneMakeKey(851, in: registry)
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 851)) }
+        try #require(spy.calls == [.keyDown(15), .keyUp(15)], "setup: \(spy.calls)")
+        keyLaneDeliver(try keyLaneKey(.keyDown, keyCode: 49, " "), to: b)
+        let before = spy.calls
+        try keyLaneMakeKey(852, in: registry)
+        autoreleasepool { registry.closeWindowsForSessionEnd() }
+        #expect(spy.calls == before, "the session reset sent something: \(spy.calls)")
+        #expect(registry.keyLedgersAreEmpty())
+    }
+
+    /// D7. Without an injected seam the live read answers false in an xctest host, so a delete flushes
+    /// nothing -- the runtime twin of the seam's default (lane mutant M5: a default of `{ _ in true }`).
+    @Test("D7: with the seam left alone, deleting a window flushes nothing")
+    func theDefaultSeamFlushesNothing() throws {
+        let (spy, registry, view) = try makeKeyLaneSpyRegistry(window: 861)
+        try openKeyLaneGate(861, of: view, in: registry, spy: spy)
+        keyLaneDeliver(try keyLaneKey(.keyDown, keyCode: 15, "r"), to: view)
+        try #require(spy.calls == [.keyDown(15)], "setup: \(spy.calls)")
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 861)) }
+        #expect(spy.calls == [.keyDown(15)], "\(spy.calls)")
+        #expect(!registry.wireHeldKeysAreEmpty())
+        autoreleasepool { registry.closeWindowsForSessionEnd() }
+    }
+
+    /// D8 (gate r1 PU1b, F9's sequence). R goes out while the server's focus is elsewhere, a click on
+    /// A starts an epoch toward A (on a real host its `.makeKey(A)` is what keeps the target the local
+    /// key window; here the first frame never came, so A is key through the seam), R's release is
+    /// buffered -- and the server deletes A, still the local key window. The synthesized focus loss
+    /// releases R.
+    @Test("D8: the server deleting the epoch's target, still the key window, releases a key held on the wire")
+    func deletingTheEpochTargetReleasesTheHeldKey() throws {
+        let spy = KeyLaneSpySession(host: "", user: "", passwordBytes: Data(), program: "")
+        let registry = try makeKeyLaneRegistry(session: spy)
+        let a = try makeKeyLaneWindow(871, in: registry)
+        try openKeyLaneGate(871, of: a, in: registry, spy: spy)
+        autoreleasepool { registry.handle(KeyLaneMonitoredDesktopStub(activeWindowId: 9999)) }
+        keyLaneDeliver(try keyLaneKey(.keyDown, keyCode: 15, "r"), to: a)
+        try #require(spy.calls == [.keyDown(15)], "R out: \(spy.calls)")
+        a.onEvent?(.mouseButton(.left, down: true, screenPoint: NSPoint(x: 400, y: 400)))
+        a.onEvent?(.mouseButton(.left, down: false, screenPoint: NSPoint(x: 400, y: 400)))
+        keyLaneDeliver(try keyLaneKey(.keyUp, keyCode: 15, "r"), to: a)
+        try #require(spy.calls == [.keyDown(15)], "release buffered: \(spy.calls)")
+        try keyLaneMakeKey(871, in: registry)
+
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 871)) }
+        #expect(spy.calls == [.keyDown(15), .keyUp(15)], "\(spy.calls)")
+        #expect(registry.wireHeldKeysAreEmpty())
+        autoreleasepool { registry.closeWindowsForSessionEnd() }
+    }
+
+    /// D9. The Cmd mapper is reset with the flush: Cmd held (withheld) and C pressed through A go out
+    /// as the mapped chord; deleting A, the key window, releases them; Cmd's physical release, arriving
+    /// at B (the window still in the table), finds an idle mapper and sends nothing (lane mutant M7':
+    /// the flush without `commandKeyMapper.reset()`).
+    @Test("D9: deleting the key window resets the Cmd mapper too")
+    func deletingTheKeyWindowResetsTheMapper() throws {
+        let spy = KeyLaneSpySession(host: "", user: "", passwordBytes: Data(), program: "")
+        let registry = try makeKeyLaneRegistry(session: spy)
+        let view = try makeKeyLaneWindow(881, in: registry)
+        let other = try makeKeyLaneWindow(882, in: registry)
+        try openKeyLaneGate(881, of: view, in: registry, spy: spy)
+        keyLaneDeliver(try keyLaneKey(.flagsChanged, keyCode: 55, "", .command), to: view)
+        keyLaneDeliver(try keyLaneKey(.keyDown, keyCode: 8, "c", .command), to: view)
+        try #require(spy.calls.contains(.keyDown(8)) && !registry.wireHeldModifiersIsEmpty(), "setup: \(spy.calls)")
+        let pressed = spy.calls.count
+        try keyLaneMakeKey(881, in: registry)
+
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 881)) }
+        let flushed = Array(spy.calls.dropFirst(pressed))
+        let heldModifiers = spy.calls.prefix(pressed).compactMap { call -> CRModifierKey? in
+            if case .modifier(let key, down: true) = call { return key } else { return nil }
+        }
+        #expect(flushed == [.keyUp(8)] + heldModifiers.map { .modifier($0, down: false) }, "\(spy.calls)")
+        #expect(registry.wireHeldKeysAreEmpty() && registry.wireHeldModifiersIsEmpty())
+
+        let afterFlush = spy.calls
+        keyLaneDeliver(try keyLaneKey(.flagsChanged, keyCode: 55, ""), to: other)
+        #expect(spy.calls == afterFlush, "Cmd's release after the flush sent: \(spy.calls)")
         autoreleasepool { registry.closeWindowsForSessionEnd() }
     }
 }
