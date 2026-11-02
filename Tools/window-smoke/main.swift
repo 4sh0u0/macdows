@@ -9595,9 +9595,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
 
         // adr/0011 §5 item 5's LIVE battery (WINDOW_SMOKE_CMDMAP_LIVE=1 + INPUT_TEST=cmdmap).
         // What this process CAN assert: the scenario had a real, focused target; every one of
-        // the six chords actually went out as real NSEvents; and the wire-side modifier ledger
-        // is empty at the end (adr/0011 §5 item 2's structural "zero stuck modifiers" -- the
-        // live twin of MacdowsCore's offline ledger tests). The key-window half of the
+        // the six chords actually went out as real NSEvents; and both wire-side ledgers --
+        // modifiers and, since lane-focuslost-flush, keys (`wireDown`) -- are empty at the end
+        // (adr/0011 §5 item 2's structural "zero stuck modifiers", now "zero stuck keys" too --
+        // the live twin of MacdowsCore's offline ledger tests and of
+        // `KeyLaneLedgersInjectionTests`). The key-window half of the
         // preamble is gated by the generic `keyWindowCheckResult` assertion further down,
         // which fires for every input-test mode -- not duplicated here.
         //
@@ -9626,6 +9628,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 registry.wireHeldModifiersIsEmpty(),
                 "cmdmap-live: the wire-side modifier ledger is empty at finish -- zero stuck modifiers after six "
                     + "Cmd chords (adr/0011 §5 item 2, §3's wireHeldModifiers)"
+            )
+            check(
+                registry.wireHeldKeysAreEmpty(),
+                "cmdmap-live: the wire-side key ledger is empty at finish -- zero stuck keys after six Cmd chords "
+                    + "(adr/0011 §5 item 2, §3's wireDown; lane-smoke-wirekeys)"
             )
             print("[cmdmap-live] NOTE: file-content equality (seed x3) is asserted EXTERNALLY by the controller's "
                 + "readback pass against the expected-utf8-hex marker above -- this process cannot read the host's "
@@ -9674,6 +9681,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
                 registry.wireHeldModifiersIsEmpty(),
                 "ime: the wire-side modifier ledger is empty at finish -- zero stuck modifiers after the Cmd+S "
                     + "chord (adr/0011 §5 item 2, §3's wireHeldModifiers)"
+            )
+            check(
+                registry.wireHeldKeysAreEmpty(),
+                "ime: the wire-side key ledger is empty at finish -- zero stuck keys after the Cmd+S chord and the "
+                    + "IME commits (adr/0011 §5 item 2, §3's wireDown; lane-smoke-wirekeys)"
             )
             print("[ime] NOTE: file-content equality is asserted EXTERNALLY by the controller's readback pass "
                 + "against the expected-utf8-hex marker above -- this process cannot read the host's filesystem "
