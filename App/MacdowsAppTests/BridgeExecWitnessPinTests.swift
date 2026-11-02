@@ -321,10 +321,12 @@ extension BridgeExecWitnessPinTests {
     private static let clampSignature =
         "+ (CRWorkAreaClamp)clampWorkAreaLeft:(uint32_t)left top:(uint32_t)top right:(uint32_t)right "
         + "bottom:(uint32_t)bottom toDesktopWidth:(uint32_t)width height:(uint32_t)height"
-    /// Its one call: the four raw reads in, the advertised desktop pair as the bound.
+    /// Its one call: the four raw reads in, the advertised desktop pair as the bound. Re-frozen by
+    /// lane-jobkeys-desktop (lane-smoke-wa gate r1 O-2): the bound is the local pair
+    /// `crb_pre_connect` reads once from the session, the same values it sets as the desktop.
     private static let clampCall =
         "const CRWorkAreaClamp clamped = [CRSession clampWorkAreaLeft:rawLeft top:rawTop right:rawRight "
-        + "bottom:rawBottom toDesktopWidth:session.desktopWidth height:session.desktopHeight];"
+        + "bottom:rawBottom toDesktopWidth:desktopWidth height:desktopHeight];"
     /// The clamp's WARN: numbers only.
     private static let clampWarnFormat =
         "\"work area %u,%u,%u,%u exceeds the advertised desktop %ux%u -- clamped to %u,%u,%u,%u (F-ja-4 m-3)\""
@@ -365,6 +367,41 @@ extension BridgeExecWitnessPinTests {
         #expect(bridgeOccurrences(of: Self.clampWarnFormat, in: raw) == 1)
         let warnStatement = preConnect[warn...].prefix { $0 != ";" }
         #expect(!warnStatement.contains("%s"), "the clamp WARN prints a string")
+    }
+
+    @Test("O-2 crb_pre_connect reads the session's desktop pair once and shares it between the setting and the clamp")
+    func theDesktopPairIsReadOnce() throws {
+        let raw = try Self.raw()
+        let code = try Self.code()
+        let preConnect = try bridgeCodeOnly(Self.functionBody("static BOOL crb_pre_connect(freerdp *instance)", in: raw))
+        #expect(bridgeOccurrences(of: "session.desktopWidth", in: preConnect) == 1)
+        #expect(bridgeOccurrences(of: "session.desktopHeight", in: preConnect) == 1)
+        let readWidth = "const uint32_t desktopWidth = session.desktopWidth;"
+        let readHeight = "const uint32_t desktopHeight = session.desktopHeight;"
+        #expect(bridgeOccurrences(of: readWidth, in: preConnect) == 1)
+        #expect(bridgeOccurrences(of: readHeight, in: preConnect) == 1)
+        let width = try Self.index(of: readWidth, in: preConnect)
+        let height = try Self.index(of: readHeight, in: preConnect)
+        let setting = try Self.index(of: "FreeRDP_DesktopWidth,", in: preConnect)
+        let call = try Self.index(of: Self.clampCall, in: preConnect)
+        #expect(width < setting, "the width is read before the desktop is set")
+        #expect(height < setting, "the height is read before the desktop is set")
+        #expect(setting < call)
+        #expect(bridgeOccurrences(of: "freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, desktopWidth)",
+                                  in: preConnect) == 1)
+        #expect(bridgeOccurrences(of: "freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, desktopHeight)",
+                                  in: preConnect) == 1)
+        #expect(bridgeOccurrences(of: "toDesktopWidth:session.desktopWidth", in: code) == 0)
+        // gate r1 I-1 (lane-jobkeys-desktop): `[session desktopWidth]` is the same getter as the dotted
+        // read -- a re-read through it at any site (the WARN's arguments, the setting's gate) passed the
+        // pins above. Zero message sends anywhere in the file, exactly one dotted read of each property
+        // inside the function, and the two sites that were not spelled out above frozen as well.
+        #expect(bridgeOccurrences(of: "session desktopWidth]", in: code) == 0)
+        #expect(bridgeOccurrences(of: "session desktopHeight]", in: code) == 0)
+        #expect(bridgeOccurrences(of: ".desktopWidth", in: preConnect) == 1)
+        #expect(bridgeOccurrences(of: ".desktopHeight", in: preConnect) == 1)
+        #expect(bridgeOccurrences(of: "if (desktopWidth > 0 && desktopHeight > 0)", in: preConnect) == 1)
+        #expect(bridgeOccurrences(of: "(unsigned)desktopWidth, (unsigned)desktopHeight,", in: preConnect) == 1)
     }
 }
 
