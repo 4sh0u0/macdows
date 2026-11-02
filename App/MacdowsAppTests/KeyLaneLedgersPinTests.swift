@@ -261,6 +261,51 @@ struct KeyLaneLedgersPinTests {
             in: code
         ) == 1)
     }
+
+    /// lane-smoke-wirekeys: Tools/window-smoke's two live batteries (cmdmap-live, ime) assert the wire
+    /// key ledger at finish, each right after its modifier-ledger assertion. The behaviour runs only in
+    /// the live battery (a real host); this pin guards "both places have it, each after the modifier
+    /// check" (lane mutants M1 / M2: an assertion deleted; M3: the order swapped; M4: the predicate
+    /// swapped for the modifier one with the message kept). The needles hold no `//`, so the strip
+    /// keeps them. Gate r1 I-1: a bare predicate-name needle is spelling-level -- `|| true` (V2) and
+    /// `true,` with the name left in a string (V3) kept it -- so the needle is the CALL SHAPE, the
+    /// predicate as `check`'s condition followed by the battery's message; a dead-branch decoy (V1,
+    /// the check wrapped in `if false { }`) keeps every needle by construction and is pinned as
+    /// "neither battery body contains `if false` or `#if`" -- the pin's known ceiling.
+    @Test("window-smoke: cmdmap-live and ime each assert wireHeldKeysAreEmpty() after the modifier ledger")
+    func theLiveBatteriesAssertTheWireKeyLedger() throws {
+        let code = try keyLaneLedgersCode("Tools/window-smoke/main.swift")
+        #expect(keyLaneLedgersOccurrences(of: "registry.wireHeldKeysAreEmpty()", in: code) == 2)
+        #expect(keyLaneLedgersOccurrences(of: "registry.wireHeldModifiersIsEmpty()", in: code) == 2)
+        #expect(keyLaneLedgersOccurrences(
+            of: "check( registry.wireHeldKeysAreEmpty(), \"cmdmap-live: the wire-side key ledger is empty at finish", in: code
+        ) == 1, "cmdmap-live: the predicate is not check's condition (gate r1 V2 / V3)")
+        #expect(keyLaneLedgersOccurrences(
+            of: "check( registry.wireHeldKeysAreEmpty(), \"ime: the wire-side key ledger is empty at finish", in: code
+        ) == 1, "ime: the predicate is not check's condition (gate r1 V2 / V3)")
+        // `if cmdMapLiveActive {` also opens an earlier block (the input-test driver), so each battery
+        // is located from its own message: the last occurrence of the signature before the message.
+        let batteries = [
+            ("if cmdMapLiveActive {", "\"cmdmap-live: the wire-side key ledger is empty at finish"),
+            ("if inputTestMode == .ime {", "\"ime: the wire-side key ledger is empty at finish"),
+        ]
+        for (signature, message) in batteries {
+            let messageRange = try #require(code.range(of: message), "\(message) not found")
+            let open = try #require(
+                code.range(of: signature, options: .backwards, range: code.startIndex..<messageRange.lowerBound),
+                "\(signature) not found before its message"
+            )
+            let body = try #require(Self.body(of: signature, in: String(code[open.lowerBound...])), "\(signature) body")
+            #expect(keyLaneLedgersOccurrences(of: "registry.wireHeldKeysAreEmpty()", in: String(body)) == 1, "\(signature)")
+            #expect(keyLaneLedgersOccurrences(of: "registry.wireHeldModifiersIsEmpty()", in: String(body)) == 1, "\(signature)")
+            let keys = try #require(body.range(of: "registry.wireHeldKeysAreEmpty()"))
+            let modifiers = try #require(body.range(of: "registry.wireHeldModifiersIsEmpty()"))
+            #expect(modifiers.upperBound <= keys.lowerBound, "\(signature): keys assertion before the modifier one")
+            #expect(!body.contains("if false") && !body.contains("#if"), "\(signature): a dead-branch decoy (gate r1 V1)")
+        }
+        #expect(keyLaneLedgersOccurrences(of: "\"cmdmap-live: the wire-side key ledger is empty at finish", in: code) == 1)
+        #expect(keyLaneLedgersOccurrences(of: "\"ime: the wire-side key ledger is empty at finish", in: code) == 1)
+    }
 }
 
 /// lane-delete-key-window: makes window `windowId` the one `registry.isKeyWindow` answers true for

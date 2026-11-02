@@ -1431,7 +1431,9 @@ final class RemoteWindowRegistry {
     /// event sequences with no CRSession or AppKit anywhere): those prove the state machine
     /// computes the right releases; this proves a real chord sequence, dispatched through a
     /// real `NSWindow`/`RemoteWindowContentView` against a real host, actually left nothing
-    /// behind (`Tools/window-smoke`'s adr/0011 §5 item 5/6 batteries gate on it).
+    /// behind (`Tools/window-smoke`'s adr/0011 §5 item 5/6 batteries gate on it). Its twin for the
+    /// non-modifier keys is `wireHeldKeysAreEmpty()` below, which the same batteries assert right
+    /// after this one (lane-smoke-wirekeys).
     func wireHeldModifiersIsEmpty() -> Bool {
         wireHeldModifiers.isEmpty
     }
@@ -1450,7 +1452,9 @@ final class RemoteWindowRegistry {
     /// the wire ledger (`keyLedgers.wireDown`, the "which keys are ACTUALLY held down on the wire right
     /// now" state `releaseAllHeldKeys()` reads) is currently empty. Read-only, and deliberately only
     /// the emptiness predicate, for `wireHeldModifiersIsEmpty()`'s reasons: the assertion this exists
-    /// for is "no key is stuck", not "these specific codes are held".
+    /// for is "no key is stuck", not "these specific codes are held". Tools/window-smoke's
+    /// cmdmap-live / ime batteries gate on it at finish, right after `wireHeldModifiersIsEmpty()`
+    /// (lane-smoke-wirekeys).
     func wireHeldKeysAreEmpty() -> Bool {
         keyLedgers.wireDown.isEmpty
     }
