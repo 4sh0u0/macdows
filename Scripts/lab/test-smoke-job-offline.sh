@@ -46,7 +46,7 @@
 #      branch is not taken; the osascript shim records into a run-long trace that is never reset,
 #      and the "never reached" assertion at the end covers the whole run.
 #
-# Fifteen mutation proofs (M1 gate bypassed, M2 key whitelist bypassed, M3 overlap guard removed,
+# Sixteen mutation proofs (M1 gate bypassed, M2 key whitelist bypassed, M3 overlap guard removed,
 # M4 the window closed before the DONE line is written, M5 the overlap guard reading the process
 # table instead of the capture's own pid line, M6 the manifest reading the template's batch instead
 # of the run's, M7 the missing-artefact count removed, M8 the batch override appended without a
@@ -56,7 +56,8 @@
 # its mtime instead of by the clear-then-present proof, M12 WINDOW_SMOKE_WORK_AREA dropped from the
 # managed-variable list so an inherited knob reaches the child, M13 the WORK_AREA=0 mapping line
 # deleted, M14 the WORK_AREA shape check disabled, M15 the job-key clearing moved back after the
-# subshell that sources the job, so an exported key reaches it) copy the script under test with one guard
+# subshell that sources the job, so an exported key reaches it, M16 the child-environment unset
+# loop for the 16 job keys deleted) copy the script under test with one guard
 # removed and require the case that claims to pin it to FAIL against the mutant. A pin that would
 # also pass against the broken code pins nothing.
 #
@@ -1314,6 +1315,36 @@ grep -qF 'work_area=1' "$SMOKELOG" || reasons="$reasons inherited-job-key-not-de
 [ "$(child_calls)" = '1' ] || reasons="$reasons inherited-job-key-launcher-calls=$(child_calls);"
 if [ -z "$reasons" ]; then
 	pass "$CASE: WORK_AREA=0 puts WINDOW_SMOKE_WORK_AREA=0 in the child and work_area=0 in the run line, 1 and an absent key both leave the variable absent (the product work area) with work_area=1 in the run line, and a WINDOW_SMOKE_WORK_AREA=0 inherited from the launching shell is stripped -- and an exported job key in the launching shell does not disarm it either"
+else
+	fail "$CASE:$reasons"
+	note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
+fi
+
+# 22f. The child's environment holds none of the 16 bare job-key names (lane-jobkeys-desktop, the
+#      D-16 tightening of lane-smoke-wa): a job key exported by the shell that opened Terminal --
+#      or written by the job itself -- is not passed on under its own name. The launcher reads only
+#      WINDOW_SMOKE_*, so this is not a behaviour change; it makes "the child's environment is a
+#      function of the job file" complete. `-u` removes the 16 names, it is not `env -i`: an
+#      unrelated variable still reaches the child. (M16 pins the loop.)
+begin '22f the child environment carries none of the bare job-key names'
+reasons=''
+reset_run
+job_base
+run_smoke_inheriting "$SBLAB/smoke-job.command" 'EDGE_PROFILE=1'
+if child_has_var EDGE_PROFILE; then reasons="$reasons exported-EDGE_PROFILE-reached-the-child;"; fi
+if child_has_var WINDOW_SMOKE_EDGE_PROFILE; then reasons="$reasons inherited-job-key-armed-the-child;"; fi
+[ "$(child_calls)" = '1' ] || reasons="$reasons edge-launcher-calls=$(child_calls);"
+reset_run
+job_base
+run_smoke_inheriting "$SBLAB/smoke-job.command" 'TAG=exported-should-vanish'
+if child_has_var TAG; then reasons="$reasons TAG-reached-the-child;"; fi
+[ "$(child_calls)" = '1' ] || reasons="$reasons tag-launcher-calls=$(child_calls);"
+reset_run
+job_base
+run_smoke_inheriting "$SBLAB/smoke-job.command" 'LABTEST_UNRELATED=1'
+child_has_var LABTEST_UNRELATED || reasons="$reasons unrelated-variable-was-removed;"
+if [ -z "$reasons" ]; then
+	pass "$CASE: an exported EDGE_PROFILE or TAG of the launching shell does not appear in the child's environment (nor does it arm WINDOW_SMOKE_EDGE_PROFILE), while an unrelated variable still does"
 else
 	fail "$CASE:$reasons"
 	note "trace: $(tr '\n' ';' < "$LABTEST_TRACE")"
@@ -3177,9 +3208,38 @@ else
 	fail "$CASE: could not build the mutant (the three clearing lines or the subshell line moved?)"
 fi
 
+# M16. The child-environment unset loop for the 16 job keys deleted (the state before this lane):
+#      an exported EDGE_PROFILE / TAG then reaches the child under its own name -- i.e. case 22f
+#      bites. The mutant drops the three lines of that loop (`for key in $SMOKE_JOB_KEYS; do`, its
+#      body, `done`) and nothing else -- dropping the `for` line alone would leave an orphan `done`
+#      and a syntax error, which is not the state before this lane.
+begin 'M16 job-key-unset-loop-removed mutant'
+MUTANT_UNSET="$SBLAB/labtest-mutant-unset.command"
+if awk '
+	$0 == "            for key in $SMOKE_JOB_KEYS; do" { skip = 3 }
+	skip > 0 { skip--; dropped++; next }
+	{ print }
+	END { if (dropped != 3) exit 1 }' "$SBLAB/smoke-job.command" > "$MUTANT_UNSET" \
+	&& ! cmp -s "$MUTANT_UNSET" "$SBLAB/smoke-job.command" && bash -n "$MUTANT_UNSET"; then
+	leaked=''
+	for arm in 'EDGE_PROFILE=1 EDGE_PROFILE' 'TAG=exported-should-vanish TAG'; do
+		reset_run
+		job_base
+		run_smoke_inheriting "$MUTANT_UNSET" "${arm%% *}"
+		if child_has_var "${arm#* }"; then leaked="$leaked ${arm#* }"; fi
+	done
+	if [ "$leaked" = ' EDGE_PROFILE TAG' ]; then
+		pass "$CASE: detected -- the exported job keys ($leaked ) reach the child under their own names (case 22f pins the unset loop)"
+	else
+		fail "$CASE: NOT detected for every arm -- leaked only [$leaked ]; 22f would pass against a wrapper without the unset loop"
+	fi
+else
+	fail "$CASE: could not build the mutant (the unset loop moved?)"
+fi
+
 # Every case must have reported: a case that neither passed nor failed would otherwise vanish from
 # the tally with exit 0. Placed after the LAST case on purpose.
-EXPECTED_CASES=93
+EXPECTED_CASES=95
 if [ $((PASSES + FAILURES)) -ne "$EXPECTED_CASES" ]; then
 	fail "case tally: $((PASSES + FAILURES)) cases reported, expected $EXPECTED_CASES -- a case produced no verdict"
 fi

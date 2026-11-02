@@ -2057,13 +2057,19 @@ static BOOL crb_pre_connect(freerdp *instance)
 
     if (!freerdp_settings_set_bool(settings, FreeRDP_RemoteApplicationMode, TRUE))
         return FALSE;
+    /* lane-jobkeys-desktop (lane-smoke-wa gate r1 O-2): the advertised desktop pair is read ONCE
+     * here and shared by the setting below, the work-area clamp and its WARN, so the desktop the
+     * clamp bounds the work area to is the desktop that went out (CRSession.h: "read once by the
+     * connect path"). */
+    const uint32_t desktopWidth = session.desktopWidth;
+    const uint32_t desktopHeight = session.desktopHeight;
     /* Remote desktop sized to the caller's screen (see CRSession.h's desktopWidth doc:
      * the RAIL server clamps window positions to this desktop, so leaving FreeRDP's
      * 1024x768 default put an un-drag-past-able wall at a 2560pt display's midpoint). */
-    if (session.desktopWidth > 0 && session.desktopHeight > 0)
+    if (desktopWidth > 0 && desktopHeight > 0)
     {
-        if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, session.desktopWidth) ||
-            !freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, session.desktopHeight))
+        if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, desktopWidth) ||
+            !freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, desktopHeight))
             return FALSE;
     }
     /* W3 lanes E + H (ADR-0018 §2; U-1 ruled D 2026-09-08): the advertised scale pair. The App
@@ -2097,13 +2103,13 @@ static BOOL crb_pre_connect(freerdp *instance)
         const uint32_t rawRight = session.workAreaRight;
         const uint32_t rawBottom = session.workAreaBottom;
         const CRWorkAreaClamp clamped = [CRSession clampWorkAreaLeft:rawLeft top:rawTop right:rawRight bottom:rawBottom
-                                                      toDesktopWidth:session.desktopWidth height:session.desktopHeight];
+                                                      toDesktopWidth:desktopWidth height:desktopHeight];
         if (clamped.changed)
         {
             WLog_WARN(TAG,
                       "work area %u,%u,%u,%u exceeds the advertised desktop %ux%u -- clamped to %u,%u,%u,%u (F-ja-4 m-3)",
                       (unsigned)rawLeft, (unsigned)rawTop, (unsigned)rawRight, (unsigned)rawBottom,
-                      (unsigned)session.desktopWidth, (unsigned)session.desktopHeight,
+                      (unsigned)desktopWidth, (unsigned)desktopHeight,
                       (unsigned)clamped.left, (unsigned)clamped.top, (unsigned)clamped.right, (unsigned)clamped.bottom);
         }
         const uint32_t left = clamped.left;

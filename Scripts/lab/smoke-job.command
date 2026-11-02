@@ -152,7 +152,13 @@ TAG_OK=0
 # would still expand inside them. A trailing `\"` can still continue a double-quoted value onto the
 # next line; that is the one shape this grammar cannot see, and it is what the sentinel below is
 # for. Assembled from pieces because the alternatives contain both kinds of quote.
-SMOKE_JOB_KEYS_RE='TAG|BATCH|DISPLAY_LOOKS_LIKE|ADVERTISED_SCALE|MOVE|MAXIMIZE|TRAY|TRAY_CLICK|EDGE_PROFILE|EXTRA_APPS|MOVE_TARGET|MOVE_KEEP|WORK_AREA|APP|APP_ARGS|REQUIRE_SYMBOL'
+# The job keys, in one place. The list appears five more times in this file, in this order:
+# the RE below (derived from it) and four literal copies -- the STEP 2 clearing line and the
+# sub-shell printf (their shape is anchored by the offline suite's M15 awk), the `read` sequence
+# that takes the printf's lines back, and the CR strip after it. The child-environment unset loop
+# iterates this list. No pin ties the four literal copies to it (registered, lane-jobkeys-desktop).
+SMOKE_JOB_KEYS='TAG BATCH DISPLAY_LOOKS_LIKE ADVERTISED_SCALE MOVE MAXIMIZE TRAY TRAY_CLICK EDGE_PROFILE EXTRA_APPS MOVE_TARGET MOVE_KEEP WORK_AREA APP APP_ARGS REQUIRE_SYMBOL'
+SMOKE_JOB_KEYS_RE="${SMOKE_JOB_KEYS// /|}"
 SMOKE_SQ="'"
 SMOKE_VALUE_BARE='[A-Za-z0-9._:,%@=+/-]*'
 SMOKE_VALUE_DQ='"[^"$`]*"'
@@ -502,6 +508,13 @@ EOF_JOB_KEYS
             CHILD_ENV=(-u WIN_HOST -u WIN_USER -u WIN_PASS)
             for managed in $SMOKE_MANAGED_VARS; do
                 CHILD_ENV+=(-u "$managed")
+            done
+            # D-16 (lane-smoke-wa): the launcher reads only WINDOW_SMOKE_*, so these bare job-key names
+            # have no reader in the child -- but "the child's environment is a function of the job
+            # file" is only complete if an exported TAG / EDGE_PROFILE / ... of the starting shell is
+            # removed too.
+            for key in $SMOKE_JOB_KEYS; do
+                CHILD_ENV+=(-u "$key")
             done
             CHILD_ENV+=(TERM_PROGRAM= "WINDOW_SMOKE_LOG=$WS_LOG")
             # D = the product default = the knob UNSET (main.swift: unset/empty is the product
