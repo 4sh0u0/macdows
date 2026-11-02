@@ -306,6 +306,36 @@ struct KeyLaneLedgersPinTests {
         #expect(keyLaneLedgersOccurrences(of: "\"cmdmap-live: the wire-side key ledger is empty at finish", in: code) == 1)
         #expect(keyLaneLedgersOccurrences(of: "\"ime: the wire-side key ledger is empty at finish", in: code) == 1)
     }
+
+    /// lane-close-composition: the window-close path drops a composition in progress and cuts the
+    /// wiring (B-1 gate r1 m-5, the B-5 shape). The view's method is the two statements (lane mutants
+    /// M3: `discardMarkedText()` deleted; M4: `unmarkText()` deleted); `close(via:)` opens with the
+    /// two calls, in that order, before its first-frame cancel (M1 / M2: one deleted; M5: moved after
+    /// `window.close()`; M6: `onInput = nil` made conditional). The stripped body must hold no `func `
+    /// (`closeRemovesEveryObserverTheInitializerAdds`). Gate r1 m-3: the view must not override
+    /// `inputContext` -- a nil one would turn `discardMarkedText()` into a no-op that every offline test
+    /// still passes (variant VC); the input method's side of the discard is only observable in person.
+    @Test("close(via:) drops the composition and cuts onInput first; the view's method is discard + unmark")
+    func theClosePathDropsTheCompositionAndCutsTheWiring() throws {
+        let input = try keyLaneLedgersCode(Self.input)
+        #expect(keyLaneLedgersOccurrences(
+            of: "func discardComposition() { inputContext?.discardMarkedText() unmarkText() }", in: input
+        ) == 1)
+        #expect(keyLaneLedgersOccurrences(of: "discardMarkedText()", in: input) == 1)
+        #expect(keyLaneLedgersOccurrences(of: "override var inputContext", in: input) == 0,
+                "the view overrides inputContext (gate r1 VC: a nil context makes discardMarkedText() a no-op)")
+        let code = try keyLaneLedgersCode(Self.window)
+        let body = try #require(Self.body(of: "func close(via session: CRSession) {", in: code))
+        #expect(body.hasPrefix(" contentView.discardComposition() onInput = nil firstFrameTimeoutWorkItem?.cancel()"))
+        #expect(keyLaneLedgersOccurrences(of: "contentView.discardComposition()", in: code) == 1)
+        #expect(keyLaneLedgersOccurrences(of: "onInput = nil", in: code) == 1)
+        let discard = try #require(body.range(of: "contentView.discardComposition()"))
+        let cut = try #require(body.range(of: "onInput = nil"))
+        let orderOut = try #require(body.range(of: "window.orderOut(nil)"))
+        #expect(discard.upperBound <= cut.lowerBound, "discard before the cut")
+        #expect(cut.upperBound <= orderOut.lowerBound, "the cut before orderOut")
+        #expect(!body.contains("func "))
+    }
 }
 
 /// lane-delete-key-window: makes window `windowId` the one `registry.isKeyWindow` answers true for
@@ -370,11 +400,26 @@ private func makeKeyLaneRegistry(session: CRSession) throws -> RemoteWindowRegis
     return RemoteWindowRegistry(session: session, topologyProvider: StaticDisplayTopologyProvider(topology))
 }
 
+/// lane-close-composition: puts `view` mid-composition the way an input method's `setMarkedText` does,
+/// and proves it took (a view that is not composing would make every "composition dropped" test vacuous).
+@MainActor
+private func keyLaneCompose(_ view: RemoteWindowContentView, _ text: String) throws {
+    let none = NSRange(location: NSNotFound, length: 0)
+    view.setMarkedText(text, selectedRange: none, replacementRange: none)
+    try #require(view.hasMarkedText(), "setup: the view is composing")
+}
+
+/// True when the spy saw a committed-text send.
+private func keyLaneSawUnicodeText(_ spy: KeyLaneSpySession) -> Bool {
+    spy.calls.contains { if case .unicodeText = $0 { true } else { false } }
+}
+
 /// One keyboard call the registry made on its session, as `KeyLaneSpySession` records it.
 private enum KeyLaneWireCall: Equatable {
     case keyDown(UInt16)
     case keyUp(UInt16)
     case modifier(CRModifierKey, down: Bool)
+    case unicodeText(String)
 }
 
 /// lane-focuslost-flush: an UNSTARTED `CRSession` (as above: no `-start`, no host, empty strings) that
@@ -394,6 +439,15 @@ private final class KeyLaneSpySession: CRSession {
 
     override func send(_ key: CRModifierKey, down: Bool) {
         calls.append(.modifier(key, down: down))
+    }
+
+    /// lane-close-composition: the spy's server negotiated INPUT_FLAG_UNICODE, so the registry's
+    /// degradation gate (adr/0011 §2) forwards a commit instead of dropping it.
+    override var unicodeInputSupported: Bool { true }
+
+    /// lane-close-composition: the committed-text exit (`sendKeyboardLaneEvent`'s `.unicodeText` arm).
+    override func sendUnicodeText(_ text: String) {
+        calls.append(.unicodeText(text))
     }
 
     func clear() {
@@ -1023,6 +1077,109 @@ struct KeyLaneLedgersInjectionTests {
         let afterFlush = spy.calls
         keyLaneDeliver(try keyLaneKey(.flagsChanged, keyCode: 55, ""), to: other)
         #expect(spy.calls == afterFlush, "Cmd's release after the flush sent: \(spy.calls)")
+        autoreleasepool { registry.closeWindowsForSessionEnd() }
+    }
+
+    // MARK: lane-close-composition: the close path drops a composition and cuts the wiring
+
+    /// C1. The server deletes a window whose view is composing: the composition is gone, the wiring is
+    /// cut, and a late commit from the input method reaches no window (the B-5 shape).
+    @Test("C1: deleting a composing window drops the composition and cuts onInput; a late commit goes nowhere")
+    func deletingAComposingWindowDropsTheComposition() throws {
+        let (spy, registry, view) = try makeKeyLaneSpyRegistry(window: 901)
+        try openKeyLaneGate(901, of: view, in: registry, spy: spy)
+        try keyLaneCompose(view, "わた")
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 901)) }
+        #expect(!view.hasMarkedText())
+        #expect(view.onEvent == nil)
+        #expect(registry.window(forWindowId: 901) == nil)
+        view.insertText("わたし", replacementRange: NSRange(location: NSNotFound, length: 0))
+        #expect(!keyLaneSawUnicodeText(spy), "a late commit reached the wire: \(spy.calls)")
+        autoreleasepool { registry.closeWindowsForSessionEnd() }
+    }
+
+    /// C2. The same through the session reset (`closeAllWindows()` -> `close(via:)`).
+    @Test("C2: the session reset drops a composition and cuts onInput; a late commit goes nowhere")
+    func theSessionResetDropsTheComposition() throws {
+        let (spy, registry, view) = try makeKeyLaneSpyRegistry(window: 911)
+        try openKeyLaneGate(911, of: view, in: registry, spy: spy)
+        try keyLaneCompose(view, "わた")
+        autoreleasepool { registry.closeWindowsForSessionEnd() }
+        #expect(!view.hasMarkedText())
+        #expect(view.onEvent == nil)
+        #expect(registry.window(forWindowId: 911) == nil)
+        view.insertText("わたし", replacementRange: NSRange(location: NSNotFound, length: 0))
+        #expect(!keyLaneSawUnicodeText(spy), "a late commit reached the wire: \(spy.calls)")
+    }
+
+    /// C3. The wire flush for a deleted key window (lane-delete-key-window) still happens, and it
+    /// happens before the cut: R's release goes out, and afterwards the view's wiring is gone, so a
+    /// later `.focusLost` has nowhere to go.
+    @Test("C3: the key-window flush still runs; the wiring is cut after it")
+    func theKeyWindowFlushStillRunsBeforeTheCut() throws {
+        let (spy, registry, view) = try makeKeyLaneSpyRegistry(window: 921)
+        try openKeyLaneGate(921, of: view, in: registry, spy: spy)
+        keyLaneDeliver(try keyLaneKey(.keyDown, keyCode: 15, "r"), to: view)
+        try #require(spy.calls == [.keyDown(15)], "R out: \(spy.calls)")
+        try keyLaneMakeKey(921, in: registry)
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 921)) }
+        #expect(spy.calls == [.keyDown(15), .keyUp(15)], "\(spy.calls)")
+        #expect(view.onEvent == nil)
+        view.onEvent?(.focusLost)
+        #expect(spy.calls == [.keyDown(15), .keyUp(15)], "a focus loss after the cut sent: \(spy.calls)")
+        autoreleasepool { registry.closeWindowsForSessionEnd() }
+    }
+
+    /// C4. Another window is untouched: B keeps its composition and its wiring, and its commit still
+    /// reaches the wire.
+    @Test("C4: deleting window A leaves composing window B alone")
+    func deletingAnotherWindowLeavesTheComposingOneAlone() throws {
+        let spy = KeyLaneSpySession(host: "", user: "", passwordBytes: Data(), program: "")
+        let registry = try makeKeyLaneRegistry(session: spy)
+        _ = try makeKeyLaneWindow(931, in: registry)
+        let viewB = try makeKeyLaneWindow(932, in: registry)
+        try openKeyLaneGate(932, of: viewB, in: registry, spy: spy)
+        try keyLaneCompose(viewB, "わた")
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 931)) }
+        #expect(viewB.hasMarkedText())
+        #expect(viewB.onEvent != nil)
+        viewB.insertText("わたし", replacementRange: NSRange(location: NSNotFound, length: 0))
+        #expect(spy.calls == [.unicodeText("わたし")], "\(spy.calls)")
+        autoreleasepool { registry.closeWindowsForSessionEnd() }
+    }
+
+    /// C6 (gate r1 I-1, the gate's probe GATE-C6): the real-host shape of lane mutant M2. The registry does
+    /// not gate on its window table -- `handleInput`'s closure captures the window id, and the keyboard
+    /// lane's `.unicodeText` carries none -- so once the gate has converged on B, a late commit from the
+    /// deleted A would go out as if B had typed it. The cut in `close(via:)` is the ONLY guard: A's late
+    /// commit sends nothing, B's own commit still does.
+    @Test("C6: a late commit from a deleted window sends nothing while the gate is converged on another window")
+    func aLateCommitFromADeletedWindowSendsNothingWhileAnotherWindowHoldsTheGate() throws {
+        let spy = KeyLaneSpySession(host: "", user: "", passwordBytes: Data(), program: "")
+        let registry = try makeKeyLaneRegistry(session: spy)
+        let viewA = try makeKeyLaneWindow(951, in: registry)
+        let viewB = try makeKeyLaneWindow(952, in: registry)
+        try openKeyLaneGate(951, of: viewA, in: registry, spy: spy)
+        try keyLaneCompose(viewA, "わた")
+        try openKeyLaneGate(952, of: viewB, in: registry, spy: spy)
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 951)) }
+        viewA.insertText("わたし", replacementRange: NSRange(location: NSNotFound, length: 0))
+        #expect(!keyLaneSawUnicodeText(spy), "a late commit from the deleted window reached the wire: \(spy.calls)")
+        viewB.insertText("b", replacementRange: NSRange(location: NSNotFound, length: 0))
+        #expect(spy.calls == [.unicodeText("b")], "the surviving window's commit: \(spy.calls)")
+        autoreleasepool { registry.closeWindowsForSessionEnd() }
+    }
+
+    /// C5. Not composing: the delete cuts the wiring all the same (lane mutant M6: only when
+    /// composing) and sends nothing.
+    @Test("C5: deleting a window that is not composing cuts onInput and sends nothing")
+    func deletingANonComposingWindowCutsTheWiring() throws {
+        let (spy, registry, view) = try makeKeyLaneSpyRegistry(window: 941)
+        try openKeyLaneGate(941, of: view, in: registry, spy: spy)
+        try #require(!view.hasMarkedText(), "setup: not composing")
+        autoreleasepool { registry.handle(KeyLaneWindowDeleteStub(windowId: 941)) }
+        #expect(view.onEvent == nil)
+        #expect(spy.calls.isEmpty, "\(spy.calls)")
         autoreleasepool { registry.closeWindowsForSessionEnd() }
     }
 }

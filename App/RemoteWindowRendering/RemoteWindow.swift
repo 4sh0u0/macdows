@@ -177,6 +177,7 @@ final class RemoteWindow {
     /// `init` below (adr/0005 §5: "outbound traffic goes through the registry calling back
     /// into CRSession", so the actual
     /// CRSession-calling logic lives one level up, in `RemoteWindowRegistry`).
+    /// `close(via:)` sets this to nil (the window is gone; late events from its view are dropped).
     var onInput: ((RemoteWindowInputEvent) -> Void)? {
         get { contentView.onEvent }
         set { contentView.onEvent = newValue }
@@ -1842,6 +1843,20 @@ final class RemoteWindow {
     /// or the session-end entry, `closeWindowsForSessionEnd()`) -- not idempotent against a
     /// second call.
     func close(via session: CRSession) {
+        // B-5 shape (F-ja-2' B-1 gate r1 m-5): the server closed this window while the user was
+        // composing. When the input context is deactivated by the close below, the input method may
+        // implicitly commit through `insertText:`, which would travel `onEvent` into the registry --
+        // `handleInput` does not check the window table and the keyboard lane carries no window id --
+        // and out to whatever FocusAuthority is converged on by then, another window or this one's
+        // successor (gate r1 I-1: the cut below is the ONLY guard against that commit, C1 / C6). So first make the
+        // input method abandon the composition, then cut the wiring -- both before `orderOut` /
+        // `close`. The registry's wire flush for a deleted key window (lane-delete-key-window) runs
+        // before this method is called, and `closeAllWindows()` reaches this body too. Anything
+        // this view emits after the cut (a late commit, a `resignFirstResponder` -> `.focusLost`
+        // while closing) is dropped on purpose: the wire flush and the session reset have their own
+        // paths.
+        contentView.discardComposition()
+        onInput = nil
         // Phase 2 W0③: nothing left to time out once this window is closing -- covers
         // WindowDelete, closeAllWindows, and prepareForReconnect alike, since all three
         // route through this one method (see this method's own doc comment above).
