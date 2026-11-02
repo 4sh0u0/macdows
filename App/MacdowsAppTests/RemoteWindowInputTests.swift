@@ -1060,4 +1060,17 @@ struct RemoteWindowInputTests {
     func seamDefaultIsTheLiveInputSourceRead() {
         #expect(RemoteWindowContentView.inputSourceIsASCIICapable() == Self.liveInputSourceIsASCIICapable())
     }
+
+    /// lane-close-composition V1: `discardComposition()` on a view with no window clears the local
+    /// composition and does not crash (measured: such a view still has an input context here; if a
+    /// future macOS returns nil, the `?.` call is skipped and only the local state is cleared).
+    @Test func discardCompositionClearsTheLocalCompositionWithoutAnInputContext() throws {
+        let (view, events) = Self.makeView()
+        let noRange = NSRange(location: NSNotFound, length: 0)
+        view.setMarkedText("わた", selectedRange: noRange, replacementRange: noRange)
+        try #require(view.hasMarkedText())
+        view.discardComposition() // on this macOS a window-less view still has a context; a nil one is skipped by `?.`
+        #expect(!view.hasMarkedText())
+        #expect(events().isEmpty, "discarding commits nothing")
+    }
 }

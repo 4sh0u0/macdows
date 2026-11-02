@@ -635,6 +635,22 @@ extension RemoteWindowContentView: @preconcurrency NSTextInputClient {
         markedText = ""
     }
 
+    /// Window-close path only (`RemoteWindow.close(via:)` is the one caller): drops a composition
+    /// still in progress when the window is closed under the user (the server deleted it, or the
+    /// session ended). First asks the input method to abandon its marked text
+    /// (`NSTextInputContext.discardMarkedText()` -- abandon, not commit), so that when the input
+    /// context is deactivated a moment later there is nothing for it to implicitly commit through
+    /// `insertText(_:replacementRange:)` to whatever the keyboard lane is converged on by then; then
+    /// clears the local `markedText`. Deliberately NOT called from the `.focusLost` path: clearing
+    /// only the local state while the input method keeps composing would desynchronise the two, and
+    /// letting the input method commit on focus loss is exactly the hazard (adr/0011 §2, B-1 gate r1
+    /// m-5). When `inputContext` is nil the optional call is skipped and only the local state is
+    /// cleared (a window-less xctest view was measured to still have a context on macOS 27.2).
+    func discardComposition() {
+        inputContext?.discardMarkedText()
+        unmarkText()
+    }
+
     func selectedRange() -> NSRange {
         // No local text storage to report a real selection against -- NSNotFound is the
         // conventional "unknown" answer Cocoa text-input clients give here.
