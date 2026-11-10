@@ -82,6 +82,23 @@ policy).
    for whether upstream has since merged the fix — if so, drop the local patch on the
    next version bump instead of carrying it forever.
 
+5. **The lock's inventory names exactly the files in this directory.** The set of
+   `.patches[].file` names in `deps/freerdp.lock` must equal the set of `*.patch` file names
+   here, in both directions: a lock entry with no file, or a file with no lock entry, fails
+   `Scripts/check-patch-queue.sh` (Tier 1's patch queue step, pinned by
+   `Scripts/test-patch-queue.sh`); both empty passes. The lock must carry a `.patches` array
+   (an empty queue is written `[]`, not left out), every entry a bare file name, no name twice.
+   The build never reads the lock's inventory -- `Scripts/build-freerdp.sh` globs this
+   directory, and `.patches` is not a config-hash input -- so before this rule a deleted patch
+   file with its entry left behind passed as "No patches", and a `.patches` emptied with the
+   file left in place passed with a lock that no longer said the checkout is patched. So adding
+   a patch adds its file and its lock entry in one commit, and retiring one deletes the file
+   and moves its entry from `.patches` to `.retired_patches` in one commit (`.retired_patches`
+   is history and is not compared). The rule compares names only: the entries' other keys are
+   prose for reviewers, and whether a built prefix actually carries a patch's behaviour is a
+   different question -- `Scripts/test-rail-handshake.sh` (Tier 2) asks it for the behaviour
+   the current queue exists for.
+
 ## Current state
 
 **One patch** against FreeRDP 3.32.1 (`bf217a504e54cc719880c228e82353382cd7d4fa`):
@@ -115,7 +132,11 @@ policy).
   outcomes, as above, and its "CMake hunks would change the build graph" does not hold for
   this build, where `BUILD_TESTING_INTERNAL` and `BUILD_FUZZERS` are both OFF -- the two
   reasons given here are the ones that stand. **Retire when** the pin moves to >= 3.33.0:
-  `git apply --check` then fails because upstream already carries both commits (rule 2).
+  `git apply --check` then fails because upstream already carries both commits (rule 2). The
+  file goes and its `deps/freerdp.lock` entry moves to `retired_patches` in the same commit
+  (rule 5), and the behavioural acceptance of that retirement is Tier 2's RAIL handshake check
+  (`Scripts/test-rail-handshake.sh`), which must still PASS on the new pin: it checks the
+  behaviour this patch adds, not the file.
 
 Before it (2026-09-07 to 2026-11-10) the queue was empty on purpose: both earlier patches were
 retired -- `0001` absorbed upstream on the 3.31.1 pin bump (2026-09-02), `0002` retired by design

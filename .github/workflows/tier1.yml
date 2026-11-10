@@ -465,6 +465,10 @@ jobs:
         # against the pinned submodule -- both in Scripts/check-patch-queue.sh, pinned by
         # Scripts/test-patch-queue.sh. Before 2026-09-07 this step carried its own copy of the
         # rule-1 grep, which is exactly how an exception lands in one place and not the other.
+        # Rule 5 (2026-11-10): deps/freerdp.lock's .patches must name exactly the queue's *.patch
+        # files. The build never reads that inventory, so this step is the only thing keeping it
+        # true; the call below therefore stays bare (no --no-lock, --lock or --patch-dir), and
+        # Scripts/test-patch-queue.sh pins that shape ("Tier 1 runs check-patch-queue.sh bare").
         run: |
           ./Scripts/test-patch-queue.sh
           ./Scripts/check-patch-queue.sh
