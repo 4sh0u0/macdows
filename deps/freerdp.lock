@@ -5,7 +5,16 @@
   "tag": "3.32.1",
   "commit": "bf217a504e54cc719880c228e82353382cd7d4fa",
   "upstream_url": "https://github.com/FreeRDP/FreeRDP.git",
-  "patches": [],
+  "patches": [
+    {
+      "file": "0003-rail-client-status-on-default-handshake.patch",
+      "targets": ["channels/rail/client/client_rails.c", "channels/rail/client/rail_main.h", "channels/rail/client/rail_main.c"],
+      "upstream": "https://github.com/FreeRDP/FreeRDP/pull/13696 (commits cb01a90c2d6d0a5714065c6e406296f9abc4b1b4 and 91b9a6f56fe86911970ea6da29907a2fbb1013b6; both in 3.33.0, neither in 3.32.1)",
+      "added_on": "2026-11-10",
+      "summary": "Backport of the production code of the two upstream commits: the default RAIL handshake answer now sends the client status (TS_RAIL_ORDER_CLIENTSTATUS) right after ClientHandshake, through the new shared rail_send_client_status() that client_rail_server_start_cmd() also calls. Without it 3.32.1 sends CLIENTSTATUS only from client_rail_server_start_cmd(), which clients call after ARC_COMPLETED; the current Windows host withholds the monitored-desktop ARC notification until it has CLIENTSTATUS, so both sides wait for each other: the handshake succeeds and no window order arrives (an Exec sent meanwhile is accepted with no window following, or returns RAIL_EXEC_E_HOOK_NOT_LOADED). The upstream test and its CMake wiring are not carried (production files only; the test target exists only under BUILD_TESTING_INTERNAL, which this build never enables). Observable changes, the same as 3.33.0: CLIENTSTATUS is sent after the handshake and again by every start command; a failed handshake-time send ends the session as a channel error; ServerZOrderSync arrives twice per session on the lab host (was once), the first before any monitored-desktop order. The diff body is verbatim from `git diff cb01a90c2^ 91b9a6f56` on the three files, which are byte-identical between the 3.32.1 tag and cb01a90c2^.",
+      "retire_when": "The pin moves to >= 3.33.0: `git apply --check` then fails because upstream already carries both commits (ThirdParty/patches/README.md rule 2)."
+    }
+  ],
   "_patches_note": "Inventory and rationale only — ThirdParty/patches/*.patch is the authoritative queue. Scripts/build-freerdp.sh discovers patches by globbing that directory (never from this field) and folds their file *contents* into the config hash, and Scripts/gen-notices.sh derives the SBOM's pedigree.patches from the same directory, so nothing mechanical reads this block and it cannot drift the build. It exists because this lock is the reviewable pin record: a reader must be able to see from here alone that the pinned checkout is not built verbatim. Per-hunk detail (defect, provenance, upstream status, retirement condition) lives in each patch file's own header; the queue's rules live in ThirdParty/patches/README.md.",
   "deployment_target": "14.0",
   "_deployment_target_note": "Single source for the minimum macOS version this repo targets. Scripts/build-openssl.sh reads this for -mmacosx-version-min; Scripts/build-freerdp.sh substitutes it into the -DCMAKE_OSX_DEPLOYMENT_TARGET flag below (the literal '14.0' in cmake_config.flags is a fallback/documentation value only — the running script always overrides it from this field, so the two can never drift silently).",

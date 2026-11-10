@@ -62,11 +62,21 @@ everything the licences require.
   headers untouched — see `ThirdParty/patches/README.md`). Shipped with the app as
   `Contents/Resources/licenses/LICENSE-FreeRDP-Apache-2.0.txt`, a byte-identical copy
   tracked at `ThirdParty/licenses/LICENSE-FreeRDP-Apache-2.0.txt`.
-- **Modified**: No — the external patch queue at `ThirdParty/patches/` is empty as of
-  2026-09-07. The vendored checkout is a verbatim copy of the pinned tag, and
-  `Scripts/build-freerdp.sh` still applies whatever the queue holds before configuring and
-  reverts it afterwards, so a future patch would re-enter this section the same way. Two
-  patches were carried and retired: `0001-core-capabilities-apply-input-caps-from-src.patch`
+- **Modified**: Yes — one patch, applied at build time from the external patch queue at
+  `ThirdParty/patches/` (the vendored checkout itself stays a verbatim copy of the pinned
+  tag; `Scripts/build-freerdp.sh` applies the queue before configuring and reverts it
+  afterwards). The entry is `0003-rail-client-status-on-default-handshake.patch`
+  (2026-11-10): a backport of the production code of two commits of upstream PR #13696,
+  `cb01a90c2` ("share client status initialization") and `91b9a6f56` ("initialize client
+  status during the default handshake"), both in FreeRDP 3.33.0 and not in the pinned 3.32.1.
+  It makes the RAIL channel send the client status right after the default handshake answer,
+  touching `channels/rail/client/client_rails.c`, `channels/rail/client/rail_main.h` and
+  `channels/rail/client/rail_main.c`; the diff body is verbatim upstream. It is dropped when
+  the pin moves to 3.33.0 or later (`git apply --check` then fails because upstream already
+  carries both commits). Its upstream record is auto-populated into
+  `sbom/macdows.cdx.json`'s `pedigree.patches` for this component as a CycloneDX `patch`
+  object (the SBOM generator reads the queue directory, not this text). Two patches were
+  carried before and retired: `0001-core-capabilities-apply-input-caps-from-src.patch`
   (against 3.30.0; absorbed upstream by PR #13287 and this project's PR #13313, retired on the
   3.31.1 pin bump) and `0002-rdpgfx-lab-scaledmap-advertise-option.patch` (2026-09-07 only; a
   default-OFF CMake option for one laboratory contrast experiment on the non-rendering capture
@@ -74,8 +84,9 @@ everything the licences require.
   the experiment's record was filed -- no product build ever shipped with it ON, and with it
   OFF the preprocessed source was identical to the pinned tag). Both retirement records with
   their verification live in `deps/freerdp.lock` (`retired_patches`).
-  `sbom/macdows.cdx.json`'s `pedigree.patches` for this component is therefore empty; the
-  SBOM generator reads the queue directory, not this text.
+  On Apache-2.0 §4(b) ("modified files carry prominent notices"): the patch file itself
+  discharges it — the modified source is never distributed, only the patch is — and its header
+  records what changed, why, its upstream status and the condition under which it is dropped.
   The Apache-2.0 obligations are met as before: the licence text and every upstream copyright
   header ship unaltered. §4(d) adds nothing here: FreeRDP 3.32.1 has no top-level `NOTICE`
   file, only `LICENSE`. (The one `NOTICE` anywhere in its tree,

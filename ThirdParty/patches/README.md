@@ -84,10 +84,43 @@ policy).
 
 ## Current state
 
-**No patches** against FreeRDP 3.32.1 (`bf217a504e54cc719880c228e82353382cd7d4fa`). The queue is
-empty on purpose: both patches this project ever carried are retired -- `0001` absorbed upstream on
-the 3.31.1 pin bump (2026-09-02), `0002` retired by design when its lab experiment closed
-(2026-09-07). The rules above, including the lab-only exception, stay set with the directory empty.
+**One patch** against FreeRDP 3.32.1 (`bf217a504e54cc719880c228e82353382cd7d4fa`):
+
+- `0003-rail-client-status-on-default-handshake.patch` (2026-11-10) -- backport of the
+  production code of two commits of upstream PR
+  [#13696](https://github.com/FreeRDP/FreeRDP/pull/13696), `cb01a90c2` "refactor(rail): share
+  client status initialization" and `91b9a6f56` "fix(rail): initialize client status during the
+  default handshake" (both in 3.33.0, neither in 3.32.1), touching
+  `channels/rail/client/client_rails.c`, `rail_main.h` and `rail_main.c`. The default RAIL
+  handshake answer now sends the client status right after `ClientHandshake`. **Why it is
+  needed:** 3.32.1 sends CLIENTSTATUS only from `client_rail_server_start_cmd()`, which clients
+  (the bridge, `Tools/rail-probe`) call after `ARC_COMPLETED`; the current Windows host withholds
+  the monitored-desktop ARC notification until it has received CLIENTSTATUS, so the two sides wait
+  for each other -- the RAIL handshake succeeds and no window order ever arrives (an Exec sent
+  meanwhile is either accepted with no window following or comes back
+  `RAIL_EXEC_E_HOOK_NOT_LOADED`). The upstream test and its CMake wiring are not carried: this
+  queue holds production code only, and the test target exists only under
+  `BUILD_TESTING_INTERNAL`, which this build never enables. The diff body is verbatim from
+  upstream. **What changes on the wire and in the callbacks** (the `ServerZOrderSync` count and
+  order measured on the lab host, 2026-11-10, the rest read from the source; all the same as
+  3.33.0): CLIENTSTATUS is sent once after the handshake and again by
+  every start command (`client_rail_server_start_cmd()`, on `ARC_COMPLETED`), built by the same
+  helper from the same settings; a failure of the handshake-time send is returned from the
+  handshake handler and ends the session as a channel error; and because `rail->clientStatus`
+  is set from the handshake on, the receive gates that read it open earlier --
+  `ServerZOrderSync` arrives twice per session instead of once, the first one before the
+  first monitored-desktop order and before the start command. **Known inexact wording in the
+  patch header** (left as is: the header is part of the file whose contents feed the prefix
+  config hash): its "an Exec returns `RAIL_EXEC_E_HOOK_NOT_LOADED`" is one of two observed
+  outcomes, as above, and its "CMake hunks would change the build graph" does not hold for
+  this build, where `BUILD_TESTING_INTERNAL` and `BUILD_FUZZERS` are both OFF -- the two
+  reasons given here are the ones that stand. **Retire when** the pin moves to >= 3.33.0:
+  `git apply --check` then fails because upstream already carries both commits (rule 2).
+
+Before it (2026-09-07 to 2026-11-10) the queue was empty on purpose: both earlier patches were
+retired -- `0001` absorbed upstream on the 3.31.1 pin bump (2026-09-02), `0002` retired by design
+when its lab experiment closed (2026-09-07). The rules above, including the lab-only exception,
+stay set whatever the queue holds.
 
 ### Retired
 
@@ -112,4 +145,4 @@ the 3.31.1 pin bump (2026-09-02), `0002` retired by design when its lab experime
   `deps/freerdp.lock` (`retired_patches`).
 
 The rules above predate the first patch on purpose -- the bar was set before anything was
-ever added to this directory, and it stays set with the directory empty.
+ever added to this directory, and it stays set whether the directory is empty or not.

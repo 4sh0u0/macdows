@@ -1,0 +1,96 @@
+# Upstream: https://github.com/FreeRDP/FreeRDP/pull/13696
+#
+# Send the RAIL client status (TS_RAIL_ORDER_CLIENTSTATUS) as soon as the default handshake
+# answer (ClientHandshake) has been sent, instead of only from client_rail_server_start_cmd().
+#
+# Backport of two commits of the upstream PR, production files only, diff body taken verbatim
+# from `git diff cb01a90c2^ 91b9a6f56 -- <the three files below>` (both are in 3.33.0, neither
+# is in 3.32.1):
+#   cb01a90c2d6d0a5714065c6e406296f9abc4b1b4  refactor(rail): share client status initialization
+#   91b9a6f56fe86911970ea6da29907a2fbb1013b6  fix(rail): initialize client status during the default handshake
+# The three files are byte-identical between the 3.32.1 tag and cb01a90c2^, so the hunks apply
+# unchanged. The upstream test (channels/rail/client/test/TestRailHandshake.c) and its CMake
+# wiring (channels/rail/client/CMakeLists.txt, channels/rail/client/test/CMakeLists.txt) are
+# deliberately left out: this queue carries production code only, the test target exists only
+# under BUILD_TESTING_INTERNAL, which this build never enables, and CMake hunks would change the
+# build graph beyond the defect.
+#
+# Why: the Windows host now withholds the monitored-desktop ARC notification (and with it every
+# window order) until it has received CLIENTSTATUS. FreeRDP 3.32.1 sends CLIENTSTATUS only from
+# client_rail_server_start_cmd(), which clients call after ARC_COMPLETED, so client and host wait
+# for each other: the RAIL handshake succeeds, no window order ever arrives and an Exec returns
+# RAIL_EXEC_E_HOOK_NOT_LOADED. With this patch the status goes out right after ClientHandshake.
+#
+# Retire when: the pin moves to >= 3.33.0. `git apply --check` then fails because upstream
+# already carries both commits (README rule 2: drop the patch).
+diff --git a/channels/rail/client/client_rails.c b/channels/rail/client/client_rails.c
+index 3cd5a8ccf..9e3606d3f 100644
+--- a/channels/rail/client/client_rails.c
++++ b/channels/rail/client/client_rails.c
+@@ -6,26 +6,31 @@
+ 
+ #include "rail_main.h"
+ 
+-UINT client_rail_server_start_cmd(RailClientContext* context)
++UINT rail_send_client_status(RailClientContext* context)
+ {
+ 	WINPR_ASSERT(context);
+ 	railPlugin* rail = context->handle;
+ 	WINPR_ASSERT(rail);
+ 	WINPR_ASSERT(rail->rdpcontext);
+-
+ 	const rdpSettings* settings = rail->rdpcontext->settings;
+ 	WINPR_ASSERT(settings);
+-
+ 	RAIL_CLIENT_STATUS_ORDER clientStatus = { .flags = freerdp_settings_get_uint32(
+ 		                                          settings, FreeRDP_RemoteAppFeatureFlags) };
+-
+ 	if (freerdp_settings_get_bool(settings, FreeRDP_AutoReconnectionEnabled))
+ 		clientStatus.flags |= TS_RAIL_CLIENTSTATUS_AUTORECONNECT;
+ 	else
+ 		clientStatus.flags &= ~TS_RAIL_CLIENTSTATUS_AUTORECONNECT;
+-
+-	UINT status = context->ClientInformation(context, &clientStatus);
+-
++	return context->ClientInformation(context, &clientStatus);
++}
++UINT client_rail_server_start_cmd(RailClientContext* context)
++{
++	WINPR_ASSERT(context);
++	railPlugin* rail = context->handle;
++	WINPR_ASSERT(rail);
++	WINPR_ASSERT(rail->rdpcontext);
++	const rdpSettings* settings = rail->rdpcontext->settings;
++	WINPR_ASSERT(settings);
++	UINT status = rail_send_client_status(context);
+ 	if (status != CHANNEL_RC_OK)
+ 		return status;
+ 
+diff --git a/channels/rail/client/rail_main.c b/channels/rail/client/rail_main.c
+index b797d993c..04c45e25b 100644
+--- a/channels/rail/client/rail_main.c
++++ b/channels/rail/client/rail_main.c
+@@ -361,7 +361,11 @@ static UINT rail_server_handshake(RailClientContext* context, const RAIL_HANDSHA
+ 	const UINT32 buildnumber =
+ 	    freerdp_settings_get_uint32(rail->rdpcontext->settings, FreeRDP_ClientBuild);
+ 	const RAIL_HANDSHAKE_ORDER clientHandshake = { buildnumber };
+-	return context->ClientHandshake(context, &clientHandshake);
++	const UINT status = context->ClientHandshake(context, &clientHandshake);
++	if (status != CHANNEL_RC_OK)
++		return status;
++	/* Advertise client status before waiting for monitored-desktop orders. */
++	return rail_send_client_status(context);
+ }
+ 
+ static UINT rail_server_handshake_ex(RailClientContext* context,
+diff --git a/channels/rail/client/rail_main.h b/channels/rail/client/rail_main.h
+index e7d6af5f0..d0f338882 100644
+--- a/channels/rail/client/rail_main.h
++++ b/channels/rail/client/rail_main.h
+@@ -57,4 +57,6 @@ WINPR_ATTR_NODISCARD FREERDP_LOCAL RailClientContext* rail_get_client_interface(
+ 
+ WINPR_ATTR_NODISCARD FREERDP_LOCAL UINT rail_send_channel_data(railPlugin* rail, wStream* s);
+ 
++WINPR_ATTR_NODISCARD FREERDP_LOCAL UINT rail_send_client_status(RailClientContext* context);
++
+ #endif /* FREERDP_CHANNEL_RAIL_CLIENT_MAIN_H */
