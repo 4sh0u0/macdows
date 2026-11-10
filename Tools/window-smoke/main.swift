@@ -4596,8 +4596,10 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
     // Flow evidence counters (W1 focus-observability slice, task item 1): proves the
     // eb2e333 MonitoredDesktop/ZOrderSync/MinMaxInfo/LocalMoveSize plumbing is actually
     // live end to end, not just compiled -- see docs/adr/0008 §0 for the sample-derived
-    // per-session shapes these counters are checked against (MonitoredDesktop ~25/session,
-    // ZOrderSync exactly 1/session). MinMaxInfo/LocalMoveSize are counted but never gated
+    // per-session shapes these counters are checked against (MonitoredDesktop ~25/session;
+    // ZOrderSync 2/session on the lab host since FreeRDP patch 0003 (the same code as upstream 3.33.0), the first one arriving
+    // before the first monitored-desktop order and the start command, 1/session before that;
+    // the count is only gated at >= 1). MinMaxInfo/LocalMoveSize are counted but never gated
     // (informational only -- LocalMoveSize in particular needs a local drag, which this
     // headless harness never performs).
     private var monitoredDesktopEventCount = 0
@@ -8987,11 +8989,11 @@ final class WindowSmokeDelegate: NSObject, NSApplicationDelegate {
             + "ZOrderSync=\(zOrderSyncEventCount) MinMaxInfo=\(minMaxInfoEventCount) LocalMoveSize=\(localMoveSizeEventCount)")
         // Gating: proves the eb2e333 contract is live against a real host, per adr/0008 §0's
         // sample-derived per-session shapes (MonitoredDesktop observed ~25/session across
-        // six samples; ZOrderSync observed exactly once per sampled session). MinMaxInfo/
+        // six samples; ZOrderSync observed exactly once per sampled session in those pre-patch samples, 2/session on the lab host since FreeRDP patch 0003 -- gated at >= 1 only). MinMaxInfo/
         // LocalMoveSize stay informational-only (no gating) -- see their counters' own doc
         // comment for why.
         check(monitoredDesktopEventCount >= 1, "received >=1 MonitoredDesktop event this session (adr/0008 §0: ~25/session observed) (got \(monitoredDesktopEventCount))")
-        check(zOrderSyncEventCount >= 1, "received >=1 ZOrderSync event this session (adr/0008 §0: exactly 1/session observed) (got \(zOrderSyncEventCount))")
+        check(zOrderSyncEventCount >= 1, "received >=1 ZOrderSync event this session (adr/0008 §0: 2/session on the lab host since the client status goes out right after the RAIL handshake -- FreeRDP patch 0003, the same code as upstream 3.33.0; 1/session before that) (got \(zOrderSyncEventCount))")
 
         // Phase 2 W6 acceptance as adr/0023 D-3 rewrites it (W6-1: the tray side's live entry
         // count == create−delete; it used to read "NSStatusItem 数量 == create−delete" before the

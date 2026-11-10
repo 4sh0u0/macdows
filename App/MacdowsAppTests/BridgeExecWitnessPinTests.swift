@@ -520,3 +520,367 @@ extension BridgeExecWitnessPinTests {
         #expect(!branch.contains("exec.flags"))
     }
 }
+
+// MARK: - lane-handshake-followups: the bridge forwards the RAIL handshake to FreeRDP's default handlers
+extension BridgeExecWitnessPinTests {
+
+    private static let handshakeSignature =
+        "static UINT crb_rail_server_handshake(RailClientContext *context, const RAIL_HANDSHAKE_ORDER *handshake)"
+    private static let handshakeExSignature = "static UINT crb_rail_server_handshake_ex(RailClientContext *context,"
+
+    /// Both wrappers as they stand, comments stripped and whitespace folded.
+    private static let handshakeBodyFolded =
+        handshakeSignature + " { CRBridgeContext *p = (CRBridgeContext *)context->custom; CrdpEvent ev; "
+        + "memset(&ev, 0, sizeof(ev)); ev.type = CRDPQ_EVENT_HANDSHAKE_FLAGS; "
+        + "ev.payload.handshakeFlags.buildNumber = handshake->buildNumber; crdpq_post(crb_control(p), &ev); "
+        + "if (p->orig_ServerHandshake) return p->orig_ServerHandshake(context, handshake); return CHANNEL_RC_OK; }"
+    private static let handshakeExBodyFolded =
+        handshakeExSignature + " const RAIL_HANDSHAKE_EX_ORDER *handshakeEx) { "
+        + "CRBridgeContext *p = (CRBridgeContext *)context->custom; CrdpEvent ev; "
+        + "memset(&ev, 0, sizeof(ev)); ev.type = CRDPQ_EVENT_HANDSHAKE_FLAGS; "
+        + "ev.payload.handshakeFlags.buildNumber = handshakeEx->buildNumber; "
+        + "ev.payload.handshakeFlags.railHandshakeFlags = handshakeEx->railHandshakeFlags; "
+        + "crdpq_post(crb_control(p), &ev); "
+        + "if (p->orig_ServerHandshakeEx) return p->orig_ServerHandshakeEx(context, handshakeEx); return CHANNEL_RC_OK; }"
+    /// Save the defaults, then override the slots: one block, in this order.
+    private static let handshakeInstallBlock =
+        "p->orig_ServerHandshake = rail->ServerHandshake; p->orig_ServerHandshakeEx = rail->ServerHandshakeEx; "
+        + "rail->ServerHandshake = crb_rail_server_handshake; rail->ServerHandshakeEx = crb_rail_server_handshake_ex;"
+    /// The RAIL branch of the channel-connected callback, from its signature through the install block:
+    /// the branch condition, `rail->custom = p;`, the window callbacks, then the install block, contiguous.
+    private static let handshakeConnectedHead =
+        "static void crb_on_channel_connected(void *context, const ChannelConnectedEventArgs *e) { "
+        + "CRBridgeContext *p = (CRBridgeContext *)context; if (strcmp(e->name, RAIL_SVC_CHANNEL_NAME) == 0) { "
+        + "RailClientContext *rail = (RailClientContext *)e->pInterface; p->rail = rail; rail->custom = p; "
+        + "rdpWindowUpdate *window = p->common.context.update->window; window->WindowCreate = crb_window_common; "
+        + "window->WindowUpdate = crb_window_common; window->WindowDelete = crb_window_delete; "
+        + "window->WindowIcon = crb_window_icon; window->WindowCachedIcon = crb_window_cached_icon; "
+        + "window->NotifyIconCreate = crb_notify_icon_create; window->NotifyIconUpdate = crb_notify_icon_update; "
+        + "window->NotifyIconDelete = crb_notify_icon_delete; window->MonitoredDesktop = crb_monitored_desktop; "
+        + "window->NonMonitoredDesktop = crb_non_monitored_desktop; " + handshakeInstallBlock
+    private static let handshakeSubscription =
+        "if (PubSub_SubscribeChannelConnected(instance->context->pubSub, crb_on_channel_connected) < 0) return FALSE;"
+
+    /// `crb_pre_connect`'s tail: both subscriptions, the function's end and the next function's start.
+    private static let handshakePreConnectTail =
+        "if (PubSub_SubscribeChannelConnected(instance->context->pubSub, crb_on_channel_connected) < 0) return FALSE; "
+        + "if (PubSub_SubscribeChannelDisconnected(instance->context->pubSub, crb_on_channel_disconnected) < 0) "
+        + "return FALSE; return TRUE; } static BOOL crb_post_connect(freerdp *instance) {"
+    /// The disconnect callback up to the end of its RAIL branch (the one place `rail->custom` is cleared).
+    private static let handshakeDisconnectHead =
+        "static void crb_on_channel_disconnected(void *context, const ChannelDisconnectedEventArgs *e) { "
+        + "CRBridgeContext *p = (CRBridgeContext *)context; if (strcmp(e->name, RAIL_SVC_CHANNEL_NAME) == 0) { "
+        + "if (p->rail) p->rail->custom = NULL; p->rail = NULL; }"
+    /// `crb_post_disconnect` up to the one unsubscribe.
+    private static let handshakePostDisconnectHead =
+        "static void crb_post_disconnect(freerdp *instance) { "
+        + "PubSub_UnsubscribeChannelConnected(instance->context->pubSub, crb_on_channel_connected);"
+    /// The only `#define` lines the file may carry, verbatim and in order.
+    private static let handshakeFrozenDefines = [
+        "#define __STDC_WANT_LIB_EXT1__ 1",
+        "#define TAG CLIENT_TAG(\"macdows\")",
+    ]
+
+    /// What the lexer view reports besides its text.
+    private struct HandshakeScan {
+        var view = ""
+        var rawStringStarts = 0
+        /// `'` directly after `[A-Za-z0-9_]` in code: digit separators and prefixed character literals.
+        var quotesAfterIdentifier = 0
+        /// Preprocessor lines other than `include` / `import` / `define`, and an include whose header name
+        /// carries a comment opener or is not a literal `<...>` / `"..."` (a trailing comment is accepted).
+        var badDirectives: [String] = []
+        var defines: [String] = []
+    }
+
+    /// Count of the raw-text shapes the scanner does not model and therefore refuses: CR, FF, VT and NUL
+    /// scalars, and a backslash followed by blanks (space, tab, FF, VT) and a newline (LF or CR), which
+    /// clang treats as a line splice. The file has none of them today; a future multi-line macro would
+    /// have to relax this on purpose and extend the scanner.
+    private static func unmodelledByteCount(_ text: String) -> Int {
+        let s = Array(text.unicodeScalars)
+        var count = s.filter { $0 == "\r" || $0 == "\u{0B}" || $0 == "\u{0C}" || $0 == "\u{00}" }.count
+        for k in s.indices where s[k] == "\\" {
+            var j = k + 1
+            while j < s.count, s[j] == " " || s[j] == "\t" || s[j] == "\u{0B}" || s[j] == "\u{0C}" { j += 1 }
+            if j < s.count, s[j] == "\n" || s[j] == "\r" { count += 1 }
+        }
+        return count
+    }
+
+    /// Occurrences compared scalar by scalar (`.literal`): Swift's default string equality is canonical
+    /// equivalence, under which U+212A KELVIN SIGN equals `K`, while C identifiers compare by bytes.
+    private static func exactOccurrences(of needle: String, in haystack: String) -> Int {
+        var count = 0
+        var from = haystack.startIndex
+        while let hit = haystack.range(of: needle, options: .literal, range: from..<haystack.endIndex) {
+            count += 1
+            from = hit.upperBound
+        }
+        return count
+    }
+
+    /// The file's text as the compiler's lexer sees it, for text without CR / FF / VT / NUL and without
+    /// backslash line splices (`unmodelledByteCount` refuses those first). One scan over Unicode scalars
+    /// (C's lexer does not know grapheme clusters; a quote followed by a combining mark is still a quote)
+    /// with five states: code, `//` comment (to the end of the line), `/* */` comment (to the first
+    /// `*/`; an unterminated one drops the rest), string literal and character literal (backslash
+    /// escapes honoured). Comments become one space; the CONTENT of string and character literals is
+    /// dropped (the quotes stay), so a string can neither open a comment nor stand in for a statement.
+    /// Whitespace is then folded. Comment openers are recognised only in the code state. Also reported:
+    /// raw string starts (`R"`, with an `u8` / `u` / `U` / `L` prefix or none, seen in the code state),
+    /// `'` directly after an identifier character (digit separators), and preprocessor lines (a `#` that
+    /// is the first thing on a line, comments counting as blanks, as in clang) other than `include`,
+    /// `import` and `define`. The scanner models none of raw strings, digit separators, trigraphs,
+    /// digraphs or directive-specific lexing; the test forbids the first three outright and refuses
+    /// every directive except `include` / `import` / the two frozen `#define`s.
+    private static func scanHandshakeView(_ text: String) -> HandshakeScan {
+        var result = HandshakeScan()
+        let s = Array(text.unicodeScalars)
+        func isIdentifierScalar(_ u: Unicode.Scalar) -> Bool {
+            (u >= "a" && u <= "z") || (u >= "A" && u <= "Z") || (u >= "0" && u <= "9") || u == "_"
+        }
+        var out = String.UnicodeScalarView()
+        var lineStart = true
+        var i = 0
+        while i < s.count {
+            let c = s[i]
+            let next: Unicode.Scalar? = i + 1 < s.count ? s[i + 1] : nil
+            if c == "/", next == "/" {
+                while i < s.count, s[i] != "\n" { i += 1 }
+                out.append(" ")
+            } else if c == "/", next == "*" {
+                var j = i + 2
+                while j + 1 < s.count, !(s[j] == "*" && s[j + 1] == "/") { j += 1 }
+                if j + 1 >= s.count {
+                    result.view = bridgeFolded(String(out))
+                    return result
+                }
+                i = j + 2
+                out.append(" ")
+            } else if c == "\"" || c == "'" {
+                if c == "\"", i > 0, s[i - 1] == "R" {
+                    var start = i - 1
+                    while start > 0, isIdentifierScalar(s[start - 1]) { start -= 1 }
+                    var prefix = String.UnicodeScalarView()
+                    prefix.append(contentsOf: s[start..<(i - 1)])
+                    if ["", "u8", "u", "U", "L"].contains(String(prefix)) { result.rawStringStarts += 1 }
+                }
+                if c == "'", i > 0, isIdentifierScalar(s[i - 1]) { result.quotesAfterIdentifier += 1 }
+                out.append(c)
+                i += 1
+                while i < s.count, s[i] != c, s[i] != "\n" {
+                    if s[i] == "\\", i + 1 < s.count { i += 1 }
+                    i += 1
+                }
+                if i < s.count, s[i] == c { out.append(c); i += 1 }
+                lineStart = false
+            } else if c == "\n" {
+                out.append(c)
+                lineStart = true
+                i += 1
+            } else if c == " " || c == "\t" {
+                out.append(c)
+                i += 1
+            } else if c == "#", lineStart {
+                var end = i
+                while end < s.count, s[end] != "\n" { end += 1 }
+                var line = String.UnicodeScalarView()
+                line.append(contentsOf: s[i..<end])
+                let directive = String(line).trimmingCharacters(in: .whitespaces)
+                var k = 1
+                while k < line.count, [" ", "\t"].contains(Array(line)[k]) { k += 1 }
+                var name = ""
+                while k < line.count, Array(line)[k].properties.isAlphabetic { name.unicodeScalars.append(Array(line)[k]); k += 1 }
+                if name == "define" {
+                    result.defines.append(directive)
+                } else if name == "include" || name == "import" {
+                    // The header name between <> or "" is lexed as one token, so a comment opener inside
+                    // it would be wrong for the scan; a trailing comment after it is fine.
+                    let after = directive.drop { $0 != "<" && $0 != "\"" }
+                    if let open = after.first, let close = after.dropFirst().firstIndex(of: open == "<" ? ">" : "\"") {
+                        let header = after[after.index(after.startIndex, offsetBy: 1)..<close]
+                        if header.contains("/*") || header.contains("//") { result.badDirectives.append(directive) }
+                    } else {
+                        result.badDirectives.append(directive)
+                    }
+                } else {
+                    result.badDirectives.append(directive)
+                }
+                out.append(c)
+                lineStart = false
+                i += 1
+            } else {
+                out.append(c)
+                lineStart = false
+                i += 1
+            }
+        }
+        result.view = bridgeFolded(String(out))
+        return result
+    }
+
+    /// The bridge replaces the RAIL channel's two handshake callbacks with wrappers that post an event
+    /// and then forward to the FreeRDP default handler it saved. That forward is the only path that
+    /// sends the client status (CLIENTSTATUS) before the monitored-desktop ARC notification, which the
+    /// current host withholds until it has the status (the start command at ARC_COMPLETED sends it
+    /// again, too late). FreeRDP's default handshake handler sends it right after the handshake (patch
+    /// 0003 / upstream PR 13696). Tier 1 (`check-patch-queue.sh`) and Tier 2 (`rail-handshake-check`)
+    /// judge the prefix and cannot see the bridge, so this pin holds the bridge's side.
+    ///
+    /// The approach is a closed syntax: whatever the small scanner does not model is refused outright
+    /// (none of it occurs in `CRSession.mm` today), rather than chasing every corner of clang's lexer.
+    /// Refused: CR, FF, VT and NUL, backslash line splices, C++ raw string literals, `'` directly after
+    /// an identifier character (digit separators, prefixed character literals), any non-ASCII scalar in
+    /// the code (after comments and literal contents are removed), any preprocessor line except
+    /// `include` / `import` (with a literal header name that carries no comment opener; a comment after
+    /// the header name is accepted) and the two frozen `#define`s. Within what is accepted, the scan
+    /// follows the compiler: both comment kinds, string and character literals.
+    ///
+    /// What it holds (all read in that view, whose string and character literals are emptied, so a
+    /// string can neither hide a statement nor stand in for one; the shared helpers `bridgeCodeOnly` /
+    /// `functionBody` are not used and were not changed):
+    ///  * both wrapper bodies frozen whole, each present exactly once;
+    ///  * the premises of the forward, frozen in place: FreeRDP only calls a `Server*` callback when
+    ///    `context->custom` is set (`channels/rail/client/rail_orders.c`, `ServerHandshake` at line 372,
+    ///    `ServerHandshakeEx` at line 484), and `rail->custom = p;` runs only inside the RAIL branch of
+    ///    `crb_on_channel_connected`, which runs only when that callback is subscribed. So the callback
+    ///    from its signature through the four-line install block (save before override) is one frozen
+    ///    text; the tail of `crb_pre_connect` (both subscriptions, `return TRUE; }`, the next function's
+    ///    start), the disconnect callback through the RAIL branch's `custom` clear, and
+    ///    `crb_post_disconnect` through its one unsubscribe are frozen too; `->custom = ` is assigned
+    ///    exactly twice and there is exactly one unsubscribe;
+    ///  * call and assignment shapes of the saved pointers and the callback slots, each exactly one;
+    ///  * total mention counts that account for the prefix overlap (`orig_ServerHandshake` is a prefix of
+    ///    `orig_ServerHandshakeEx`, `ServerHandshake` of `ServerHandshakeEx`): any spelling that names
+    ///    one of these identifiers counts, so an assignment without spaces, a `memset` into a named
+    ///    field, a local alias, an extra mention of a wrapper, or an extra `custom` or
+    ///    `crb_on_channel_connected` mention changes a number;
+    ///  * needles are matched scalar by scalar (`.literal`), and the view must be pure ASCII.
+    ///
+    /// What it cannot hold (registered, not chased): preprocessing and definitions inside the headers
+    /// `CRSession.mm` includes; a write that does not name the field (pointer arithmetic from a
+    /// neighbouring field, a `memset` over a range or over a whole `CRBridgeContext` or
+    /// `RailClientContext`); the behaviour of functions the frozen text calls (`crb_control`,
+    /// `crdpq_post`); trigraphs and digraphs; and a same-named definition supplied from another
+    /// translation unit. Frozen text is deliberate: changing a wrapper, one of the frozen regions
+    /// (including the ten `window->` assignments in the connected callback) or a counted name on purpose
+    /// means re-freezing the needles above.
+    @Test("the bridge's RAIL handshake wrappers forward to FreeRDP's default handlers, saved before the override")
+    func theHandshakeWrappersForwardToTheDefaults() throws {
+        let raw = try Self.raw()
+
+        // Scanner and gate self-checks: fixed inputs, so a broken scanner cannot quietly widen or narrow
+        // the pin. The view holds literals emptied, comments gone, whitespace folded.
+        func view(_ text: String) -> String { Self.scanHandshakeView(text).view }
+        #expect(view("a = \"/*\"; b; c = \"*/\";") == "a = \"\"; b; c = \"\";",
+                "scanner: a string literal opened a comment")
+        #expect(view("a; // /* b\nc; // */ d\ne;") == "a; c; e;", "scanner: a // line opened a block comment")
+        #expect(view("a; /* x\ny */ b; // c\nd;") == "a; b; d;", "scanner: a block comment or a // line ran wrong")
+        #expect(view("c = '\"'; d = \"x\"; /* gone */ e;") == "c = ''; d = \"\"; e;",
+                "scanner: a character literal holding a quote opened a string")
+        #expect(view("c = '\\''; d = \"/*\"; x; e = \"*/\";") == "c = ''; d = \"\"; x; e = \"\";",
+                "scanner: an escaped quote ended a character literal")
+        #expect(view("s = \"a\\\"b/*\"; t;") == "s = \"\"; t;", "scanner: an escaped quote ended a string")
+        #expect(view("a; /* never closed b; c;") == "a;", "scanner: an unterminated block comment kept the rest")
+        #expect(view("a = \"\u{301}/*\"; b; c = \"\u{301}*/\"; d;") == "a = \"\"; b; c = \"\"; d;",
+                "scanner: a quote followed by a combining mark was not recognised as a string start")
+        #expect(view("x = \"p->orig_ServerHandshake(\";") == "x = \"\";",
+                "scanner: a string literal's content stayed in the view, so it could stand in for code")
+        #expect(Self.exactOccurrences(of: "K", in: "HANDSHA\u{212A}E") == 0,
+                "matching: U+212A KELVIN SIGN matched K")
+        #expect(Self.scanHandshakeView("x = HANDSHA\u{212A}E;").view.unicodeScalars.contains { !$0.isASCII },
+                "scanner: a non-ASCII identifier scalar did not survive into the view")
+        for raw in ["s = R\"(a)\";", "s = u8R\"x(b)x\";", "s = uR\"(a)\";", "s = UR\"(a)\";", "s = LR\"(a)\";"] {
+            #expect(Self.scanHandshakeView(raw).rawStringStarts == 1, "scanner: raw string start not counted: \(raw)")
+        }
+        #expect(Self.scanHandshakeView("a = \"WLOG_APPENDER\", \"b\"; PAIR(x);").rawStringStarts == 0,
+                "scanner: a string ending in R counted as a raw string start")
+        for (text, expected) in [("a = 1'0;", 1), ("b = u8'x';", 1), ("c = 'a'; f('a'); d = '\\'';", 0)] {
+            #expect(Self.scanHandshakeView(text).quotesAfterIdentifier == expected,
+                    "scanner: ' after an identifier character miscounted in \(text)")
+        }
+        for text in ["#pragma mark see /* below\n", "  #  undef A\n", "#if 0\n", "#error e\n", "#warning w\n",
+                     "# line 5\n", "#ident \"x\"\n", "#include <a/*b.h>\n", "#include <a//b.h>\n", "#elif 1\n",
+                     "#include FOO\n"] {
+            #expect(Self.scanHandshakeView(text).badDirectives.count == 1, "scanner: directive not refused: \(text)")
+        }
+        for text in ["#include <a/b.h> /* c */\n", "  # import <c.h>\n", "#include \"d.h\" // e\n",
+                     "x; // #pragma q\n", "x; #pragma not-a-directive\n", "/* #if 0 */\nx;\n"] {
+            #expect(Self.scanHandshakeView(text).badDirectives.isEmpty, "scanner: a non-directive was refused: \(text)")
+        }
+        #expect(Self.scanHandshakeView("#define A 1\n/* c */ #define B 2\nx; #define C 3\n").defines
+                    == ["#define A 1", "#define B 2"], "scanner: #define lines not collected")
+        for bad in ["a\rb", "a\u{0B}b", "a\u{0C}b", "a\u{00}b", "a \\\nb", "a \\ \nb", "a \\\t\nb", "a \\\r\nb",
+                    "a \\\u{0C}\nb", "a \\\u{0B}\rb"] {
+            #expect(Self.unmodelledByteCount(bad) > 0, "gate: an unmodelled byte shape was not found: \(bad.debugDescription)")
+        }
+        #expect(Self.unmodelledByteCount("a;\nb \\n; \"\\\\\"\n") == 0, "gate: a clean text was reported")
+
+        // The file itself: none of the refused shapes.
+        #expect(Self.unmodelledByteCount(raw) == 0,
+                "CRSession.mm holds CR / FF / VT / NUL or a backslash line splice, which the pin's scanner does not model")
+        let scan = Self.scanHandshakeView(raw)
+        #expect(scan.rawStringStarts == 0,
+                "the file holds a raw string literal start (R\"), which the scanner does not model")
+        #expect(scan.quotesAfterIdentifier == 0,
+                "the file holds a ' right after an identifier character (digit separator or prefixed literal)")
+        #expect(scan.badDirectives.isEmpty, "the file holds a preprocessor line other than include / import / define: \(scan.badDirectives)")
+        #expect(scan.defines == Self.handshakeFrozenDefines, "the file's #define lines changed: \(scan.defines)")
+        let code = scan.view
+        #expect(!code.unicodeScalars.contains { !$0.isASCII }, "the code holds a non-ASCII scalar outside comments and literals")
+        let why = "the pinned text changed; if the bridge no longer hands the RAIL handshake to FreeRDP's "
+            + "default handler, the client status (CLIENTSTATUS) is not sent and the current host sends no "
+            + "window events -- re-freeze only after confirming the forward still happens"
+
+        // Frozen texts, each present exactly once in the view (the wrapper bodies are the code's own
+        // definitions; the premises are frozen in place).
+        let frozen: [(String, String)] = [
+            (Self.handshakeBodyFolded, "crb_rail_server_handshake"),
+            (Self.handshakeExBodyFolded, "crb_rail_server_handshake_ex"),
+            (Self.handshakeInstallBlock, "the save-then-override block"),
+            (Self.handshakeConnectedHead, "the RAIL branch of crb_on_channel_connected (condition, rail->custom = p, install block)"),
+            (Self.handshakeSubscription, "the channel-connected subscription"),
+            (Self.handshakePreConnectTail, "the tail of crb_pre_connect (both subscriptions)"),
+            (Self.handshakeDisconnectHead, "the disconnect callback's RAIL branch (rail->custom cleared)"),
+            (Self.handshakePostDisconnectHead, "crb_post_disconnect up to the unsubscribe"),
+        ]
+        for (text, label) in frozen {
+            #expect(Self.exactOccurrences(of: text, in: code) == 1, "\(label) is not present exactly once as frozen: \(why)")
+        }
+
+        let counted: [(String, String)] = [
+            ("p->orig_ServerHandshake(", "forwarding call"),
+            ("p->orig_ServerHandshakeEx(", "forwarding call (Ex)"),
+            ("orig_ServerHandshake = ", "assignment to the saved pointer"),
+            ("orig_ServerHandshakeEx = ", "assignment to the saved pointer (Ex)"),
+            ("rail->ServerHandshake = ", "assignment to the callback slot"),
+            ("rail->ServerHandshakeEx = ", "assignment to the callback slot (Ex)"),
+            ("static UINT crb_rail_server_handshake(", "wrapper definition"),
+            ("static UINT crb_rail_server_handshake_ex(", "wrapper definition (Ex)"),
+            ("->custom = ", "assignment to a ->custom field (set on connect, cleared on disconnect)"),
+            ("PubSub_UnsubscribeChannelConnected(", "unsubscribe from channel-connected"),
+        ]
+        for (needle, label) in counted {
+            let expected = needle == "->custom = " ? 2 : 1
+            #expect(Self.exactOccurrences(of: needle, in: code) == expected,
+                    "\(label) `\(needle)` is not exactly \(expected): \(why)")
+        }
+
+        // Total mentions of these names in the view, whatever the spelling:
+        // orig_ServerHandshake: declaration 2 + save 2 + null check 2 + call 2 (the Ex names included);
+        // rail->ServerHandshake: slot read while saving 2 + slot write while overriding 2 (the Ex names
+        // included); crb_rail_server_handshake: two definitions + two installs (the Ex name included);
+        // ServerHandshake: types 2 + fields 2 + wrappers 4 + install block 6;
+        // custom: six handlers read it once each + set on connect + cleared on disconnect + one read
+        // in the outbound input path; crb_on_channel_connected: definition + subscribe + unsubscribe.
+        let mentions: [(String, Int)] = [
+            ("orig_ServerHandshake", 8), ("rail->ServerHandshake", 4), ("crb_rail_server_handshake", 4),
+            ("ServerHandshake", 14), ("custom", 9), ("crb_on_channel_connected", 3),
+        ]
+        for (needle, expected) in mentions {
+            #expect(Self.exactOccurrences(of: needle, in: code) == expected,
+                    "`\(needle)` is not mentioned exactly \(expected) times in the code: \(why)")
+        }
+    }
+}
