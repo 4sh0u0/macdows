@@ -475,6 +475,9 @@ def main(environ: Optional[Dict[str, str]] = None, stdout: Optional[TextIO] = No
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False          # must be cleared before CERT_NONE
     context.verify_mode = ssl.CERT_NONE     # the pin below is the trust decision
+    # Set the floor explicitly: an older interpreter / TLS library still allows TLS 1.0 and 1.1 by
+    # default, and the pin below stops impersonation, not a protocol downgrade.
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     try:
         sock = context.wrap_socket(raw, server_hostname=_sni_for(host))
     except OSError as exc:
