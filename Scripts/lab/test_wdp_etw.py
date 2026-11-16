@@ -726,11 +726,26 @@ class EndToEndTests(unittest.TestCase):
         """m-11(b): the wait for the portal's own closing frame must count toward the wall
         time SUMMARY reports, not be silently absorbed after the measurement is taken. The
         portal never answers the client's close frame, so the client must burn the full
-        DRAIN_TIMEOUT before giving up -- a gap only the fixed code folds into `seconds`."""
+        DRAIN_TIMEOUT before giving up -- a gap only the fixed code folds into `seconds`.
+
+        The check is one-sided on purpose. `wall` also holds the connect, TLS and upgrade work
+        that happens before the client's own clock starts, so a two-sided comparison with `wall`
+        fails whenever that work is slow. Load after the client's clock starts can only make
+        `seconds` larger; only a stall longer than the 0.5 s of slack in `silence`, right after
+        the providers are enabled, lets the portal's silence end inside the drain. The
+        discriminating bound is the lower one: duration + DRAIN_TIMEOUT, less the 0.05 that
+        "%.1f" can round away.
+        Measuring before the drain gives about the duration alone, which holds because the
+        capture loop, with the portal silent, ends at the first multiple of RECV_TIMEOUT that is
+        not below the duration -- the duration itself for the values used here (1.0 and 0.5)."""
+        duration = 1.0
+        # Silent past the client's whole run, so the drain ends on its own timeout, never on the
+        # portal hanging up.
+        silence = duration + wdp_etw.DRAIN_TIMEOUT + 0.5
         portal = FakePortal(self.cert, self.key, self.USER, self.PW,
-                            script=[("await-commands", 2), ("silence", 2.0)], deadline=8.0)
+                            script=[("await-commands", 2), ("silence", silence)], deadline=8.0)
         portal.start()
-        env = self.env(portal, WDP_DURATION="1.0")
+        env = self.env(portal, WDP_DURATION=str(duration))
         started = time.monotonic()
         rc, out = self.run_main(env)
         wall = time.monotonic() - started
@@ -739,8 +754,10 @@ class EndToEndTests(unittest.TestCase):
         match = re.search(r"seconds=(\d+\.\d)", out)
         self.assertIsNotNone(match, out)
         seconds = float(match.group(1))
-        self.assertGreaterEqual(seconds, 1.0, out)
-        self.assertAlmostEqual(seconds, wall, delta=0.2, msg=out)
+        # "%.1f" rounds to nearest, so the printed value is at least the true one minus 0.05.
+        self.assertGreaterEqual(seconds, duration + wdp_etw.DRAIN_TIMEOUT - 0.05 - 1e-9, out)
+        # The client's interval lies inside the test's, whatever the load; 0.05 covers rounding.
+        self.assertLessEqual(seconds, wall + 0.05 + 1e-9, out)
 
 
 # ------------------------------------------------------------------------------------------
