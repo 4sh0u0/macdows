@@ -152,6 +152,35 @@ jobs:
           sw_vers
           echo "cores: $(sysctl -n hw.ncpu)"
 
+      - name: sign-and-verify gate suite (offline; ad-hoc signing, system /bin/bash 3.2 and shebang)
+        # Lane signgate-bash32 (2026-11-16): the release rehearsal found Scripts/sign-and-verify.sh,
+        # the release gate, exiting 0 under the macOS system /bin/bash (3.2.57) after re-signing
+        # the embedded dylibs but not the bundle (an empty entitlements array unbound under
+        # `set -u`, then an EXIT trap that read $? as 0). Tier 1 is ubuntu: no codesign and no bash
+        # 3.2, so the behaviour is only checkable here, on the macOS image whose /bin/bash is 3.2.
+        # Scripts/test-sign-and-verify.sh builds a throwaway .app with cc, signs it ad-hoc with
+        # --offline only (no network, no notarytool, no certificate), and runs the script under
+        # /bin/bash and through its shebang. It needs no FreeRDP prefix, hence its place right
+        # after the toolchain pin and ahead of the cache and build steps: a red here is
+        # fast and does not wait for a ten-minute cold build. 43 cases; a count that drops means a
+        # case stopped running, so the verdict line is matched exactly, down to the system bash:
+        # the pattern requires "(system bash 3.2." on purpose. If the image ever ships another
+        # system bash, this step goes red, which is the intended reminder that the bash 3.2 half of
+        # the coverage is gone and the suite needs a deliberate re-look.
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          SUITE_LOG="${RUNNER_TEMP:-/tmp}/test-sign-and-verify.log"
+          ./Scripts/test-sign-and-verify.sh | tee "$SUITE_LOG"
+          LAST_LINE="$(tail -n1 "$SUITE_LOG")"
+          case "$LAST_LINE" in
+            "test-sign-and-verify: PASS 43 cases, 0 failed (system bash 3.2."*")") ;;
+            *)
+              echo "::error::sign-and-verify suite: expected a final 'test-sign-and-verify: PASS 43 cases, 0 failed (system bash 3.2.x)' line; got '${LAST_LINE}' -- see the log above."
+              exit 1
+              ;;
+          esac
+
       - name: Compute cache keys
         id: keys
         run: |

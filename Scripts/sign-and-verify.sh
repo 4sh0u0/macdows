@@ -122,8 +122,18 @@ EXEC_NAME="$(defaults read "$INFO_PLIST" CFBundleExecutable 2>/dev/null || true)
 # defeats the point of printing that path.
 NOTARIZE_TMP_DIR=""
 CHECK_DIR=""
+# Success sentinel, set to 1 as the very last thing this script does. The EXIT trap must not
+# trust $? alone: bash 3.2 (the macOS system /bin/bash) leaves $? at 0 inside an EXIT trap when
+# the shell dies on an unbound variable under `set -u`, so a script that stopped half-way would
+# exit 0 -- a false green on the release gate. Fail closed instead: exiting with status 0
+# before the sentinel is set is turned into a failure.
+SIGN_AND_VERIFY_COMPLETED=0
 cleanup_on_exit() {
 	local status=$?
+	if [ "$status" -eq 0 ] && [ "$SIGN_AND_VERIFY_COMPLETED" -ne 1 ]; then
+		status=1
+		printf '[%s] ERROR: exiting with status 0 before the script completed (bash 3.2 after an unbound variable, or an interrupting signal); failing closed\n' "$(basename "$0")" >&2
+	fi
 	if [ -n "$NOTARIZE_TMP_DIR" ]; then
 		rm -rf "$NOTARIZE_TMP_DIR"
 	fi
@@ -179,7 +189,11 @@ fi
 
 # --- 3. Sign the app bundle itself (with preserved entitlements, if any) -------------
 log "codesign (bundle): $APP_PATH"
-codesign --force --options runtime "$TIMESTAMP_FLAG" "${ENTITLEMENTS_ARGS[@]}" --sign "$IDENTITY" "$APP_PATH"
+# The ${ARR[@]+...} form keeps an empty array safe: bash < 4.4 (the macOS system /bin/bash is
+# 3.2) treats "${ARR[@]}" of an empty array as an unbound variable under `set -u`. A bundle
+# without entitlements (a Release build) leaves ENTITLEMENTS_ARGS empty; a Debug build carries
+# get-task-allow, so the array is non-empty and the old spelling never tripped there.
+codesign --force --options runtime "$TIMESTAMP_FLAG" ${ENTITLEMENTS_ARGS[@]+"${ENTITLEMENTS_ARGS[@]}"} --sign "$IDENTITY" "$APP_PATH"
 
 # --- 4. Verify ------------------------------------------------------------------------
 log "Verifying signature (codesign --verify --deep --strict)"
@@ -366,3 +380,4 @@ else
 fi
 
 log "sign-and-verify.sh: OK"
+SIGN_AND_VERIFY_COMPLETED=1
