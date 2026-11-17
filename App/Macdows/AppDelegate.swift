@@ -566,6 +566,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// A staleness verdict belongs to the session it was computed against, and the line above
 		// just started a new one against a fresh snapshot.
 		lastDisplayChangeNote = nil
+		// adr/0026 (proposed) lane L1 (owner rulings D3 = A, D4 = A of 2026-11-17): the one global audio
+		// preference, read at every session start -- on -> .on, off -> .off; the App never leaves a
+		// session .unmanaged. The reconnect hook below reads it again before every automatic
+		// reconnect, so a change made while connected applies at the next connection, a reconnect
+		// included -- like the display values above, which that hook re-takes too.
+		newSession.audioPlaybackMode = AudioPlaybackPreferences.shared.sessionMode
 		session = newSession
 		// The registry is handed the session's FROZEN snapshot, not the live provider -- adr/0015
 		// §5.A.4: within one session the Y-flip anchor and the desktop size must come from the
@@ -606,8 +612,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		// closure, and a strong `self` would close that cycle. `unowned newSession` is safe for the
 		// opposite reason -- the driver owns the session it restarts, so this closure cannot
 		// outlive it, and the session holds no reference back to the driver.
+		//
+		// adr/0026 L1 (gate r1 m-5): the hook also re-reads the audio preference. It runs where the
+		// topology re-take must run -- on the main actor, inside `restartForReconnect(preparing:)`,
+		// with the session idle between its shutdown and its next `-start`, whose pre-connect step
+		// reads the mode -- so the Sound row's "Applies at the next connection." holds for a reconnect
+		// as it does for the Display page's values.
 		driver.topologyRefresh = { [weak self, unowned newSession] in
 			guard let self else { return nil }
+			newSession.audioPlaybackMode = AudioPlaybackPreferences.shared.sessionMode
 			return ReconnectTopologyRefresh.refreeze(session: newSession, topology: self.displayTopology)
 		}
 		driver.onStateChange = { [weak self] state in

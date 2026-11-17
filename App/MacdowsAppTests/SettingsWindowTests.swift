@@ -208,9 +208,13 @@ struct SettingsWindowTests {
         // start-panel checkbox is the second, and its value is NOT kept here: the binding reads and
         // calls `StartPanelPreferences` (App/UI/StartPanel), so the no-persistence-API loop below
         // still holds for every Settings file.
-        #expect(settingsOccurrences(of: "Toggle(", in: pages) == 2, "a_include and sp_ax are the two live controls")
+        // RE-WRITTEN by adr/0026 lane L1 (owner rulings D3 = A, D4 = A): three live controls. The
+        // General page's audio playback checkbox is the third, kept the same way -- the binding reads
+        // and calls `AudioPlaybackPreferences` (App/UI/Audio) -- so the loop below still holds.
+        #expect(settingsOccurrences(of: "Toggle(", in: pages) == 3, "a_include, sp_ax and g_sound_v are the three live controls")
         #expect(pages.contains("Toggle(isOn: $state.includeAccountAndKeyWitness)"))
         #expect(pages.contains("Toggle(isOn: Binding(get: { startPanel.preciseDockPositioning }, set: { startPanel.setPreciseDockPositioning($0) }))"))
+        #expect(pages.contains("Toggle(isOn: Binding(get: { audioPlayback.playOnThisMac }, set: { audioPlayback.setPlayOnThisMac($0) }))"))
         for file in try settingsFiles() {
             let code = settingsCodeOnly(file.code)
             for forbidden in ["UserDefaults", "@AppStorage", "@SceneStorage", "NSUserDefaults"] {
@@ -303,21 +307,27 @@ struct SettingsWindowTests {
 
     /// RE-WRITTEN by ADR-0025 a-1 (design note §7): a fourth row, the start panel's, in a section of
     /// its own between the first section and Notifications. Still no last-window row.
-    @Test("General has exactly four rows (At launch / If the connection drops / Start panel / Notifications); no 'disconnect when the last window closes' row (UI-1 v0.2 §10 (7))")
+    /// RE-WRITTEN by adr/0026 lane L1: a fifth row, Sound (the audio playback checkbox), in a section
+    /// of its own between the start panel and Notifications; its three keys join the `g_*` set.
+    @Test("General has exactly five rows (At launch / If the connection drops / Start panel / Sound / Notifications); no 'disconnect when the last window closes' row (UI-1 v0.2 §10 (7))")
     func generalHasNoLastWindowRow() throws {
         let pages = settingsCodeOnly(try settingsSource("\(settingsDirectory)/SettingsPages.swift"))
         let start = try #require(pages.range(of: "struct SettingsGeneralPage"))
         let end = try #require(pages.range(of: "struct SettingsKeyboardPage"))
         let general = String(pages[start.lowerBound..<end.lowerBound])
-        #expect(settingsOccurrences(of: "SettingsRow(", in: general) == 4)
+        #expect(settingsOccurrences(of: "SettingsRow(", in: general) == 5)
         #expect(general.contains("SettingsRow(SettingsStrings.launch)") && general.contains("SettingsRow(SettingsStrings.connectionDrops)")
-                && general.contains("SettingsRow(SettingsStrings.notifications)") && general.contains("SettingsRow(UIStrings.startPanelTitle)"))
+                && general.contains("SettingsRow(SettingsStrings.notifications)") && general.contains("SettingsRow(UIStrings.startPanelTitle)")
+                && general.contains("SettingsRow(SettingsStrings.sound)"))
         let drops = try #require(general.range(of: "SettingsRow(SettingsStrings.connectionDrops)"))
         let panel = try #require(general.range(of: "SettingsRow(UIStrings.startPanelTitle)"))
+        let sound = try #require(general.range(of: "SettingsRow(SettingsStrings.sound)"))
         let notifications = try #require(general.range(of: "SettingsRow(SettingsStrings.notifications)"))
         #expect(drops.lowerBound < panel.lowerBound && panel.lowerBound < notifications.lowerBound, "after the first section, before Notifications")
+        #expect(panel.lowerBound < sound.lowerBound && sound.lowerBound < notifications.lowerBound, "Sound after the start panel, before Notifications")
         let catalog = try settingsSource("App/Macdows/Localizable.xcstrings")
-        let general_keys = ["g_launch", "g_launch_v", "g_drop", "g_drop_n", "g_drop_v", "g_notif", "g_n1", "g_n2", "g_n3"]
+        let general_keys = ["g_launch", "g_launch_v", "g_drop", "g_drop_n", "g_drop_v", "g_notif", "g_n1", "g_n2", "g_n3",
+                            "g_sound", "g_sound_v", "g_sound_n"]
         let found = try Regex(#""(g_[a-z0-9_]+)" : \{"#)
         let names = Set(catalog.matches(of: found).compactMap { $0.output[1].substring.map(String.init) })
         #expect(names == Set(general_keys), "no g_last / g_last_v key in the catalog")
@@ -546,7 +556,7 @@ struct SettingsWindowTests {
         for match in code.matches(of: keys) {
             if let key = match.output[1].substring { found.append(String(key)) }
         }
-        #expect(found.count == 67)
+        #expect(found.count == 70, "67, and adr/0026 L1's g_sound / g_sound_v / g_sound_n")
         func value(_ key: String, _ language: String) -> String? {
             let entry = strings[key] as? [String: Any]
             let localizations = entry?["localizations"] as? [String: Any]

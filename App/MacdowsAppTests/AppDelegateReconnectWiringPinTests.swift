@@ -164,11 +164,19 @@ struct AppDelegateReconnectWiringPinTests {
     ///
     /// MUST-RED for: giving the driver a provider of its own, dropping `refreeze`'s result,
     /// and a strong `self` in either closure.
+    ///
+    /// RE-FROZEN by adr/0026 lane L1's gate r1 fold (m-5, option (a)): the hook writes the session's
+    /// audio mode from the App's one audio preference, after the `self` guard and before the
+    /// re-take it returns, so a reconnect reads the preference as a fresh connect does
+    /// (`AudioPlaybackPreferencesTests` pins the two places the App writes the mode). The rest of the
+    /// hook -- its captures, its guard, the returned `refreeze` over this delegate's provider -- is
+    /// word for word as before.
     @Test("the topology hook is the App's own provider, and neither closure retains the delegate")
     func theSeamsAreInstalledTheWayTheirOwnersRequire() throws {
         let src = try source(Self.appDelegate)
         #expect(occurrences(
             of: "driver.topologyRefresh = { [weak self, unowned newSession] in guard let self else { return nil } "
+                + "newSession.audioPlaybackMode = AudioPlaybackPreferences.shared.sessionMode "
                 + "return ReconnectTopologyRefresh.refreeze(session: newSession, topology: self.displayTopology) }",
             in: src) == 1,
             "the hook returns the refreeze's provider, and reads the App's single NSScreen reader")

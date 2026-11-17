@@ -449,6 +449,17 @@ struct AppDelegateAutolaunchPinTests {
     /// `applicationWillTerminate` are unchanged; no `@objc` was added. It now folds to 53615
     /// characters, +1070.
     ///
+    /// RE-FROZEN by adr/0026 lane L1 (basic audio playback, owner rulings D3 = A and D4 = A of
+    /// 2026-11-17, with its gate r1 fold m-5 (a)): `beginSession` assigns
+    /// `newSession.audioPlaybackMode` from the one global audio preference
+    /// (`AudioPlaybackPreferences.shared.sessionMode`) in two places -- right after the
+    /// display-change note is cleared and before `session = newSession`, with a five-line comment,
+    /// and inside the reconnect hook (`driver.topologyRefresh`), after its `self` guard and before
+    /// the re-take it returns, with a five-line paragraph appended to the comment above the hook.
+    /// `connectTapped`, `drainTick`, `applyShell`, `tearDownSession`, `endSessionTapped` and
+    /// `applicationWillTerminate` are unchanged; no `@objc` was added. It now folds to 54631
+    /// characters, +1016.
+    ///
     /// The "net folded edit" above is the folded-length delta for each re-freeze, which is what the
     /// length chain below already checks; it is not a token-by-token added/removed count -- those
     /// depend on the diff algorithm and separator convention used to produce them, so this pin does
@@ -464,9 +475,9 @@ struct AppDelegateAutolaunchPinTests {
     /// expected to re-freeze this constant in the same commit that makes the edit, and the length
     /// below is here so that such a re-freeze can be sanity-checked (a length that MOVED by the size
     /// of the edit is a re-freeze; a length that moved by 22638 is a needle that stopped matching).
-    private static let foldedTailLength = 53615
+    private static let foldedTailLength = 54631
     private static let foldedTailSHA256 =
-        "e981294ec0057e86f4d9b23b63779c7ac116e22e151f6ee165a7448e2f6ff728"
+        "4db50e819b9d457a140c583e926f3532533a2f5397005c7fc8aeff417cfa2a18"
 
     @Test("connectTapped to end-of-file is byte-identical to its last deliberate freeze")
     func theRestOfTheFileIsUnchanged() throws {

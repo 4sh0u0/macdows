@@ -34,9 +34,9 @@ and allow-list your host (see the first known issue below).
 - **Phase 3** (hardening) is in progress. Delivered so far: HiDPI on a single display,
   automatic reconnect after a dropped connection, an app shell (host list and editor,
   settings, certificate confirmation, and a start panel opened from the Dock icon; the
-  Help menu items are placeholders), and input-method and keyboard handling. Not done
-  yet: clipboard, audio, multi-monitor, drag and drop, and systematic compatibility
-  testing.
+  Help menu items are placeholders), and input-method and keyboard handling. Audio
+  playback is wired up but not yet verified on a real host. Not done yet: clipboard,
+  multi-monitor, drag and drop, and systematic compatibility testing.
 
 ### Known issues and limitations
 
@@ -45,7 +45,9 @@ and allow-list your host (see the first known issue below).
   `~/.config/macdows/lab-boundary.env` (one key, `MACDOWS_LAB_ALLOWED_NETS`, holding a
   space-separated CIDR list); without that file, every connection is refused.
 - **No clipboard redirection.** The `cliprdr` channel is not wired up.
-- **No audio.** The `rdpsnd` channel is not wired up.
+- **Audio is playback only and not yet verified on a real host.** The host's sound
+  is routed to this Mac through the `rdpsnd` channel; it can be turned off in the
+  settings (General > Sound). The microphone is not supported.
 - **Single display only.** No per-monitor layout is sent to the host, only a single
   local display has been exercised, and display changes made during a session are not
   sent to the host.
@@ -84,8 +86,9 @@ path.
 - Enterprise gateways or public-internet-exposure hardening
 
 (Basic audio redirection via `rdpsnd` is in scope for v1 — day-to-day usability without
-sound was judged worth the small increment, given FreeRDP already provides it. It is not
-implemented yet; see Known issues above.)
+sound was judged worth the small increment, given FreeRDP already provides it. Playback
+is wired up but not yet verified on a real host, and the microphone is not supported;
+see Known issues above.)
 
 ## Requirements
 

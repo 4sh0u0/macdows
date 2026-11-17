@@ -351,6 +351,68 @@ typedef struct {
     BOOL changed;
 } CRWorkAreaClamp;
 
+/// adr/0026 (proposed; lane L1, owner rulings D3 = A and D4 = A of 2026-11-17): what one connection
+/// does about sound -- the type of `CRSession.audioPlaybackMode`. Playback only: no mode ever
+/// enables the microphone.
+typedef NS_ENUM(NSInteger, CRAudioPlaybackMode) {
+    /// The default, and what every harness under `Tools/` keeps by never setting the property: the
+    /// connect path writes no audio setting and adds no channel, so the connection is exactly what
+    /// it was before this type existed (FreeRDP's defaults: the playback flag off, and the
+    /// `rdpsnd sys:fake` entries FreeRDP adds next to rdpdr).
+    CRAudioPlaybackModeUnmanaged = 0,
+    /// No sound: every `rdpsnd` entry already in either channel collection is removed (FreeRDP's
+    /// channel loading would turn playback back on for one), and `AudioPlayback`, `AudioCapture` and
+    /// `RemoteConsoleAudio` are written FALSE; FreeRDP's defaults then load the channels as they
+    /// always have for this mode (the `rdpsnd sys:fake` entries next to rdpdr).
+    CRAudioPlaybackModeOff = 1,
+    /// The host's sound plays on this Mac: `AudioCapture` and `RemoteConsoleAudio` are written
+    /// FALSE, `rdpsnd` is added as a static and as a dynamic channel with the arguments
+    /// `sys:mac format:1 channel:2` (FreeRDP's macOS backend; only two-channel PCM is offered to
+    /// the host), and `AudioPlayback` is written TRUE.
+    CRAudioPlaybackModeOn = 2,
+};
+
+/// adr/0026 L1 offline tests only (the App never calls the method that returns it): the state of
+/// a fresh client `rdpSettings` after the connect path's audio step ran on it, read back.
+@interface CRAudioPlaybackSettingsProbe : NSObject
+/// What the audio step returned: NO means the connect path would have refused the connection.
+@property (nonatomic, readonly) BOOL applied;
+@property (nonatomic, readonly) BOOL audioPlayback;
+@property (nonatomic, readonly) BOOL audioCapture;
+@property (nonatomic, readonly) BOOL remoteConsoleAudio;
+/// Every entry of the static channel collection, in order, each as its argument vector
+/// (`argv[0]` is the channel name).
+@property (nonatomic, readonly, copy) NSArray<NSArray<NSString *> *> *staticChannels;
+/// The same for the dynamic channel collection.
+@property (nonatomic, readonly, copy) NSArray<NSArray<NSString *> *> *dynamicChannels;
+- (instancetype)init NS_UNAVAILABLE;
+@end
+
+/// What `+[CRSession audioPlaybackSettingsProbeForMode:setup:]` does around the audio step.
+typedef NS_OPTIONS(NSUInteger, CRAudioPlaybackProbeSetup) {
+    CRAudioPlaybackProbeSetupNone = 0,
+    /// Before the step: `AudioPlayback`, `AudioCapture` and `RemoteConsoleAudio` all set TRUE, so
+    /// a mode that writes none of them is told apart from one that writes FreeRDP's defaults.
+    CRAudioPlaybackProbeSetupSeedAudioFlags = 1 << 0,
+    /// Before the step: `rdpsnd sys:fake` already in both channel collections -- the entry an
+    /// earlier writer could have left, which the step's same-name check would otherwise keep.
+    CRAudioPlaybackProbeSetupSeedFakeRdpsnd = 1 << 1,
+    /// After the step: the `rdpsnd` add calls FreeRDP's default channel loading makes, made
+    /// unconditionally -- `{rdpsnd}` dynamic, `{rdpsnd, sys:fake}` static and dynamic, `{rdpsnd}`
+    /// static -- through the same two add functions. Meaningful after `On`.
+    CRAudioPlaybackProbeSetupReplayUpstreamAdds = 1 << 2,
+    /// Before the step: `rdpsnd sys:mac format:1 channel:1` in both channel collections -- the `On`
+    /// entry with only its last argument different, which the step's entry check must refuse.
+    CRAudioPlaybackProbeSetupSeedOneChannelRdpsnd = 1 << 3,
+    /// After the step: the `rdpsnd` part of FreeRDP's default channel loading, with its own
+    /// conditions and in its order -- `{rdpsnd}` dynamic if `AudioPlayback`; `AudioPlayback` (and
+    /// `DeviceRedirection`) set TRUE if either collection holds an `rdpsnd` entry; the rdpdr step's
+    /// `{rdpsnd, sys:fake}` static and dynamic if neither does; `{rdpsnd}` static if
+    /// `AudioPlayback` -- so the result is what a connection would load. Use it instead of
+    /// `ReplayUpstreamAdds`, not with it.
+    CRAudioPlaybackProbeSetupReplayUpstreamLoad = 1 << 4,
+};
+
 /// One RDP/RAIL/RDPGFX session bridging a remote Windows host into this process, per
 /// adr/0005. `CRSession.mm`'s implementation links FreeRDP and CRDPQueue's C API
 /// directly; none of that leaks across this header — it stays pure Objective-C so Swift
@@ -454,6 +516,26 @@ typedef struct {
                               bottom:(uint32_t)bottom
                       toDesktopWidth:(uint32_t)width
                               height:(uint32_t)height;
+
+/// adr/0026 L1 offline tests only; the App never calls this. Creates a fresh client `rdpSettings`
+/// (`freerdp_settings_new(0)`, the defaults a connection starts from), applies `setup`'s seeds,
+/// runs the connect path's audio step for `mode` on it -- the very function the pre-connect step
+/// calls -- applies `setup`'s replay, reads the result back and frees the settings. Nil when the
+/// settings could not be created, a seed could not be added or the replay failed; a step that
+/// refuses the connection is not nil but `applied` NO. Logs what the step logs.
++ (nullable CRAudioPlaybackSettingsProbe *)audioPlaybackSettingsProbeForMode:(CRAudioPlaybackMode)mode
+                                                                       setup:(CRAudioPlaybackProbeSetup)setup
+    NS_SWIFT_NAME(audioPlaybackSettingsProbe(mode:setup:));
+
+/// adr/0026 L1 offline tests only; the App never calls this. Whether the linked FreeRDP has the
+/// rdpsnd playback backend `subsystem` (for example `mac`) for the static (`dynamic` NO) or the
+/// dynamic channel: the lookup rdpsnd itself makes for a `sys:` argument
+/// (`freerdp_channels_load_static_addin_entry`, the provider FreeRDP registers for client
+/// contexts), and the one the `On` mode checks before it adds `sys:mac`. Given a `sys:` argument
+/// rdpsnd tries no other backend, and a static channel whose backend cannot load reports a channel
+/// error that ends the session -- which is why `On` falls back to no playback when this is NO.
++ (BOOL)rdpsndPlaybackBackendIsLinked:(NSString *)subsystem dynamic:(BOOL)dynamic
+    NS_SWIFT_NAME(rdpsndPlaybackBackendIsLinked(_:dynamic:));
 
 /// ADR-0024 D-4 (Y-b): the trust snapshot the certificate callback judges against -- the ONE
 /// SHA-256 fingerprint (canonical, 64 hex digits) this connection may accept, or nil to accept
@@ -564,6 +646,33 @@ typedef struct {
 /// unsynchronized afterwards), or leave nil for no arguments. Windows-side quoting is the
 /// caller's responsibility — this string is passed through verbatim.
 @property (nonatomic, copy, nullable) NSString *programArguments;
+
+/// adr/0026 (proposed) lane L1: whether this connection plays the host's sound on this Mac (see
+/// `CRAudioPlaybackMode`). Same contract as `desktopWidth`: set it on T_main before `-start`; the
+/// connect path reads it ONCE, on T_rdp, in its pre-connect step (the thread spawn orders the
+/// write before the read) and never again for that connection, so a change while a connection is
+/// up takes effect at the next `-start` -- including the one inside
+/// `-restartForReconnectPreparing:`, which reads whatever the property holds by then: a caller
+/// that wants a reconnect to follow a changed preference writes it again in the `prepare` block
+/// (the App does, from the same preference it reads at every session start).
+///
+/// `CRAudioPlaybackModeUnmanaged` (0, the default) writes nothing and logs nothing: the harnesses
+/// under `Tools/` never set this property and connect exactly as before. `Off` and `On` first write
+/// `AudioCapture` and `RemoteConsoleAudio` FALSE -- the microphone backend is linked into FreeRDP
+/// and the App declares no microphone use -- and a failure to write either refuses the connection,
+/// like the other security settings of the pre-connect step. `Off` then removes every `rdpsnd`
+/// entry already in the channel collections -- FreeRDP's channel loading turns `AudioPlayback`
+/// back on for any it finds, so one that cannot be removed refuses the connection -- and writes
+/// `AudioPlayback` FALSE. `On` checks that the `mac` playback backend is linked, adds `rdpsnd` with
+/// fixed arguments to both channel collections before FreeRDP loads its channels, checks that what
+/// the collections hold under that name is exactly those arguments, and writes `AudioPlayback`
+/// TRUE. If any of that fails, the connection goes on exactly as under `Off` -- the `rdpsnd`
+/// entries removed and `AudioPlayback` FALSE, so the host is told not to send audio (FreeRDP then
+/// adds its `rdpsnd sys:fake` next to rdpdr, as it does for `Off`) -- with one WARN that carries no
+/// host data, rather than refusing the connection; only if that rollback itself fails is the
+/// connection refused. A value outside the three is treated as `Off`, with a WARN. `Off` and `On`
+/// each log one INFO line naming the mode.
+@property (nonatomic) CRAudioPlaybackMode audioPlaybackMode;
 
 /// adr/0021 lane CA-2 (owner ruling 2026-10-06 on P-CA1-1): the client-side key witness switch,
 /// OBSERVATION ONLY. Process-wide and default `NO`. When `YES`, every connection started AFTER it

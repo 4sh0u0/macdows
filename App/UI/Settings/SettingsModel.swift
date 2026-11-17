@@ -3,12 +3,16 @@ import MacdowsCore
 
 /// UI slice ③ (UI-1 spec §1 / §4.6 / §6.4 / §8 ③ / §10): what the Settings window shows and which
 /// of its controls can be changed. The rule of this slice is "only capabilities that already
-/// exist; everything else is shown, disabled and labelled Coming later" -- and today NOTHING on
-/// these four pages is configurable: every behaviour they describe is fixed in code. So every
-/// choice below is either the one behaviour the App has (selected, and the only option that is
-/// not disabled) or a later option (disabled, Coming later). The window keeps no settings of its
-/// own: nothing here is persisted, and nothing reads or writes a launch knob (§10 ②; the overrides
-/// row only counts which of the seven known knob names are present).
+/// exist; everything else is shown, disabled and labelled Coming later" -- and nothing modelled
+/// here is configurable: every behaviour these choices describe is fixed in code. (The pages'
+/// live controls are not modelled here: the General page's start-panel and audio playback
+/// checkboxes render `StartPanelPreferences` and `AudioPlaybackPreferences`, which live outside
+/// this directory (owner ruling §10-7), and the Advanced page's `a_include` is a choice for the
+/// next export, `SettingsAdvancedState`.) So every choice below is either the one behaviour the App
+/// has (selected, and the only option that is not disabled) or a later option (disabled, Coming
+/// later). The window keeps no settings of its own: nothing here is persisted, and nothing reads
+/// or writes a launch knob (§10 ②; the overrides row only counts which of the seven known knob
+/// names are present).
 ///
 /// The two things the window can DO are actions on existing capabilities, not settings: Export
 /// Diagnostics… (ADR-0024 D-8, `DiagnosticExport`) and Reset All Pins… (ADR-0024 D-6,

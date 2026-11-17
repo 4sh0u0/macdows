@@ -26,6 +26,9 @@ enum SettingsStrings {
     static var notifyLost: String { String(localized: "g_n1", defaultValue: "When the connection is lost", comment: "General: notification (coming later)") }
     static var notifyReconnectFailed: String { String(localized: "g_n2", defaultValue: "When reconnecting fails", comment: "General: notification (coming later)") }
     static var notifyHidden: String { String(localized: "g_n3", defaultValue: "When the remote session hides its windows", comment: "General: notification (coming later)") }
+    static var sound: String { String(localized: "g_sound", defaultValue: "Sound", comment: "General: row label (adr/0026 L1)") }
+    static var soundPlayOnThisMac: String { String(localized: "g_sound_v", defaultValue: "Play remote audio on this Mac", comment: "General: the audio playback checkbox, on by default (adr/0026 L1)") }
+    static var soundNote: String { String(localized: "g_sound_n", defaultValue: "Applies at the next connection.", comment: "General: when the audio playback checkbox takes effect (adr/0026 L1)") }
 
     // MARK: Keyboard
     static var commandKey: String { String(localized: "k_cmd", defaultValue: "Command (⌘) key", comment: "Keyboard: row label") }
