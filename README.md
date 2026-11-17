@@ -6,7 +6,8 @@ Macdows maps each application window of a remote Windows host to a native macOS
 `NSWindow` — the experience of Parallels' "Coherence" mode, but talking RDP to a real
 remote machine instead of a local VM. It's built on FreeRDP's RAIL/RemoteApp channel
 (`MS-RDPERP`) with a from-scratch Cocoa seamless-window backend — FreeRDP has never
-shipped one before; the only RAIL backend it ships is X11.
+shipped one before; the RAIL backends it does ship belong to its other clients (X11,
+Windows, Android and, since 3.32.0, SDL3).
 
 > **Not affiliated with or endorsed by Microsoft, Apple, or Parallels.** "Coherence" is
 > a Parallels feature name, "Windows" is a Microsoft trademark, and "Mac"/macOS are
@@ -15,26 +16,64 @@ shipped one before; the only RAIL backend it ships is X11.
 
 ## Status
 
-**Pre-alpha.** Phase 1 (native MVP: multi-window mapping + input) is complete, verified
-on real hardware:
+**Pre-alpha.** No builds are published: there are no prebuilt binaries and no releases,
+and the only way to run Macdows is to build it from source (see [Building](#building))
+and allow-list your host (see the first known issue below).
 
-- Multi-app single session — several distinct remote application windows rendering
-  concurrently in one RAIL session (the product's core claim)
-- 20-cycle connect/disconnect soak, clean under a normal build, ASan, and TSan alike
-- push→present latency, p95 ≈ 5ms
+- **Phase 1** (native MVP: multi-window mapping + input) is complete, verified on real
+  hardware:
+  - Multi-app single session — several distinct remote application windows rendering
+    concurrently in one RAIL session (the product's core claim)
+  - 20-cycle connect/disconnect soak, clean under a normal build, ASan, and TSan alike
+  - push→present latency, p95 ≈ 5ms
+- **Phase 2** (seamless-experience core) is complete: focus synchronization, Z-order
+  synchronization, window style translation, local move/resize, remote tray icons
+  (mirrored as entries in the Macdows menu bar menu, left click only), and Cmd↔Ctrl key
+  mapping. An LGPL-only FFmpeg with H264 and VideoToolbox decode is built in and linked
+  dynamically, but the client does not negotiate H264 with the host yet.
+- **Phase 3** (hardening) is in progress. Delivered so far: HiDPI on a single display,
+  automatic reconnect after a dropped connection, an app shell (host list and editor,
+  settings, certificate confirmation, and a start panel opened from the Dock icon; the
+  Help menu items are placeholders), and input-method and keyboard handling. Not done
+  yet: clipboard, audio, multi-monitor, drag and drop, and systematic compatibility
+  testing.
 
-Phase 2 (seamless-experience core) is next: focus synchronization, Z-order sync, and
-real H264 decode via a dynamically-linked ffmpeg + VideoToolbox hardware decode path.
+### Known issues and limitations
+
+- **Connections are limited to an allow-list.** As a development safeguard, Macdows
+  refuses to connect unless the host's address falls inside a network listed in
+  `~/.config/macdows/lab-boundary.env` (one key, `MACDOWS_LAB_ALLOWED_NETS`, holding a
+  space-separated CIDR list); without that file, every connection is refused.
+- **No clipboard redirection.** The `cliprdr` channel is not wired up.
+- **No audio.** The `rdpsnd` channel is not wired up.
+- **Single display only.** No per-monitor layout is sent to the host, only a single
+  local display has been exercised, and display changes made during a session are not
+  sent to the host.
+- **Manual host setup.** You publish the RemoteApp yourself through the registry (see
+  Requirements); there is no user-facing host setup guide, and `Tools/host-agent` is
+  only a feasibility prototype.
+- **NLA only.** Connections use Network Level Authentication with NTLM (no Kerberos, no
+  Microsoft Entra ID sign-in); hosts that require Standard RDP Security or TLS-only
+  security are not supported.
+- **Host lock screen, UAC and Ctrl+Alt+Del are not handled.** When the host switches to
+  its secure desktop, Macdows does not detect it or tell you, and how the remote windows
+  behave then has not been characterized.
+- **Few verified host configurations.** No systematic compatibility testing across
+  Windows builds and applications has been done, so expect gaps beyond the ones tried
+  so far.
 
 ### Architecture, in brief
 
-FreeRDP 3.30 is vendored as a pinned git submodule plus an external, upstream-linked
-patch queue — upstream source and license headers are never modified in place. A small
-C event queue (`crdpq`) bridges FreeRDP's RAIL and window callbacks, which fire on
-FreeRDP's own protocol threads, onto an ordered queue the Swift/AppKit side drains on
-the main thread — no `NSWindow` is ever touched off-main. A from-scratch Cocoa
-seamless-window backend then maps each RAIL window to a native `NSWindow`, presenting
-pixel content via the `MS-RDPEGFX` surface-to-window binding path.
+FreeRDP is vendored as a pinned git submodule (the pinned version is recorded in
+`deps/freerdp.lock`) plus an external, upstream-linked patch queue. The patches live
+outside the submodule: the build applies them to the checkout and reverts them when it
+exits, so the checkout is clean at rest. None of the queued patches touches upstream
+license headers. A small C event queue (`crdpq`) bridges FreeRDP's RAIL and window
+callbacks, which fire on FreeRDP's own protocol threads, onto an ordered queue the
+Swift/AppKit side drains on the main thread — no `NSWindow` is ever touched off-main. A
+from-scratch Cocoa seamless-window backend then maps each RAIL window to a native
+`NSWindow`, presenting pixel content via the `MS-RDPEGFX` surface-to-window binding
+path.
 
 ## Non-goals (v1)
 
@@ -44,8 +83,9 @@ pixel content via the `MS-RDPEGFX` surface-to-window binding path.
 - Printing, drive redirection
 - Enterprise gateways or public-internet-exposure hardening
 
-(v1 *does* include basic audio redirection via `rdpsnd` — day-to-day usability without
-sound was judged worth the small increment, given FreeRDP already provides it.)
+(Basic audio redirection via `rdpsnd` is in scope for v1 — day-to-day usability without
+sound was judged worth the small increment, given FreeRDP already provides it. It is not
+implemented yet; see Known issues above.)
 
 ## Requirements
 
@@ -100,7 +140,9 @@ actual `NSApplication` against a live RAIL session) — it's opt-in and needs a 
 RDP host you control, supplied via `WIN_HOST`/`WIN_USER`/`WIN_PASS` environment
 variables or a local, untracked host-credentials file (see
 `Tools/window-smoke/main.swift` for the exact mechanism). No real host values are
-documented anywhere in this repository. Launch it via `Scripts/run-window-smoke.command`.
+documented anywhere in this repository. Like the app, it refuses any host outside the
+allow-list described under Known issues. Launch it via
+`Scripts/run-window-smoke.command`.
 
 ## Legal
 
