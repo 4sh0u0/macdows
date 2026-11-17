@@ -13,8 +13,12 @@ import UniformTypeIdentifiers
 /// Closing only orders the window out; File ▸ Close Window (⌘W, `MainMenu.closeWindowAction`)
 /// closes it while it is key (UI-9), and ⌘, opens it again.
 ///
-/// The window changes no setting (there are none to change today, see `SettingsModel`). Its two
-/// actions use existing capabilities only:
+/// The window keeps no setting of its own. Two controls on its General page change a stored
+/// preference that lives outside the Settings files (owner ruling §10-7): the start-panel checkbox
+/// (`StartPanelPreferences`, ADR-0025 R-2) and the audio playback checkbox
+/// (`AudioPlaybackPreferences`, adr/0026 L1); the Advanced page's `a_include` is a choice for the
+/// next export only. Every other behaviour the pages show is fixed in code (`SettingsModel`). Its
+/// two actions use existing capabilities only:
 ///  - Reset All Pins… (ADR-0024 D-6, UI-1 spec §5.3): a confirmation alert, then
 ///    `HostOperations.resetAllPins` -- the pin store's `resetAllPins` off the main thread, then
 ///    `HostRecordStore.noteAllPinsReset` -- then the result.
@@ -47,7 +51,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSMe
 
     init(actions: HostActions, store: HostRecordStore, buffer: DiagnosticLogBuffer = .shared,
          environment: [String: String] = ProcessInfo.processInfo.environment,
-         startPanel: StartPanelPreferences = .shared) {
+         startPanel: StartPanelPreferences = .shared,
+         audioPlayback: AudioPlaybackPreferences = .shared) {
         self.actions = actions
         self.store = store
         self.buffer = buffer
@@ -61,7 +66,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSMe
         window.setAccessibilityLabel(SettingsStrings.windowLabel)
         super.init(window: window)
 
-        addPage(.general, title: SettingsStrings.tabGeneral, symbol: "gearshape", view: SettingsGeneralPage(startPanel: startPanel))
+        addPage(.general, title: SettingsStrings.tabGeneral, symbol: "gearshape",
+                view: SettingsGeneralPage(startPanel: startPanel, audioPlayback: audioPlayback))
         addPage(.keyboard, title: SettingsStrings.tabKeyboard, symbol: "keyboard", view: SettingsKeyboardPage())
         addPage(.display, title: SettingsStrings.tabDisplay, symbol: "display", view: SettingsDisplayPage())
         addPage(.advanced, title: SettingsStrings.tabAdvanced, symbol: "gearshape.2", view: SettingsAdvancedPage(state: advanced))

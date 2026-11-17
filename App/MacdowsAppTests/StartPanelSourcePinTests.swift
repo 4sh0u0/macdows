@@ -305,7 +305,11 @@ struct StartPanelSourcePinTests {
         #expect(pinCount("orderFront(nil)", controller) == 0 && pinCount("orderFrontRegardless(", controller) == 0)
     }
 
-    @Test("§10-7: the start-panel preference is the App's only UserDefaults user; NSScreen is still read in one file")
+    /// RE-WRITTEN by adr/0026 lane L1 (owner rulings D3 = A, D4 = A): the audio playback preference is
+    /// the App's second stored preference, kept the §10-7 way -- one type in a directory of its own
+    /// (App/UI/Audio), one key, rendered by the Settings page, which still touches no persistence
+    /// API. Each preference type stays its file's only UserDefaults user.
+    @Test("§10-7: the start-panel and audio playback preferences are the App's only UserDefaults users; NSScreen is still read in one file")
     func onePreferenceStore() throws {
         var defaults: [String] = []
         var screens: [String] = []
@@ -313,7 +317,7 @@ struct StartPanelSourcePinTests {
             if file.code.contains("UserDefaults") { defaults.append(file.path) }
             if file.code.contains("NSScreen.screens") { screens.append(file.path) }
         }
-        #expect(defaults == ["App/UI/StartPanel/StartPanelPreferences.swift"])
+        #expect(defaults == ["App/UI/Audio/AudioPlaybackPreferences.swift", "App/UI/StartPanel/StartPanelPreferences.swift"])
         #expect(screens == ["App/RemoteWindowRendering/DisplayTopologyProvider.swift"], "adr/0015 §5.A.5")
     }
 

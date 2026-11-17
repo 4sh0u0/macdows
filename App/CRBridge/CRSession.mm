@@ -28,6 +28,12 @@
 #include <freerdp/crypto/certificate.h>
 #include <freerdp/client/rdpgfx.h>
 #include <freerdp/channels/channels.h>
+/* adr/0026 (proposed) lane L1, the audio step of the pre-connect: RDPSND_CHANNEL_NAME, the two
+ * channel-collection add / del functions, and the static addin table lookup rdpsnd uses for its
+ * `sys:` backend. */
+#include <freerdp/channels/rdpsnd.h>
+#include <freerdp/client/channels.h>
+#include <freerdp/client/cmdline.h>
 #include <freerdp/rail.h>
 #include <freerdp/input.h>
 #include <freerdp/scancode.h>
@@ -590,6 +596,51 @@ typedef NS_ENUM(NSInteger, CRSessionState) {
         _issuer = [issuer copy];
         _flags = flags;
         _unsupportedRoute = (flags & (VERIFY_CERT_FLAG_REDIRECT | VERIFY_CERT_FLAG_GATEWAY)) != 0;
+    }
+    return self;
+}
+@end
+
+/* adr/0026 L1: one channel collection read back as argument vectors, in collection order. */
+static NSArray<NSArray<NSString *> *> *crb_channel_argvs(const rdpSettings *settings,
+                                                         FreeRDP_Settings_Keys_UInt32 countKey,
+                                                         FreeRDP_Settings_Keys_Pointer arrayKey)
+{
+    NSMutableArray<NSArray<NSString *> *> *out = [NSMutableArray array];
+    const UINT32 count = freerdp_settings_get_uint32(settings, countKey);
+    for (UINT32 index = 0; index < count; index++)
+    {
+        const ADDIN_ARGV *entry = (const ADDIN_ARGV *)freerdp_settings_get_pointer_array(settings, arrayKey, index);
+        NSMutableArray<NSString *> *argv = [NSMutableArray array];
+        if (entry && entry->argv)
+        {
+            for (int k = 0; k < entry->argc; k++)
+            {
+                NSString *argument = entry->argv[k] ? [NSString stringWithUTF8String:entry->argv[k]] : nil;
+                [argv addObject:argument ?: @""];
+            }
+        }
+        [out addObject:argv];
+    }
+    return out;
+}
+
+@interface CRAudioPlaybackSettingsProbe ()
+- (instancetype)initWithApplied:(BOOL)applied settings:(const rdpSettings *)settings NS_DESIGNATED_INITIALIZER;
+@end
+
+@implementation CRAudioPlaybackSettingsProbe
+- (instancetype)initWithApplied:(BOOL)applied settings:(const rdpSettings *)settings
+{
+    self = [super init];
+    if (self)
+    {
+        _applied = applied;
+        _audioPlayback = freerdp_settings_get_bool(settings, FreeRDP_AudioPlayback);
+        _audioCapture = freerdp_settings_get_bool(settings, FreeRDP_AudioCapture);
+        _remoteConsoleAudio = freerdp_settings_get_bool(settings, FreeRDP_RemoteConsoleAudio);
+        _staticChannels = [crb_channel_argvs(settings, FreeRDP_StaticChannelCount, FreeRDP_StaticChannelArray) copy];
+        _dynamicChannels = [crb_channel_argvs(settings, FreeRDP_DynamicChannelCount, FreeRDP_DynamicChannelArray) copy];
     }
     return self;
 }
@@ -2035,6 +2086,161 @@ static BOOL crb_keyboard_set_ime_status(rdpContext *context, UINT16 imeId, UINT3
  * Connect lifecycle
  * ==================================================================================== */
 
+/* adr/0026 (proposed) lane L1: the rdpsnd entry the On mode adds to BOTH channel collections (the
+ * host may use the static rdpsnd channel or its dynamic AUDIO_PLAYBACK_DVC; both load from an
+ * entry named rdpsnd and parse the same arguments, rdpsnd_main.c rdpsnd_process_addin_args).
+ * sys:mac names FreeRDP's macOS backend: with a sys: argument rdpsnd loads that backend and no
+ * other, where without one it would fall back to `fake` (rdpsnd_process_connect). format:1 and
+ * channel:2 fill the format filter's wFormatTag (1 = WAVE_FORMAT_PCM) and nChannels, so of the
+ * host's format list only two-channel PCM is offered back (rdpsnd_select_supported_audio_formats
+ * -> audio_format_compatible); no rate is fixed, and no bit depth can be (rdpsnd has no such
+ * argument). channel:2 is the filter that keeps the process alive, not a preference: the mac
+ * backend connects its AVAudioPlayerNode with format nil (rdpsnd_mac.m), which fixes the node's
+ * output at two channels, and schedules each buffer in the format the host picked, with no @try
+ * around scheduleBuffer. Without channel:2 one-channel PCM would be offered too; if the host
+ * picked it, the first buffer would raise an NSException that nothing catches, on rdpsnd's
+ * playback thread, and the App would terminate (adr/0026 L1 gate r1 measured the exception
+ * offline). Do not drop it as a redundant filter. The strings are copied:
+ * freerdp_addin_argv_new duplicates each one, and the settings own and free the copy. */
+static const char *const crb_rdpsnd_playback_args[] = {RDPSND_CHANNEL_NAME, "sys:mac", "format:1", "channel:2"};
+/* The backend that sys:mac names, as the static addin table spells it. */
+static const char *const crb_rdpsnd_playback_backend = "mac";
+
+/* adr/0026 L1: whether `found` is exactly the On entry -- the same number of arguments, each the
+ * same string. */
+static BOOL crb_rdpsnd_entry_is_playback(const ADDIN_ARGV *found)
+{
+    const size_t count = ARRAYSIZE(crb_rdpsnd_playback_args);
+    if (!found || !found->argv || found->argc < 0 || (size_t)found->argc != count)
+        return FALSE;
+    for (size_t index = 0; index < count; index++)
+    {
+        if (!found->argv[index] || strcmp(found->argv[index], crb_rdpsnd_playback_args[index]) != 0)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+/* adr/0026 L1: the lookup rdpsnd makes for its sys: backend (rdpsnd_load_device_plugin ->
+ * freerdp_load_channel_addin_entry), asked of the provider FreeRDP registers for every client
+ * context (client.c freerdp_client_context_new -> freerdp_register_addin_provider), with the flags
+ * rdpsnd uses for its static and its dynamic instance. */
+static BOOL crb_rdpsnd_backend_linked(const char *subsystem, BOOL dynamic)
+{
+    const DWORD flags = dynamic ? FREERDP_ADDIN_CHANNEL_DYNAMIC
+                                : (FREERDP_ADDIN_CHANNEL_STATIC | FREERDP_ADDIN_CHANNEL_ENTRYEX);
+    return freerdp_channels_load_static_addin_entry(RDPSND_CHANNEL_NAME, subsystem, NULL, flags) != NULL;
+}
+
+/* adr/0026 L1: removes every entry named rdpsnd from both collections -- a del call removes the
+ * first match only -- and says whether none is left. */
+static BOOL crb_remove_rdpsnd_entries(rdpSettings *settings)
+{
+    for (UINT32 left = freerdp_settings_get_uint32(settings, FreeRDP_StaticChannelCount); left > 0; left--)
+    {
+        if (!freerdp_static_channel_collection_find(settings, RDPSND_CHANNEL_NAME) ||
+            !freerdp_client_del_static_channel(settings, RDPSND_CHANNEL_NAME))
+            break;
+    }
+    for (UINT32 left = freerdp_settings_get_uint32(settings, FreeRDP_DynamicChannelCount); left > 0; left--)
+    {
+        if (!freerdp_dynamic_channel_collection_find(settings, RDPSND_CHANNEL_NAME) ||
+            !freerdp_client_del_dynamic_channel(settings, RDPSND_CHANNEL_NAME))
+            break;
+    }
+    return !freerdp_static_channel_collection_find(settings, RDPSND_CHANNEL_NAME) &&
+           !freerdp_dynamic_channel_collection_find(settings, RDPSND_CHANNEL_NAME);
+}
+
+/* adr/0026 (proposed) lane L1: the pre-connect step's audio settings, CRSession.h's
+ * audioPlaybackMode contract. It takes no CRSession on purpose: the offline tests run this very
+ * function on a settings object of their own (+audioPlaybackSettingsProbeForMode:setup:). It runs
+ * in crb_pre_connect, i.e. before FreeRDP loads its channels (freerdp.c: PreConnect, then
+ * utils_reload_channels -> LoadChannels -> freerdp_client_load_addins); every default step there
+ * adds a channel only when no entry of that name exists yet (cmdline.c
+ * freerdp_client_add_static_channel / _dynamic_channel return TRUE on a name match), so the On
+ * entry is the one rdpsnd loads with, and the rdpdr step adds no `rdpsnd sys:fake`.
+ *
+ * Off removes every rdpsnd entry already in either collection before it writes AudioPlayback
+ * FALSE: FreeRDP's step 2 of load_addins (cmdline.c) sets AudioPlayback TRUE again whenever
+ * either collection holds an rdpsnd entry, so an entry left by an earlier writer would quietly
+ * overturn the user's Off, with whatever backend that entry names. With none left, the rdpdr step
+ * adds its `rdpsnd sys:fake` to both collections, as it always has for Off, so what Off does on
+ * the wire is unchanged. An entry that cannot be removed refuses the connection (one ERR of
+ * numbers): the user turned sound off, and no entry FreeRDP would turn back on may stay.
+ *
+ * Failure semantics. The two privacy settings fail closed: FALSE, the connection is refused, as
+ * for the security settings in crb_pre_connect. Playback does not: if any On step fails -- 1 the
+ * mac backend is not linked (static or dynamic), 2 / 3 the static / dynamic add, 4 an entry named
+ * rdpsnd that is not exactly the On entry (an earlier writer's, which the add's name check would
+ * keep), 5 the flag -- every rdpsnd entry is removed and AudioPlayback is written FALSE, so the
+ * connection goes on as Off would (no sound, INFO_NOAUDIOPLAYBACK) and one WARN of numbers says
+ * which step failed. Without the removal a half-added entry would turn AudioPlayback back on in
+ * FreeRDP's own step 2 of load_addins, with unknown arguments. Without the backend check a
+ * missing backend would end every On connection right after it connected, whether or not the
+ * host ever plays a sound: freerdp_channels_post_connect (core/client.c) signals
+ * CHANNEL_EVENT_CONNECTED to every loaded static channel, rdpsnd loads its sys: backend there,
+ * and a static rdpsnd that cannot load it reports a channel error that ends the session. Only a
+ * rollback that itself fails, or an Off that cannot remove an entry or write its flag, refuses
+ * the connection. Unmanaged returns at once: nothing written, nothing logged. */
+static BOOL crb_apply_audio_playback_mode(rdpSettings *settings, CRAudioPlaybackMode mode)
+{
+    if (mode == CRAudioPlaybackModeUnmanaged)
+        return TRUE;
+
+    /* Privacy, on every managed path, before anything else. The microphone backend (audin, mac)
+     * is linked into FreeRDP and the App's Info.plist declares no microphone use; sound played at
+     * the host is not this client's to ask for. Both are FreeRDP's defaults today -- written here
+     * so that stays true whatever a default becomes. */
+    if (!freerdp_settings_set_bool(settings, FreeRDP_AudioCapture, FALSE))
+        return FALSE;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_RemoteConsoleAudio, FALSE))
+        return FALSE;
+
+    if (mode != CRAudioPlaybackModeOn)
+    {
+        if (mode != CRAudioPlaybackModeOff)
+            WLog_WARN(TAG, "[audio] playback mode=%ld is not a known mode -- treated as off", (long)mode);
+        if (!crb_remove_rdpsnd_entries(settings))
+        {
+            WLog_ERR(TAG, "[audio] playback mode=%ld could not remove an rdpsnd entry -- refusing the connection", (long)mode);
+            return FALSE;
+        }
+        if (!freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, FALSE))
+            return FALSE;
+        WLog_INFO(TAG, "[audio] playback mode=off");
+        return TRUE;
+    }
+
+    int failedStep = 0;
+    if (!crb_rdpsnd_backend_linked(crb_rdpsnd_playback_backend, FALSE) ||
+        !crb_rdpsnd_backend_linked(crb_rdpsnd_playback_backend, TRUE))
+        failedStep = 1;
+    else if (!freerdp_client_add_static_channel(settings, ARRAYSIZE(crb_rdpsnd_playback_args), crb_rdpsnd_playback_args))
+        failedStep = 2;
+    else if (!freerdp_client_add_dynamic_channel(settings, ARRAYSIZE(crb_rdpsnd_playback_args), crb_rdpsnd_playback_args))
+        failedStep = 3;
+    else if (!crb_rdpsnd_entry_is_playback(freerdp_static_channel_collection_find(settings, RDPSND_CHANNEL_NAME)) ||
+             !crb_rdpsnd_entry_is_playback(freerdp_dynamic_channel_collection_find(settings, RDPSND_CHANNEL_NAME)))
+        failedStep = 4;
+    else if (!freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, TRUE))
+        failedStep = 5;
+
+    if (failedStep == 0)
+    {
+        WLog_INFO(TAG, "[audio] playback mode=on");
+        return TRUE;
+    }
+    if (!crb_remove_rdpsnd_entries(settings) || !freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, FALSE))
+    {
+        WLog_ERR(TAG, "[audio] playback mode=on failed at step %d and could not be rolled back -- refusing the connection",
+                 failedStep);
+        return FALSE;
+    }
+    WLog_WARN(TAG, "[audio] playback mode=on failed at step %d -- this connection plays no sound", failedStep);
+    return TRUE;
+}
+
 static BOOL crb_pre_connect(freerdp *instance)
 {
     CRBridgeContext *p = (CRBridgeContext *)instance->context;
@@ -2177,6 +2383,11 @@ static BOOL crb_pre_connect(freerdp *instance)
     if (!freerdp_settings_set_bool(settings, FreeRDP_ExternalCertificateManagement, TRUE))
         return FALSE;
     if (!freerdp_settings_set_string(settings, FreeRDP_CertificateAcceptedFingerprints, NULL))
+        return FALSE;
+    /* adr/0026 (proposed) lane L1: the audio step, last of the settings and before the two
+     * subscriptions (that block and this function's end are frozen by the RAIL handshake pin).
+     * The mode is read once here, like desktopWidth; Unmanaged -- every harness -- writes nothing. */
+    if (!crb_apply_audio_playback_mode(settings, session.audioPlaybackMode))
         return FALSE;
 
     if (PubSub_SubscribeChannelConnected(instance->context->pubSub, crb_on_channel_connected) < 0)
@@ -2853,6 +3064,84 @@ static BOOL crb_attach_process_log_callbacks(wLog *log)
     out.bottom = bottom < height ? bottom : height;
     out.changed = (out.left != left || out.top != top || out.right != right || out.bottom != bottom) ? YES : NO;
     return out;
+}
+
+/* adr/0026 L1 offline tests: CRSession.h's contract. The seeds and both replays go through the
+ * same two public add functions FreeRDP's default channel loading uses, with its exact argument
+ * vectors (cmdline.c freerdp_client_load_addins: step 1 `{rdpsnd}` dynamic, the rdpdr step's
+ * `{rdpsnd, sys:fake}` static and dynamic, step 3 `{rdpsnd}` static). ReplayUpstreamAdds makes
+ * those four calls whatever the settings say. ReplayUpstreamLoad makes them only under
+ * load_addins' own conditions and in its order, with what lies between them that bears on rdpsnd:
+ * step 2 (an rdpsnd entry in either collection sets DeviceRedirection and AudioPlayback TRUE) and
+ * the RDP8 features' rule (NetworkAutoDetect, SupportHeartbeatPdu or SupportMultitransport set
+ * DeviceRedirection TRUE), which decides whether the rdpdr step runs. The drive, printer, port and
+ * smart-card rules that can also set DeviceRedirection are not modelled: the RDP8 settings are on
+ * in a fresh client settings object, so DeviceRedirection is TRUE before the rdpdr step whatever
+ * those rules would add. The one-channel seed is the On entry with its last argument changed,
+ * built from crb_rdpsnd_playback_args so that it keeps following them. */
++ (nullable CRAudioPlaybackSettingsProbe *)audioPlaybackSettingsProbeForMode:(CRAudioPlaybackMode)mode
+                                                                       setup:(CRAudioPlaybackProbeSetup)setup
+{
+    static const char *const bare[] = {RDPSND_CHANNEL_NAME};
+    static const char *const fake[] = {RDPSND_CHANNEL_NAME, "sys:fake"};
+    const char *oneChannel[ARRAYSIZE(crb_rdpsnd_playback_args)];
+    for (size_t index = 0; index < ARRAYSIZE(crb_rdpsnd_playback_args); index++)
+        oneChannel[index] = crb_rdpsnd_playback_args[index];
+    oneChannel[ARRAYSIZE(oneChannel) - 1] = "channel:1";
+    rdpSettings *settings = freerdp_settings_new(0);
+    if (!settings)
+        return nil;
+    CRAudioPlaybackSettingsProbe *probe = nil;
+    BOOL seeded = YES;
+    if (setup & CRAudioPlaybackProbeSetupSeedAudioFlags)
+        seeded = freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, TRUE) &&
+                 freerdp_settings_set_bool(settings, FreeRDP_AudioCapture, TRUE) &&
+                 freerdp_settings_set_bool(settings, FreeRDP_RemoteConsoleAudio, TRUE);
+    if (seeded && (setup & CRAudioPlaybackProbeSetupSeedFakeRdpsnd))
+        seeded = freerdp_client_add_static_channel(settings, ARRAYSIZE(fake), fake) &&
+                 freerdp_client_add_dynamic_channel(settings, ARRAYSIZE(fake), fake);
+    if (seeded && (setup & CRAudioPlaybackProbeSetupSeedOneChannelRdpsnd))
+        seeded = freerdp_client_add_static_channel(settings, ARRAYSIZE(oneChannel), oneChannel) &&
+                 freerdp_client_add_dynamic_channel(settings, ARRAYSIZE(oneChannel), oneChannel);
+    if (seeded)
+    {
+        const BOOL applied = crb_apply_audio_playback_mode(settings, mode);
+        BOOL replayed = YES;
+        if (setup & CRAudioPlaybackProbeSetupReplayUpstreamAdds)
+            replayed = freerdp_client_add_dynamic_channel(settings, ARRAYSIZE(bare), bare) &&
+                       freerdp_client_add_static_channel(settings, ARRAYSIZE(fake), fake) &&
+                       freerdp_client_add_dynamic_channel(settings, ARRAYSIZE(fake), fake) &&
+                       freerdp_client_add_static_channel(settings, ARRAYSIZE(bare), bare);
+        if (replayed && (setup & CRAudioPlaybackProbeSetupReplayUpstreamLoad))
+        {
+            if (freerdp_settings_get_bool(settings, FreeRDP_AudioPlayback))
+                replayed = freerdp_client_add_dynamic_channel(settings, ARRAYSIZE(bare), bare);
+            if (replayed && (freerdp_static_channel_collection_find(settings, RDPSND_CHANNEL_NAME) ||
+                             freerdp_dynamic_channel_collection_find(settings, RDPSND_CHANNEL_NAME)))
+                replayed = freerdp_settings_set_bool(settings, FreeRDP_DeviceRedirection, TRUE) &&
+                           freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, TRUE);
+            if (replayed && (freerdp_settings_get_bool(settings, FreeRDP_NetworkAutoDetect) ||
+                             freerdp_settings_get_bool(settings, FreeRDP_SupportHeartbeatPdu) ||
+                             freerdp_settings_get_bool(settings, FreeRDP_SupportMultitransport)))
+                replayed = freerdp_settings_set_bool(settings, FreeRDP_DeviceRedirection, TRUE);
+            if (replayed && freerdp_settings_get_bool(settings, FreeRDP_DeviceRedirection) &&
+                !freerdp_static_channel_collection_find(settings, RDPSND_CHANNEL_NAME) &&
+                !freerdp_dynamic_channel_collection_find(settings, RDPSND_CHANNEL_NAME))
+                replayed = freerdp_client_add_static_channel(settings, ARRAYSIZE(fake), fake) &&
+                           freerdp_client_add_dynamic_channel(settings, ARRAYSIZE(fake), fake);
+            if (replayed && freerdp_settings_get_bool(settings, FreeRDP_AudioPlayback))
+                replayed = freerdp_client_add_static_channel(settings, ARRAYSIZE(bare), bare);
+        }
+        if (replayed)
+            probe = [[CRAudioPlaybackSettingsProbe alloc] initWithApplied:applied settings:settings];
+    }
+    freerdp_settings_free(settings);
+    return probe;
+}
+
++ (BOOL)rdpsndPlaybackBackendIsLinked:(NSString *)subsystem dynamic:(BOOL)dynamic
+{
+    return crb_rdpsnd_backend_linked(subsystem.UTF8String, dynamic);
 }
 
 /* ADR-0024 D-2: FreeRDP takes the password as a NUL-terminated string and keeps its own copy

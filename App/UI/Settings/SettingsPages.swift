@@ -7,8 +7,9 @@ import SwiftUI
 /// choice is enabled only when it is the behaviour the App has today, every other one is disabled
 /// and labelled Coming later (§7.1: not by dimming alone). No page keeps or writes a setting; the
 /// bindings are constant -- except the General page's start-panel checkbox (ADR-0025 R-2), whose
-/// value lives in `StartPanelPreferences` (`App/UI/StartPanel/`) and is only rendered and handed
-/// back from here. Every text is `verbatim` (catalog strings are resolved in
+/// value lives in `StartPanelPreferences` (`App/UI/StartPanel/`), and its audio playback checkbox
+/// (adr/0026 L1), whose value lives in `AudioPlaybackPreferences` (`App/UI/Audio/`); both are only
+/// rendered and handed back from here. Every text is `verbatim` (catalog strings are resolved in
 /// `SettingsStrings`; `Text("…")` would look its argument up a second time and read `%` as a
 /// format).
 
@@ -164,6 +165,9 @@ struct SettingsGeneralPage: View {
     /// ADR-0025 R-2 / design note §7: the start panel's one stored preference and the Accessibility
     /// state beside it. This page renders it and calls its methods; it stores nothing itself.
     @ObservedObject var startPanel: StartPanelPreferences
+    /// adr/0026 L1 (owner rulings D3 = A, D4 = A): the one audio preference, global and on by
+    /// default. Rendered and handed back like the start panel's; this page stores nothing itself.
+    @ObservedObject var audioPlayback: AudioPlaybackPreferences
 
     var body: some View {
         Form {
@@ -199,6 +203,17 @@ struct SettingsGeneralPage: View {
                 }
             }
             .onAppear { startPanel.refreshTrust() }
+            Section {
+                SettingsRow(SettingsStrings.sound) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle(isOn: Binding(get: { audioPlayback.playOnThisMac }, set: { audioPlayback.setPlayOnThisMac($0) })) {
+                            Text(verbatim: SettingsStrings.soundPlayOnThisMac)
+                        }
+                        .toggleStyle(.checkbox)
+                        SettingsNote(text: SettingsStrings.soundNote)
+                    }
+                }
+            }
             Section {
                 SettingsRow(SettingsStrings.notifications) {
                     VStack(alignment: .leading, spacing: 4) {
