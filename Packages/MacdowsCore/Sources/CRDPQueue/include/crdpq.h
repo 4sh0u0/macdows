@@ -3,10 +3,11 @@
 
 /*
  * crdpq: the C event-queue layer specified by adr/0005 §1/§3/§4 — three independent
- * primitives, each crossing exactly one thread boundary FreeRDP's callback threads and
- * AppKit's main thread must never cross directly:
+ * lanes, each crossing exactly one thread boundary FreeRDP's callback threads and
+ * AppKit's main thread must never cross directly, plus two bounded side stores that hold
+ * the bulk data a lane's POD events refer to but must not carry:
  *
- *   1. crdpq_control  — T_rdp/T_dvc (any number of producer threads) -> T_main.
+ *   1. crdpq_control  — T_rdp/T_dvc/T_clip (any number of producer threads) -> T_main.
  *                        FIFO, POD-deep-copy double buffer (adr/0005 §1's "rdpq").
  *   2. crdpq_frames    — T_dvc -> T_main. Not a queue: GFX frames are *state*, not
  *                        events, so this is a last-writer-wins per-surfaceId slot table
@@ -14,6 +15,41 @@
  *   3. crdpq_outbound  — T_main -> T_rdp. The reverse direction (adr/0005 §3's "outbound
  *                        commands go through a queue too"): ClientExecute/ClientActivate/ClientWindowMove/input
  *                        never call into FreeRDP directly from T_main.
+ *   4. crdpq_icon_store — notify-icon pixels (adr/0013 §1): written on T_rdp, read on
+ *                        T_main after the event that names the slot is drained.
+ *   5. crdpq_clip_store — clipboard bytes (adr/0026, PROPOSED): one-shot blocks, written on
+ *                        T_clip (Windows -> Mac) or T_main (Mac -> Windows) and taken on
+ *                        T_main or T_rdp after the event/command that names them is drained.
+ *
+ * Producer threads. adr/0005 names exactly two upstream producers, T_rdp (the FreeRDP main
+ * loop) and T_dvc (dynamic-channel callbacks). Clipboard redirection adds a third: T_clip,
+ * the message thread the cliprdr static channel creates for itself and runs every
+ * `Server*` callback on. T_clip is recorded by the adr/0005 addendum and by adr/0026, both
+ * being drafted in parallel with this code and both PROPOSED, not accepted, at the time of
+ * writing; until they land, the two rules this header relies on are restated here: T_clip
+ * posts to crdpq_control and writes crdpq_clip_store exactly like any other producer, and
+ * it never waits on T_main -- no AppKit, no `dispatch_sync`, and no lock T_main may hold
+ * other than the short internal critical sections of this library's own primitives (the
+ * control lane's post lock and the clip store's mutex, both of which T_main also takes).
+ *
+ * What T_clip does, and what it must not (S0 of the T1 semantics, adr/0026). T_clip keeps
+ * no clipboard state and makes no decision; the one number it keeps is a counter that
+ * allocates store keys and means nothing else (see CRDPQ_EVENT_CLIP_REMOTE_DATA in
+ * `crdpq_clip_ref_t`). Its callbacks do exactly four things: send the
+ * two replies the protocol requires on the spot -- Client Capabilities on Monitor Ready
+ * (version 2, general flags announcing long format names only: no file streams, no data
+ * locking, no huge files), a successful Format List Response on every server Format List --
+ * copy a Format Data Response's bytes into crdpq_clip_store, and post one of the four
+ * CRDPQ_EVENT_CLIP_* kinds; every callback then returns success. The one other thing it
+ * looks at is the server's Format List, scanned once for two facts that become the
+ * REMOTE_FORMATS event's `flags` (see CRDPQ_CLIP_FLAG_*); the list and its format names stay
+ * on T_clip. Everything else is T_main's: whether to announce,
+ * whether to request, whether and how to answer, whether a response is current. T_main
+ * posts the resulting CRDPQ_CMD_CLIP_ANNOUNCE / _REQUEST / _RESPOND on crdpq_outbound and
+ * T_rdp sends them. The reason is one bookkeeping problem: a Format Data Response carries no
+ * identifier, so it can only be paired with a request by order, and the two things that make
+ * a request obsolete happen on different threads -- a new server Format List on T_clip, a
+ * local announcement on T_main. Only T_main sees both, so only T_main keeps that book.
  *
  * Zero FreeRDP, zero AppKit, zero Objective-C dependencies in this target — pure C11.
  * The callback side (waking the consumer) is a function pointer supplied at creation:
@@ -138,6 +174,14 @@ typedef enum {
     CRDPQ_EVENT_LOCAL_MOVE_SIZE,
     CRDPQ_EVENT_MIN_MAX_INFO,
     CRDPQ_EVENT_ZORDER_SYNC,
+    /* adr/0026 (PROPOSED) clipboard T1, appended at the END per adr/0008 §5 so no existing
+     * kind's numeric value moves (16, 17, 18, 19). All four are posted on T_clip, which
+     * decides nothing (S0 of the T1 semantics: every decision is T_main's), and carry a
+     * `crdpq_clip_ref_t` -- never clipboard content; see that struct for the per-kind fields. */
+    CRDPQ_EVENT_CLIP_READY,
+    CRDPQ_EVENT_CLIP_REMOTE_FORMATS,
+    CRDPQ_EVENT_CLIP_REMOTE_DATA,
+    CRDPQ_EVENT_CLIP_DATA_REQUEST,
 } crdpq_event_type_t;
 
 /** adr/0008 §2b: a wire-faithful `RECTANGLE_16` (window.c:462/478 parses this as four
@@ -557,6 +601,152 @@ typedef struct {
 } crdpq_zorder_sync_t;
 _Static_assert(sizeof(crdpq_zorder_sync_t) == 4, "crdpq_zorder_sync_t layout changed -- re-measure and audit consumers (adr/0008 §5)");
 
+/** The `crdpq_clip_ref_t.formatId` that means "no format": on CRDPQ_CMD_CLIP_ANNOUNCE, send an
+ *  EMPTY Format List. Windows never assigns format id 0 (the standard formats start at 1, the
+ *  registered ones at 0xC000), so it cannot be mistaken for a real format.
+ *  (Semantics v2 also used it on CRDPQ_EVENT_CLIP_REMOTE_FORMATS; v3 moved what that event
+ *  says into `flags`, below, and leaves its `formatId` 0.) */
+#define CRDPQ_CLIP_NO_FORMAT 0u
+
+/** Bits of `crdpq_clip_ref_t.flags`. Only CRDPQ_EVENT_CLIP_REMOTE_FORMATS sets any; every other
+ *  kind leaves the field 0. A word of named bits rather than two fields, and rather than a
+ *  borrowed `formatId` (what semantics v2 did for the first fact), so each fact has one
+ *  unambiguous home and a later fact is one more bit: a consumer ignores bits it does not
+ *  know, and bits nobody has defined are 0. Values are fixed; new bits take the next free one.
+ *
+ *  CRDPQ_CLIP_FLAG_OFFERS_UNICODETEXT: the server's Format List names format 13
+ *  (CF_UNICODETEXT).
+ *
+ *  CRDPQ_CLIP_FLAG_REMOTE_EXCLUDED: the same list names at least one EXCLUSION format -- a
+ *  registered format a Windows program adds to say "keep this out of clipboard history /
+ *  cloud sync", which password managers do for the passwords they copy. T1 then writes the
+ *  text on the Mac as sensitive content (the Swift layer's `sensitive` write; the App adds
+ *  org.nspasteboard.ConcealedType and keeps it out of cross-device sync). Matched BY NAME on
+ *  T_clip, against exactly these four (copy them verbatim; the comparison is the bridge's,
+ *  the names never leave T_clip, never reach an event and never reach a log -- S9):
+ *      "ExcludeClipboardContentFromMonitorProcessing"
+ *      "CanIncludeInClipboardHistory"
+ *      "CanUploadToCloudClipboard"
+ *      "Clipboard Viewer Ignore"
+ *  Any one present sets the bit. A deliberate over-approximation: the middle two carry a
+ *  DWORD whose value 0 means "do not", and reading it would take one more data request; going
+ *  by the name alone errs towards treating content as sensitive, never the other way.
+ *  FULL NAMES ONLY WITH LONG FORMAT NAMES: compare by full name only when long format names
+ *  were negotiated (CB_USE_LONG_FORMAT_NAMES in BOTH sides' clipboard capabilities; the
+ *  client always offers it, S0). Without it the server's Format List carries 32-byte short
+ *  names -- 16 UTF-16 units, or 32 ASCII bytes -- which truncate all four names in the
+ *  UTF-16 form (each is longer than 16 characters) and the first in the ASCII form (longer
+ *  than 32), so a full-name comparison would miss them and a password would cross as
+ *  ordinary text. In that case the bridge must take the
+ *  conservative direction -- e.g. set this bit on every list that names 13 -- and count
+ *  each list it judged that way. */
+#define CRDPQ_CLIP_FLAG_OFFERS_UNICODETEXT 0x00000001u
+#define CRDPQ_CLIP_FLAG_REMOTE_EXCLUDED 0x00000002u
+
+/** What a `crdpq_clip_ref_t.status` says about the bytes it refers to. Stored in that struct
+ *  as a `uint32_t`, not as this enum type, so the field's width does not depend on how a
+ *  compiler sizes an enum. Values are fixed; new ones append. */
+typedef enum {
+    /** The bytes are in `crdpq_clip_store_t` under (`storeGeneration`, the kind's direction,
+     *  `sequence`), `byteCount` of them. The consumer must take or discard them -- even when it
+     *  goes on to drop the text -- or they occupy one of the direction's slots until the next
+     *  `crdpq_clip_store_clear`. */
+    CRDPQ_CLIP_STATUS_OK = 0,
+    /** No bytes anywhere. On CLIP_REMOTE_DATA: the server answered CB_RESPONSE_FAIL. On
+     *  CLIP_RESPOND: the consumer (T_rdp) must answer the server with CB_RESPONSE_FAIL. */
+    CRDPQ_CLIP_STATUS_FAILED = 1,
+    /** CLIP_REMOTE_DATA only: the server answered OK but the bytes are not in the store,
+     *  because `crdpq_clip_store_put` refused them. This is also the status of S6's first
+     *  check, the over-limit response T_clip must not copy: T_clip does not compare against
+     *  the limit itself, because the store's block limit IS the S6 limit (the bridge creates
+     *  the store from the Swift layer's one constant), so a put refused with
+     *  CRDPQ_CLIP_ERR_BLOCK_TOO_LARGE is that check, made before anything is allocated.
+     *  Deliberately not renamed "too large": a full slot table, the total limit, a stale
+     *  generation or a failed allocation end here too, and a name that claimed "over the limit"
+     *  would be wrong for those. `byteCount` stays the length on the wire, so T_main tells the
+     *  over-limit case apart by comparing it against the limit -- S6's second check. */
+    CRDPQ_CLIP_STATUS_NOT_STORED = 2,
+} crdpq_clip_status_t;
+
+/** Clipboard T1 (adr/0026, PROPOSED; owner rulings D1/D2/D4 of 2026-11-17): the ONE payload
+ *  shape all four clipboard event kinds and all three clipboard command kinds carry. Six
+ *  scalars and deliberately no clipboard content: the text is the only sensitive thing in
+ *  this feature, so it never rides in a control-lane or outbound-lane slot. It lives in
+ *  `crdpq_clip_store_t` (below) and this struct is the reference into it -- the same
+ *  "the event carries a reference" split `crdpq_notify_icon_t.iconSlot` makes for icon
+ *  pixels (adr/0013 §1). Even content that were not sensitive could not ride here: the T1
+ *  limit is 4 MiB per direction, thousands of times this union's largest member.
+ *
+ *  Field use per kind (a field a kind does not use is 0). Every event is posted on T_clip,
+ *  which decides nothing; every command is posted on T_main and sent on T_rdp:
+ *   - CRDPQ_EVENT_CLIP_READY (on the server's Monitor Ready, after T_clip has sent Client
+ *     Capabilities): `storeGeneration` only -- the `crdpq_clip_store_generation` value this
+ *     channel connection captured when it came up and stamps on everything it stores. T_main
+ *     answers it with the initial CRDPQ_CMD_CLIP_ANNOUNCE (S2 (a)).
+ *   - CRDPQ_EVENT_CLIP_REMOTE_FORMATS (on a server Format List, after T_clip has sent the
+ *     successful Format List Response): `storeGeneration`; `flags` =
+ *     CRDPQ_CLIP_FLAG_OFFERS_UNICODETEXT if the list names 13, ORed with
+ *     CRDPQ_CLIP_FLAG_REMOTE_EXCLUDED if it names an exclusion format (both described at the
+ *     flags). Those two bits are all T1 needs from a list; the list itself, format names
+ *     included (S9), never leaves T_clip. `formatId` is unused (0).
+ *   - CRDPQ_EVENT_CLIP_REMOTE_DATA (on a Format Data Response): `storeGeneration`;
+ *     `sequence` = the key (direction CRDPQ_CLIP_REMOTE_TO_LOCAL) the bytes were put under,
+ *     a RESPONSE NUMBER T_clip assigns itself: a per-connection counter only T_clip touches,
+ *     advanced once per response, wrapping. It is not T_main's clipboard generation (T_clip
+ *     never sees that), it does not say which request the response answers (the wire does
+ *     not say either), and it decides nothing: it only keeps two responses that are in the
+ *     store at the same time -- an unsolicited one behind an expected one, say -- apart under
+ *     two keys. It must be unique within one STORE generation, which is not always one
+ *     channel instance: see `crdpq_clip_store_put` (a reused key is refused with
+ *     CRDPQ_CLIP_ERR_KEY_IN_USE, and the producer then posts NOT_STORED like for any other
+ *     refusal). `byteCount` = the response's length on the wire (0 for a failure);
+ *     `status` = OK, FAILED or NOT_STORED. `formatId` is unused: the wire's response names
+ *     no format, and T_main knows what it asked for.
+ *   - CRDPQ_EVENT_CLIP_DATA_REQUEST (on a server Format Data Request): `storeGeneration`;
+ *     `formatId` = whatever format the server asked for (T_main refuses all but 13).
+ *   - CRDPQ_CMD_CLIP_ANNOUNCE: `formatId` only -- 13 = send a Format List naming
+ *     CF_UNICODETEXT; CRDPQ_CLIP_NO_FORMAT = send an EMPTY Format List (only ever as the
+ *     initial list, S2 (a)).
+ *   - CRDPQ_CMD_CLIP_REQUEST: `formatId` only (13) -- send one Format Data Request. T_main
+ *     posts it exactly when its state machine says so, which is never while another request
+ *     is still unanswered (S5).
+ *   - CRDPQ_CMD_CLIP_RESPOND: `storeGeneration`; `sequence` = the key (direction
+ *     CRDPQ_CLIP_LOCAL_TO_REMOTE) T_main chose for its put -- any number unique among
+ *     T_main's own live answers in the current store generation (never a constant: a reused
+ *     live key is refused, see `crdpq_clip_store_put`), a counter T_main keeps being the
+ *     obvious choice; `formatId` = the format the request asked for; `byteCount`; `status`
+ *     (OK or FAILED). One RESPOND
+ *     per DATA_REQUEST, in the requests' order (the wire's response carries no request id,
+ *     so the server pairs answers with requests purely by order; the FIFO outbound lane
+ *     keeps it) -- EXCEPT when T_main's decision is "no answer" (S3 rule 0, Mac -> Windows
+ *     not allowed). Then T_main posts nothing at all: in that mode the channel has already
+ *     answered the server with a failure on its own, and a second answer would trip the
+ *     channel's assertion and abort the process.
+ *
+ *  `storeGeneration` is the clip store's own counter, NOT the session generation
+ *  `CrdpEvent.generation` carries (that one is stamped by `crdpq_post`; this one is stamped by
+ *  the producer from `crdpq_clip_store_generation`), and NOT T_main's clipboard generation of
+ *  S4/S5 either (that one lives in the Swift layer and never crosses a lane). The first two
+ *  exist on purpose: the session generation filters stale events at the drain entry point
+ *  (adr/0005 §3), the store generation makes the store itself refuse a stale key (see
+ *  `crdpq_clip_store_t`). */
+typedef struct {
+    uint32_t storeGeneration;
+    uint32_t sequence;
+    uint32_t formatId;
+    uint32_t byteCount;
+    uint32_t status; /* a crdpq_clip_status_t value */
+    uint32_t flags;  /* CRDPQ_CLIP_FLAG_* bits; appended last so the first five keep their offsets */
+} crdpq_clip_ref_t;
+
+/* adr/0008 §5's measure-don't-estimate discipline: six uint32_t, 4-byte alignment, no padding
+ * -- 24, MEASURED with clang/arm64 (semantics v3 appended `flags`; the assert was compiled at 0
+ * and clang reported "expression evaluates to '24 == 0'"; v2's five fields had measured 20).
+ * Still far under crdpq_window_order_t's 588 and under the outbound lane's 260-byte
+ * crdpq_cmd_execute_t, so neither union nor either envelope moves; that is re-asserted, not
+ * assumed, by the unchanged union/envelope asserts below. */
+_Static_assert(sizeof(crdpq_clip_ref_t) == 24, "crdpq_clip_ref_t layout changed -- re-measure and audit consumers (adr/0008 §5 / adr/0026)");
+
 typedef union {
     crdpq_window_order_t windowOrder;   /* WINDOW_CREATE, WINDOW_UPDATE */
     crdpq_window_id_t windowId;         /* WINDOW_DELETE, WINDOW_ICON */
@@ -569,6 +759,7 @@ typedef union {
     crdpq_local_move_size_t localMoveSize;   /* CRDPQ_EVENT_LOCAL_MOVE_SIZE */
     crdpq_min_max_info_t minMaxInfo;         /* CRDPQ_EVENT_MIN_MAX_INFO */
     crdpq_zorder_sync_t zorderSync;          /* CRDPQ_EVENT_ZORDER_SYNC */
+    crdpq_clip_ref_t clip;                   /* CRDPQ_EVENT_CLIP_READY / _REMOTE_FORMATS / _REMOTE_DATA / _DATA_REQUEST */
     /* CRDPQ_EVENT_DISCONNECTED carries no payload — the envelope's `generation` field
      * (the generation *as of the disconnect*, per adr/0005 §4 step 3: "post
      * DISCONNECTED(gen)") is everything a consumer needs. */
@@ -704,7 +895,8 @@ uint64_t crdpq_seal_rejected_count(const crdpq_control_t* q);
 
 /* ==================================================================================== *
  * Notify-icon pixel side-store + DIB->RGBA conversion (adr/0013) — the fourth primitive,
- * and the only one that is not itself a lane: it is the bounded side storage the control
+ * and the first that is not itself a lane (`crdpq_clip_store`, further below, is the
+ * second): it is the bounded side storage the control
  * lane's `crdpq_notify_icon_t.iconSlot` refers into (adr/0013 §1). Pixels never ride in a
  * control slot; the event carries a reference, exactly like the frames lane keeps GFX
  * pixels out of the control lane.
@@ -912,6 +1104,259 @@ size_t crdpq_icon_store_refusal_count(const crdpq_icon_store_t* s, crdpq_icon_co
 size_t crdpq_icon_store_oversize_count(const crdpq_icon_store_t* s);
 
 /* ==================================================================================== *
+ * Clipboard byte side-store (adr/0026, PROPOSED) — the fifth primitive and the second side
+ * store: where the bytes a `crdpq_clip_ref_t` refers to actually live. Shaped after
+ * `crdpq_icon_store` (one mutex, fixed slot table, cumulative refusal counters), with three
+ * deliberate differences, each forced by what the bytes are:
+ *   - one-shot, not state: a block is taken exactly once and the take removes it. An icon is
+ *     re-read for as long as the tray icon lives; a clipboard text is delivered once.
+ *   - its own generation: `crdpq_clip_store_clear` bumps it, and every put/take/discard must
+ *     present the generation it was issued under. A reconnect clears the store, so an event
+ *     or command left over from the old session can never take the new session's bytes, and
+ *     a late producer of the old session can never plant bytes in the new one.
+ *   - wiped: every byte the store ever held is overwritten with zeros before its memory is
+ *     released or reused -- clipboard text is the most sensitive data this client moves.
+ * ==================================================================================== */
+
+/** Which half of the store a block lives in. The halves never share a slot or a key space,
+ *  so an inbound text and an outbound answer that happen to use the same number can never
+ *  overwrite each other. */
+typedef enum {
+    /** Windows -> Mac. Put on T_clip (before CRDPQ_EVENT_CLIP_REMOTE_DATA is posted), taken on
+     *  T_main (after that event is drained). Key: the response number T_clip assigns and the
+     *  event repeats in `sequence` (see `crdpq_clip_ref_t`). */
+    CRDPQ_CLIP_REMOTE_TO_LOCAL = 0,
+    /** Mac -> Windows. Put on T_main (before CRDPQ_CMD_CLIP_RESPOND is posted), taken on T_rdp
+     *  (after that command is drained). Key: a number T_main chooses for the answer and the
+     *  command repeats in `sequence` (see `crdpq_clip_ref_t`). */
+    CRDPQ_CLIP_LOCAL_TO_REMOTE = 1,
+} crdpq_clip_direction_t;
+
+/** Live blocks each direction may hold at once. Windows -> Mac: T_main never has more than
+ *  one request in flight (S5) and takes or discards every response's block when it drains
+ *  the event, so one slot carries the expected flow; the other three absorb responses nobody
+ *  asked for (each gets its own key, see CRDPQ_EVENT_CLIP_REMOTE_DATA) that arrive before
+ *  T_main has drained. Mac -> Windows: one block per answered Format Data Request -- one at a
+ *  time in the expected flow, though that is not verified against a live host -- and the
+ *  spare slots absorb a T_rdp that is a few drains behind (a second request answered before
+ *  T_rdp took the first answer, say) without refusing anything. A consumer that never takes
+ *  its blocks fills the four and every later put is refused with CRDPQ_CLIP_ERR_SLOTS_FULL --
+ *  the bound that keeps a forgotten take from becoming unbounded memory. */
+#define CRDPQ_CLIP_SLOTS_PER_DIRECTION 4
+
+/** Outcome of a put/take/discard. Every non-OK value returned for a non-NULL store is also
+ *  counted, by cause, in `crdpq_clip_store_refusal_count`. Values are fixed; new causes go
+ *  ABOVE the anchor below. */
+typedef enum {
+    CRDPQ_CLIP_OK = 0,
+    /** NULL store or pointer, a non-zero length with no buffer, or an unknown direction. A
+     *  caller bug, not server input. Not countable when the store itself is NULL. */
+    CRDPQ_CLIP_ERR_ARGUMENT,
+    /** The caller's generation is not the store's current one: the caller belongs to a session
+     *  the store has since been cleared for (or to one it has not reached yet). */
+    CRDPQ_CLIP_ERR_STALE_GENERATION,
+    /** take/discard: no live block under (direction, key). Already taken, discarded, never put,
+     *  or released by a clear. */
+    CRDPQ_CLIP_ERR_NOT_FOUND,
+    /** put: the block is longer than the store's per-block limit. Refused before any memory is
+     *  allocated, so an over-limit request costs nothing. */
+    CRDPQ_CLIP_ERR_BLOCK_TOO_LARGE,
+    /** put: storing the block would take the store's live bytes, both directions together, over
+     *  its total limit. */
+    CRDPQ_CLIP_ERR_TOTAL_TOO_LARGE,
+    /** put: the key is new and the direction already holds CRDPQ_CLIP_SLOTS_PER_DIRECTION
+     *  blocks. */
+    CRDPQ_CLIP_ERR_SLOTS_FULL,
+    /** take: `dst_capacity` is smaller than the block. The block stays in the store and
+     *  `*out_length` reports the capacity needed, so the caller can retry. */
+    CRDPQ_CLIP_ERR_BUFFER_TOO_SMALL,
+    /** put: (`direction`, `key`) already holds a block nobody has taken or discarded yet. A
+     *  CALLER ERROR -- two producers handed out the same key within one store generation --
+     *  refused rather than resolved: the live block stays exactly as it was, the new bytes are
+     *  wiped and dropped. See `crdpq_clip_store_put` for why the store never replaces one. */
+    CRDPQ_CLIP_ERR_KEY_IN_USE,
+    /** put: the store could not allocate its copy of the block.
+     *  MAINTENANCE ANCHOR, same contract as CRDPQ_ICON_ERR_DEST: this must stay the LAST
+     *  member -- crdpq_clip.c sizes its per-cause counter array by it and both range guards
+     *  compare against it. A cause appended after it would silently go uncounted. */
+    CRDPQ_CLIP_ERR_NO_MEMORY,
+} crdpq_clip_result_t;
+
+/** Fixed table of 2 x `CRDPQ_CLIP_SLOTS_PER_DIRECTION` slots, each holding at most one
+ *  heap block the store allocated itself (a copy: the store never keeps a caller's pointer).
+ *
+ *  DELIBERATELY A PLAIN pthread_mutex, for the reason `crdpq_icon_store_t` gives: clipboard
+ *  traffic is a handful of blocks per user copy, a frequency indistinguishable from zero next
+ *  to the frames lane, so a lock-free design would be pure liability. The mutex covers only
+ *  the slot bookkeeping; copying bytes in, copying them out, wiping and freeing all happen
+ *  outside it on memory no other thread can reach at that moment.
+ *
+ *  THREADING (adr/0026 and the adr/0005 addendum, both PROPOSED -- see the top of this
+ *  header):
+ *   - Windows -> Mac. Writer: T_clip, the cliprdr channel's own message thread, calls
+ *     `crdpq_clip_store_put(..., CRDPQ_CLIP_REMOTE_TO_LOCAL, responseNumber, ...)` inside its
+ *     Format Data Response callback, THEN posts CRDPQ_EVENT_CLIP_REMOTE_DATA with the same
+ *     generation, and the response number in `sequence`, on crdpq_control (status
+ *     NOT_STORED, and no block anywhere, when the put was refused). Reader: T_main calls
+ *     `crdpq_clip_store_take` (or `_discard`, for a response its state machine drops before
+ *     needing the bytes) after crdpq_drain has handed it that event. Happens-before: the control
+ *     lane's own post-side critical section and drain-side swap (adr/0005 §1), exactly the
+ *     edge `crdpq_icon_store_t` relies on -- "put before post" plus "take after drain" is
+ *     already a totally ordered pair.
+ *   - Mac -> Windows. Writer: T_main calls `crdpq_clip_store_put(...,
+ *     CRDPQ_CLIP_LOCAL_TO_REMOTE, answerKey, ...)` while handling a drained
+ *     CRDPQ_EVENT_CLIP_DATA_REQUEST it decided to answer with data, THEN posts
+ *     CRDPQ_CMD_CLIP_RESPOND, with that key in `sequence`, on crdpq_outbound.
+ *     Reader: T_rdp calls `crdpq_clip_store_take` after crdpq_outbound_drain has handed it
+ *     that command. Happens-before: the outbound lane's post/drain, mirrored (adr/0005 §3).
+ *   - Clear: T_main, in the session teardown that already clears the icon store and bumps
+ *     the session generation (adr/0005 §4). By then T_clip and T_rdp have been joined in the
+ *     normal path; the store generation is what keeps an abnormal path (a producer still
+ *     running, an event still queued) harmless rather than racy: a put or take presenting the
+ *     old generation is refused and counted, whichever side of the clear it lands on.
+ *   - A producer whose post fails after a successful put (sealed or full lane) must
+ *     `crdpq_clip_store_discard` the block itself: nobody else will ever be told it exists.
+ *   - The mutex makes the slot table consistent under any interleaving of the calls above;
+ *     it is not what orders a put before its take -- the lanes are.
+ *
+ *  LIFECYCLE OF AN ENTRY (S0 of the T1 semantics, v3). The point: no outcome may leave a block
+ *  behind, because a block left behind holds a slot and part of the total limit until the
+ *  next clear, and a few of them stop every later put.
+ *   - Windows -> Mac. T_clip puts the block before it posts CRDPQ_EVENT_CLIP_REMOTE_DATA. T_main,
+ *     for EVERY such event drained with status OK -- whether the text is then written or
+ *     dropped, and on every path, including one that drops the event before it reaches the
+ *     clipboard state machine -- first removes the block: `crdpq_clip_store_take` into its own
+ *     buffer, or `crdpq_clip_store_discard` when it already knows the response will be dropped
+ *     (the Swift layer's `expectsRemoteData` is false). Both remove it. Only then does it hand
+ *     the Swift layer the bytes it took, or "unavailable" (`successWithoutBytes`) when it
+ *     discarded, when the take failed, or when the status was NOT_STORED.
+ *   - When the block is not stored (any put refusal: over the block limit, the total limit, no
+ *     free slot, a key still in use), T_clip copies nothing and posts the event with status
+ *     NOT_STORED and the length on the wire in `byteCount`; the store has counted the refusal
+ *     by cause. A KEY_IN_USE refusal leaves the block already under that key untouched: it
+ *     still belongs to the earlier event, which removes it as usual.
+ *   - Mac -> Windows. T_main puts the block before it posts CRDPQ_CMD_CLIP_RESPOND. T_rdp takes
+ *     it when it handles the command (copying it out to call the channel's response function,
+ *     and wiping its own copy once that call has returned), or, when it drops the command
+ *     instead of sending it (lane sealed, channel gone, any other drop path), discards it.
+ *
+ *  THREE DROPS THAT STALL WINDOWS -> MAC (the bridge must count each one on its own). T_main
+ *  keeps at most one data request on the wire and never gives up on it (S5), so losing either
+ *  half of one round trip leaves Windows -> Mac waiting until the next CRDPQ_EVENT_CLIP_READY
+ *  (which clears the request in flight) or the next connection:
+ *   1. T_clip fails to post CRDPQ_EVENT_CLIP_REMOTE_DATA (control lane sealed or full) -- it
+ *      discards its block as above, and the answer is lost;
+ *   2. T_main fails to post CRDPQ_CMD_CLIP_REQUEST (outbound lane sealed or full) -- the
+ *      Swift layer already counts that request as in flight;
+ *   3. T_rdp drops a CRDPQ_CMD_CLIP_REQUEST instead of sending it (for instance a "RAIL not
+ *      connected" drop that does not route clipboard commands first, see
+ *      `crdpq_command_type_t`).
+ *
+ *  The two limits are given at creation, not compiled in: the S6 limit of the clipboard
+ *  design (4 MiB of UTF-16LE including the terminating NUL) is owned by the Swift layer's
+ *  single named constant, and the bridge passes it down, so the number exists in one place. */
+typedef struct crdpq_clip_store crdpq_clip_store_t;
+
+/** Creates an empty store at generation 0. `max_block_bytes` bounds any one block; a
+ *  `max_total_bytes` below it is raised to it (a store that could never hold its own largest
+ *  block is meaningless) -- the bridge's sensible choice is `2 * max_block_bytes`, one
+ *  full-size block per direction. Returns NULL only on allocation or mutex-init failure. */
+crdpq_clip_store_t* crdpq_clip_store_create(size_t max_block_bytes, size_t max_total_bytes);
+
+/** Wipes and frees every live block, then the store. NULL is a no-op. */
+void crdpq_clip_store_destroy(crdpq_clip_store_t* s);
+
+/** The current generation, to be captured by a producer when its channel connects and
+ *  presented on every later put/take/discard. 0 for a NULL store. */
+uint32_t crdpq_clip_store_generation(const crdpq_clip_store_t* s);
+
+/** Wipes and releases every live block in both directions and increments the generation;
+ *  returns the new generation. The refusal counters are NOT reset: they are cumulative for
+ *  the store's lifetime, the contract every other counter in this header already has. */
+uint32_t crdpq_clip_store_clear(crdpq_clip_store_t* s);
+
+/** Copies `bytes[0..length)` into a fresh block stored under (`direction`, `key`). `length`
+ *  may be 0: an empty block is a legal value -- the server can answer with zero bytes, and
+ *  judging that is the Swift layer's job, not the store's.
+ *
+ *  KEYS ARE UNIQUE WITHIN ONE STORE GENERATION, per direction: a key may be put again only
+ *  after its block has been taken or discarded (or cleared away). A put under a key that still
+ *  holds a block is a caller error and is REFUSED with CRDPQ_CLIP_ERR_KEY_IN_USE -- never an
+ *  upsert, unlike `crdpq_icon_store_put`. An icon has a newer version that should win; a
+ *  one-shot block has none, and a silent replacement would hand the event that announced the
+ *  first block the second block's bytes (and leave the second event NOT_FOUND). Refusing
+ *  keeps the first block intact for the event that refers to it and makes the collision
+ *  visible in the counters.
+ *  FOR THE BRIDGE: the Windows -> Mac key is T_clip's per-connection response counter (see
+ *  CRDPQ_EVENT_CLIP_REMOTE_DATA in `crdpq_clip_ref_t`). If the cliprdr channel is reloaded
+ *  within one connection -- a server redirection reloads the channels in the same context
+ *  (adr/0005 addendum) -- the new channel instance starts its counter again while the store
+ *  is NOT cleared, so either clear the store when the channel is reloaded (the new instance
+ *  then captures the new generation), or make the counter follow the store generation
+ *  instead of the channel instance. The Mac -> Windows key T_main chooses must not be a
+ *  constant either ("only one answer at a time" is not guaranteed while T_rdp lags).
+ *
+ *  Checked in this order, first failure wins: arguments, `length` against the block limit
+ *  (before any allocation), allocation, then under the lock the generation, the key (already
+ *  live: KEY_IN_USE), the total limit, and a free slot. On any failure the store is unchanged
+ *  and the store's own copy, if one was made, is wiped and freed. */
+crdpq_clip_result_t crdpq_clip_store_put(crdpq_clip_store_t* s, uint32_t generation,
+                                         crdpq_clip_direction_t direction, uint32_t key,
+                                         const uint8_t* bytes, size_t length);
+
+/** Takes the block under (`direction`, `key`): copies it into caller-owned `dst`, removes it
+ *  from the store, and wipes and frees the store's copy. One-shot -- a second take of the
+ *  same key is CRDPQ_CLIP_ERR_NOT_FOUND. OWNERSHIP: the store never hands out its own
+ *  memory; after an OK return the only copy left is the caller's, and wiping that
+ *  (`crdpq_clip_wipe`) when done with it is the caller's job.
+ *
+ *  `dst` may be NULL only when `dst_capacity` is 0 (which takes a zero-length block).
+ *  `out_length` may be NULL. On OK it receives the block's length; on
+ *  CRDPQ_CLIP_ERR_BUFFER_TOO_SMALL the length needed, with the block left in place; on any
+ *  other failure 0. */
+crdpq_clip_result_t crdpq_clip_store_take(crdpq_clip_store_t* s, uint32_t generation,
+                                          crdpq_clip_direction_t direction, uint32_t key,
+                                          uint8_t* dst, size_t dst_capacity, size_t* out_length);
+
+/** Removes, wipes and frees the block under (`direction`, `key`) without copying it out: for
+ *  a consumer that has already decided to drop it, and for a producer whose post failed. */
+crdpq_clip_result_t crdpq_clip_store_discard(crdpq_clip_store_t* s, uint32_t generation,
+                                             crdpq_clip_direction_t direction, uint32_t key);
+
+/** Cumulative number of calls that returned exactly `rc`; 0 for CRDPQ_CLIP_OK, an
+ *  out-of-range code, or a NULL store. Survives `crdpq_clip_store_clear`. */
+size_t crdpq_clip_store_refusal_count(const crdpq_clip_store_t* s, crdpq_clip_result_t rc);
+
+/** Live blocks in `direction` (0 for an unknown direction). Diagnostics/tests only. */
+size_t crdpq_clip_store_live_count(const crdpq_clip_store_t* s, crdpq_clip_direction_t direction);
+
+/** Sum of the lengths of every live block, both directions. Diagnostics/tests only. */
+size_t crdpq_clip_store_live_bytes(const crdpq_clip_store_t* s);
+
+/** Overwrites `p[0..n)` with zeros in a way the compiler may not remove. A plain memset of
+ *  memory that is never read again is a dead store, and the optimizer is allowed to delete
+ *  it. Measured with this toolchain's clang (Apple clang 2100.4, arm64): at -O1 and above a
+ *  memset of a stack buffer after its last use IS deleted, while a memset immediately
+ *  before free() is currently kept -- kept only because of what this optimizer version
+ *  happens to prove about free(), not because anything requires it. An "erase then free"
+ *  must not rest on that, so this uses C11 Annex K `memset_s`, whose specification
+ *  (K.3.7.4.1) requires the write to be performed as if the memory might be read later.
+ *  Exposed so a caller can wipe its own copy of a taken block (a stack buffer included) the
+ *  same way. NULL or 0 is a no-op. */
+void crdpq_clip_wipe(void* p, size_t n);
+
+/** Test hook, never set in production: called once for every block the store releases --
+ *  taken, discarded, cleared, destroyed, or its own copy of a refused put -- after
+ *  the block has been wiped and before it is freed, with the block's address and length.
+ *  Outside the store's lock, on the releasing thread. It exists so a test can assert that
+ *  the wipe happened (a deleted wipe is otherwise unobservable: the memory is freed right
+ *  after). It sees only zeros by construction, so it cannot be used to read content. Not
+ *  called for zero-length blocks, which own no memory. Pass NULL to remove. */
+typedef void (*crdpq_clip_release_observer_fn)(const uint8_t* bytes, size_t length, void* ctx);
+void crdpq_clip_store_set_release_observer(crdpq_clip_store_t* s, crdpq_clip_release_observer_fn observer,
+                                           void* ctx);
+
+/* ==================================================================================== *
  * Frame lane (crdpq_frames) — GFX frames are state, not events: last-writer-wins per
  * surfaceId, never queued (adr/0005 §1). A sparse open-addressed table keyed by
  * surfaceId, since observed surfaceId values are small and dense in practice but the
@@ -987,6 +1432,17 @@ typedef enum {
      *  (adr/0008 §5's append-only rule, applied to this enum exactly as it is to the
      *  inbound one) so no existing command type's numeric value moves. */
     CRDPQ_CMD_NOTIFY_EVENT,
+    /** adr/0026 (PROPOSED) clipboard T1, appended at the END for the same reason (6, 7, 8).
+     *  All three are posted by T_main, whose state machine alone decides them (S0), and carry
+     *  a `crdpq_clip_ref_t` (see it for the fields): ANNOUNCE asks T_rdp to send a Format List
+     *  naming CF_UNICODETEXT, or an empty one; REQUEST asks it to send one Format Data Request
+     *  for CF_UNICODETEXT; RESPOND asks it to answer one server Format Data Request with the
+     *  bytes the store holds for it, or with CB_RESPONSE_FAIL. Unlike every other command
+     *  here, none of them goes through RAIL -- a consumer that drops commands while RAIL is
+     *  not connected must route these three before that check. */
+    CRDPQ_CMD_CLIP_ANNOUNCE,
+    CRDPQ_CMD_CLIP_REQUEST,
+    CRDPQ_CMD_CLIP_RESPOND,
 } crdpq_command_type_t;
 
 /** ClientExecute (launching/re-launching the RemoteApp program).
@@ -1174,6 +1630,7 @@ typedef union {
     crdpq_cmd_sys_command_t sysCommand;
     crdpq_cmd_input_t input;
     crdpq_cmd_notify_event_t notifyEvent;
+    crdpq_clip_ref_t clip; /* CRDPQ_CMD_CLIP_ANNOUNCE / _REQUEST / _RESPOND (24B, under execute's 260B) */
 } crdpq_command_payload_t;
 
 /** No generation field, deliberately: outbound commands don't carry the same
