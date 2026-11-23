@@ -82,7 +82,7 @@ final class AppLauncher {
         let ticket: any ReconnectClockTicket
     }
 
-    private static let logger = DiagnosticLogger(subsystem: "dev.haru.macdows", category: "Launch")
+    private static let logger = DiagnosticLogger(subsystem: "es.4sh.macdows", category: "Launch")
 
     /// The App's state, read on every launch.
     var reading: () -> Reading = { .noSession }

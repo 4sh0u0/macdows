@@ -201,7 +201,7 @@ struct StartPanelSourcePinTests {
             #expect(body.wholeMatch(of: allowed) != nil, "a log interpolates \(body)")
         }
         let launcher = pinCode(try pinSource("App/SessionControl/AppLauncher.swift"))
-        #expect(pinCount("DiagnosticLogger(subsystem: \"dev.haru.macdows\", category: \"Launch\")", launcher) == 1)
+        #expect(pinCount("DiagnosticLogger(subsystem: \"es.4sh.macdows\", category: \"Launch\")", launcher) == 1)
         let registry = pinCode(try pinSource("App/RemoteWindowRendering/RemoteWindowRegistry.swift"))
         let branch = try #require(registry.range(of: "case .execResult:"))
         let next = try #require(registry.range(of: "case .windowIcon, .handshakeFlags:", range: branch.upperBound..<registry.endIndex))

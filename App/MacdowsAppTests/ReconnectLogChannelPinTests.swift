@@ -110,7 +110,7 @@ struct ReconnectLogChannelPinTests {
         #expect(occurrences(of: "privacy: .public", in: stripped) == 1)
         // UI slice ③: the logger is a `DiagnosticLogger`, which forwards to an `os.Logger` with the
         // same subsystem and category (`DiagnosticPipelineTests` pins the forwarding).
-        #expect(occurrences(of: "DiagnosticLogger(subsystem: \"dev.haru.macdows\", category: \"Reconnect\")",
+        #expect(occurrences(of: "DiagnosticLogger(subsystem: \"es.4sh.macdows\", category: \"Reconnect\")",
                             in: stripped) == 1,
                 "the predicate a `log show` export will filter on")
     }

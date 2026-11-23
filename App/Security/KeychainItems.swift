@@ -111,9 +111,10 @@ enum KeychainItems {
         "Macdows — \(displayName)"
     }
 
-    /// `<bundle-id>.<suffix>`; the bundle id falls back to the App's when there is none (tools).
+    /// `<bundle-id>.<suffix>`. No target in this repository runs this without a bundle id; one that
+    /// did would use the development build's id, never the Release build's.
     static func service(suffix: String) -> String {
-        "\(Bundle.main.bundleIdentifier ?? "dev.haru.macdows").\(suffix)"
+        "\(Bundle.main.bundleIdentifier ?? "es.4sh.macdows.dev").\(suffix)"
     }
 }
 
@@ -126,7 +127,7 @@ enum KeychainItems {
 /// suspended (it holds no thread), the blocked call holds this queue's own thread, and the calls
 /// run one at a time -- so at most one prompt is ever on screen, in the order the user caused them.
 enum KeychainQueue {
-    static let queue = DispatchQueue(label: "dev.haru.macdows.keychain", qos: .userInitiated)
+    static let queue = DispatchQueue(label: "es.4sh.macdows.keychain", qos: .userInitiated)
 
     /// Runs `body` on `queue` and resumes the caller with its result.
     static func run<T: Sendable>(_ body: @escaping @Sendable () -> T) async -> T {

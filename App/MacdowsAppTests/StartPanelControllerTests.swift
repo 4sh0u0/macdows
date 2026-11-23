@@ -53,7 +53,7 @@ struct StartPanelControllerTests {
     static let host = HostID()
 
     static func preferences() -> StartPanelPreferences {
-        let suite = "dev.haru.macdows.tests.startpanel.\(UUID().uuidString)"
+        let suite = "es.4sh.macdows.tests.startpanel.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
         return StartPanelPreferences(defaults: defaults, trustReader: { false }, trustPrompter: {}, opener: { _ in }, observesActivation: false)
@@ -809,7 +809,7 @@ struct StartPanelControllerTests {
 struct StartPanelPreferencesTests {
     @Test("one key, false by default; switching on prompts once; declining keeps it on with the hint; off prompts nothing")
     func preference() {
-        let suite = "dev.haru.macdows.tests.preferences.\(UUID().uuidString)"
+        let suite = "es.4sh.macdows.tests.preferences.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         var trusted = false

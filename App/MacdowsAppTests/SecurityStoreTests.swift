@@ -243,8 +243,8 @@ struct KeychainSmokeTests {
     @Test("credential and pin items: write, read, classify a missing item, delete")
     func roundTrip() throws {
         let run = UUID().uuidString
-        let credentials = KeychainCredentialStore(service: "dev.haru.macdows.apptests.\(run).rdp.test")
-        let pins = KeychainPinStore(service: "dev.haru.macdows.apptests.\(run).cert-pin.test")
+        let credentials = KeychainCredentialStore(service: "es.4sh.macdows.dev.apptests.\(run).rdp.test")
+        let pins = KeychainPinStore(service: "es.4sh.macdows.dev.apptests.\(run).cert-pin.test")
         let host = HostID()
         defer {
             try? credentials.delete(for: host)

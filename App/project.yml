@@ -38,7 +38,8 @@ settings:
     # (macOS TCC permission grants are keyed to it) supply CODE_SIGN_IDENTITY and
     # DEVELOPMENT_TEAM via the untracked `project-local.yml` overlay — see the
     # include at the top of this file. (The identity must NOT be set here: the main
-    # spec always overrides included specs, so a value here would defeat the overlay.)
+    # spec wins over an included one on the same layer and key, so a value here would defeat
+    # the overlay.)
     CODE_SIGN_STYLE: Manual
     ENABLE_HARDENED_RUNTIME: YES
 
@@ -111,7 +112,15 @@ targets:
     settings:
       base:
         PRODUCT_NAME: Macdows
-        PRODUCT_BUNDLE_IDENTIFIER: dev.haru.macdows.dev
+        # The development build's id. It sits in `base` so that every configuration other than
+        # Release (including any added later) gets it; Release overrides it under
+        # `settings.configs` below. The configuration set (Debug and Release) is pinned by
+        # `BundleIdentityPinTests`; adding a configuration means changing that pin too.
+        PRODUCT_BUNDLE_IDENTIFIER: es.4sh.macdows.dev
+        # The one source of the version and the build number: Macdows/Info.plist references both.
+        # Read a built App's version from the Info.plist inside the product, not from this file.
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
         # A hand-authored file, referenced directly rather than through XcodeGen's
         # `info:` key — that key *generates* (overwrites) a plist at the given path
         # rather than using an existing one as-is.
@@ -166,6 +175,8 @@ targets:
           # key. The latter is silently ignored by XcodeGen for targets (verified with
           # `xcodebuild -showBuildSettings`).
           CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+          # The Release configuration's bundle id (the development build's id is in `base`).
+          PRODUCT_BUNDLE_IDENTIFIER: es.4sh.macdows
     # Build FreeRDP (and its OpenSSL dependency) before compiling/linking. Both scripts
     # are idempotent — this is a fast no-op once .build/freerdp/current is populated for
     # the current submodule SHA + patch queue + flags, so re-running it on every build
@@ -489,7 +500,7 @@ targets:
       - path: UI
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.haru.macdows.dev.apptests
+        PRODUCT_BUNDLE_IDENTIFIER: es.4sh.macdows.dev.apptests
         # No hand-authored plist for a test bundle -- unlike the app target's (which carries
         # real usage-description keys), there is nothing to declare, so Xcode's generated one
         # is the correct source rather than a second tracked file.

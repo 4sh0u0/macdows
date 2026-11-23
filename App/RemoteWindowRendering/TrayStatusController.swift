@@ -152,7 +152,7 @@ final class TrayStatusController {
     /// server-chosen values is the same unbounded surface one indirection further out.
     static let maxObservedVersions = 16
 
-    private static let logger = Logger(subsystem: "dev.haru.macdows", category: "TrayStatusController")
+    private static let logger = Logger(subsystem: "es.4sh.macdows", category: "TrayStatusController")
 
     /// Menu-item icon edge length, in points (adr/0023 D-1 I-a: 16 pt, down from the 18 pt square
     /// a W6 `NSStatusItem` used -- a deliberate change, UI-1 spec §6.3). The remote bitmap arrives

@@ -67,10 +67,11 @@ final class HostRecordStore {
     /// Called after every change (the main window and the status item re-read).
     var onChange: (() -> Void)?
 
-    /// `~/Library/Application Support/<bundle-id>/hosts.json`.
+    /// `~/Library/Application Support/<bundle-id>/hosts.json`. No target in this repository runs this
+    /// without a bundle id; one that did would use the development build's id, never the Release build's.
     static func defaultFileURL() -> URL? {
         guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
-        let folder = Bundle.main.bundleIdentifier ?? "dev.haru.macdows"
+        let folder = Bundle.main.bundleIdentifier ?? "es.4sh.macdows.dev"
         return base.appendingPathComponent(folder, isDirectory: true).appendingPathComponent("hosts.json")
     }
 

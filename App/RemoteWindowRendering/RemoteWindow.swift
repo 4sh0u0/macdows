@@ -1245,7 +1245,7 @@ final class RemoteWindow {
     /// F-ja-3 diagnostics only: the debug lines before an end applies a rect (`end-apply`), on
     /// every `applyContentRectNow` (`apply-rect`), and when the first-frame gate clears
     /// (`first-frame`).
-    private static let logger = Logger(subsystem: "dev.haru.macdows", category: "RemoteWindowRendering")
+    private static let logger = Logger(subsystem: "es.4sh.macdows", category: "RemoteWindowRendering")
 
     private static func logEndApply(snapBack: Bool, gate: Bool, serverRect: Bool, dropped: Bool, frame: NSRect) {
         logger.debug(

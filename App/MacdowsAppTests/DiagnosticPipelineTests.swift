@@ -163,7 +163,7 @@ struct DiagnosticPipelineTests {
     @Test("DiagnosticLogger copies a line into the buffer as .app, tagged with its category, at the mapped level")
     func appLoggerWritesTheBuffer() {
         let buffer = DiagnosticLogBuffer(capacity: 10)
-        let logger = DiagnosticLogger(subsystem: "dev.haru.macdows.tests", category: "Connect", buffer: buffer)
+        let logger = DiagnosticLogger(subsystem: "es.4sh.macdows.tests", category: "Connect", buffer: buffer)
         let count = 3
         logger.notice("[connect] refused: no host selected (host records: \(count, privacy: .public))")
         logger.debug("never buffered")
@@ -180,7 +180,7 @@ struct DiagnosticPipelineTests {
     @Test("a value not marked public reaches the buffer as <private>, never as itself")
     func privateInterpolationIsRedactedInTheBuffer() {
         let buffer = DiagnosticLogBuffer(capacity: 10)
-        let logger = DiagnosticLogger(subsystem: "dev.haru.macdows.tests", category: "Connect", buffer: buffer)
+        let logger = DiagnosticLogger(subsystem: "es.4sh.macdows.tests", category: "Connect", buffer: buffer)
         let secretish = "fixture-value-not-public"
         logger.notice("[connect] a=\(secretish) b=\(7, privacy: .public)")
         let message: DiagnosticLogMessage = "x=\(secretish)"
@@ -201,9 +201,9 @@ struct DiagnosticPipelineTests {
 
     @Test("the App's own loggers outside the window code are DiagnosticLoggers, so their lines reach the buffer")
     func appLoggersAreConverted() throws {
-        #expect(try diagSource("App/UI/Connect/ConnectChain.swift").contains("static let log = DiagnosticLogger(subsystem: \"dev.haru.macdows\", category: \"Connect\")"))
-        #expect(try diagSource("App/SessionControl/ReconnectDriver.swift").contains("private static let logger = DiagnosticLogger(subsystem: \"dev.haru.macdows\", category: \"Reconnect\")"))
-        #expect(try diagSource("App/SessionControl/ShellAutolaunch.swift").contains("private static let logger = DiagnosticLogger(subsystem: \"dev.haru.macdows\", category: \"Autolaunch\")"))
+        #expect(try diagSource("App/UI/Connect/ConnectChain.swift").contains("static let log = DiagnosticLogger(subsystem: \"es.4sh.macdows\", category: \"Connect\")"))
+        #expect(try diagSource("App/SessionControl/ReconnectDriver.swift").contains("private static let logger = DiagnosticLogger(subsystem: \"es.4sh.macdows\", category: \"Reconnect\")"))
+        #expect(try diagSource("App/SessionControl/ShellAutolaunch.swift").contains("private static let logger = DiagnosticLogger(subsystem: \"es.4sh.macdows\", category: \"Autolaunch\")"))
         var scanned = 0
         for directory in ["App/UI", "App/SessionControl", "App/Security", "App/Macdows"] {
             let root = diagRepoRoot().appendingPathComponent(directory)

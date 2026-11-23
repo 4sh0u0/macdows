@@ -29,7 +29,7 @@ enum ConnectChain {
     /// The `[connect]` lines (ADR-0024 D-8 registers their shape). Never an address, an account or
     /// a secret. UI slice ③: `DiagnosticLogger` writes each line to the unified log as before and
     /// copies it into the diagnostics ring buffer the export reads.
-    static let log = DiagnosticLogger(subsystem: "dev.haru.macdows", category: "Connect")
+    static let log = DiagnosticLogger(subsystem: "es.4sh.macdows", category: "Connect")
 
     /// adr/0019 supplementary ruling RB-1: the one line for a connect that failed on a reconnect
     /// leg the driver started (`ReconnectDriver`'s step 1 is its only caller). The App's

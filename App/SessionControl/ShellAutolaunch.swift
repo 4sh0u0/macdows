@@ -266,7 +266,7 @@ enum ShellAutolaunch {
     /// log, timestamped, for a cross-check the stdout line cannot carry on its own. UI slice ③: a
     /// `DiagnosticLogger` (same `os.Logger` underneath; the buffer copy has no registered export
     /// shape, so an export only counts these lines).
-    private static let logger = DiagnosticLogger(subsystem: "dev.haru.macdows", category: "Autolaunch")
+    private static let logger = DiagnosticLogger(subsystem: "es.4sh.macdows", category: "Autolaunch")
 
     /// The fixed-shape anchor line for `which`, e.g. `[autolaunch] press=disconnect`. Split out
     /// from `notePress(_:)` below so its exact shape can be value-tested, the same reason

@@ -218,7 +218,7 @@ struct ConnectErrorRoutingTests {
         #expect(app.session.restartCount == 2)
 
         let buffer = DiagnosticLogBuffer(capacity: 10)
-        let logger = DiagnosticLogger(subsystem: "dev.haru.macdows.tests", category: "Connect", buffer: buffer)
+        let logger = DiagnosticLogger(subsystem: "es.4sh.macdows.tests", category: "Connect", buffer: buffer)
         let error = NSError(domain: "Macdows.CRSession", code: 65_537)
         ConnectChain.logLegFailure(error, as: ConnectFailureClass.classify(domain: error.domain, code: error.code),
                                    to: logger)
@@ -271,7 +271,7 @@ struct ConnectLegFailedLineTests {
     @Test("domain, code and class, nothing else, and the export passes it unchanged")
     func lineShape() {
         let buffer = DiagnosticLogBuffer(capacity: 10)
-        let logger = DiagnosticLogger(subsystem: "dev.haru.macdows.tests", category: "Connect", buffer: buffer)
+        let logger = DiagnosticLogger(subsystem: "es.4sh.macdows.tests", category: "Connect", buffer: buffer)
         let error = NSError(domain: "Macdows.CRSession", code: 131_080,
                             userInfo: [NSLocalizedDescriptionKey: "freerdp_connect failed: fixture description"])
         ConnectChain.logLegFailure(error, as: .transient, to: logger)
