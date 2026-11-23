@@ -80,8 +80,8 @@ path.
 ## Non-goals (v1)
 
 - Multi-user / multi-session hosts
-- RDP Wrapper, or anything beyond the single-session `TSAppAllowList` path Win11
-  Pro/Enterprise permits
+- RDP Wrapper, or anything beyond a single session on a Windows 11 Pro/Enterprise
+  host
 - Printing, drive redirection
 - Enterprise gateways or public-internet-exposure hardening
 
@@ -98,10 +98,32 @@ see Known issues above.)
 - A **Windows 11 Pro/Enterprise host you own**, with RDP enabled and a RemoteApp
   published (`TSAppAllowList` / `fAllowUnlistedRemotePrograms`)
 
-RemoteApp publishing on Windows client SKUs relies on a documented-but-not-officially-
-supported registry mechanism. You are responsible for your own Windows licensing
-compliance; multi-user commercial deployment requires Windows Server RDS with
-appropriate CALs — that scenario is explicitly out of scope for this project.
+### Windows licensing
+
+The Macdows app is a client only. It contains no Microsoft software, and neither
+this project nor its licence grants you any right to use Windows or any other
+Microsoft product.
+
+To use Macdows, the Windows host has to be configured to accept RemoteApp
+connections, which involves registry or policy settings. There is no user-facing setup
+guide or script; you configure the host yourself. As far as we could find, Microsoft
+does not document or support this setup on a standalone Windows 11 Pro or Enterprise
+PC; Microsoft documents RemoteApp hosting for Windows Server Remote Desktop Services
+and for Azure Virtual Desktop. A Windows update may change how these settings behave.
+
+Whether your use of Windows is permitted — including who connects to the host, from
+which devices, how many people use it at the same time, and the changes you make to
+its configuration — depends on the licence terms for your copy of Windows
+(preinstalled, retail, volume and subscription licences can differ; the terms for
+preinstalled copies of Windows 11 say they can be reviewed under
+Settings > System > About). Read the terms for your copy and, if in doubt, ask
+Microsoft or a qualified adviser.
+
+Macdows is designed for one person and one session at a time. If your Windows PC is
+seldom or never used in person, check what your licence terms say about in-person use
+and how long remote access may continue before relying on such a setup. Multi-user
+use, and providing Windows to other people as a service, are out of scope. Nothing in
+this repository is legal advice.
 
 ## Building
 
@@ -150,6 +172,9 @@ allow-list described under Known issues. Launch it via
 ## Legal
 
 - Licensed under **Apache-2.0** — see [`LICENSE`](LICENSE).
+- The Macdows app contains no Microsoft software, and neither this project nor its
+  licence grants any right to use Windows or any other Microsoft product; see
+  [Windows licensing](#windows-licensing).
 - Vendors **FreeRDP** (Apache-2.0) as a pinned git submodule (`ThirdParty/FreeRDP`,
   unmodified upstream source plus an external, upstream-linked patch queue).
 - [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) documents every third-party
@@ -170,8 +195,9 @@ allow-list described under Known issues. Launch it via
 
 ## Repository conventions
 
-- Commit style: `<type>: <summary>` (`feat` / `fix` / `docs` / `chore` / `refactor` /
-  `test` / `build` / `merge`); commit messages and code comments are in English.
+- Commit style: `<type>(<scope>): <summary>` (`feat` / `fix` / `docs` / `chore` /
+  `refactor` / `test` / `build` / `ci` / `merge`), where the scope is optional; commit
+  messages and code comments are in English.
 - No tracked file may ever contain real Windows host IPs/hostnames, RDP credentials,
   private-network addresses, or personal data — those live only in untracked local
   files. Any RAIL protocol capture sample must be sanitized before being committed.
