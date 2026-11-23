@@ -419,7 +419,7 @@ final class ReconnectDriver {
     /// UI slice ③: a `DiagnosticLogger`, which hands the same string to the same `os.Logger`
     /// (subsystem, category, level and privacy unchanged) and copies it into the diagnostics ring
     /// buffer, where ADR-0024 D-8 registers the `[reconnect]` shape for the export.
-    private static let logger = DiagnosticLogger(subsystem: "dev.haru.macdows", category: "Reconnect")
+    private static let logger = DiagnosticLogger(subsystem: "es.4sh.macdows", category: "Reconnect")
 
     private func transition(to next: State) {
         state = next
@@ -463,7 +463,7 @@ final class ReconnectDriver {
     ///  - the unified log is the only channel the GUI app has. `Macdows.app` is launched by Finder,
     ///    by Xcode's Run button or by `open`, none of which gives its stdout anywhere a later
     ///    reader can find, and the App is where a live-host reconnect run will actually happen.
-    ///    `log show --predicate 'subsystem == "dev.haru.macdows" AND category == "Reconnect"'`
+    ///    `log show --predicate 'subsystem == "es.4sh.macdows" AND category == "Reconnect"'`
     ///    exports these lines, and what it exports is this same frozen text.
     ///
     /// The `print` argument is therefore byte-for-byte what it was before the second channel

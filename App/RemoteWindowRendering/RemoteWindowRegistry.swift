@@ -508,7 +508,7 @@ final class RemoteWindowRegistry {
     /// window, so without an injected seam the delete path behaves exactly as before this lane.
     var isKeyWindow: (NSWindow) -> Bool = { $0.isKeyWindow }
 
-    private static let logger = Logger(subsystem: "dev.haru.macdows", category: "RemoteWindowRendering")
+    private static let logger = Logger(subsystem: "es.4sh.macdows", category: "RemoteWindowRendering")
     /// L1 (W4b review): logged once, not on every event, so a genuinely no-display
     /// environment doesn't spam this on every drained window order — the actual skip
     /// behavior in handleWindowOrder still applies every time regardless of this flag.

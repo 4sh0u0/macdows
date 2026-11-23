@@ -62,7 +62,7 @@ import os
 /// which is the defect `DisplayTopology.swift:206-213` describes, closed rather than relocated.
 @MainActor
 final class DisplayTopologyProvider: DisplayTopologyProviding {
-    private static let logger = Logger(subsystem: "dev.haru.macdows", category: "DisplayTopology")
+    private static let logger = Logger(subsystem: "es.4sh.macdows", category: "DisplayTopology")
 
     /// The payload of one screen-parameter change (ADR §5.A.2).
     ///
