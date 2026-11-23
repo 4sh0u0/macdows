@@ -116,32 +116,91 @@ INFO_PLIST="$APP_PATH/Contents/Info"
 EXEC_NAME="$(defaults read "$INFO_PLIST" CFBundleExecutable 2>/dev/null || true)"
 [ -n "$EXEC_NAME" ] || die "could not read CFBundleExecutable from $INFO_PLIST.plist"
 
-# --- Unified cleanup: notarize's zip tmpdir always goes; the DYLD-check tmpdir is kept
-# around (with a pointer printed) if we're exiting non-zero, so its log/copy can be
-# inspected — deleting diagnostic evidence on the exact path a failure message points at
-# defeats the point of printing that path.
-NOTARIZE_TMP_DIR=""
+# --- Unified cleanup. Every temporary path this script creates comes from make_tmp_dir below
+# (the only mktemp call, used twice): a private root (the entitlements plists and the
+# notarization zip live under it) that is always removed, and the DYLD-check directory, which
+# is kept (with a pointer printed) if we're exiting non-zero, so its log/copy can be inspected
+# -- deleting diagnostic evidence on the exact path a failure message points at defeats the
+# point of printing that path. The DYLD-check copy of the app, if still running, is stopped
+# here too.
+# Every variable the EXIT trap reads is initialised before the trap is installed: under bash 3.2
+# a trap that dies on an unbound variable would replace the real exit status.
+SV_NL=$'\n'
+SV_MADE_DIRS=""
+SV_TMP_ROOT=""
 CHECK_DIR=""
+SV_CHECK_PID=""
 # Success sentinel, set to 1 as the very last thing this script does. The EXIT trap must not
 # trust $? alone: bash 3.2 (the macOS system /bin/bash) leaves $? at 0 inside an EXIT trap when
 # the shell dies on an unbound variable under `set -u`, so a script that stopped half-way would
 # exit 0 -- a false green on the release gate. Fail closed instead: exiting with status 0
 # before the sentinel is set is turned into a failure.
 SIGN_AND_VERIFY_COMPLETED=0
+
+# make_tmp_dir <mktemp template>: create a private directory under the per-user temp directory,
+# record it as this run's own, and leave its physical path in MADE_DIR (dyld reports
+# /private/var/..., not the /var/... symlink).
+MADE_DIR=""
+make_tmp_dir() {
+	local raw phys
+	raw="$(mktemp -d -t "$1")"
+	SV_MADE_DIRS="$SV_MADE_DIRS$SV_NL$raw"
+	if ! phys="$(cd "$raw" && pwd -P)"; then
+		remove_own_dir "$raw" "$1" || true
+		return 1
+	fi
+	SV_MADE_DIRS="$SV_MADE_DIRS$SV_NL$phys"
+	MADE_DIR="$phys"
+}
+
+# remove_own_dir <path> <name prefix>: the only place that deletes a temporary directory. It
+# removes <path> only if it is non-empty, absolute, was obtained from mktemp by this very run,
+# is named <prefix>.*, is a real directory and not a symbolic link.
+remove_own_dir() {
+	local path="$1" prefix="$2"
+	[ -n "$path" ] || return 0
+	case "$path" in
+	/*) ;;
+	*) return 0 ;;
+	esac
+	case "${path##*/}" in
+	"$prefix".*) ;;
+	*) return 0 ;;
+	esac
+	if [ -L "$path" ] || [ ! -d "$path" ]; then return 0; fi
+	case "$SV_NL$SV_MADE_DIRS$SV_NL" in
+	*"$SV_NL$path$SV_NL"*) ;;
+	*) return 0 ;;
+	esac
+	rm -rf "$path"
+}
+
 cleanup_on_exit() {
 	local status=$?
+	# Measured with a closed terminal window: without the next two lines this trap ended before it
+	# removed the private root. With them the root was removed in every measured run in which the
+	# window was closed while the DYLD-check copy was running (bash 3.2 and bash 5), but not in
+	# every run in which it was closed during the notarization wait (seen under both). They apply
+	# to the cleanup only, which an INT or a TERM still interrupts.
+	set +e
+	trap '' HUP
 	if [ "$status" -eq 0 ] && [ "$SIGN_AND_VERIFY_COMPLETED" -ne 1 ]; then
 		status=1
 		printf '[%s] ERROR: exiting with status 0 before the script completed (bash 3.2 after an unbound variable, or an interrupting signal); failing closed\n' "$(basename "$0")" >&2
 	fi
-	if [ -n "$NOTARIZE_TMP_DIR" ]; then
-		rm -rf "$NOTARIZE_TMP_DIR"
+	if [ -n "$SV_CHECK_PID" ]; then
+		if kill -0 "$SV_CHECK_PID" 2>/dev/null; then
+			kill "$SV_CHECK_PID" 2>/dev/null || true
+		fi
+		wait "$SV_CHECK_PID" 2>/dev/null || true
+		SV_CHECK_PID=""
 	fi
+	remove_own_dir "$SV_TMP_ROOT" macdows-sign
 	if [ -n "$CHECK_DIR" ]; then
 		if [ "$status" -ne 0 ]; then
 			log "DYLD-load-check artifacts preserved for inspection: $CHECK_DIR"
 		else
-			rm -rf "$CHECK_DIR"
+			remove_own_dir "$CHECK_DIR" macdows-dyld-check
 		fi
 	fi
 	exit "$status"
@@ -158,11 +217,12 @@ trap cleanup_on_exit EXIT
 # (`--entitlements :file`) is the one that writes real, re-signable XML — still
 # necessary here despite codesign's own deprecation warning on that syntax; there is no
 # non-deprecated equivalent that produces valid signing input on this macOS version.
-ENTITLEMENTS_FILE="$(mktemp -t macdows-entitlements).plist"
+make_tmp_dir macdows-sign
+SV_TMP_ROOT="$MADE_DIR"
+ENTITLEMENTS_FILE="$SV_TMP_ROOT/entitlements.plist"
 if codesign -d --entitlements ":$ENTITLEMENTS_FILE" "$APP_PATH" >/dev/null 2>&1 && [ -s "$ENTITLEMENTS_FILE" ]; then
 	log "Preserving existing entitlements from $APP_PATH ($ENTITLEMENTS_FILE)"
 else
-	rm -f "$ENTITLEMENTS_FILE"
 	ENTITLEMENTS_FILE=""
 fi
 ENTITLEMENTS_ARGS=()
@@ -227,14 +287,13 @@ log "Signature verification: OK"
 # call site is the only honest option: it fails closed for anyone who says --release, and
 # leaves the default lenient so routine local signing is unaffected.
 GTA_ENTITLEMENT="com.apple.security.get-task-allow"
-GTA_PLIST="$(mktemp -t macdows-gta-check).plist"
+GTA_PLIST="$SV_TMP_ROOT/gta-check.plist"
 HAS_GET_TASK_ALLOW=0
 if codesign -d --entitlements ":$GTA_PLIST" "$APP_PATH" >/dev/null 2>&1 && [ -s "$GTA_PLIST" ]; then
 	if /usr/libexec/PlistBuddy -c "Print :$GTA_ENTITLEMENT" "$GTA_PLIST" >/dev/null 2>&1; then
 		HAS_GET_TASK_ALLOW=1
 	fi
 fi
-rm -f "$GTA_PLIST"
 
 if [ "$HAS_GET_TASK_ALLOW" -eq 1 ]; then
 	if [ "$RELEASE" -eq 1 ]; then
@@ -260,8 +319,8 @@ fi
 # an independent-review BLOCKER. We never ship that entitlement (it weakens hardened
 # runtime); it exists only on this throwaway copy, used for exactly one launch, then
 # discarded.
-CHECK_DIR="$(mktemp -d -t macdows-dyld-check)"
-CHECK_DIR="$(cd "$CHECK_DIR" && pwd -P)" # physical path: dyld reports /private/var/..., not the /var/... symlink
+make_tmp_dir macdows-dyld-check
+CHECK_DIR="$MADE_DIR"
 CHECK_APP="$CHECK_DIR/$(basename "$APP_PATH")"
 cp -R "$APP_PATH" "$CHECK_APP"
 
@@ -291,14 +350,15 @@ CHECK_EXEC_PATH="$CHECK_APP/Contents/MacOS/$EXEC_NAME"
 LOG_FILE="$CHECK_DIR/dyld-print-libraries.log"
 log "Launching $CHECK_EXEC_PATH (throwaway debug copy) once with DYLD_PRINT_LIBRARIES=1"
 DYLD_PRINT_LIBRARIES=1 "$CHECK_EXEC_PATH" >"$LOG_FILE" 2>&1 &
-PID=$!
+SV_CHECK_PID=$!
 sleep 2
-if kill -0 "$PID" 2>/dev/null; then
-	kill "$PID" 2>/dev/null || true
+if kill -0 "$SV_CHECK_PID" 2>/dev/null; then
+	kill "$SV_CHECK_PID" 2>/dev/null || true
 else
 	log "WARNING: process was no longer running after 2s (exited or crashed early) — log may be incomplete"
 fi
-wait "$PID" 2>/dev/null || true
+wait "$SV_CHECK_PID" 2>/dev/null || true
+SV_CHECK_PID=""
 
 [ -s "$LOG_FILE" ] || die "DYLD_PRINT_LIBRARIES log is empty — the check itself is broken (dyld produced no output at all), not evidence of a clean load: $LOG_FILE"
 grep -qF "$CHECK_EXEC_PATH" "$LOG_FILE" \
@@ -322,8 +382,7 @@ log "No unexpected loads detected (DYLD_PRINT_LIBRARIES clean, ${DYLIB_COUNT} dy
 # --- 6. Notarization (automatic if credentials are stored, otherwise skipped) --------
 notarize() {
 	local zip_path
-	NOTARIZE_TMP_DIR="$(mktemp -d -t macdows-notarize)"
-	zip_path="$NOTARIZE_TMP_DIR/$(basename "$APP_PATH" .app).zip"
+	zip_path="$SV_TMP_ROOT/$(basename "$APP_PATH" .app).zip"
 
 	log "Zipping for submission: $zip_path"
 	ditto -c -k --keepParent "$APP_PATH" "$zip_path"
