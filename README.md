@@ -117,7 +117,8 @@ its configuration — depends on the licence terms for your copy of Windows
 (preinstalled, retail, volume and subscription licences can differ; the terms for
 preinstalled copies of Windows 11 say they can be reviewed under
 Settings > System > About). Read the terms for your copy and, if in doubt, ask
-Microsoft or a qualified adviser.
+Microsoft or a qualified adviser. Making sure that your use of Windows complies with
+the terms for your copy is your responsibility.
 
 Macdows is designed for one person and one session at a time. If your Windows PC is
 seldom or never used in person, check what your licence terms say about in-person use
