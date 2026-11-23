@@ -152,31 +152,49 @@ jobs:
           sw_vers
           echo "cores: $(sysctl -n hw.ncpu)"
 
-      - name: sign-and-verify gate suite (offline; ad-hoc signing, system /bin/bash 3.2 and shebang)
+      - name: sign-and-verify gate suite (ad-hoc signing, stubbed notarization; system /bin/bash 3.2 and shebang)
         # Lane signgate-bash32 (2026-11-16): the release rehearsal found Scripts/sign-and-verify.sh,
         # the release gate, exiting 0 under the macOS system /bin/bash (3.2.57) after re-signing
         # the embedded dylibs but not the bundle (an empty entitlements array unbound under
         # `set -u`, then an EXIT trap that read $? as 0). Tier 1 is ubuntu: no codesign and no bash
         # 3.2, so the behaviour is only checkable here, on the macOS image whose /bin/bash is 3.2.
-        # Scripts/test-sign-and-verify.sh builds a throwaway .app with cc, signs it ad-hoc with
-        # --offline only (no network, no notarytool, no certificate), and runs the script under
-        # /bin/bash and through its shebang. It needs no FreeRDP prefix, hence its place right
-        # after the toolchain pin and ahead of the cache and build steps: a red here is
-        # fast and does not wait for a ten-minute cold build. 43 cases; a count that drops means a
+        # Scripts/test-sign-and-verify.sh builds a throwaway .app with cc, signs it ad-hoc (no
+        # network, no certificate), and runs the script under /bin/bash and through its shebang.
+        # The notarization path is driven by a fake xcrun on PATH: the real notarytool and
+        # stapler are not called. Source pins are a tripwire against edits that would change
+        # that (if one is red, the script under test is not run at all), not a sandbox. Every
+        # run is checked for temporary paths made through mktemp that are left behind and for
+        # copies of the test app that are still running; TERM, HUP and INT are delivered to the
+        # script, and INT and TERM also to its process group. Not covered: SIGKILL, and a
+        # terminal that is closed (or, with bash 5, a HUP for the whole process group) while
+        # `notarytool submit` is running: the cleanup may not finish then.
+        # It needs no FreeRDP prefix, hence its place right after the toolchain pin and ahead of
+        # the cache and build steps: a red here is fast and does not wait for a ten-minute cold
+        # build. 262 cases; a count that drops means a
         # case stopped running, so the verdict line is matched exactly, down to the system bash:
         # the pattern requires "(system bash 3.2." on purpose. If the image ever ships another
         # system bash, this step goes red, which is the intended reminder that the bash 3.2 half of
         # the coverage is gone and the suite needs a deliberate re-look.
-        timeout-minutes: 5
+        #
+        # The suite takes about two minutes on a developer Mac (every run of the script under
+        # test waits two seconds by design, there are about sixty of them, and the signal cases
+        # add waits of their own); the old limit of 5 minutes was sized for the previous 43
+        # cases, which took about 20 seconds.
+        #
+        # Known fluctuation: the script under test gives its throwaway copy two seconds to start,
+        # about sixty times per run of this suite. On a loaded developer Mac one launch was seen
+        # to miss that window once in about 210 runs, which turns one case red with
+        # "DYLD_PRINT_LIBRARIES log is empty". The suite does not retry, on purpose.
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           SUITE_LOG="${RUNNER_TEMP:-/tmp}/test-sign-and-verify.log"
           ./Scripts/test-sign-and-verify.sh | tee "$SUITE_LOG"
           LAST_LINE="$(tail -n1 "$SUITE_LOG")"
           case "$LAST_LINE" in
-            "test-sign-and-verify: PASS 43 cases, 0 failed (system bash 3.2."*")") ;;
+            "test-sign-and-verify: PASS 262 cases, 0 failed (system bash 3.2."*")") ;;
             *)
-              echo "::error::sign-and-verify suite: expected a final 'test-sign-and-verify: PASS 43 cases, 0 failed (system bash 3.2.x)' line; got '${LAST_LINE}' -- see the log above."
+              echo "::error::sign-and-verify suite: expected a final 'test-sign-and-verify: PASS 262 cases, 0 failed (system bash 3.2.x)' line; got '${LAST_LINE}' -- see the log above."
               exit 1
               ;;
           esac
