@@ -321,6 +321,61 @@ typedef NS_ENUM(NSInteger, CRDPEventKind) {
 
 @end
 
+/// adr/0026 lane L3: the four clipboard events (crdpq.h `CRDPQ_EVENT_CLIP_*`), posted on the cliprdr
+/// channel's own thread. They are delivered to `CRSession.clipboardEventHandler`, never to a
+/// `-drainEventsWithHandler:` handler, so no existing switch over `CRDPEventKind` sees them. They
+/// exist only while `clipboardMode` is one of the three directed modes; under `Unmanaged` (the
+/// default, every harness) and `Off` none is ever posted.
+typedef NS_ENUM(NSInteger, CRClipboardEventKind) {
+    /// The server's Monitor Ready (Client Capabilities have been sent): answer it with the initial
+    /// announcement (`-announceClipboardFormat:`).
+    CRClipboardEventKindReady = 0,
+    /// A server Format List (a successful Format List Response has been sent): `flags` holds its
+    /// two facts (MacdowsCore's `ClipboardRemoteFormats(flags:)` decodes them).
+    CRClipboardEventKindRemoteFormats = 1,
+    /// A server Format Data Response: `status` and `byteCount`. With status OK the bytes wait in
+    /// the bridge's store, and the handler must call `-takeClipboardRemoteData:reader:` or
+    /// `-discardClipboardRemoteData:` on the event before it returns; an entry neither taken nor
+    /// discarded is discarded by the bridge and counted (`CRClipboardCounterRemoteDataUnconsumed`).
+    CRClipboardEventKindRemoteData = 2,
+    /// A server Format Data Request: `formatId` is the format asked for. Answer with
+    /// `-respondToClipboardDataRequest:bytes:`. (Under a mode without Mac -> Windows the channel
+    /// answers the server itself and this event is never posted.)
+    CRClipboardEventKindDataRequest = 3,
+};
+
+/// adr/0026 lane L3: what a RemoteData event says about its bytes (crdpq.h `crdpq_clip_status_t`,
+/// same numbers).
+typedef NS_ENUM(NSInteger, CRClipboardDataStatus) {
+    /// The server answered OK and the bytes are in the store: take or discard them.
+    CRClipboardDataStatusOK = 0,
+    /// The server answered with a failure. No bytes.
+    CRClipboardDataStatusFailed = 1,
+    /// The server answered OK but the bytes were not stored (over the byte limit, or no room in
+    /// the store); `byteCount` is the length on the wire.
+    CRClipboardDataStatusNotStored = 2,
+};
+
+/// adr/0026 lane L3: one clipboard event, an immutable snapshot of its POD fields. Carries no
+/// clipboard content and no format name.
+@interface CRClipboardEvent : NSObject
+@property (nonatomic, readonly) CRClipboardEventKind kind;
+/// The session generation the event was stamped with; always the current one when delivered.
+@property (nonatomic, readonly) uint32_t generation;
+/// RemoteFormats only: crdpq.h's `CRDPQ_CLIP_FLAG_*` bits -- 0x1 the list names CF_UNICODETEXT,
+/// 0x2 it names an exclusion format (by full name, ASCII case ignored as Windows ignores it, when
+/// long format names were negotiated; without them every list that names CF_UNICODETEXT carries 0x2
+/// as well, crdpq.h's conservative direction).
+@property (nonatomic, readonly) uint32_t flags;
+/// DataRequest only: the format the server asked for (T1 answers data for 13 only).
+@property (nonatomic, readonly) uint32_t formatId;
+/// RemoteData only: the response's length on the wire, 0 for a failure.
+@property (nonatomic, readonly) uint32_t byteCount;
+/// RemoteData only.
+@property (nonatomic, readonly) CRClipboardDataStatus status;
+- (instancetype)init NS_UNAVAILABLE;
+@end
+
 /// ADR-0024 D-4: one certificate the bridge's callback rejected. Built on T_rdp, immutable.
 @interface CRCertificateRejection : NSObject
 /// The presented leaf certificate's SHA-256 (canonical, 64 lower-case hex digits), or nil when
@@ -411,6 +466,106 @@ typedef NS_OPTIONS(NSUInteger, CRAudioPlaybackProbeSetup) {
     /// `AudioPlayback` -- so the result is what a connection would load. Use it instead of
     /// `ReplayUpstreamAdds`, not with it.
     CRAudioPlaybackProbeSetupReplayUpstreamLoad = 1 << 4,
+};
+
+/// adr/0026 lane L3 (owner rulings D1 = A, D2 = A, D4 = A of 2026-11-17; S1): what one connection
+/// does with the clipboard -- the type of `CRSession.clipboardMode`. The numbers are MacdowsCore's
+/// `ClipboardMode` raw values.
+typedef NS_ENUM(NSInteger, CRClipboardMode) {
+    /// The default, and what every harness under `Tools/` keeps by never setting the property:
+    /// the connect path writes no clipboard setting and installs no callback, so the connection is
+    /// exactly what it was before this type existed (FreeRDP loads cliprdr and nobody answers it).
+    CRClipboardModeUnmanaged = 0,
+    /// No clipboard: `RedirectClipboard` FALSE, the feature mask 0, and any `cliprdr` entry already
+    /// in the static channel collection removed -- the channel is not loaded.
+    CRClipboardModeOff = 1,
+    /// Plain text both ways: the channel is loaded with both plain direction bits and the bridge
+    /// answers it.
+    CRClipboardModeBidirectional = 2,
+    /// Windows -> Mac only (reserved; the App exposes on / off). Mac text never leaves.
+    CRClipboardModeRemoteToLocalOnly = 3,
+    /// Mac -> Windows only (reserved; the App exposes on / off).
+    CRClipboardModeLocalToRemoteOnly = 4,
+};
+
+/// adr/0026 lane L3: the bridge's clipboard counters, read with `-clipboardCounter:`. Cumulative
+/// for the session object's lifetime, like every other counter on this class. Each one counts a
+/// recoverable anomaly that was absorbed without ending the session (adr/0026 H-1) and logged as
+/// one WARN line of numbers.
+typedef NS_ENUM(NSInteger, CRClipboardCounter) {
+    /// The channel thread could not send Client Capabilities.
+    CRClipboardCounterCapabilitiesSendFailed = 0,
+    /// The channel thread could not send a Format List Response.
+    CRClipboardCounterFormatListResponseSendFailed = 1,
+    /// The channel thread could not post an event (control lane sealed or full); a stored
+    /// response's bytes were discarded with it.
+    CRClipboardCounterEventPostFailed = 2,
+    /// A server data response was not stored (over the byte limit, or no room).
+    CRClipboardCounterRemoteDataNotStored = 3,
+    /// A server data response carried neither or both of OK / FAIL.
+    CRClipboardCounterRemoteDataFlagsUnexpected = 4,
+    /// A server format list naming CF_UNICODETEXT arrived without long format names negotiated, so
+    /// its names could prove nothing and it was judged excluded (crdpq.h's conservative direction:
+    /// the RemoteFormats event carries 0x1 and 0x2). One per such list.
+    CRClipboardCounterFormatListWithoutLongNames = 5,
+    /// A server callback arrived without the argument it should carry.
+    CRClipboardCounterCallbackArgumentMissing = 6,
+    /// A clipboard command reached the outbound drain while the channel was not connected.
+    CRClipboardCounterCommandDroppedNoChannel = 7,
+    /// An answer for a request of an earlier channel instance (a reloaded channel) was dropped.
+    CRClipboardCounterCommandDroppedStale = 8,
+    /// An answer reached the outbound drain under a mode without Mac -> Windows and was not sent.
+    CRClipboardCounterResponseWithheldByMode = 9,
+    /// A format list, data request or data response send returned an error.
+    CRClipboardCounterCommandSendFailed = 10,
+    /// An answer's bytes could not be taken from the store; a failure was sent instead.
+    CRClipboardCounterResponseBytesUnavailable = 11,
+    /// A RemoteData clipboard event's bytes were neither taken nor discarded by
+    /// `clipboardEventHandler` (or there was no handler).
+    CRClipboardCounterRemoteDataUnconsumed = 12,
+    /// `-respondToClipboardDataRequest:bytes:` could not store the bytes and posted a failure.
+    CRClipboardCounterRespondStoredAsFailure = 13,
+    /// A clipboard command could not be posted (outbound lane sealed or full, or no connection).
+    CRClipboardCounterCommandPostFailed = 14,
+    /// The three drops that stall Windows -> Mac until the next ready or connection (crdpq.h), each
+    /// on its own -- also counted in the general counter above them: a RemoteData event the
+    /// channel thread could not post,
+    CRClipboardCounterStallRemoteDataPostFailed = 15,
+    /// a data request this side could not post,
+    CRClipboardCounterStallRequestPostFailed = 16,
+    /// a data request the outbound drain dropped because the channel was gone.
+    CRClipboardCounterStallRequestDropped = 17,
+};
+
+/// adr/0026 lane L3 offline tests only (the App never calls the method that returns it): the
+/// clipboard part of a fresh client `rdpSettings` after the connect path's clipboard step ran on it.
+@interface CRClipboardSettingsProbe : NSObject
+/// What the step returned: NO means the connect path would have refused the connection.
+@property (nonatomic, readonly) BOOL applied;
+@property (nonatomic, readonly) BOOL redirectClipboard;
+@property (nonatomic, readonly) uint32_t clipboardFeatureMask;
+/// Whether the bridge installs its channel callbacks for the mode (the channel-connected branch's
+/// condition).
+@property (nonatomic, readonly) BOOL installsCallbacks;
+/// Every entry of the static channel collection, in order, each as its argument vector.
+@property (nonatomic, readonly, copy) NSArray<NSArray<NSString *> *> *staticChannels;
+- (instancetype)init NS_UNAVAILABLE;
+@end
+
+/// What `+[CRSession clipboardSettingsProbeForMode:setup:]` does around the clipboard step.
+typedef NS_OPTIONS(NSUInteger, CRClipboardProbeSetup) {
+    CRClipboardProbeSetupNone = 0,
+    /// Before the step: `RedirectClipboard` FALSE and the feature mask 0x22 (the two FILES bits,
+    /// a value no mode writes), so a mode that writes nothing is told apart from one that writes.
+    CRClipboardProbeSetupSeedClipboardSettings = 1 << 0,
+    /// Before the step: a `cliprdr` entry already in the static channel collection -- what an
+    /// earlier writer could have left, which FreeRDP would load whatever `RedirectClipboard` says.
+    CRClipboardProbeSetupSeedCliprdrEntry = 1 << 1,
+    /// After the step: the `cliprdr` part of FreeRDP's default channel loading -- step 3 of
+    /// `freerdp_client_load_addins` adds `{cliprdr}` to the static collection when
+    /// `RedirectClipboard` is TRUE, through the same add function (a same-name entry is not added
+    /// twice) -- so the collection is what a connection would load.
+    CRClipboardProbeSetupReplayUpstreamLoad = 1 << 2,
 };
 
 /// One RDP/RAIL/RDPGFX session bridging a remote Windows host into this process, per
@@ -536,6 +691,16 @@ typedef NS_OPTIONS(NSUInteger, CRAudioPlaybackProbeSetup) {
 /// error that ends the session -- which is why `On` falls back to no playback when this is NO.
 + (BOOL)rdpsndPlaybackBackendIsLinked:(NSString *)subsystem dynamic:(BOOL)dynamic
     NS_SWIFT_NAME(rdpsndPlaybackBackendIsLinked(_:dynamic:));
+
+/// adr/0026 lane L3 offline tests only; the App never calls this. Creates a fresh client
+/// `rdpSettings` (`freerdp_settings_new(0)`), applies `setup`'s seeds, runs the connect path's
+/// clipboard step for `mode` on it -- the very function the pre-connect step calls -- applies
+/// `setup`'s replay when the step did not refuse, reads the result back and frees the settings. Nil
+/// when the settings could not be created or a seed could not be written; a step that refuses the
+/// connection is not nil but `applied` NO. Logs what the step logs.
++ (nullable CRClipboardSettingsProbe *)clipboardSettingsProbeForMode:(CRClipboardMode)mode
+                                                               setup:(CRClipboardProbeSetup)setup
+    NS_SWIFT_NAME(clipboardSettingsProbe(mode:setup:));
 
 /// ADR-0024 D-4 (Y-b): the trust snapshot the certificate callback judges against -- the ONE
 /// SHA-256 fingerprint (canonical, 64 hex digits) this connection may accept, or nil to accept
@@ -674,6 +839,38 @@ typedef NS_OPTIONS(NSUInteger, CRAudioPlaybackProbeSetup) {
 /// each log one INFO line naming the mode.
 @property (nonatomic) CRAudioPlaybackMode audioPlaybackMode;
 
+/// adr/0026 lane L3: what this connection does with the clipboard (see `CRClipboardMode`). Same
+/// contract as `desktopWidth` and `audioPlaybackMode`: set it on T_main before `-start`; the
+/// connect path reads it ONCE, on T_rdp, in its pre-connect step (the thread spawn orders the
+/// write before the read) and never again for that connection, so a change while a connection is
+/// up takes effect at the next `-start` -- including the one inside
+/// `-restartForReconnectPreparing:`, whose `prepare` block is where a caller writes it again.
+///
+/// `CRClipboardModeUnmanaged` (0, the default) writes nothing, installs nothing and logs nothing on
+/// the connect path: the harnesses under `Tools/` never set this property and connect exactly as
+/// before. (A clipboard command posted through the senders below on such a connection -- or under
+/// `Off` -- is dropped by T_rdp, counted as `CRClipboardCounterCommandDroppedNoChannel` and logged
+/// in a WARN line of numbers; a data request is also counted as
+/// `CRClipboardCounterStallRequestDropped` and logged in a second line, so two lines for a data
+/// request, one for an announcement or an answer. Nothing in the App posts one today.) Every other
+/// value writes the clipboard settings in the pre-connect step, before FreeRDP loads its channels,
+/// and a failure to write any of them refuses the connection -- a mask that could not be written
+/// could leave a wider data flow than the mode says. A value outside the five is treated as `Off`,
+/// with a WARN. The three directed modes also need `clipboardByteLimit` (the connection is refused
+/// without it) and install the bridge's callbacks when the channel connects.
+@property (nonatomic) CRClipboardMode clipboardMode;
+
+/// adr/0026 lane L3: the clipboard byte limit (adr/0026 S6) -- the most bytes one clipboard
+/// transfer may carry, UTF-16LE with its terminating NUL. The caller sets it from MacdowsCore's
+/// `ClipboardLimits.defaultMaxBytes`, the one place the number lives; the bridge has no copy of
+/// it. Read by `-start` on T_main: a non-zero value creates the bridge's byte store with this
+/// block limit (and twice it in total), once, and again only when the value changes. 0 (the
+/// default), or a value over half the address space, leaves no store -- one an earlier `-start`
+/// created is destroyed; a directed `clipboardMode` without a store refuses the connection.
+/// A Windows response over the limit is never copied: its event arrives as NotStored with the
+/// length on the wire.
+@property (nonatomic) NSUInteger clipboardByteLimit;
+
 /// adr/0021 lane CA-2 (owner ruling 2026-10-06 on P-CA1-1): the client-side key witness switch,
 /// OBSERVATION ONLY. Process-wide and default `NO`. When `YES`, every connection started AFTER it
 /// was set prints one `[key-witness]` INFO line per keyboard event the outbound lane actually
@@ -792,6 +989,23 @@ typedef NS_OPTIONS(NSUInteger, CRAudioPlaybackProbeSetup) {
 /// set, matching every pre-existing caller's behavior (e.g. a headless test that only
 /// polls manually).
 @property (nonatomic, copy, nullable) void (^onEventsAvailable)(void);
+
+/// adr/0026 lane L3: where the clipboard events go (see `CRClipboardEventKind`). Called from
+/// inside `-drainEventsWithHandler:`, synchronously, on the draining thread, once per clipboard
+/// event, at that event's FIFO position among the others -- after the generation check, and
+/// instead of the drain's own handler (which never sees a clipboard event, and whose return count
+/// does not include them). Read once per drain call. `nil` (the default) means no consumer: the
+/// events are dropped, and a RemoteData event's bytes are discarded and counted
+/// (`CRClipboardCounterRemoteDataUnconsumed`), so nothing is left to hold the store.
+///
+/// Take or discard a RemoteData event's bytes synchronously, inside the very call of this block
+/// that received the event: as soon as the block returns, an event nobody settled is discarded and
+/// counted, so a block that hands the event on to another execution context (another actor, a
+/// `Task`, a later run-loop turn) to deal with it there finds the bytes gone -- Windows -> Mac then
+/// fails without a word. The drain inside `-shutdownAndWait` calls this block too, after the
+/// outbound lane is sealed: a request or an answer the block posts then is not sent, only counted
+/// (`CRClipboardCounterCommandPostFailed`; a request also as `CRClipboardCounterStallRequestPostFailed`).
+@property (nonatomic, copy, nullable) void (^clipboardEventHandler)(CRClipboardEvent *event);
 
 /// The control lane's current generation (adr/0005 §3's `sessionGeneration`). Bumped by
 /// exactly one, atomically, as the last step of `-shutdownAndWait`.
@@ -1134,6 +1348,54 @@ typedef NS_ENUM(NSInteger, CRPublishedSurfaceMiss) {
 /// other outbound command) is dropped and counted in `outboundDroppedNoRailCount` if the RAIL
 /// channel isn't up yet.
 - (void)sendNotifyEvent:(uint32_t)windowId notifyIconId:(uint32_t)notifyIconId message:(uint32_t)message;
+
+// MARK: adr/0026 lane L3 -- the clipboard commands and the clipboard store
+//
+// Threads: every method below runs on the thread that owns this session (T_main), like every
+// other outbound method here. The three senders post one command on the outbound lane, which T_rdp
+// drains; that a post succeeded says the command was queued, not that it reached the server (the
+// channel may be gone by then; the drain counts what it drops). None of them makes a clipboard
+// decision: the caller's state machine (MacdowsCore's `ClipboardSession`) has made it already.
+
+/// Posts one announcement: `formatId` 13 (CF_UNICODETEXT) sends a Format List naming plain text,
+/// 0 sends an empty Format List (only ever as the initial list). Any other value is refused (T1
+/// moves plain text only) and nothing is posted. Returns whether a command was posted.
+- (BOOL)announceClipboardFormat:(uint32_t)formatId;
+
+/// Posts one Format Data Request for `formatId`, which must be 13; anything else is refused and
+/// nothing is posted. Returns whether a command was posted. A request the caller's state machine
+/// counts as sent but that was not posted leaves Windows -> Mac waiting until the next ready.
+- (BOOL)requestClipboardFormat:(uint32_t)formatId;
+
+/// Posts the one answer to `request`, a DataRequest clipboard event of this connection: `bytes`
+/// (the encoded text, UTF-16LE with its NUL) or nil for a failure. The bridge copies `bytes` into
+/// its store -- the caller's own copy stays the caller's -- and posts the answer; T_rdp sends it
+/// and wipes its copy. If the bytes cannot be stored (over the byte limit, no room) a failure is
+/// posted instead, so the server still gets exactly one answer, and that is counted
+/// (`CRClipboardCounterRespondStoredAsFailure`). Returns NO, posting nothing, when `request` is not
+/// a DataRequest event of the current connection, when `bytes` are given and the store says the
+/// request belongs to a cliprdr channel instance that is gone (an answer without bytes for such a
+/// request is posted and then dropped and counted by T_rdp), or when the outbound lane refuses the
+/// post (sealed or full; counted as `CRClipboardCounterCommandPostFailed`) -- the bytes stored for
+/// it are discarded again, and the server gets no answer from this call. Never call this when the
+/// caller's decision is "no answer" (Mac -> Windows not allowed): the channel has answered then.
+- (BOOL)respondToClipboardDataRequest:(CRClipboardEvent *)request bytes:(nullable NSData *)bytes;
+
+/// Takes the bytes of a RemoteData clipboard event with status OK out of the store, hands them to
+/// `reader` (valid only during the call; copy what you keep) and wipes the bridge's copy. Call it
+/// from the `clipboardEventHandler` call that received `event`. The entry is gone afterwards whether or not this
+/// returns YES; NO (and `reader` not called) for any other event, a second call, or bytes that are
+/// no longer there.
+- (BOOL)takeClipboardRemoteData:(CRClipboardEvent *)event
+                         reader:(NS_NOESCAPE void (^)(const uint8_t *_Nullable bytes, NSUInteger length))reader;
+
+/// Removes the bytes of a RemoteData clipboard event without reading them -- for a response the
+/// caller drops anyway (MacdowsCore's `ClipboardSession.expectsRemoteData` is false), so the bytes
+/// never reach memory that cannot be wiped. No-op for any other event or a second call.
+- (void)discardClipboardRemoteData:(CRClipboardEvent *)event;
+
+/// One of the bridge's clipboard counters (see `CRClipboardCounter`); 0 for an unknown value.
+- (uint64_t)clipboardCounter:(CRClipboardCounter)counter;
 
 /// W4c: one physical mouse button, in RDP's own PTR_FLAGS_BUTTON1/2/3 numbering (left/
 /// right/middle) -- deliberately not NSEvent.buttonNumber's own scheme (0/1/2), so this
