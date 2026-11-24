@@ -58,6 +58,9 @@
  * hook feeds. Measurement only -- nothing in the frame path reads them back. */
 #include "crgfx_counters.h"
 #include "CRSurfaceSlots.h"
+/* adr/0026 lane L3: the cliprdr bridge, pure C (crclip_bridge.c). This file only calls it from the
+ * pre-connect step, the channel callbacks, the outbound drain and the clipboard methods below. */
+#include "crclip_bridge.h"
 
 /* W4a review M4: callback-body logging goes through WLog (FreeRDP's own logging
  * facility, which real client code -- e.g. client/X11/xf_client.c -- uses uniformly)
@@ -154,6 +157,62 @@
                                        (long)self.kind, self.generation, self.windowId, self.title];
 }
 
+@end
+
+/* adr/0026 lane L3: one clipboard event, built on T_main from a drained CRDPQ_EVENT_CLIP_* event.
+ * Besides the four public scalars it keeps the two the bridge needs back -- the store generation an
+ * answer or a take must present, and the store key of a RemoteData -- and whether a RemoteData
+ * entry has been settled (taken or discarded), which the drain reads right after the handler. */
+@interface CRClipboardEvent ()
+{
+@public
+    /* The drained event's POD payload, verbatim: what crclip_take_remote / crclip_respond / the
+     * drain's settle need back (the store generation and key included). */
+    crdpq_clip_ref_t _ref;
+}
+@property (nonatomic) CRClipboardEventKind kind;
+@property (nonatomic) uint32_t generation;
+@property (nonatomic) uint32_t flags;
+@property (nonatomic) uint32_t formatId;
+@property (nonatomic) uint32_t byteCount;
+@property (nonatomic) CRClipboardDataStatus status;
+@property (nonatomic) BOOL entrySettled;
+- (instancetype)initFromEvent:(const CrdpEvent *)ev NS_DESIGNATED_INITIALIZER;
+@end
+
+@implementation CRClipboardEvent
+- (instancetype)initFromEvent:(const CrdpEvent *)ev
+{
+    self = [super init];
+    if (self)
+    {
+        const crdpq_clip_ref_t *clip = &ev->payload.clip;
+        if (ev->type == CRDPQ_EVENT_CLIP_READY)
+            _kind = CRClipboardEventKindReady;
+        else if (ev->type == CRDPQ_EVENT_CLIP_REMOTE_FORMATS)
+            _kind = CRClipboardEventKindRemoteFormats;
+        else if (ev->type == CRDPQ_EVENT_CLIP_REMOTE_DATA)
+            _kind = CRClipboardEventKindRemoteData;
+        else
+            _kind = CRClipboardEventKindDataRequest;
+        _generation = ev->generation;
+        _flags = clip->flags;
+        _formatId = clip->formatId;
+        _byteCount = clip->byteCount;
+        _status = (CRClipboardDataStatus)clip->status;
+        _ref = *clip;
+        /* Only an OK RemoteData has bytes in the store to settle. */
+        _entrySettled = !(_kind == CRClipboardEventKindRemoteData && clip->status == CRDPQ_CLIP_STATUS_OK);
+    }
+    return self;
+}
+
+- (NSString *)description
+{
+    return [NSString stringWithFormat:@"<CRClipboardEvent kind=%ld gen=%u flags=%u formatId=%u byteCount=%u status=%ld>",
+                                      (long)self.kind, self.generation, self.flags, self.formatId, self.byteCount,
+                                      (long)self.status];
+}
 @end
 
 /// Builds a CRDPEvent from one drained (already generation-checked) CrdpEvent. This is
@@ -437,6 +496,13 @@ typedef struct
      * also on T_rdp. freerdp_client_context_new() allocates this struct zero-filled, and
      * crb_pre_connect writes every field on both of its paths. */
     RECTANGLE_16 workArea;
+
+    /* adr/0026 lane L3: this connection's cliprdr bridge (crclip_bridge.h). Filled by crb_pre_connect
+     * on T_rdp from the session's clipboardMode (read once there), its control lane, byte store and
+     * counters; attached and detached in the channel callbacks (T_rdp); read by the outbound drain
+     * (T_rdp) and by the channel's own thread through the channel context, never by T_main.
+     * freerdp_client_context_new() zero-fills it: an Unmanaged bridge that never attaches. */
+    crclip_bridge_t clip;
 } CRBridgeContext;
 
 /* Only the RDPGFX wrappers need this: gdi_graphics_pipeline_init() claims
@@ -515,6 +581,20 @@ typedef NS_ENUM(NSInteger, CRSessionState) {
      * -gfxSurfaceCounters:updates:dirty:writes:refused:publishes:stale:erased:; the table's
      * own lock is the whole synchronization story (crgfx_counters.h's threading note). */
     crgfx_counters_t *_gfxFrameCounters;
+    /* adr/0026 lane L3: the clipboard byte store (crdpq_clip_store) and the bridge's counters.
+     * The store is created by -start on T_main, before T_rdp exists, from clipboardByteLimit (the
+     * Swift layer's S6 constant, handed down by the caller; this class has no copy of the number),
+     * once, and again only when that limit changes; a limit set back to 0 (or past SIZE_MAX / 2)
+     * destroys it -- always while idle, when no thread of an earlier connection is left
+     * (crclip_store_for_limit). It persists across reconnects like _iconStore: -shutdownAndWait
+     * clears it (wiping every block) before the generation bump, the channel callbacks clear it
+     * whenever a cliprdr instance comes or goes, and -dealloc destroys it. The counters are created
+     * once in -init and never reset (cumulative, like every counter here). */
+    crdpq_clip_store_t *_clipStore;
+    NSUInteger _clipStoreLimit;
+    crclip_counters_t *_clipCounters;
+    /* The store key of the last answer -respondToClipboardDataRequest:bytes: put (T_main only). */
+    uint32_t _clipAnswerSequence;
     /* Manual-reset (W4a review H2) -- WinPR's POSIX event backend on this platform never
      * actually implements auto-reset (winpr/libwinpr/synch/event.c:279-280 logs "auto-reset
      * events not yet implemented" and creates a plain, never-auto-cleared event regardless
@@ -641,6 +721,28 @@ static NSArray<NSArray<NSString *> *> *crb_channel_argvs(const rdpSettings *sett
         _remoteConsoleAudio = freerdp_settings_get_bool(settings, FreeRDP_RemoteConsoleAudio);
         _staticChannels = [crb_channel_argvs(settings, FreeRDP_StaticChannelCount, FreeRDP_StaticChannelArray) copy];
         _dynamicChannels = [crb_channel_argvs(settings, FreeRDP_DynamicChannelCount, FreeRDP_DynamicChannelArray) copy];
+    }
+    return self;
+}
+@end
+
+@interface CRClipboardSettingsProbe ()
+- (instancetype)initWithApplied:(BOOL)applied
+                           mode:(CRClipboardMode)mode
+                       settings:(const rdpSettings *)settings NS_DESIGNATED_INITIALIZER;
+@end
+
+@implementation CRClipboardSettingsProbe
+- (instancetype)initWithApplied:(BOOL)applied mode:(CRClipboardMode)mode settings:(const rdpSettings *)settings
+{
+    self = [super init];
+    if (self)
+    {
+        _applied = applied;
+        _redirectClipboard = freerdp_settings_get_bool(settings, FreeRDP_RedirectClipboard);
+        _clipboardFeatureMask = freerdp_settings_get_uint32(settings, FreeRDP_ClipboardFeatureMask);
+        _installsCallbacks = crclip_mode_installs_callbacks((uint32_t)mode);
+        _staticChannels = [crb_channel_argvs(settings, FreeRDP_StaticChannelCount, FreeRDP_StaticChannelArray) copy];
     }
     return self;
 }
@@ -1874,6 +1976,15 @@ static void crb_on_channel_connected(void *context, const ChannelConnectedEventA
         g_crbOrigDeleteSurface = gfx->DeleteSurface;
         gfx->DeleteSurface = crb_gfx_delete_surface;
     }
+    else if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0 && crclip_mode_installs_callbacks(p->clip.mode))
+    {
+        /* adr/0026 lane L3: a directed clipboard mode -- the bridge answers the channel (it installs
+         * its server callbacks; FreeRDP's own handler does nothing for cliprdr). FreeRDP created the
+         * channel's message thread just before this callback and the server's first PDU is read only
+         * when T_rdp is back in its loop, so nothing races the installation. Unmanaged (every
+         * harness) and Off fall through to the branch below, exactly as before this lane. */
+        (void)crclip_bridge_attach(&p->clip, (CliprdrClientContext *)e->pInterface);
+    }
     else
     {
         freerdp_client_OnChannelConnectedEventHandler(&p->common, e);
@@ -1889,6 +2000,14 @@ static void crb_on_channel_disconnected(void *context, const ChannelDisconnected
         if (p->rail)
             p->rail->custom = NULL;
         p->rail = NULL;
+    }
+    else if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0 && crclip_mode_installs_callbacks(p->clip.mode))
+    {
+        /* adr/0026 lane L3: FreeRDP has joined the channel's message thread before this callback.
+         * The bridge forgets the channel -- clipboard commands are dropped and counted from here on
+         * -- and clears the byte store, so nothing of this channel instance outlives it (a reloaded
+         * channel starts a new store generation). */
+        crclip_bridge_detach(&p->clip, (CliprdrClientContext *)e->pInterface);
     }
     else
     {
@@ -2384,6 +2503,17 @@ static BOOL crb_pre_connect(freerdp *instance)
         return FALSE;
     if (!freerdp_settings_set_string(settings, FreeRDP_CertificateAcceptedFingerprints, NULL))
         return FALSE;
+    /* adr/0026 lane L3: the clipboard step, before the audio step (whose call the audio pins hold
+     * right in front of the frozen subscription block) and so before both subscriptions. The mode is
+     * read once here, like desktopWidth, into this connection's bridge, together with the lanes it
+     * posts to; then crclip_apply_mode -- a function of the mode and the settings only, which the
+     * offline probe runs too -- writes the settings. Unmanaged (every harness) writes nothing.
+     * A directed mode without a byte store, or any settings write that fails, refuses the
+     * connection: a mask that was not written could leave a wider data flow than the mode. */
+    if (!crclip_bridge_init(&p->clip, (uint32_t)session.clipboardMode, crb_control(p), session->_clipStore,
+                            session->_clipCounters) ||
+        !crclip_apply_mode(settings, p->clip.mode))
+        return FALSE;
     /* adr/0026 (proposed) lane L1: the audio step, last of the settings and before the two
      * subscriptions (that block and this function's end are frozen by the RAIL handshake pin).
      * The mode is read once here, like desktopWidth; Unmanaged -- every harness -- writes nothing. */
@@ -2509,6 +2639,13 @@ static void crb_outbound_visitor(const CrdpCommand *cmd, void *vctx)
      * staleness window): a mid-session RAIL channel disconnect/reconnect could otherwise
      * leave a cached pointer pointing at a torn-down context. */
     CRBridgeContext *p = (CRBridgeContext *)vctx;
+    /* adr/0026 H-3 (lane L3): the three clipboard commands are routed BEFORE the RAIL check below --
+     * the clipboard does not depend on RAIL being connected, nor RAIL on the clipboard. The bridge
+     * sends them on the cliprdr channel, or drops and counts them (and removes an answer's store
+     * entry) when that channel is not there; it returns false, touching nothing, for every other
+     * command, which then takes the RAIL path exactly as before. */
+    if (p && crclip_outbound_dispatch(&p->clip, cmd))
+        return;
     RailClientContext *rail = p ? p->rail : NULL;
     if (!rail)
     {
@@ -3144,6 +3281,39 @@ static BOOL crb_attach_process_log_callbacks(wLog *log)
     return crb_rdpsnd_backend_linked(subsystem.UTF8String, dynamic);
 }
 
+/* adr/0026 lane L3: runs the connect path's clipboard step (crclip_apply_mode, the very function
+ * crb_pre_connect calls) on a settings object of its own. The replay is FreeRDP's step 3 of
+ * freerdp_client_load_addins for cliprdr (cmdline.c): when RedirectClipboard is TRUE, {cliprdr} is
+ * added to the static collection through the add function, which keeps a same-name entry. */
++ (nullable CRClipboardSettingsProbe *)clipboardSettingsProbeForMode:(CRClipboardMode)mode
+                                                               setup:(CRClipboardProbeSetup)setup
+{
+    static const char *const cliprdrEntry[] = {CLIPRDR_SVC_CHANNEL_NAME};
+    rdpSettings *settings = freerdp_settings_new(0);
+    if (!settings)
+        return nil;
+    CRClipboardSettingsProbe *probe = nil;
+    BOOL seeded = YES;
+    if (setup & CRClipboardProbeSetupSeedClipboardSettings)
+        seeded = freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, FALSE) &&
+                 freerdp_settings_set_uint32(settings, FreeRDP_ClipboardFeatureMask,
+                                             CLIPRDR_FLAG_LOCAL_TO_REMOTE_FILES | CLIPRDR_FLAG_REMOTE_TO_LOCAL_FILES);
+    if (seeded && (setup & CRClipboardProbeSetupSeedCliprdrEntry))
+        seeded = freerdp_client_add_static_channel(settings, ARRAYSIZE(cliprdrEntry), cliprdrEntry);
+    if (seeded)
+    {
+        const BOOL applied = crclip_apply_mode(settings, (uint32_t)mode);
+        BOOL replayed = YES;
+        if (applied && (setup & CRClipboardProbeSetupReplayUpstreamLoad) &&
+            freerdp_settings_get_bool(settings, FreeRDP_RedirectClipboard))
+            replayed = freerdp_client_add_static_channel(settings, ARRAYSIZE(cliprdrEntry), cliprdrEntry);
+        if (replayed)
+            probe = [[CRClipboardSettingsProbe alloc] initWithApplied:applied mode:mode settings:settings];
+    }
+    freerdp_settings_free(settings);
+    return probe;
+}
+
 /* ADR-0024 D-2: FreeRDP takes the password as a NUL-terminated string and keeps its own copy
  * (zeroed by winpr_zfree when the settings are freed). The terminated scratch copy made here is
  * overwritten before it is freed, so the chain's bytes stay in exactly one buffer of this class. */
@@ -3225,6 +3395,9 @@ static void crb_schedule_drain(void *ctx)
          * while the surface table's is held; nothing ever takes them in the other order (see
          * CRSurfaceSlots.h's threading note). */
         crsurface_table_set_erase_observer(_surfaceSlots, (void *)_gfxFrameCounters, crb_note_slot_erased);
+        /* adr/0026 lane L3: the clipboard counters (never reset); the byte store waits for -start
+         * and a clipboardByteLimit (see the ivar's comment). */
+        _clipCounters = crclip_counters_create();
     }
     return self;
 }
@@ -3291,6 +3464,12 @@ static void crb_schedule_drain(void *ctx)
         crgfx_counters_destroy(_gfxFrameCounters);
         _gfxFrameCounters = NULL;
     }
+    /* adr/0026 lane L3: no thread is left that could reach either (the shutdown above joined
+     * T_rdp, and with it the channel threads); the store wipes every block it still holds. */
+    crdpq_clip_store_destroy(_clipStore);
+    _clipStore = NULL;
+    crclip_counters_destroy(_clipCounters);
+    _clipCounters = NULL;
 }
 
 - (void)start
@@ -3344,6 +3523,16 @@ static void crb_schedule_drain(void *ctx)
      * compile error; none of these are that). */
     rdpContext *context = NULL;
     CRBThreadArgs *args = NULL;
+
+    /* adr/0026 lane L3: the clipboard byte store, from the caller's limit (the Swift layer's S6
+     * constant), brought in line with it here on T_main while no thread of any connection exists
+     * (crclip_store_for_limit, which Tools/cliprdr-check drives): recreated only when the limit
+     * changed, destroyed when it is 0 or past SIZE_MAX / 2. A store left by an earlier connection
+     * was cleared by its -shutdownAndWait, and an event of that connection is refused by the
+     * generation checks of the clipboard methods below before it could name a key of the new
+     * store. No store (no limit, or a failed creation) and a directed clipboard mode refuse the
+     * connection in the pre-connect step. */
+    _clipStoreLimit = crclip_store_for_limit(&_clipStore, _clipStoreLimit, self.clipboardByteLimit);
 
     _outboundWakeupEvent = CreateEvent(NULL, TRUE, FALSE, NULL); /* manual-reset -- see H2's
      * extensive comment on crb_rdp_thread_main's ResetEvent call for why. */
@@ -3534,6 +3723,12 @@ cleanup:
      * matching every other cumulative diagnostic counter on this class. */
     if (_iconStore)
         crdpq_icon_store_clear(_iconStore);
+    /* adr/0026 lane L3, the adr/0005 addendum's section 5: the clipboard store's session-scoped
+     * teardown, beside the icon store's and before the generation bump. T_rdp and the channel
+     * threads are joined; every block still held -- a Windows response nobody took, an answer
+     * T_rdp never sent -- is wiped here, and the store generation moves on. */
+    if (_clipStore)
+        (void)crdpq_clip_store_clear(_clipStore);
     crdpq_generation_bump(_controlQueue);
     _state = CRSessionStateIdle;
     return sawDisconnected;
@@ -3612,9 +3807,17 @@ cleanup:
          * because this visitor is a capture-less lambda (it converts to a C function
          * pointer) and so cannot reach `self` any other way. */
         BOOL *disconnectSentinelSeen;
+        /* adr/0026 lane L3: where clipboard events go (read once per drain, like `handler`), and
+         * what the drain needs to settle a RemoteData entry nobody took (H-5): every OK entry leaves
+         * the store during its drain -- taken or discarded by the clipboard handler, or else
+         * discarded here and counted. */
+        void (^clipboardHandler)(CRClipboardEvent *event);
+        crdpq_clip_store_t *clipStore;
+        crclip_counters_t *clipCounters;
     } DrainCtx;
-    DrainCtx dctx = {handler,  expectedGeneration, &delivered, &discarded, &unknown,
-                     _iconStore, _gfxFrameCounters, &_disconnectSentinelSeen};
+    DrainCtx dctx = {handler,          expectedGeneration,  &delivered, &discarded,
+                     &unknown,         _iconStore,          _gfxFrameCounters,
+                     &_disconnectSentinelSeen, self.clipboardEventHandler, _clipStore, _clipCounters};
 
     crdpq_drain(
         _controlQueue,
@@ -3641,6 +3844,23 @@ cleanup:
            * the session down in response. See -shutdownAndWait step 4 for the consumer. */
           if (ev->type == CRDPQ_EVENT_DISCONNECTED)
               *dctx->disconnectSentinelSeen = YES;
+          /* adr/0026 lane L3: the four clipboard kinds go to the clipboard handler, at their FIFO
+           * position, never to `handler`. */
+          if (ev->type == CRDPQ_EVENT_CLIP_READY || ev->type == CRDPQ_EVENT_CLIP_REMOTE_FORMATS ||
+              ev->type == CRDPQ_EVENT_CLIP_REMOTE_DATA || ev->type == CRDPQ_EVENT_CLIP_DATA_REQUEST)
+          {
+              CRClipboardEvent *clipEvent = [[CRClipboardEvent alloc] initFromEvent:ev];
+              if (dctx->clipboardHandler)
+                  dctx->clipboardHandler(clipEvent);
+              if (!clipEvent.entrySettled)
+              {
+                  /* Nobody took or discarded this response's bytes: the bridge removes them so they
+                   * cannot hold a slot, and counts it. */
+                  clipEvent.entrySettled = YES;
+                  crclip_settle_unconsumed(dctx->clipStore, dctx->clipCounters, &clipEvent->_ref);
+              }
+              return;
+          }
           CRDPEvent *event = CRDPEventFromCrdpEvent(ev, dctx->iconStore);
           if (!event)
           {
@@ -3861,6 +4081,116 @@ cleanup:
      * (freerdp/rail.h:437), unlike -sendSysCommand:command:'s UINT16 (rail.h:430). */
     cmd.payload.notifyEvent.message = message;
     crdpq_outbound_post(_outboundQueue, &cmd);
+}
+
+/* ==================================================================================== *
+ * adr/0026 lane L3: the clipboard commands and the clipboard store, T_main side. These methods
+ * move what the caller decided; they decide nothing themselves beyond the T1 format boundary
+ * (plain text only) and "one answer per request" (a failure when the bytes cannot be stored).
+ * ==================================================================================== */
+
+/* The header's three enums carry crclip_bridge.h's and crdpq.h's numbers. */
+static_assert((int)CRClipboardModeUnmanaged == (int)CRCLIP_MODE_UNMANAGED, "clipboard mode numbers");
+static_assert((int)CRClipboardModeOff == (int)CRCLIP_MODE_OFF, "clipboard mode numbers");
+static_assert((int)CRClipboardModeBidirectional == (int)CRCLIP_MODE_BIDIRECTIONAL, "clipboard mode numbers");
+static_assert((int)CRClipboardModeRemoteToLocalOnly == (int)CRCLIP_MODE_REMOTE_TO_LOCAL_ONLY, "clipboard mode numbers");
+static_assert((int)CRClipboardModeLocalToRemoteOnly == (int)CRCLIP_MODE_LOCAL_TO_REMOTE_ONLY, "clipboard mode numbers");
+static_assert((int)CRClipboardDataStatusOK == (int)CRDPQ_CLIP_STATUS_OK, "clipboard status numbers");
+static_assert((int)CRClipboardDataStatusFailed == (int)CRDPQ_CLIP_STATUS_FAILED, "clipboard status numbers");
+static_assert((int)CRClipboardDataStatusNotStored == (int)CRDPQ_CLIP_STATUS_NOT_STORED, "clipboard status numbers");
+static_assert((int)CRClipboardCounterCapabilitiesSendFailed == (int)CRCLIP_COUNTER_CAPABILITIES_SEND_FAILED, "counter numbers");
+static_assert((int)CRClipboardCounterFormatListResponseSendFailed == (int)CRCLIP_COUNTER_FORMAT_LIST_RESPONSE_SEND_FAILED,
+              "counter numbers");
+static_assert((int)CRClipboardCounterEventPostFailed == (int)CRCLIP_COUNTER_EVENT_POST_FAILED, "counter numbers");
+static_assert((int)CRClipboardCounterRemoteDataNotStored == (int)CRCLIP_COUNTER_REMOTE_DATA_NOT_STORED, "counter numbers");
+static_assert((int)CRClipboardCounterRemoteDataFlagsUnexpected == (int)CRCLIP_COUNTER_REMOTE_DATA_FLAGS_UNEXPECTED,
+              "counter numbers");
+static_assert((int)CRClipboardCounterFormatListWithoutLongNames == (int)CRCLIP_COUNTER_FORMAT_LIST_WITHOUT_LONG_NAMES,
+              "counter numbers");
+static_assert((int)CRClipboardCounterCallbackArgumentMissing == (int)CRCLIP_COUNTER_CALLBACK_ARGUMENT_MISSING,
+              "counter numbers");
+static_assert((int)CRClipboardCounterCommandDroppedNoChannel == (int)CRCLIP_COUNTER_COMMAND_DROPPED_NO_CHANNEL,
+              "counter numbers");
+static_assert((int)CRClipboardCounterCommandDroppedStale == (int)CRCLIP_COUNTER_COMMAND_DROPPED_STALE, "counter numbers");
+static_assert((int)CRClipboardCounterResponseWithheldByMode == (int)CRCLIP_COUNTER_RESPONSE_WITHHELD_BY_MODE,
+              "counter numbers");
+static_assert((int)CRClipboardCounterCommandSendFailed == (int)CRCLIP_COUNTER_COMMAND_SEND_FAILED, "counter numbers");
+static_assert((int)CRClipboardCounterResponseBytesUnavailable == (int)CRCLIP_COUNTER_RESPONSE_BYTES_UNAVAILABLE,
+              "counter numbers");
+static_assert((int)CRClipboardCounterRemoteDataUnconsumed == (int)CRCLIP_COUNTER_REMOTE_DATA_UNCONSUMED, "counter numbers");
+static_assert((int)CRClipboardCounterRespondStoredAsFailure == (int)CRCLIP_COUNTER_RESPOND_STORED_AS_FAILURE,
+              "counter numbers");
+static_assert((int)CRClipboardCounterCommandPostFailed == (int)CRCLIP_COUNTER_COMMAND_POST_FAILED, "counter numbers");
+static_assert((int)CRClipboardCounterStallRemoteDataPostFailed == (int)CRCLIP_COUNTER_STALL_REMOTE_DATA_POST_FAILED,
+              "counter numbers");
+static_assert((int)CRClipboardCounterStallRequestPostFailed == (int)CRCLIP_COUNTER_STALL_REQUEST_POST_FAILED,
+              "counter numbers");
+static_assert((int)CRClipboardCounterStallRequestDropped == (int)CRCLIP_COUNTER_STALL_REQUEST_DROPPED, "counter numbers");
+static_assert((int)CRCLIP_COUNTER_COUNT == 18, "a new counter needs a CRClipboardCounter value");
+
+- (BOOL)announceClipboardFormat:(uint32_t)formatId
+{
+    return crclip_announce(_outboundQueue, _clipCounters, formatId);
+}
+
+- (BOOL)requestClipboardFormat:(uint32_t)formatId
+{
+    return crclip_request(_outboundQueue, _clipCounters, formatId);
+}
+
+/* Whether `event` was delivered on the connection that is live now (an event of an earlier one
+ * names a store generation that has since been cleared). */
+- (BOOL)crb_clipboardEventIsCurrent:(CRClipboardEvent *)event
+{
+    return _controlQueue && event.generation == crdpq_current_generation(_controlQueue);
+}
+
+- (BOOL)respondToClipboardDataRequest:(CRClipboardEvent *)request bytes:(nullable NSData *)bytes
+{
+    if (!request || request.kind != CRClipboardEventKindDataRequest || ![self crb_clipboardEventIsCurrent:request])
+        return NO;
+    const crclip_respond_result_t result =
+        crclip_respond(_outboundQueue, _clipStore, _clipCounters, ++_clipAnswerSequence, &request->_ref, bytes != nil,
+                       (const uint8_t *)bytes.bytes, bytes.length);
+    return result == CRCLIP_RESPOND_POSTED || result == CRCLIP_RESPOND_POSTED_AS_FAILURE;
+}
+
+/* crclip_take_remote's reader, calling the caller's block (synchronously, during the take). */
+static void crb_clipboard_reader(const uint8_t *bytes, size_t length, void *context)
+{
+    void (^reader)(const uint8_t *_Nullable, NSUInteger) = (__bridge void (^)(const uint8_t *_Nullable, NSUInteger))context;
+    reader(bytes, (NSUInteger)length);
+}
+
+- (BOOL)takeClipboardRemoteData:(CRClipboardEvent *)event
+                         reader:(NS_NOESCAPE void (^)(const uint8_t *_Nullable bytes, NSUInteger length))reader
+{
+    if (!event || event.kind != CRClipboardEventKindRemoteData || event.entrySettled)
+        return NO;
+    event.entrySettled = YES;
+    if (![self crb_clipboardEventIsCurrent:event] || !reader)
+    {
+        if ([self crb_clipboardEventIsCurrent:event])
+            crclip_discard_remote(_clipStore, &event->_ref);
+        return NO;
+    }
+    return crclip_take_remote(_clipStore, &event->_ref, crb_clipboard_reader, (__bridge void *)reader);
+}
+
+- (void)discardClipboardRemoteData:(CRClipboardEvent *)event
+{
+    if (!event || event.kind != CRClipboardEventKindRemoteData || event.entrySettled)
+        return;
+    event.entrySettled = YES;
+    if ([self crb_clipboardEventIsCurrent:event])
+        crclip_discard_remote(_clipStore, &event->_ref);
+}
+
+- (uint64_t)clipboardCounter:(CRClipboardCounter)counter
+{
+    if (counter < 0 || counter >= (CRClipboardCounter)CRCLIP_COUNTER_COUNT)
+        return 0;
+    return crclip_counters_get(_clipCounters, (crclip_counter_t)counter);
 }
 
 - (void)sendWindowMove:(uint32_t)windowId left:(int32_t)left top:(int32_t)top right:(int32_t)right bottom:(int32_t)bottom
